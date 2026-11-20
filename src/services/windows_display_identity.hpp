@@ -127,6 +127,11 @@ inline std::u16string monitor_interface_path(std::uint32_t number){return u"\\\\
 // 上述執行個體與介面路徑的共同前綴（已摺疊為小寫），判斷呼叫是否指向監視器時使用。
 inline constexpr std::u16string_view monitor_instance_prefix=u"display\\";
 inline constexpr std::u16string_view monitor_interface_prefix=u"\\\\?\\display#";
+// 虛擬顯示器使用 CVT-RB 的最短 460 微秒遮沒期，至少保留 14 行。
+constexpr std::uint32_t vertical_blank_lines(std::uint32_t height,std::uint32_t rate){
+    const auto active=1000000U-460U*std::clamp(rate,1U,500U);
+    return std::max(14U,static_cast<std::uint32_t>((std::uint64_t{1000000U-active}*height+active-1)/active));
+}
 // EDID 1.4 基本區塊。第 54 位元組起的 DTD 為偏好時序，寬高即顯示器尺寸；遮沒區間依 CVT-RB（水平 160、最短垂直遮沒 460 微秒）。
 // DTD 的寬高欄只有 12 位元，超過 4095 時等比減半；像素時脈欄上限 655.35 MHz，超過時截在上限，推得的更新率因而偏低。
 // 實體尺寸未知（與 GetDeviceCaps(HORZSIZE)＝0 一致），依 EDID 規格填 0 表示未定義，不編造尺寸。
@@ -149,9 +154,8 @@ constexpr std::array<std::uint8_t,128> monitor_edid(std::uint32_t number,std::ui
     for(std::size_t at=38;at<54;++at)put(at,1); // 標準時序全部未使用。
     while(width>4095 || height>4095){width=(width+1)/2;height=(height+1)/2;}
     const std::uint32_t rate=std::clamp<std::uint32_t>(refresh?refresh:60,1,500);
-    constexpr std::uint32_t hblank=160,hfront=48,hsync=32,vfront=3,vsync=5,vback=6;
-    const std::uint32_t idle=1000000-460*rate;
-    const std::uint32_t vblank=std::max<std::uint32_t>(vfront+vsync+vback,static_cast<std::uint32_t>((UINT64_C(460)*height*rate+idle-1)/idle));
+    constexpr std::uint32_t hblank=160,hfront=48,hsync=32,vfront=3,vsync=5;
+    const auto vblank=vertical_blank_lines(height,rate);
     const std::uint64_t clock=std::clamp<std::uint64_t>((std::uint64_t{width+hblank}*(height+vblank)*rate+5000)/10000,1,65535);
     constexpr std::size_t dtd=54;
     put(dtd,clock);put(dtd+1,clock>>8);

@@ -20,6 +20,28 @@ bool WindowsServices::begin_gui_control(GuestState& state,GuestMemory& memory,co
     const auto window=gui_.windows.find(message.window);
     if(window==gui_.windows.end())return false;
     const auto& cls=gui_control_class(window->second);
+    if(cls==u"scrollbar"){
+        const auto msg=message.message;
+        if(msg==0xe3){
+            const auto found=gui_.scroll_info.find({message.window,2});
+            const auto value=[&](unsigned offset,std::uint32_t fallback){
+                if(found==gui_.scroll_info.end())return fallback;
+                std::uint32_t v=0;for(unsigned i=0;i<4;++i)v|=std::uint32_t{found->second[offset+i]}<<(8*i);
+                return v;
+            };
+            if(message.wparam)memory.store(GuestAddress{message.wparam},32,value(8,0));
+            if(message.lparam)memory.store(GuestAddress{message.lparam},32,value(12,100));
+            complete_call(state,memory,0);return true;
+        }
+        if(msg==0xe9 || msg==0xea || msg==0xeb || msg==0xe1){
+            const auto symbol=msg==0xe9?"SetScrollInfo":msg==0xea?"GetScrollInfo":msg==0xeb?"GetScrollBarInfo":"GetScrollPos";
+            std::vector<std::uint64_t> args{message.window,msg==0xeb?0xfffffffcU:2U};
+            if(msg!=0xe1)args.push_back(message.lparam);
+            if(msg==0xe9)args.push_back(message.wparam);
+            start_callbacks(state,memory,{{resolve("internal-scroll",symbol).value,std::move(args)}},Continuation::ReturnCallback);
+            return true;
+        }
+    }
     const GuiControlAbi abi(x86_);const auto header=abi.notify_size;
     if(cls==u"edit" && window->second.header_owner){
         const auto owner=gui_.windows.find(window->second.header_owner);
@@ -359,7 +381,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_tree_selection(GuestSta
 }
 void WindowsServices::discard_gui_control(std::uint64_t token){
     const auto found=gui_.control_operations.find(token);if(found==gui_.control_operations.end())return;
-    if(found->second.clipboard_opened && gui_.clipboard_open_thread==found->second.thread){(void)clipboard_notice(ClipboardNoticeAction::Close,0,found->second.thread);gui_.clipboard_open_thread=gui_.clipboard_open_window=0;if(gui_.clipboard_dirty)notify_clipboard();}
+    if(found->second.clipboard_opened && gui_.clipboard_open_thread==found->second.thread){const auto closed=clipboard_notice(ClipboardNoticeAction::Close,0,found->second.thread);gui_.clipboard_open_thread=gui_.clipboard_open_window=0;if(closed.notify)notify_clipboard(&closed);}
     if(found->second.calendar && found->second.calendar->callback_active){const auto window=gui_.windows.find(found->second.message.window);if(window!=gui_.windows.end() && window->second.calendar && window->second.calendar->callback_depth)--window->second.calendar->callback_depth;}
     if(found->second.header && found->second.header->filter_buffer)gui_.control_notification_buffers.push_back(found->second.header->filter_buffer);
     if(found->second.header && found->second.header->drag_image){const auto& paint=*found->second.header;

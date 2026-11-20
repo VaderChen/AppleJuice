@@ -30,7 +30,8 @@ void d3d11_pooled_visibility(D3D11State& bridge,Identity& context,Identity& quer
 }
 // Graphics 不更新 CS 階段，Compute 只更新 CS 階段；未更新的部分在這份快取裡維持上次內容（原始指標與解析值仍一致），只有對應的提交才會讀它。
 enum class D3D11DrawScope:std::uint8_t {All,Graphics,Compute};
-GraphicsDraw& d3d11_draw_state(D3D11State& bridge,const std::shared_ptr<Identity>& context,const D3D11DrawScope scope,const std::string_view symbol){
+// pooled 非空時改用呼叫端提供的快取物件（延遲內容的快照池，見 D3D11DeferredDrawPool），不輪替、也不等命令執行緒。
+GraphicsDraw& d3d11_draw_state(D3D11State& bridge,const std::shared_ptr<Identity>& context,const D3D11DrawScope scope,const std::string_view symbol,D3D11DrawCache* pooled=nullptr){
     static const std::array<std::string,6> stage_names{"VS","PS","GS","HS","DS","CS"};
     const auto require=[&](bool value){if(!value)throw std::invalid_argument("D3D11 參數或狀態不合法："+std::string(symbol));};
     const auto object=[&](std::uint64_t address)->const Object& {const auto found=bridge.objects.find_fast(address);if(found==bridge.objects.end())throw HostCallFault("D3D11 COM 物件已釋放或位址無效");return found->second;};
@@ -59,12 +60,28 @@ GraphicsDraw& d3d11_draw_state(D3D11State& bridge,const std::shared_ptr<Identity
     static const std::string stream_key{"StreamOutput"},layout_key{"Layout"},index_key{"Index"},vertex_key{"Vertices"},target_key{"Targets"},depth_key{"Depth"},blend_key{"Blend"},depth_state_key{"DepthState"},raster_key{"Raster"};
     // 多份快取輪流使用：先前以參照排入命令執行緒的繪製可能仍在讀前幾份，只等使用同一份的那次繪製
     // （連續繪製間客體工作很少時，少量份數仍會等待；DQ3 四份時同步等待約 6%，改八份吸收更深的突發）。
-    context->draw_slot=(context->draw_slot+1)%d3d11_draw_cache_count();
-    auto& cache=context->draw_caches[context->draw_slot];if(!cache)cache=std::make_unique<D3D11DrawCache>();
-    if(context->native)context->native->graphics_sync_until(cache->ticket);
-    if(snapshot_enabled && draw_cache_enabled && !context->weak_bindings && cache->destroyed==bridge.destroyed_objects)++bridge.draw_cache_incremental;
+    D3D11DrawCache* cache=pooled;
+    if(!cache){
+        context->draw_slot=(context->draw_slot+1)%d3d11_draw_cache_count();
+        auto& slot=context->draw_caches[context->draw_slot];if(!slot)slot=std::make_unique<D3D11DrawCache>();
+        if(context->native)context->native->graphics_sync_until(slot->ticket);
+        cache=slot.get();
+    }
+    // 物件銷毀後同一位址可能被新物件重用，快取的原始指標不能再當作「沒變」；但不必整份解構重建約 70 KB 的狀態：
+    // 把每個槽位的原始指標標成不可能出現的值，下面的逐槽比對就會重新解析每個綁定槽（含清空已解除的槽），只碰有綁定的槽位。
+    // 遊戲每幀銷毀數十個物件時，原本 32 份輪替快取在每次銷毀後都要整份重建（Control 約 36%）。X64ARM_D3D11_DRAW_CACHE_REFRESH=0 回到整份重建。
+    static const bool refresh_enabled=[](){const char* option=std::getenv("X64ARM_D3D11_DRAW_CACHE_REFRESH");return !option || std::string_view(option)!="0";}();
+    const bool reusable=snapshot_enabled && draw_cache_enabled && !context->weak_bindings;
+    if(reusable && cache->destroyed==bridge.destroyed_objects)++bridge.draw_cache_incremental;
+    else if(reusable && refresh_enabled && cache->destroyed!=UINT64_MAX){
+        constexpr auto stale=UINT64_MAX;
+        for(auto& stage:cache->stage_raw)for(auto& raw:stage)std::fill(raw.begin(),raw.end(),stale);
+        for(auto* raw:{&cache->stream_raw,&cache->vertex_raw,&cache->target_raw})std::fill(raw->begin(),raw->end(),stale);
+        cache->shaders.fill(stale);cache->layout=cache->index=cache->depth=cache->blend=cache->depth_state=cache->raster=stale;
+        ++bridge.draw_cache_refresh;
+    }
     // 就地解構再建構（命令執行緒已用完這份快取）；以暫存物件指派會讓每次呼叫的堆疊框架多出約 64 KB。
-    else {std::destroy_at(cache.get());std::construct_at(cache.get());++bridge.draw_cache_full;}
+    else {std::destroy_at(cache);std::construct_at(cache);++bridge.draw_cache_full;}
     cache->destroyed=bridge.destroyed_objects;
     auto& draw=cache->draw;
     try{

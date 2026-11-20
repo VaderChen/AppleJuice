@@ -7,13 +7,6 @@ struct GuiMessage;
 // 對話框與訊息派送共用 MSG 客體佈局及記憶體範圍檢查。
 GuiMessage gui_read_message(const GuestMemory&,std::uint64_t);
 void gui_write_message(GuestMemory&,std::uint64_t,const GuiMessage&);
-// 與 RegisterWindowMessageA/W 共用穩定名稱對應，供系統對話框接收公開註冊訊息。
-// 名稱與 atom 相同不分大小寫：ASCII 與 Latin-1 小寫字母先轉大寫再雜湊（"SHELLHOOK" 與 "shellhook" 為同一訊息）。
-constexpr std::uint32_t gui_registered_message(std::u16string_view text) {
-    std::uint32_t hash=2166136261;
-    for(auto c:text){if((c>=u'a' && c<=u'z') || (c>=0xe0 && c<=0xfe && c!=0xf7))c=static_cast<char16_t>(c-32);hash=(hash^c)*16777619;}
-    return 0xc000+hash%0x4000;
-}
 // Windows 視窗類別的客體 ABI；不可使用宿主指標寬度。
 struct GuiClassAbi {
     unsigned size, style, procedure, class_extra, window_extra, instance, icon, cursor, background, menu, name, small_icon;

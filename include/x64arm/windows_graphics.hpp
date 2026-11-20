@@ -22,6 +22,7 @@ struct GraphicsObject {virtual ~GraphicsObject()=default;std::uint64_t pending_s
 struct GraphicsResourceDesc {
     std::uint32_t dimension{1},width{},height{1},depth{1},levels{1},layers{1},format{},samples{1},bind{},stride{},misc{};
     std::uint32_t sample_quality{};
+    std::uint32_t initialized{}; // 呼叫端建立後會立即寫入的前段位元組數：緩衝的這一段不必先清零。
 };
 struct GraphicsResource:GraphicsObject {
     GraphicsResourceDesc desc;
@@ -40,7 +41,7 @@ struct GraphicsPipelineStatistics {std::uint64_t ia_vertices{},ia_primitives{},v
 struct GraphicsBinding {std::uint32_t type{},slot{},native_slot{},counter_slot{UINT32_MAX},space{},count{},source{UINT32_MAX},dimension{};};
 struct GraphicsInput {std::string semantic;std::uint32_t index{},attribute{},component{};}; // component：0 浮點、1 無號、2 有號。
 struct GraphicsLegacyShader {std::string source,entry;std::vector<GraphicsBinding> bindings;std::vector<GraphicsInput> inputs;};
-GraphicsLegacyShader graphics_legacy_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes);
+GraphicsLegacyShader graphics_legacy_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes,std::uint32_t shadow_samplers=0);
 // SM5.1 DXBC 與 DXIL：經 vkd3d-shader（SPIR-V）與 SPIRV-Cross 轉為 MSL；入口為 xlatMtlMain。
 // 原始 D3D 簽章的位置與分量遮罩；階段連結不能把轉譯器的 locnN 當成語意名稱。
 struct GraphicsShaderSemantic {std::string semantic;std::uint32_t index{},location{},mask{};};
@@ -166,6 +167,9 @@ public:
     // 呼叫端之後會修改物件（例如加上串流輸出宣告）時使用：後端可依內容共用編譯結果，但回傳私有物件。
     virtual std::shared_ptr<GraphicsShader> graphics_shader_private(std::uint32_t stage,std::span<const std::uint8_t> bytes){return graphics_shader(stage,bytes);}
     virtual std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t,std::span<const std::uint8_t>){throw std::runtime_error("後端缺少 DXBC 著色器");}
+    // D3D9 SM1–3：shadow_samplers 的位元指定以比較取樣處理的取樣器（由繪製端依綁定的陰影深度紋理決定）。
+    virtual std::shared_ptr<GraphicsShader> graphics_legacy_shader_variant(std::uint32_t stage,std::span<const std::uint8_t> bytes,std::uint32_t shadow_samplers){
+        if(shadow_samplers)throw std::runtime_error("後端缺少 D3D9 陰影取樣器變體");return graphics_shader(stage,bytes);}
     // 背景準備著色器：已在快取、曾經失敗或後端不支援背景編譯時回 0（呼叫端照常同步建立）；否則啟動或沿用進行中的背景
     // 轉譯與編譯並回傳非零票號，呼叫端可讓客體執行緒等票號完成後重試，不在持鎖的服務內編譯。
     virtual std::uint64_t graphics_shader_prefetch(std::uint32_t,std::span<const std::uint8_t>,
@@ -176,6 +180,9 @@ public:
     virtual std::shared_ptr<GraphicsSampler> graphics_sampler(std::span<const std::uint8_t>){throw std::runtime_error("後端缺少取樣器");}
     virtual bool graphics_timestamp_supported()const{return false;}
     virtual GraphicsTimestamp graphics_timestamp(){throw std::runtime_error("後端沒有 GPU timestamp");}
+    // 目前的 GPU 時鐘值（與 graphics_timestamp／查詢時間戳同一時基），不提交命令、不等 GPU；不支援時為空。
+    // 供 D3D12 GetClockCalibration 與 CPU 時鐘配對取樣。
+    virtual std::optional<std::uint64_t> graphics_gpu_clock(){return std::nullopt;}
     // 在目前提交點記錄 GPU 時間戳，不等待；供 D3D11 TIMESTAMP／TIMESTAMP_DISJOINT 查詢輪詢。預設後端同步取樣後直接完成。
     virtual std::shared_ptr<const GraphicsTimestampFuture> graphics_timestamp_future(){auto future=std::make_shared<GraphicsTimestampFuture>();future->value=graphics_timestamp();future->done.store(true,std::memory_order_release);return future;}
     virtual void graphics_write(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t){throw std::runtime_error("後端缺少資源寫入");}

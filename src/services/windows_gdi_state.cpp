@@ -4,6 +4,7 @@
 #include <bit>
 #include "x64arm/windows_transform.hpp"
 #include "gui_paint_region.hpp"
+#include "gui_cursor_bounds.hpp"
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> gdi_state_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
@@ -59,7 +60,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
         if(window!=gui_.windows.end()){width=window->second.width;height=window->second.height;}
         else if(remote){width=remote->width;height=remote->height;}
         else if(const auto bitmap=gui_.bitmaps.find(dc.bitmap);bitmap!=gui_.bitmaps.end()){width=bitmap->second.width;height=bitmap->second.height;}
-        else if(dc.display){width=1440;height=900;}
+        else if(dc.display || arg(0)==0x10000000U)return GuiRegion{gui_virtual_screen_bounds(gui_monitors())};
         return width && height?GuiRegion{{0,0,static_cast<std::int32_t>(width),static_cast<std::int32_t>(height)}}:GuiRegion{};
     };
     const auto effective=[&](const GuiDc& value,bool bounded){
@@ -120,7 +121,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
             if(!level || found==gui_.saved_contexts.end())return failure(87);auto& saved=found->second;
             const auto index=level>0?static_cast<std::int64_t>(level)-1:static_cast<std::int64_t>(saved.size())+level;
             if(index<0 || static_cast<std::uint64_t>(index)>=saved.size())return failure(87);
-            auto restored=saved[static_cast<std::size_t>(index)];restored.paint_clip=dc.paint_clip;update(restored);dc=std::move(restored);saved.resize(static_cast<std::size_t>(index));
+            auto restored=saved[static_cast<std::size_t>(index)];restored.paint_clip=dc.paint_clip;restored.acquisition_clip=dc.acquisition_clip;restored.acquisition_region=dc.acquisition_region;update(restored);dc=std::move(restored);saved.resize(static_cast<std::size_t>(index));
             if(window!=gui_.windows.end()){window->second.text_color=dc.color;window->second.background_mode=dc.mode;}
             gui_.dc_objects[arg(0)]=dc.font;return finish(1);
         }

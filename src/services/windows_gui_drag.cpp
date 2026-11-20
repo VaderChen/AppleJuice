@@ -6,7 +6,7 @@ namespace x64arm {
 std::span<const WindowsServiceDescriptor> gui_drag_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         // POINT 是值參數：Win32 佔兩個 DWORD，Win64 佔一個 64 位元暫存器。
-        {"user32.dll","DragDetect",2,2},
+        {"user32.dll","DragDetect",2,2},{"win32u.dll","NtUserDragDetect",3,0,0,0x6},
         {"internal-gui-drag","ReadMessage",4}};
     return table;
 }
@@ -40,12 +40,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_drag(GuestState& state,
     const auto window=gui_.windows.find(arg(0));
     if(window==gui_.windows.end()){fail(1400);return std::nullopt;}
     if(window->second.thread!=threads_.current){fail(5);return std::nullopt;}
-    if(!(gui_.keyboard[1]&0x80U)){arg.return_to(state,0);return std::nullopt;}
+    if(!(threads_.input_queue(threads_.current).keys[1]&0x80U)){arg.return_to(state,0);return std::nullopt;}
     if(gui_.drag_detections.size()>=4096){fail(1816);return std::nullopt;}
     const auto buffer=allocate_heap(memory,x86_?28:48);if(!buffer){fail(8);return std::nullopt;}
     GuiDragDetection operation;operation.window=arg(0);operation.thread=threads_.current;operation.message_buffer=buffer;
     const auto point=arg(1);
-    operation.detection=mouse_drag::Detection{{std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(point)),std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(point>>32))},gui_.mouse_drag_width,gui_.mouse_drag_height};
+    operation.client_coordinates=service.symbol=="NtUserDragDetect";
+    const auto y=operation.client_coordinates?arg(2):point>>32;
+    operation.detection=mouse_drag::Detection{{std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(point)),std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(y))},gui_.mouse_drag_width,gui_.mouse_drag_height};
     operation.capture_generation=gui_.capture_generation+(gui_.capture==operation.window?0U:1U);
     const auto id=gui_.next_object++;gui_.drag_detections.emplace(id,operation);
     start_callbacks(state,memory,{{resolve("user32.dll","SetCapture").value,{operation.window}}},Continuation::GuiDragDetection,id);
@@ -70,8 +72,16 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_drag(GuestState& state,
             const auto message=memory.load(GuestAddress{buffer+(x86_?4:8)},32),key=memory.load(GuestAddress{buffer+(x86_?8:16)},bits);
             if(!value){operation.quit=true;operation.quit_code=static_cast<std::uint32_t>(key);operation.detection.cancel();}
             else if(message==0x200){
-                const auto offset=x86_?20U:36U;
-                operation.detection.move({std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{buffer+offset},32))),std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{buffer+offset+4},32)))},key&1U);
+                if(operation.client_coordinates){
+                    // NT 入口以工作區座標追蹤；WM_MOUSEMOVE 的 LPARAM 包含兩個帶正負號的 WORD。
+                    const auto packed=memory.load(GuestAddress{buffer+(x86_?12:24)},32);
+                    const auto x=std::bit_cast<std::int16_t>(static_cast<std::uint16_t>(packed));
+                    const auto y=std::bit_cast<std::int16_t>(static_cast<std::uint16_t>(packed>>16));
+                    operation.detection.move({x,y},true);
+                }else{
+                    const auto offset=x86_?20U:36U;
+                    operation.detection.move({std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{buffer+offset},32))),std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{buffer+offset+4},32)))},key&1U);
+                }
             }else if(message==0x202 || ((message==0x100 || message==0x104) && key==27) || ((message==0x1f || message==0x215) && memory.load(GuestAddress{buffer},bits)==operation.window))operation.detection.cancel();
             else {
                 callback(Stage::Dispatch,{{resolve("user32.dll","TranslateMessage").value,{buffer}},{resolve("user32.dll","DispatchMessageW").value,{buffer}}});

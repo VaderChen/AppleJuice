@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <vector>
 
 namespace x64arm {
@@ -25,6 +26,7 @@ struct WinrtOriginOperation {
     std::uint64_t object{}, payload{};
     std::uint32_t hresult{}, length{};
     bool exception{};
+    std::optional<std::uint32_t> original_hresult;
     bool operator==(const WinrtOriginOperation&) const = default;
 };
 struct ComErrorBridge {

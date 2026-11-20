@@ -478,6 +478,66 @@ void WindowsServices::poll_file_io(GuestMemory &memory, bool scheduler_poll) {
     std::erase_if(pending_file_io_,
                   [](const auto &io) { return (io.overlapped || io.native_iosb) && !io.blocking && io.notify && io.done; });
 }
+// worker 上的 PeekNamedPipe：管線的跨程序 session 鎖可能被其他程序（Steam 用戶端的全表存活掃描等）持有數十至數百毫秒，
+// 在協調者（持獨占映射鎖）等待時所有客體執行緒都停住。偷看不消耗資料也不改佇列，只讀控制代碼表（建立與關閉在協調者、
+// 持獨占映射鎖）與管線共享頁，等鎖時只停住呼叫者。管線錯誤要設 LastError，交回協調者重做（偷看可重做）。
+// I/O 次數記帳只在協調者路徑累計。回傳 false 表示交回協調者。
+bool WindowsServices::pipe_peek_worker(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    const WindowsCall arg(state,memory,service);
+    const auto file=files_.find(arg(0));if(file==files_.end() || !file->second.pipe)return false;
+    const auto capacity=static_cast<std::uint32_t>(arg(2));if(capacity>output_limit)return false;
+    for(unsigned i=3;i<6;++i)if(arg(i))memory.check(GuestAddress{arg(i)},4,Access::Write);
+    const auto count=arg(1)?capacity:0U;memory.check(GuestAddress{arg(1)},count,Access::Write);
+    std::vector<std::uint8_t> data(count);std::uint32_t available{},remaining{};
+    const auto pipe=file->second.pipe;
+    const auto io=pipe->read(data,(pipe->information().mode&4)!=0,true,&available,&remaining);
+    if(io.error)return false;
+    memory.write(GuestAddress{arg(1)},std::span(data).first(io.bytes));
+    if(arg(3))memory.store(GuestAddress{arg(3)},32,io.bytes);
+    if(arg(4))memory.store(GuestAddress{arg(4)},32,available);
+    if(arg(5))memory.store(GuestAddress{arg(5)},32,remaining);
+    arg.return_to(state,1);return true;
+}
+// worker 上的同步 ReadFile：一般本機檔案、非 overlapped、目的範圍為整段私人可寫 backing 時，以 pread 直接讀進客體記憶體。
+// 協調者路徑（含協調者本地版）每次持獨占映射鎖做宿主磁碟讀取（Control 載入時每次約 1 ms），期間其他 vCPU 的服務都要等。
+// 控制代碼表、檔案位置表與位元組範圍鎖只在協調者持獨占映射鎖時變更，worker 持共用映射鎖讀取；同一檔案物件的游標以分段鎖序列化。
+// 不改變 handle 訊號（只收已在訊號狀態者，同步讀取前後皆為訊號）、不記 I/O 次數（同 PeekNamedPipe）。
+// 標準串流、主控台、通訊端、裝置、管線類、完成埠、目錄、跨程序共用游標、NtReadFile 被客體改寫與任何錯誤都交回協調者重做。
+bool WindowsServices::file_read_worker(GuestState& state,GuestMemory& memory){
+    const WindowsCall arg(state,memory,{"kernel32.dll","ReadFile",5});
+    const auto handle=arg(0),buffer=arg(1),count_pointer=arg(3),overlapped=arg(4);const auto count=static_cast<std::uint32_t>(arg(2));
+    if(overlapped || !count_pointer || (handle>=0x100 && handle<=0x102) || console_handle(handle) || runtime_.network.sockets.contains(handle) ||
+       kernel_device_handle(handle))return false;
+    const auto found=files_.find(handle);if(found==files_.end())return false;
+    const auto& file=found->second;
+    if(!file.native || file.pipe || file.serial || file.hid || file.usb || file.completion_port || !file.io_signaled ||
+       (file.metadata.attributes&0x10U) || !(file.access&(0x80000000U|1U)) || file.native->null_device())return false;
+    if(static const char* const read_trace=std::getenv("X64ARM_TRACE_FILE_READ");read_trace && *read_trace)return false;
+    if(native_file_entry(memory,"NtReadFile").second)return false;
+    const auto position=runtime_.win_file_positions.find(file.object);
+    if(position==runtime_.win_file_positions.end() || position->second.identity())return false;
+    // 輸出計數位置：4 位元組私人可寫，且不與讀取範圍重疊（重疊時讀取結果與計數的先後由完整路徑決定）。
+    const auto counter=memory.native_private_span(GuestAddress{count_pointer},4,2);if(counter.empty())return false;
+    static std::array<std::mutex,64> cursors;
+    const std::lock_guard cursor(cursors[(file.object^(file.object>>6))&63U]);
+    const auto guard=position->second.lock();
+    const auto offset=static_cast<std::uint64_t>(position->second);const auto size=file.native->current_size();
+    const auto extent=static_cast<std::size_t>(std::min<std::uint64_t>(count,size>offset?size-offset:0));
+    if(extent && count_pointer<buffer+extent && buffer<count_pointer+4)return false;
+    if(file.native->validate_io(offset,count,false,0))return false;
+    std::size_t transferred=0;
+    if(extent){
+        const auto target=memory.native_private_span(GuestAddress{buffer},extent,2);if(target.empty())return false;
+        while(transferred<extent){
+            const auto io=file.native->read(target.subspan(transferred),offset+transferred,0);
+            if(io.error)return false;
+            transferred+=static_cast<std::size_t>(io.bytes);if(!io.bytes)break;
+        }
+    }
+    position->second=offset+transferred;
+    const auto bytes=static_cast<std::uint32_t>(transferred);std::memcpy(counter.data(),&bytes,4);
+    arg.return_to(state,1);return true;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_file_lock(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
     const bool native=symbol.starts_with("Nt"),unlock=symbol=="NtUnlockFile" || symbol=="UnlockFile" || symbol=="UnlockFileEx";

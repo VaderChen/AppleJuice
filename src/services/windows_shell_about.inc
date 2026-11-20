@@ -4,7 +4,7 @@
 // - OpenAs_RunDLL：rundll32 入口，命令列即檔案路徑，轉呼叫既有的 SHOpenWithDialog（OAIF_ALLOW_REGISTRATION｜OAIF_REGISTER_EXT｜OAIF_EXEC）。
 // - SHGetSetSettings：與 SHGetSettings 相同的來源（Explorer\Advanced 的 DWORD 與 Explorer\ShellState 二進位），設定時寫回同一處。
 // - ReadCabinetState：HKCU\...\Explorer\CabinetState 的 Settings 二進位；沒有值時填入預設。
-if(service.symbol.starts_with("ShellAbout") || service.symbol.starts_with("OpenAs_RunDLL") || service.symbol=="SHGetSetSettings" || service.symbol=="ReadCabinetState" ||
+if(service.symbol.starts_with("ShellAbout") || service.symbol.starts_with("OpenAs_RunDLL") || service.symbol=="SHGetSettings" || service.symbol=="SHGetSetSettings" || service.symbol=="ReadCabinetState" ||
    service.family=="internal-shell-about"){
     const std::uint64_t current_user=x86_?0x80000001U:0xffffffff80000001ULL,local_machine=x86_?0x80000002U:0xffffffff80000002ULL;
     if(service.family=="internal-shell-about")
@@ -102,8 +102,10 @@ if(service.symbol.starts_with("ShellAbout") || service.symbol.starts_with("OpenA
     }
     // SHGetSetSettings(LPSHELLSTATE, DWORD dwMask, BOOL bSet)：SHELLSTATE 32 位元組；第一組旗標在 0、lParamSort 在 12、iSortDirection 在 16、第二組旗標在 28。
     // ShellState 二進位為 {cbSize＝0x24, SHELLSTATE}；沒有值時 fDoubleClickInWebView 開啟、fStartPanelOn 開啟。
-    const auto lpss=call(0);const auto mask=static_cast<std::uint32_t>(call(1));const bool set=call(2)!=0;if(!lpss)return done(0);
-    memory.check(GuestAddress{lpss},32,set?Access::Read:Access::Write);
+    const auto lpss=call(0);const auto mask=static_cast<std::uint32_t>(call(1));const bool compact=service.symbol=="SHGetSettings";
+    const bool set=!compact && call(2)!=0;if(!lpss)return done(0);
+    const unsigned state_size=compact?4:32;
+    memory.check(GuestAddress{lpss},state_size,set?Access::Read:Access::Write);
     struct Flag{std::uint32_t mask;unsigned word,bit;std::u16string_view name;std::uint32_t fallback,on;};
     // name 為空表示存在 ShellState 二進位；on 為「開啟」對應的 DWORD 值（Hidden 1／2、HideFileExt 反向）。
     static constexpr Flag flags[]{
@@ -113,10 +115,14 @@ if(service.symbol.starts_with("ShellAbout") || service.symbol.starts_with("OpenA
         {0x100000,0,16,u"NoNetCrawling",0,1},{0x80000,1,0,u"SeparateProcess",0,1},{0x200000,1,1,{},0,1},{0x400000,1,2,{},0,1},{0x800000,1,3,u"AutoCheckSelect",0,1},
         {0x1000000,1,4,u"IconsOnly",0,1},{0x2000000,1,5,u"ShowTypeOverlay",1,1},{0x4000000,1,6,u"ShowStatusBar",1,1}};
     std::vector<std::uint8_t> blob(36,0);blob[0]=0x24;blob[4]=0x20;blob[32]=0x02;
-    if(const auto stored=read_value(explorer,u"ShellState",0x08,256);stored && stored->size()>=36)blob.assign(stored->begin(),stored->begin()+36);
-    std::vector<std::uint8_t> shell(32);memory.read(GuestAddress{lpss},shell);bool blob_changed=false;
+    if(const auto stored=read_value(explorer,u"ShellState",0x08,256);stored && stored->size()>=36)blob=*stored;
+    std::vector<std::uint8_t> shell(state_size);memory.read(GuestAddress{lpss},shell);bool blob_changed=false;
     for(const auto& flag:flags){
-        if(!(mask&flag.mask))continue;const auto offset=flag.word?28U:0U;const auto bit=1U<<flag.bit;
+        if(!(mask&flag.mask))continue;
+        // SHELLFLAGSTATE 的低 13 位元與 SHELLSTATE 相同，另外兩個旗標位於 13、14。
+        if(compact && !(flag.word==0 && flag.bit<13) && !(flag.word==1 && (flag.bit==3 || flag.bit==4)))continue;
+        const auto offset=flag.word && !compact?28U:0U;
+        const auto bit=1U<<(compact && flag.word?flag.bit+10:flag.bit);
         if(set){
             const bool on=(le32(shell,offset)&bit)!=0;
             if(flag.name.empty()){const auto value=le32(blob,4+offset);set32(blob,4+offset,on?value|bit:value&~bit);blob_changed=true;}
@@ -130,7 +136,7 @@ if(service.symbol.starts_with("ShellAbout") || service.symbol.starts_with("OpenA
             set32(shell,offset,on?le32(shell,offset)|bit:le32(shell,offset)&~bit);
         }
     }
-    if(mask&0x10U){ // SSF_SORTCOLUMNS：lParamSort 與 iSortDirection
+    if(!compact && (mask&0x10U)){ // SSF_SORTCOLUMNS：lParamSort 與 iSortDirection
         if(set){set32(blob,4+12,le32(shell,12));set32(blob,4+16,le32(shell,16));blob_changed=true;}
         else{set32(shell,12,le32(blob,4+12));set32(shell,16,le32(blob,4+16));}
     }

@@ -25,6 +25,8 @@
 #include <unicode/udatpg.h>
 #include <unicode/uchar.h>
 #include <unicode/ucol.h>
+#include <unicode/usearch.h>
+#include <unicode/uregex.h>
 #include <unicode/unorm2.h>
 #include <unicode/uscript.h>
 #include <unicode/ustring.h>
@@ -422,6 +424,11 @@ std::uint32_t windows_nls_language_group_mask(){
         return result;
     }();return mask;
 }
+// UTF-7 是 Windows NLS 字碼頁，最長五個位元組，沒有 DBCS 前導位元組。
+std::optional<CrtLocaleCategory> windows_nls_codepage(std::uint32_t page){
+    if(page!=65000)return windows_crt_codepage(page);
+    CrtLocaleCategory value;value.codepage=page;value.maximum_character_bytes=5;return value;
+}
 std::optional<CrtLocaleCategory> windows_crt_codepage(std::uint32_t page){
     static std::mutex lock;
     static std::map<std::uint32_t,CrtLocaleCategory> cache;
@@ -559,6 +566,53 @@ std::optional<std::vector<std::uint8_t>> windows_crt_encode(std::u16string_view 
     status=U_ZERO_ERROR;std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));ucnv_fromUChars(converter.get(),reinterpret_cast<char*>(bytes.data()),size,text.data(),static_cast<std::int32_t>(text.size()),&status);if(U_FAILURE(status))return {};return bytes;
 }
 namespace {
+// Windows UTF-7 直接輸出 NUL，選用字元則一律以 UTF-16 碼元組成移位序列。
+constexpr std::string_view utf7_alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+bool utf7_direct(char16_t ch){
+    return (ch>=u'A' && ch<=u'Z') || (ch>=u'a' && ch<=u'z') || (ch>=u'0' && ch<=u'9') ||
+           ch==0 || std::u16string_view(u" \t\r\n'()+,-./:?").find(ch)!=std::u16string_view::npos;
+}
+NlsEncodedString encode_utf7(std::u16string_view text){
+    NlsEncodedString result;
+    auto& bytes=result.bytes;
+    for(std::size_t i=0;i<text.size();){
+        if(utf7_direct(text[i])){
+            const auto ch=text[i++];bytes.push_back(static_cast<std::uint8_t>(ch));
+            if(ch==u'+')bytes.push_back('-');
+            continue;
+        }
+        bytes.push_back('+');
+        unsigned bits=0;std::uint32_t buffer=0;
+        do{
+            buffer=(buffer<<16)|text[i++];bits+=16;
+            while(bits>=6){bits-=6;bytes.push_back(static_cast<std::uint8_t>(utf7_alphabet[(buffer>>bits)&63]));}
+        }while(i<text.size() && !utf7_direct(text[i]));
+        if(bits)bytes.push_back(static_cast<std::uint8_t>(utf7_alphabet[(buffer<<(6-bits))&63]));
+        bytes.push_back('-');
+    }
+    return result;
+}
+std::u16string decode_utf7(std::string_view bytes){
+    std::u16string text;
+    unsigned bits=0;std::uint32_t buffer=0;
+    for(std::size_t i=0;i<bytes.size();){
+        const auto ch=static_cast<unsigned char>(bytes[i++]);
+        if(ch!='+'){text.push_back(ch);continue;}
+        if(i<bytes.size() && bytes[i]=='-'){text.push_back(u'+');++i;continue;}
+        while(i<bytes.size()){
+            const auto digit=utf7_alphabet.find(bytes[i]);
+            if(digit==utf7_alphabet.npos){
+                // Windows 只在 ASCII 結束符清掉殘留位元；未移位的高位元 byte 仍逐一輸出。
+                if(static_cast<unsigned char>(bytes[i])<128)bits=0;
+                if(bytes[i]=='-')++i;
+                break;
+            }
+            ++i;buffer=(buffer<<6)|static_cast<unsigned>(digit);bits+=6;
+            if(bits>=16){bits-=16;text.push_back(static_cast<char16_t>(buffer>>bits));}
+        }
+    }
+    return text;
+}
 void U_CALLCONV nls_replacement_callback(const void*,UConverterToUnicodeArgs* args,const char*,
                                         std::int32_t,UConverterCallbackReason reason,UErrorCode* status){
     if(reason<=UCNV_IRREGULAR){
@@ -568,6 +622,7 @@ void U_CALLCONV nls_replacement_callback(const void*,UConverterToUnicodeArgs* ar
 }
 }
 std::optional<std::u16string> windows_nls_decode(std::string_view bytes,std::uint32_t page,bool strict){
+    if(page==65000)return decode_utf7(bytes);
     UErrorCode error=U_ZERO_ERROR;
     std::unique_ptr<UConverter,decltype(&ucnv_close)> converter(ucnv_open(codepage_encoding(page).c_str(),&error),ucnv_close);
     if(U_FAILURE(error) || !converter)return {};
@@ -588,6 +643,7 @@ void U_CALLCONV nls_default_callback(const void* context,UConverterFromUnicodeAr
 }
 std::optional<NlsEncodedString> windows_nls_encode(std::u16string_view text,std::uint32_t page,
                                                  bool no_best_fit,std::string_view replacement,bool strict){
+    if(page==65000)return encode_utf7(text);
     bool used=false;UErrorCode error=U_ZERO_ERROR;
     std::unique_ptr<UConverter,decltype(&ucnv_close)> converter(ucnv_open(codepage_encoding(page).c_str(),&error),ucnv_close);
     if(U_FAILURE(error) || !converter || replacement.empty() || replacement.size()>2)return {};
@@ -630,6 +686,30 @@ std::optional<CrtLocaleCategory> windows_crt_locale_id(std::uint32_t id){
     if(!id)return CrtLocaleCategory{};
     const auto locale=numbered(id);if(!locale)return {};
     auto category=windows_crt_locale(locale->name);if(category)category->lcid=id;return category;
+}
+bool windows_nls_contains(std::u16string text,std::u16string pattern,std::uint32_t id,std::uint32_t flags,bool prefix){
+    if(text.size()>INT32_MAX || pattern.size()>INT32_MAX)return false;
+    const auto locale=numbered(id);if(!locale)return false;
+    const auto order=collator(*locale,flags);if(!order)return false;
+    text=sort_input(std::move(text),flags);pattern=sort_input(std::move(pattern),flags);
+    if(ucol_strcoll(order.get(),pattern.data(),static_cast<int32_t>(pattern.size()),u"",0)==UCOL_EQUAL)return true;
+    if(text.empty())return false;
+    UErrorCode error=U_ZERO_ERROR;
+    std::unique_ptr<UStringSearch,decltype(&usearch_close)> search(
+        usearch_openFromCollator(pattern.data(),static_cast<int32_t>(pattern.size()),text.data(),static_cast<int32_t>(text.size()),order.get(),nullptr,&error),usearch_close);
+    if(U_FAILURE(error))return false;
+    const auto at=usearch_first(search.get(),&error);
+    return U_SUCCESS(error) && at>=0 && (!prefix || ucol_strcoll(order.get(),text.data(),at,u"",0)==UCOL_EQUAL);
+}
+bool windows_regex_search(std::u16string_view text,std::u16string_view pattern){
+    if(text.size()>INT32_MAX || pattern.size()>INT32_MAX)return false;
+    if(pattern.empty())return true;
+    UErrorCode error=U_ZERO_ERROR;
+    std::unique_ptr<URegularExpression,decltype(&uregex_close)> regex(
+        uregex_open(pattern.data(),static_cast<int32_t>(pattern.size()),0,nullptr,&error),uregex_close);
+    if(U_FAILURE(error))return false;
+    uregex_setText(regex.get(),text.data(),static_cast<int32_t>(text.size()),&error);
+    return uregex_find(regex.get(),0,&error) && U_SUCCESS(error);
 }
 std::optional<int> windows_nls_compare(std::u16string_view left,std::u16string_view right,std::uint32_t id,std::uint32_t flags){
     const auto locale=numbered(id);if(!locale || flags&~compare_flags)return {};
@@ -1597,7 +1677,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             if(flags&0x20000000U){if(!info->number)return fail(1004);const unsigned required=wide?2:4;
                 if(!capacity)return finish(required);if(static_cast<unsigned>(capacity)<required)return fail(122);
                 memory.store(GuestAddress{arg(2)},32,*info->number);return finish(required);}
-            auto value=info->text;value.push_back(0);const auto bytes=wide?utf16_bytes(info->text):ansi_output(value,"UTF-8");
+            const auto bytes=wide?utf16_bytes(info->text):ansi_output(info->text+u'\0',ansi_encoding(*locale,(flags&0x40000000U)!=0));
             const auto required=static_cast<std::uint32_t>(wide?bytes.size()/2:bytes.size());
             if(!capacity)return finish(required);if(static_cast<std::uint32_t>(capacity)<required)return fail(122);
             memory.write(GuestAddress{arg(2)},bytes);return finish(required);
@@ -1741,7 +1821,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         const auto capacity=static_cast<std::int32_t>(arg(5));const auto flags=static_cast<std::uint32_t>(arg(1));
         if(!arg(2) || capacity<0 || (capacity && (!arg(4) || arg(4)==arg(2))))return fail(87);
         if(flags&~0xc0000000U || (arg(3) && flags))return fail(1004);
-        const auto read=[&](std::uint64_t address){return wide?read_utf16(memory,GuestAddress{address}):utf8_to_utf16_lossy(read_ansi(memory,address));};
+        const auto encoding=ansi_encoding(*locale,(flags&0x40000000U)!=0);
+        const auto read=[&](std::uint64_t address){return wide?read_utf16(memory,GuestAddress{address}):ansi_input(memory,address,-1,false,encoding);};
         const auto input=read(arg(2));std::string decimal;bool point=false,digit=false;
         for(std::size_t i=0;i<input.size();++i){const auto c=input[i];if(c>=u'0' && c<=u'9')digit=true;else if(c==u'.' && !point)point=true;else if(c!=u'-' || i)return fail(87);decimal+=static_cast<char>(c);}
         if(!digit)return fail(87);
@@ -1802,9 +1883,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             static constexpr std::array<std::u16string_view,16> negatives{u"($n)",u"-$n",u"$-n",u"$n-",u"(n$)",u"-n$",u"n-$",u"n$-",u"-n $",u"-$ n",u"n $-",u"$ n-",u"$ -n",u"n- $",u"($ n)",u"(n $)"};
             result=decorate_number(currency?(minus?negatives[negative]:positives[positive]):minus?numbers[negative]:u"n",result,symbol,sign);
         }
-        const auto narrow=wide?std::string{}:utf16_to_utf8(result);const auto required=static_cast<std::uint32_t>((wide?result.size():narrow.size())+1);
-        if(!capacity)return finish(required);if(static_cast<std::uint32_t>(capacity)<required)return fail(122);
-        if(wide)memory.write(GuestAddress{arg(4)},utf16_bytes(result));else memory.write(GuestAddress{arg(4)},std::span(reinterpret_cast<const std::uint8_t*>(narrow.c_str()),narrow.size()+1));return finish(required);
+        const auto bytes=wide?utf16_bytes(result):ansi_output(result+u'\0',encoding);
+        const auto required=static_cast<std::uint32_t>(wide?result.size()+1:bytes.size());
+        if(!capacity)return finish(required);
+        if(static_cast<std::uint32_t>(capacity)<required)return fail(122);
+        memory.write(GuestAddress{arg(4)},bytes);return finish(required);
     }
     if(name=="GetDateFormatA" || name=="GetDateFormatW" || name=="GetDateFormatEx" || name=="GetTimeFormatA" || name=="GetTimeFormatW" || name=="GetTimeFormatEx"){
         const bool date=name.starts_with("GetDate"),extended=name.ends_with("Ex"),wide=!name.ends_with('A');
@@ -1867,10 +1950,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
     if(name=="GetStringTypeW" || name=="GetStringTypeExW" || name=="GetStringTypeA" || name=="GetStringTypeExA"){
         const unsigned offset=name=="GetStringTypeW"?0U:1U,type=static_cast<unsigned>(arg(offset));
         const auto source=arg(offset+1),output=arg(offset+3);const auto length=static_cast<std::int32_t>(arg(offset+2));
-        if(type!=1 && type!=2 && type!=4)return fail(1004);
-        if(!source || !output || source==output || !length)return fail(87);
-        const auto locale=numbered(static_cast<std::uint32_t>(arg(0)));if(name.ends_with('A') && !locale)return fail(87);
-        const auto text=name.ends_with('A')?ansi_input(memory,source,length,true,ansi_encoding(*locale)):counted_string(memory,source,length,true);memory.check(GuestAddress{output},text.size()*2,Access::Write);
+        if((type!=1 && type!=2 && type!=4) || !source || !output || source==output || length< -1)return fail(87);
+        std::u16string text;
+        if(name.ends_with('A')){
+            const auto locale=numbered(static_cast<std::uint32_t>(arg(0)));
+            if(!locale)return fail(87);
+            if(length)text=ansi_input(memory,source,length,true,ansi_encoding(*locale));
+        }else if(length)text=counted_string(memory,source,length,true);
+        if(text.empty())return finish(1);
+        memory.check(GuestAddress{output},text.size()*2,Access::Write);
         for(std::size_t i=0;i<text.size();++i)memory.store(GuestAddress{output+i*2},16,character_type(text[i],type));return finish(1);
     }
     if(name=="ConvertDefaultLocale"){
@@ -2067,7 +2155,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             28597,28598,28599,28603,28605,38598,50220,50221,50222,50225,50227,51932,51936,51949,52936,54936,57002,57003,57004,57005,57006,57007,57008,57009,57010,
             57011,65000,65001};
         std::vector<std::pair<std::vector<std::uint8_t>,std::vector<std::uint64_t>>> items;
-        for(const auto page:candidates)if(windows_crt_codepage(page)){const auto text=std::to_string(page);
+        for(const auto page:candidates)if(windows_nls_codepage(page)){const auto text=std::to_string(page);
             items.emplace_back(name.ends_with('W')?utf16_bytes(utf8_to_utf16(text)):std::vector<std::uint8_t>(text.c_str(),text.c_str()+text.size()+1),std::vector<std::uint64_t>{});}
         return enumerate(arg(0),std::move(items),8);
     }

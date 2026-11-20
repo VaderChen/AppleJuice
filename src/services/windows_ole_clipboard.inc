@@ -152,10 +152,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_clipboard(GuestState& s
             if(name=="Skip"){const auto count=static_cast<std::uint32_t>(arg(1));const auto left=object.entries.size()-object.cursor;object.cursor+=std::min<std::size_t>(count,left);return done(count<=left?0:1);}
             if(name=="Clone"){if(!arg(1))return done(clip_pointer);memory.store(GuestAddress{arg(1)},bits,0);auto copy=object;copy.references=1;const auto clone=create_clipboard_object(memory,std::move(copy));if(!clone)return done(clip_memory);memory.store(GuestAddress{arg(1)},bits,clone);return done(0);}
             if(name!="Next")throw HostCallFault("未知的 IEnumFORMATETC 方法");
-            const auto count=static_cast<std::uint32_t>(arg(1));if(count>4096 || (!arg(3) && count!=1))return done(clip_invalid);
+            const auto count=static_cast<std::uint32_t>(arg(1));if(!arg(3) && count!=1)return done(clip_invalid);
             if(arg(3))memory.store(GuestAddress{arg(3)},32,0);if(count && !arg(2))return done(clip_pointer);
             const auto amount=std::min<std::size_t>(count,object.entries.size()-object.cursor);const auto stride=x86_?20U:32U;
-            memory.check(GuestAddress{arg(2)},amount*stride,Access::Write);std::vector<std::uint64_t> targets;
+            if(!amount)return done(count?1:0);
+            memory.check(GuestAddress{arg(2)},amount*stride,Access::Write);
+            std::vector<std::uint64_t> targets;
+            targets.reserve(amount);
             try{for(std::size_t i=0;i<amount;++i){const auto& format=object.entries[object.cursor+i].format;std::uint64_t target=0;
                 if(!format.device.empty()){target=allocate_heap(memory,format.device.size());if(!target)throw std::bad_alloc();targets.push_back(target);memory.write(GuestAddress{target},format.device);gui_.task_allocations.insert(target);}
                 clip_write_format(memory,arg(2)+i*stride,format,target,x86_);
@@ -404,7 +407,7 @@ std::optional<std::uint32_t> WindowsServices::resume_ole_clipboard(GuestState& s
     }
     if(op.stage==Stage::Window){
         if(!valid())return finish(0x800703e3U);
-        if(op.source && op.kind==Kind::Set){op.window=result;const auto window=gui_.windows.find(op.window);if(window==gui_.windows.end())return finish(clip_memory);window->second.procedure=resolve("internal-ole-clipboard","WindowProc").value;window->second.unicode=true;gui_.clipboard_windows[{op.thread,op.station}]=op.window;}
+        if(op.source && op.kind==Kind::Set){op.window=result;const auto window=gui_.windows.find(op.window);if(window==gui_.windows.end())return finish(clip_memory);window->second.procedure=resolve("internal-ole-clipboard","WindowProc").value;window->second.unicode=true;publish_gui_window(op.window);gui_.clipboard_windows[{op.thread,op.station}]=op.window;}
         if(native_gui_ && interactive_station() && !native_gui_->clear_clipboard())return finish(clip_empty);
         const auto old=gui_.clipboard_ole_object,old_thread=gui_.clipboard_ole_thread;
         release_gui_clipboard(state,memory);gui_.clipboard_ole_object=gui_.clipboard_ole_thread=0;gui_.clipboard_native_text.reset();

@@ -1,11 +1,14 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "guest_counted_string.hpp"
+#include "service_callback_task.hpp"
 #include <bit>
 #include <algorithm>
 
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> hook_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
+        {"win32u.dll","NtUserSetWinEventHook",8},
         {"user32.dll","NotifyWinEvent",4},{"user32.dll","SetWinEventHook",7},{"user32.dll","UnhookWinEvent",1},{"user32.dll","IsWinEventHookInstalled",1},
         {"user32.dll","SetWindowsHookExA",4},{"user32.dll","SetWindowsHookExW",4},
         {"user32.dll","UnhookWindowsHookEx",1},{"user32.dll","CallNextHookEx",4},
@@ -85,26 +88,60 @@ std::optional<std::uint32_t> WindowsServices::invoke_hooks(GuestState& state,Gue
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
     const auto dword=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
     std::uint64_t result=0;const auto fail=[&](std::uint32_t error){last_error_=error;};
-    if(symbol=="SetWinEventHook"){
-        const auto minimum=dword(0),maximum=dword(1),flags=dword(6),identifier=dword(5);const auto thread=thread_from_identifier(identifier);
-        if(!minimum || minimum>maximum || maximum>0x7fffffffU || !arg(3) || (flags&~7U))fail(87);
-        else if(identifier && !thread)fail(1444);
-        else if((flags&4U) || (dword(4)!=process_id() && !(dword(4)==0 && thread && threads_.items.contains(thread))))fail(50); // 僅目前程序的 out-of-context 通知；不假裝具有 desktop／DLL injection 後端。
-        else if(thread && (!threads_.items.contains(thread) || threads_.items.at(thread).status==ThreadStatus::Exited))fail(1444);
+    if(symbol=="SetWinEventHook" || symbol=="NtUserSetWinEventHook"){
+        const bool native=symbol=="NtUserSetWinEventHook";
+        const unsigned proc_index=native?4U:3U;
+        const auto minimum=dword(0),maximum=dword(1),flags=dword(proc_index+3);
+        const auto pid=dword(proc_index+1),identifier=dword(proc_index+2);
+        const auto thread=thread_from_identifier(identifier),procedure=arg(proc_index);
+        if((flags&4U) && !arg(2))fail(1428);
+        else if(minimum>maximum)fail(1426);
+        else if(!procedure)fail(1427);
+        else if(!minimum || maximum>0x7fffffffU || (flags&~7U))fail(87);
+        else if(identifier && (!thread || !threads_.items.contains(thread) || threads_.items.at(thread).status==ThreadStatus::Exited))fail(1444);
+        else if(pid!=process_id() && !(pid==0 && thread))fail(50); // 跨程序事件需由桌面共用通知服務傳遞。
+        else if((flags&4U) && (!module_image(arg(2)) || module_image(procedure,true)!=module_image(arg(2))))fail(1427);
         else if(gui_.event_hooks.size()>=4096)fail(8);
-        else {memory.check(GuestAddress{arg(3)},1,Access::Execute);result=gui_.next_object++;gui_.event_hooks.emplace(result,GuiWinEventHook{arg(3),threads_.current,thread,minimum,maximum,flags});}
+        else try{
+            if(native && !identifier && arg(2)){
+                if(!arg(3)){last_error_=87;arg.return_to(state,0);return std::nullopt;}
+                const auto path=read_counted_header(memory,arg(3),x86_);
+                if((path.length&1U) || path.length>path.capacity || !path.length || !path.buffer){last_error_=87;arg.return_to(state,0);return std::nullopt;}
+                memory.check(GuestAddress{path.buffer},path.length,Access::Read);
+            }
+            memory.check(GuestAddress{procedure},1,Access::Execute);result=gui_.next_object++;
+            gui_.event_hooks.emplace(result,GuiWinEventHook{procedure,threads_.current,thread,minimum,maximum,flags});
+        }catch(const MemoryFault&){fail(998);}
     }else if(symbol=="UnhookWinEvent"){
         const auto hook=gui_.event_hooks.find(arg(0));if(hook==gui_.event_hooks.end())fail(1404);else if(hook->second.owner!=threads_.current)fail(5);
         else {gui_.event_hooks.erase(hook);std::erase_if(gui_.event_queue,[&](const auto& event){return event.hook==arg(0);});result=1;}
     }else if(symbol=="IsWinEventHookInstalled"){
         result=std::any_of(gui_.event_hooks.begin(),gui_.event_hooks.end(),[&](const auto& entry){return dword(0)>=entry.second.minimum && dword(0)<=entry.second.maximum;});
     }else if(symbol=="NotifyWinEvent"){
-        const auto event=dword(0);
-        for(const auto& [handle,hook]:gui_.event_hooks){
-            if(event<hook.minimum || event>hook.maximum || (hook.thread && hook.thread!=threads_.current) || (hook.flags&2U) || ((hook.flags&1U) && hook.owner==threads_.current))continue;
-            if(gui_.event_queue.size()>=10000)throw HostCallFault("WinEvent 通知佇列超過上限");
-            gui_.event_queue.push_back({handle,arg(1),thread_identifier(threads_.current),event,dword(2),dword(3),static_cast<std::uint32_t>(runtime_.clock_ticks/10000)});
-        }
+        return nested_continuation(state,memory,"WinEvent 通知",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);
+            const auto event=static_cast<std::uint32_t>(call(0)),object=static_cast<std::uint32_t>(call(2)),child=static_cast<std::uint32_t>(call(3));
+            const auto window=call(1),thread=threads_.current;
+            const auto tid=thread_identifier(thread),time=static_cast<std::uint32_t>(runtime_.clock_ticks/10000);
+            if(!window){last_error_=1400;call.return_to(s,0);co_return std::nullopt;}
+            std::vector<std::uint64_t> immediate;
+            for(const auto& [handle,hook]:gui_.event_hooks){
+                if(event<hook.minimum || event>hook.maximum || (hook.thread && hook.thread!=thread) ||
+                   (hook.flags&2U) || ((hook.flags&1U) && hook.owner==thread) ||
+                   thread_desktop_object(hook.owner)!=thread_desktop_object(thread))continue;
+                if(hook.flags&4U)immediate.push_back(handle);
+                else{
+                    if(gui_.event_queue.size()>=10000)throw HostCallFault("WinEvent 通知佇列超過上限");
+                    gui_.event_queue.push_back({handle,window,tid,event,object,child,time});
+                }
+            }
+            for(const auto handle:immediate){
+                const auto hook=gui_.event_hooks.find(handle);
+                if(hook!=gui_.event_hooks.end())
+                    (void)co_await service_callback::call(hook->second.procedure,{handle,event,window,object,child,tid,time});
+            }
+            call.return_to(s,0);co_return std::nullopt;
+        });
     }else if(symbol.starts_with("SetWindowsHookEx")) {
         const auto type=std::bit_cast<std::int32_t>(dword(0));const auto identifier=dword(3);const auto thread=thread_from_identifier(identifier);
         if(type < -1 || type>14 || type==8)fail(1426);

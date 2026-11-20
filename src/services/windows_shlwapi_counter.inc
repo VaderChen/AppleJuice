@@ -1,4 +1,4 @@
-// 舊版序號傳遞真正的號誌控制代碼，名稱前綴及 MAX_PATH 截斷與 Windows 相同。
+// 舊版序號傳遞真正的號誌控制代碼，名稱前綴及 MAX_PATH 截斷沿用 參考實作。
 if(name=="#222" || name=="#422" || name=="#423"){
     std::u16string object_name=u"shell.";
     std::uint32_t initial=0;

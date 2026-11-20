@@ -5,8 +5,9 @@ WinrtString WindowsServices::winrt_string(const GuestMemory& memory,std::uint64_
     if(!handle)return {};
     if(const auto found=runtime_.winrt_strings.find(handle);found!=runtime_.winrt_strings.end())return found->second;
     memory.check(GuestAddress{handle},x86_?20:24,Access::Read);
-    if(memory.load(GuestAddress{handle},32)!=0x52534858U)throw HostCallFault("HSTRING handle 不合法");
-    return {memory.load(GuestAddress{handle+8},x86_?32:64),static_cast<std::uint32_t>(memory.load(GuestAddress{handle+4},32)),0};
+    const auto flags=memory.load(GuestAddress{handle},32);
+    if(!(flags&1U) && flags!=0x52534858U)throw HostCallFault("HSTRING handle 不合法");
+    return {memory.load(GuestAddress{handle+(flags==0x52534858U?8:16)},x86_?32:64),static_cast<std::uint32_t>(memory.load(GuestAddress{handle+4},32)),0};
 }
 std::u16string WindowsServices::winrt_content(const GuestMemory& memory,const WinrtString& value,std::uint32_t maximum) const {
     const auto length=std::min(value.length,maximum);const auto size=std::uint64_t{length}*2;

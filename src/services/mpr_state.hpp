@@ -4,6 +4,9 @@
 
 namespace x64arm {
 struct MprState {
+    // 磁碟機能力依目前網路登入範圍隔離；成功查詢卷資訊後才標記能力完整。
+    struct DriveCapabilities {unsigned type,flags;bool probed;};
+    std::map<std::string,std::map<unsigned,DriveCapabilities>> drive_capabilities;
     struct ExtendedError {std::uint32_t code{};std::u16string description,provider;};
     std::map<std::uint64_t,ExtendedError> errors;
     struct Enumeration {std::string scope;std::vector<network_resources::Resource> values;std::size_t position{};};

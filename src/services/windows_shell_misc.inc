@@ -1,12 +1,10 @@
 // shell32 的工具函式（由 windows_shell.cpp 的 invoke_shell 引入）：
 // - SHGetImageList：系統影像清單（SHIL_LARGE 32、SMALL 16、EXTRALARGE 48、SYSSMALL＝SM_CXSMICON、JUMBO 256）以 HIMAGELIST_QueryInterface 取得 IImageList。
-// - Shell_MergeMenus：把來源選單的項目複製到目的選單的指定位置，ID 加上 uIDAdjust、超過 uIDAdjustMax 的項目略過；子選單逐層複製（MM_SUBMENUSHAVEIDS 時子選單本身的 ID 也調整），
-//   MM_ADDSEPARATOR 在插入點前補分隔線，未指定 MM_DONTREMOVESEPS 時不產生開頭或連續的分隔線；回傳下一個可用 ID。
 // - SHGetNewLinkInfo(A／W)：新捷徑的完整路徑「顯示名稱 - Shortcut.lnk」（SHGNLI_PREFIXNAME 為「Shortcut to 顯示名稱」），同名時加上 (2)、(3)…；
 //   目標本身是捷徑（.lnk／.pif／.url）時 *pfMustCopy 為 TRUE 並沿用原檔名。
 // - SHGetSetFolderCustomSettings：資料夾的 desktop.ini（[.ShellClassInfo] 的 InfoTip、CLSID、IconResource、Logo，[ViewState] 的 Vid）讀寫；寫入時資料夾設為唯讀、desktop.ini 設為隱藏＋系統。
 // - SHIsFileAvailableOffline：沙箱沒有離線檔案（CSC）快取，存在的路徑回 E_FAIL。
-if(service.symbol=="SHGetImageList" || service.symbol=="Shell_MergeMenus" || service.symbol.starts_with("SHGetNewLinkInfo") ||
+if(service.symbol=="#15" || service.symbol=="#186" || service.symbol=="SHGetImageList" || service.symbol.starts_with("SHGetNewLinkInfo") ||
    service.symbol=="SHGetSetFolderCustomSettings" || service.symbol=="SHIsFileAvailableOffline"){
     return nested_continuation(state,memory,"shell32 工具函式",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
         const WindowsCall call(s,m,service);const auto symbol=service.symbol;const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
@@ -14,6 +12,40 @@ if(service.symbol=="SHGetImageList" || service.symbol=="Shell_MergeMenus" || ser
         const auto api=[&](std::string_view dll,std::string_view name){return resolve(dll,name).value;};
         GuestScratch scratch(*this,m,s);
         const auto wide_text=[&](std::u16string_view text)->std::uint64_t{const auto bytes=utf16_bytes(text);const auto at=scratch.allocate(bytes.size());if(at)m.write(GuestAddress{at},bytes);return at;};
+        if(symbol=="#15" || symbol=="#186"){
+            // NT 的 ILGetDisplayName 與 ILGetDisplayNameEx 共用 Unicode 輸出。
+            const bool extended=symbol=="#186";
+            auto folder=extended?call(0):0;
+            auto pidl=call(extended?1:0);
+            const auto output=call(extended?2:1);
+            const auto type=extended?static_cast<std::uint32_t>(call(3)):0U;
+            if(!pidl || !output)co_return finish(0);
+            const bool parent=type!=0 && m.load(GuestAddress{pidl},16)!=0;
+            const bool owned=parent || !folder;
+            const auto storage=scratch.allocate(272); // STRRET（64 位元為 272 bytes）。
+            if(!storage)co_return finish(0);
+            if(owned){
+                const auto slot=scratch.allocate(unit*2);
+                if(!slot)co_return finish(0);
+                std::uint32_t hr;
+                if(parent){
+                    constexpr std::array<std::uint8_t,16> iid_folder{0xe6,0x14,0x02,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
+                    m.write(GuestAddress{storage},iid_folder);
+                    hr=co_await service_callback::call(api("shell32.dll","SHBindToParent"),{pidl,storage,slot,slot+unit});
+                    if(!(hr&0x80000000U))pidl=m.load(GuestAddress{slot+unit},bits);
+                }else{
+                    hr=co_await service_callback::call(api("shell32.dll","SHGetDesktopFolder"),{slot});
+                }
+                if(hr&0x80000000U)co_return finish(0);
+                folder=m.load(GuestAddress{slot},bits);
+            }
+            const auto method=[&](unsigned index){return m.load(GuestAddress{m.load(GuestAddress{folder},bits)+unit*index},bits);};
+            const auto flags=type==1?0U:type==2?1U:0xc000U;
+            auto hr=co_await service_callback::call(method(11),{folder,pidl,flags,storage});
+            if(!(hr&0x80000000U))hr=co_await service_callback::call(api("shlwapi.dll","StrRetToBufW"),{storage,pidl,output,260});
+            if(owned)(void)co_await service_callback::call(method(2),{folder});
+            co_return finish(!(hr&0x80000000U));
+        }
         if(symbol=="SHGetImageList"){
             // (iImageList, riid, ppv)
             if(!call(2))co_return finish(0x80004003U);m.store(GuestAddress{call(2)},bits,0);
@@ -34,51 +66,6 @@ if(service.symbol=="SHGetImageList" || service.symbol=="Shell_MergeMenus" || ser
             if(!call(0))co_return finish(0x80070057U);const auto path=wide_text(read_utf16(m,GuestAddress{call(0)},32768));if(!path)co_return finish(0x8007000eU);
             const auto attributes=co_await service_callback::call(api("kernel32.dll","GetFileAttributesW"),{path});
             co_return finish(attributes==UINT32_MAX?0x80070057U:0x80004005U);
-        }
-        if(symbol=="Shell_MergeMenus"){
-            // (hmDst, hmSrc, uInsert, uIDAdjust, uIDAdjustMax, uFlags)；MENUITEMINFOW：x86 48、x64 80 位元組。
-            const auto adjust=static_cast<std::uint32_t>(call(3)),maximum=static_cast<std::uint32_t>(call(4)),flags=static_cast<std::uint32_t>(call(5));
-            const unsigned size=x86_?48U:80U,submenu=x86_?20U:24U,data_at=x86_?36U:56U,cch_at=x86_?40U:64U;
-            const auto info=scratch.allocate(size),text=scratch.allocate(1024);if(!info || !text)co_return finish(adjust);
-            std::uint32_t next=adjust;
-            const auto count_of=[&](std::uint64_t menu)->service_callback::Task<std::int32_t>{co_return static_cast<std::int32_t>(co_await service_callback::call(api("user32.dll","GetMenuItemCount"),{menu}));};
-            const auto read_item=[&](std::uint64_t menu,std::uint32_t index)->service_callback::Task<bool>{
-                m.write(GuestAddress{info},std::vector<std::uint8_t>(size));m.store(GuestAddress{info},32,size);m.store(GuestAddress{info+4},32,0x1efU); // 不含舊式 MIIM_TYPE
-                m.store(GuestAddress{info+data_at},bits,text);m.store(GuestAddress{info+cch_at},32,511);
-                co_return co_await service_callback::call(api("user32.dll","GetMenuItemInfoW"),{menu,index,1,info})!=0;
-            };
-            const auto separator_at=[&](std::uint64_t menu,std::int32_t index)->service_callback::Task<bool>{
-                if(index<0)co_return false;if(!co_await read_item(menu,static_cast<std::uint32_t>(index)))co_return false;co_return (m.load(GuestAddress{info+8},32)&0x800U)!=0;
-            };
-            const auto insert_separator=[&](std::uint64_t menu,std::uint32_t position)->service_callback::Task<bool>{
-                m.write(GuestAddress{info},std::vector<std::uint8_t>(size));m.store(GuestAddress{info},32,size);m.store(GuestAddress{info+4},32,0x100U);m.store(GuestAddress{info+8},32,0x800U);
-                co_return co_await service_callback::call(api("user32.dll","InsertMenuItemW"),{menu,position,1,info})!=0;
-            };
-            // 待處理的 {目的選單, 來源選單, 插入位置}；子選單建立後排入，逐層複製。
-            std::vector<std::array<std::uint64_t,3>> work{{call(0),call(1),call(2)}};
-            for(std::size_t job=0;job<work.size() && job<256;++job){
-                const auto [destination,source,insert]=work[job];const auto source_count=co_await count_of(source);if(source_count<=0)continue;
-                const auto destination_count=co_await count_of(destination);if(destination_count<0)continue;
-                std::uint32_t position=static_cast<std::uint32_t>(insert)>=static_cast<std::uint32_t>(destination_count)?static_cast<std::uint32_t>(destination_count):static_cast<std::uint32_t>(insert);
-                if(job==0 && (flags&1U) && position>0 && !co_await separator_at(destination,static_cast<std::int32_t>(position)-1) && co_await insert_separator(destination,position))++position;
-                for(std::int32_t index=0;index<source_count;++index){
-                    if(!co_await read_item(source,static_cast<std::uint32_t>(index)))continue;
-                    const auto type=static_cast<std::uint32_t>(m.load(GuestAddress{info+8},32));const auto child=m.load(GuestAddress{info+submenu},bits);
-                    if(type&0x800U){
-                        if(!(flags&4U) && (position==0 || co_await separator_at(destination,static_cast<std::int32_t>(position)-1)))continue;
-                        if(co_await insert_separator(destination,position))++position;continue;
-                    }
-                    if(!co_await read_item(source,static_cast<std::uint32_t>(index)))continue;
-                    auto id=static_cast<std::uint32_t>(m.load(GuestAddress{info+16},32));
-                    if(child){
-                        if(flags&2U){if(id+adjust>maximum)continue;id+=adjust;next=std::max(next,id+1);m.store(GuestAddress{info+16},32,id);}
-                        auto created=co_await service_callback::call_value(api("user32.dll","CreatePopupMenu"),{});if(x86_)created&=UINT32_MAX;if(!created)continue;
-                        m.store(GuestAddress{info+submenu},bits,created);work.push_back({created,child,UINT32_MAX});
-                    }else{if(id+adjust>maximum)continue;id+=adjust;next=std::max(next,id+1);m.store(GuestAddress{info+16},32,id);}
-                    if(co_await service_callback::call(api("user32.dll","InsertMenuItemW"),{destination,position,1,info}))++position;
-                }
-            }
-            co_return finish(next);
         }
         if(symbol.starts_with("SHGetNewLinkInfo")){
             // (pszLinkTo, pszDir, pszName[MAX_PATH] 輸出, pfMustCopy, uFlags)；SHGNLI_PIDL 1、PREFIXNAME 2、NOUNIQUE 4、NOLNK 8、NOLOCNAME 0x10、USEURLEXT 0x20。

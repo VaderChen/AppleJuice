@@ -1,4 +1,5 @@
 #pragma once
+#include "x64arm/windows_keyboard_model.h"
 #include <vector>
 #include "x64arm/windows_abi.hpp"
 #include <array>
@@ -7,7 +8,7 @@
 namespace x64arm {
 // 客體聚合鍵盤的能力；Win32、Raw Input 與 DirectInput 共用同一個裝置描述。
 struct GuiKeyboardCapabilities {std::uint32_t type,subtype,function_keys,dinput_subtype;};
-inline constexpr GuiKeyboardCapabilities windows_keyboard_capabilities{4,0,12,4};
+inline constexpr GuiKeyboardCapabilities windows_keyboard_capabilities{X64ARM_KEYBOARD_TYPE,X64ARM_KEYBOARD_SUBTYPE,X64ARM_KEYBOARD_FUNCTION_KEYS,4};
 // 目前提供的 HKL 為 0409；掃描碼、文字與原生實體位置必須使用同一個配置。
 struct GuiKeyboardTranslation {
     std::uint32_t alt_number{};bool alt_digits{},ansi{};

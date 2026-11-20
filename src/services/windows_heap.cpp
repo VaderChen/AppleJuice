@@ -181,7 +181,7 @@ bool WindowsServices::await_heap_service(GuestState& state,GuestMemory& memory,c
         ,"ReadClassStm","WriteClassStm","OleSaveToStream","OleLoadFromStream"
         ,"CreateBindCtx","GetRunningObjectTable"
     };
-    const bool stl_family=service.family=="msvcp100.dll" || service.family=="msvcp140.dll" || service.family=="internal-msvcp100" || service.family=="internal-msvcp140";
+    const bool stl_family=service.family=="msvcp100.dll" || service.family=="msvcp140.dll" || service.family=="msvcp120.dll" || service.family=="internal-msvcp100" || service.family=="internal-msvcp140" || service.family=="internal-msvcp120";
     const bool stl_allocator=stl_family && (name.starts_with("??0") || name.starts_with("??1") || name.starts_with("??6") || name.starts_with("?_Getcat@") || name.starts_with("?_New_Locimp@") || name.starts_with("?_Locimp_Addfac@") || name.starts_with("?__ExceptionPtr") || name.find("FacetDelete")!=name.npos || name.find("IosDelete")!=name.npos || name.find("StreamDelete")!=name.npos || name.find("ExceptionControl")!=name.npos || name.find("ErrorCategoryMessage")!=name.npos || name.starts_with("?_Throw_C_error@") || name.starts_with("?_XGetLastError@"));
     const bool exception_allocator=service.family=="x64arm.msvc" && (name=="ExceptionCopy" || name=="ExceptionDestroy" || name=="ExceptionDelete");
     const bool bind_allocator=service.family.starts_with("internal-com-bind") || service.family.starts_with("internal-com-rot");

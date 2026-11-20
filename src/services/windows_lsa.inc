@@ -338,9 +338,9 @@
         else if(!arg(1) || !arg(2) || !arg(4))status=status_invalid_parameter;
         else {store_pointer(arg(2),0);memory.store(GuestAddress{arg(4)},32,0);status=status_no_more_entries;}
     }else if(symbol=="LsaRegisterPolicyChangeNotification" || symbol=="LsaUnregisterPolicyChangeNotification"){
-        // (InformationClass 1～7, NotificationEventHandle)：本程序登記；原則變更由 LsaSetInformationPolicy 等寫入觸發。
+        // (InformationClass 1～8, NotificationEventHandle)：本程序登記；原則變更由 LsaSetInformationPolicy 等寫入觸發。
         const auto information=u32(0);const auto key=std::pair<std::uint32_t,std::uint64_t>{information,arg(1)};
-        if(information<1 || information>7)status=status_invalid_parameter;
+        if(information<1 || information>8)status=status_invalid_parameter;
         else if(symbol.starts_with("LsaRegister")){const auto event=runtime_.wait_objects.find(arg(1));
             if(event==runtime_.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event)status=status_invalid_handle;else lsa_notifications_.insert(key);}
         else status=lsa_notifications_.erase(key)?status_success:status_invalid_handle;

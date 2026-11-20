@@ -149,6 +149,7 @@ AppleJuice 라이브러리에 등록된 게임은 EXE별로 저장한 표시 설
 | 프로그램 | x64/x86 | 주요 동작 코어 | 지원 수준 |
 | --- | --- | --- | :---: |
 | 7-Zip | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
+| 드래곤 퀘스트 I & II HD-2D Remake | x64 | D3D12(Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 드래곤 퀘스트 III HD-2D Remake | x64 | D3D11(Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 不谙世事的猫艾露莎 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
@@ -168,6 +169,8 @@ AppleJuice 라이브러리에 등록된 게임은 EXE별로 저장한 표시 설
 | 클레르 옵스퀴르: 33 원정대 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="원활 (MetalFX)" title="원활 (MetalFX)"> |
 | 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 사이버펑크 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
+| 컨트롤 얼티밋 에디션 | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
+| 테일즈 오브 베르세리아 | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | It Takes Two | x64 | D3D11(Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
@@ -177,6 +180,8 @@ AppleJuice 라이브러리에 등록된 게임은 EXE별로 저장한 표시 설
 | DEATH STRANDING DIRECTOR'S CUT | x64 | D3D12 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="실행 가능" title="실행 가능"> |
 | Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="실행 가능" title="실행 가능"> |
 | 바이오하자드 빌리지 | x64 | D3D12 (RE Engine) | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="미작동·작업 중" title="미작동·작업 중"> |
+| 위쳐 3: 와일드 헌트 차세대 | x64 | D3D12 | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="미작동·작업 중" title="미작동·작업 중"> |
+| 페르소나 5 더 로열 | x64 | 알 수 없음(보호 계층) | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="미작동·작업 중" title="미작동·작업 중"> |
 
 "원활 (MetalFX)"는 Launcher의 프레임 보간 또는 2배 확대(MetalFX)를 켜면 원활 기준을 충족한다는 뜻이며, 끄면 저효율에 해당합니다.
 

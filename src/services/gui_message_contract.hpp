@@ -2,6 +2,10 @@
 #include <cstdint>
 
 namespace x64arm {
+inline constexpr std::uint32_t gui_show_window_message=0x80000002U; // 內部顯示視窗訊息
+// 僅引擎間傳送，讓目標程序核對私有的快顯視窗恢復狀態。
+inline constexpr std::uint32_t gui_owned_popup_request=0x81000001U;
+inline constexpr std::uint32_t gui_move_minimized_window=0x81000002U;
 inline bool gui_pointer_message(std::uint32_t message,std::uint64_t wparam) {
     // WM_USER 以下的系統訊息與標準控制項訊息由 Windows 定義指標生命週期。
     // 判斷訊息契約，不把碰巧落在客體位址範圍的整數當成指標。

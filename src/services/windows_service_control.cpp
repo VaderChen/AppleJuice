@@ -23,6 +23,7 @@ std::span<const WindowsServiceDescriptor> service_control_descriptors() {
         {"advapi32.dll","RegisterServiceCtrlHandlerA",2},{"advapi32.dll","RegisterServiceCtrlHandlerW",2},
         {"advapi32.dll","RegisterServiceCtrlHandlerExA",3},{"advapi32.dll","RegisterServiceCtrlHandlerExW",3},
         {"advapi32.dll","SetServiceStatus",2},{"advapi32.dll","NotifyServiceStatusChangeW",3,0,0,2},{"advapi32.dll","QueryServiceObjectSecurity",5},{"advapi32.dll","SetServiceObjectSecurity",3},
+        {"advapi32.dll","EnumServiceGroupA",9},{"advapi32.dll","EnumServiceGroupW",9},
         {"advapi32.dll","EnumServicesStatusA",8},{"advapi32.dll","EnumServicesStatusW",8},
         {"advapi32.dll","EnumServicesStatusExA",10},{"advapi32.dll","EnumServicesStatusExW",10},
         // 目錄查詢：顯示名稱／鍵名互查、相依服務（遞移，依停止順序）、相容用的資料庫鎖定。
@@ -331,7 +332,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_service_control(GuestState&
                     else {memory.check(GuestAddress{arg(1)},bytes.size(),Access::Write);for(const auto& [at,offset]:pointers)put(at,arg(1)+offset,unit);memory.write(GuestAddress{arg(1)},bytes);result=1;}
                 }
             }else fail(1060);
-        }else if(name.starts_with("EnumServicesStatus")) {
+        }else if(name.starts_with("EnumServicesStatus") || name.starts_with("EnumServiceGroup")) {
             // 原生唯讀服務目錄與客體 SCM 服務合併，依名稱（不分大小寫）排序；resume handle 為下一筆索引。
             const bool ex=name.starts_with("EnumServicesStatusEx");const unsigned base=ex?1U:0U;
             const auto manager=find(arg(0));const auto type=static_cast<std::uint32_t>(arg(base+1)),wanted=static_cast<std::uint32_t>(arg(base+2));
@@ -342,10 +343,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_service_control(GuestState&
             else if(ex && static_cast<std::uint32_t>(arg(1))!=0)fail(124);
             else if(!needed || !returned || !type || (type&~0x3fU) || wanted<1 || wanted>3 || capacity>0x1000000 || (capacity && !buffer))fail(87);
             else {
-                std::optional<std::u16string> group;if(ex && arg(9))group=text(arg(9));
+                std::optional<std::u16string> group;
+                if(ex || name.starts_with("EnumServiceGroup")){
+                    const auto group_name=arg(base+8);
+                    if(group_name)group=folded(text(group_name));
+                }
                 std::vector<ServiceCatalogEntry> entries;
                 for(auto& item:service_catalog_entries())
-                    if((item.words[0]&type) && (wanted==3 || (wanted==1)==(item.words[1]!=1)) && (!group || folded(*group)==folded(item.group)))entries.push_back(std::move(item));
+                    if((item.words[0]&type) && (wanted==3 || (wanted==1)==(item.words[1]!=1)) && (!group || *group==folded(item.group)))entries.push_back(std::move(item));
                 const std::uint64_t start=resume?memory.load(GuestAddress{resume},32):0;
                 std::size_t index=static_cast<std::size_t>(std::min<std::uint64_t>(start,entries.size()));std::uint64_t used=0;std::vector<const ServiceCatalogEntry*> fitted;
                 for(;index<entries.size();++index){const auto size=service_entry_size(entries[index],ex,wide,x86_);if(used+size>capacity)break;used+=size;fitted.push_back(&entries[index]);}

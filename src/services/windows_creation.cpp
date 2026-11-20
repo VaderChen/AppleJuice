@@ -1,3 +1,4 @@
+#include "shared_window_order.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/unicode.hpp"
@@ -111,6 +112,7 @@ std::optional<std::uint32_t> WindowsServices::advance_gui_creation(GuestState& s
     publish_gui_window(item.handle);
     const bool bottom=item.window.parent && !(item.window.style&0x01000000U);
     gui_.z_order.insert(bottom?gui_.z_order.end():gui_.z_order.begin(),item.handle);
+    publish_window_order(shared_windows_.get(),item.handle,bottom?1:0);
     operation.cbt_data=allocate_gui_scratch(memory,operation.scratch,{},16);memory.store(GuestAddress{operation.cbt_data},x86_?32:64,item.window.create_data);
     memory.store(GuestAddress{operation.cbt_data+(x86_?4:8)},x86_?32:64,bottom?1:0);
     if(start_gui_hooks(state,memory,5,3,item.handle,operation.cbt_data,Continuation::GuiCbtCreate,id,item.wide))return std::nullopt;
@@ -144,7 +146,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_creation(GuestState& st
         const auto client=gui_client_size(width,height,gui_frame_insets(current));current.width=client[0];current.height=client[1];
         const auto after=memory.load(GuestAddress{operation.cbt_data+(x86_?4:8)},x86_?32:64);
         if(after>1 && (!gui_.windows.contains(after) || gui_.windows.at(after).parent!=current.parent)){last_error_=1400;erase_window(handle,false);return abort_gui_creation(state,memory,id);}
-        if(after!=handle){std::erase(gui_.z_order,handle);auto position=after==1?gui_.z_order.end():after==0?gui_.z_order.begin():std::find(gui_.z_order.begin(),gui_.z_order.end(),after);if(after>1 && position!=gui_.z_order.end())++position;gui_.z_order.insert(position,handle);}
+        if(after!=handle){std::erase(gui_.z_order,handle);auto position=after==1?gui_.z_order.end():after==0?gui_.z_order.begin():std::find(gui_.z_order.begin(),gui_.z_order.end(),after);if(after>1 && position!=gui_.z_order.end())++position;gui_.z_order.insert(position,handle);publish_window_order(shared_windows_.get(),handle,after);}
         if(!current.parent && !gui_.application_icon_loaded){
             gui_.application_icon_loaded=true;const auto saved_error=last_error_;
             // 自動取得裝飾圖示不可讓沒有 PE 資源或資源受損的程式無法建立視窗。

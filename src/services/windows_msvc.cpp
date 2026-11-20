@@ -1,6 +1,8 @@
 #include "x64arm/windows_services.hpp"
 #include <algorithm>
 #include <bit>
+#include <map>
+#include <set>
 #include "msvcp_stream_abi.hpp"
 #include "msvc_exception_abi.hpp"
 #include "msvc_eh_metadata.hpp"
@@ -50,6 +52,19 @@ void WindowsServices::initialize_guest_msvcp90(GuestMemory& memory){
     // 程式與 unwind／匯出資料建立後唯讀，不會保存宿主指標或執行期可變狀態。
     for(auto& mapping:parsed.mappings)mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
     map_pe_image(memory,parsed);runtime_.builtin_images.emplace(base,std::move(image));
+}
+namespace {
+// msvcp120 的 iostream／locale 匯出與對應的 VC14 實作名稱（VC12 的 mbstate_t 為 int，修飾名以 H 取代 _Mbstatet）。
+struct Msvcp120Stream {std::string_view vc12,vc14;WindowsServiceDescriptor descriptor;};
+#define X64ARM_MSVCP120_STREAM(vc12,vc14,...) Msvcp120Stream{vc12,vc14,{"msvcp120.dll",vc12,__VA_ARGS__}},
+constexpr Msvcp120Stream msvcp120_streams[]{
+#include "msvcp120_stream_descriptors.inc"
+};
+#undef X64ARM_MSVCP120_STREAM
+std::string_view msvcp120_stream_implementation(std::string_view symbol){
+    static const auto index=[] {std::map<std::string_view,std::string_view> out;for(const auto& item:msvcp120_streams)out.emplace(item.vc12,item.vc14);return out;}();
+    const auto found=index.find(symbol);return found==index.end()?std::string_view{}:found->second;
+}
 }
 std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
@@ -176,6 +191,21 @@ std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
             for(const auto name:{"?_Winerror_map@std@@YAPEBDH@Z","?_Winerror_map@std@@YAPBDH@Z",
                                   "?_Winerror_map@std@@YAHH@Z","?_Syserror_map@std@@YAPEBDH@Z","?_Syserror_map@std@@YAPBDH@Z"})
                 all.push_back({family,name,1,0,0,0,true});
+        // VC11／VC12 的偵錯迭代器容器基底 _Container_base12：{_Container_proxy* _Myproxy}，proxy 為 {容器, 第一個迭代器}，
+        // 迭代器為 {proxy, 下一個迭代器}。以 _ITERATOR_DEBUG_LEVEL 編譯的程式會呼叫這些匯出（緋夜傳奇啟動即用到建構子）。
+        for(const auto family:{"msvcp110.dll","msvcp120.dll"})
+            for(const auto& item:std::array<std::pair<std::string_view,unsigned>,10>{{
+                {"??0_Container_base12@std@@QEAA@XZ",1},{"??1_Container_base12@std@@QEAA@XZ",1},{"?_Orphan_all@_Container_base12@std@@QEAAXXZ",1},
+                {"?_Getpfirst@_Container_base12@std@@QEBAPEAPEAU_Iterator_base12@2@XZ",1},{"?_Swap_all@_Container_base12@std@@QEAAXAEAU12@@Z",2},
+                {"??0_Container_base12@std@@QAE@XZ",0},{"??1_Container_base12@std@@QAE@XZ",0},{"?_Orphan_all@_Container_base12@std@@QAEXXZ",0},
+                {"?_Getpfirst@_Container_base12@std@@QBEPAPAU_Iterator_base12@2@XZ",0},{"?_Swap_all@_Container_base12@std@@QAEXAAU12@@Z",1}}})
+                all.push_back({family,item.first,item.second});
+        // 非偵錯版的空容器基底 _Container_base0：_Orphan_all 與 _Swap_all 都是空操作。
+        for(const auto family:{"msvcp110.dll","msvcp120.dll"})
+            for(const auto& item:std::array<std::pair<std::string_view,unsigned>,4>{{
+                {"?_Orphan_all@_Container_base0@std@@QEAAXXZ",1},{"?_Swap_all@_Container_base0@std@@QEAAXAEAU12@@Z",2},
+                {"?_Orphan_all@_Container_base0@std@@QAEXXZ",0},{"?_Swap_all@_Container_base0@std@@QAEXAAU12@@Z",1}}})
+                all.push_back({family,item.first,item.second});
         // VC10 _Lockit 保留 int locktype；只共用此經核對的鎖契約，不轉送 STL 物件。
         for(const auto& item:std::array<WindowsServiceDescriptor,6>{{
             {"msvcp100.dll","??0_Lockit@std@@QEAA@H@Z",2},
@@ -184,6 +214,17 @@ std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
             {"msvcp100.dll","??0_Lockit@std@@QAE@H@Z",1},
             {"msvcp100.dll","??0_Lockit@std@@QAE@XZ",0},
             {"msvcp100.dll","??1_Lockit@std@@QAE@XZ",0}}})all.push_back(item);
+        // VC12 _Lockit 與 VC14 相同只保存 int locktype，共用同一組全域鎖。
+        for(const auto& item:std::array<std::pair<std::string_view,unsigned>,6>{{
+            {"??0_Lockit@std@@QEAA@H@Z",2},{"??0_Lockit@std@@QEAA@XZ",1},{"??1_Lockit@std@@QEAA@XZ",1},
+            {"??0_Lockit@std@@QAE@H@Z",1},{"??0_Lockit@std@@QAE@XZ",0},{"??1_Lockit@std@@QAE@XZ",0}}})all.push_back({"msvcp120.dll",item.first,item.second});
+        // VC12 iostream／locale：串流、facet 與 ios_base 版面同 VC14，只有 locale 物件是單一 _Locimp 指標；
+        // 共用 VC14 實作，派送時依 msvcp120 家族取得 VC12 版面，虛擬表指向另立的 internal-msvcp120 家族。
+        std::set<std::string_view> existing;
+        for(const auto& item:all)if(item.family=="msvcp120.dll")existing.insert(item.symbol);
+        for(const auto& item:msvcp_runtime_service_descriptors())if(item.family=="msvcp120.dll")existing.insert(item.symbol);
+        for(const auto& item:msvcp120_streams)if(!existing.contains(item.vc12))all.push_back(item.descriptor);
+        for(std::size_t i=0,count=all.size();i<count;++i)if(all[i].family=="internal-msvcp140"){auto entry=all[i];entry.family="internal-msvcp120";all.push_back(entry);}
         return all;
     }();
     return versions;
@@ -278,7 +319,7 @@ std::uint64_t WindowsServices::msvc_exception_cells(GuestState&,GuestMemory& mem
     return cells;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    if(service.family=="msvcp100.dll" && service.symbol.find("_Lockit@std@@")!=service.symbol.npos)return invoke_nt_native(state,memory,service);
+    if((service.family=="msvcp100.dll" || service.family=="msvcp120.dll") && service.symbol.find("_Lockit@std@@")!=service.symbol.npos)return invoke_nt_native(state,memory,service);
     if(service.symbol.starts_with("?_XGetLastError@") || service.symbol.starts_with("?generic_category@") || service.symbol.starts_with("?system_category@") || service.symbol.starts_with("?iostream_category@") || service.symbol.starts_with("?_Winerror_map@") || service.symbol.starts_with("?_Winerror_message@") || service.symbol.starts_with("?_Syserror_map@") || service.symbol.starts_with("?_Throw_future_error@") || service.symbol.starts_with("?_Rethrow_future_exception@"))return invoke_msvcp100(state,memory,service);
     if(service.symbol.starts_with("??0exception@") || service.symbol.starts_with("??1exception@") || service.symbol.starts_with("??4exception@") || service.symbol.starts_with("??0bad_") || service.symbol.starts_with("??1bad_") ||
        service.symbol.starts_with("??4bad_") || service.symbol.starts_with("??_Fbad_") || service.symbol.find("__non_rtti_object@")!=std::string_view::npos || service.symbol.starts_with("?what@exception@") || service.symbol.starts_with("?_type_info_dtor_internal_method@") || service.family=="x64arm.msvc" || service.symbol.starts_with("__RT") || service.symbol.starts_with("?_X") || service.symbol=="?_Random_device@std@@YAIXZ")return invoke_rtti(state,memory,service);
@@ -314,8 +355,35 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,Gues
         method.return_to(state,result);return std::nullopt;
     }
 #include "msvcp_yarn_handlers.inc"
+    if((service.family=="msvcp110.dll" || service.family=="msvcp120.dll") && symbol.find("_Container_base0@std@@")!=symbol.npos){
+        const WindowsCall method(state,memory,(x86_?0U:1U)+(symbol.starts_with("?_Swap_all@")?1U:0U));method.return_to(state,0);return std::nullopt;
+    }
+    if((service.family=="msvcp110.dll" || service.family=="msvcp120.dll") && symbol.find("_Container_base12@std@@")!=symbol.npos){
+        // _Container_base12：建構子清空 _Myproxy 並回傳 this；解構子與 _Orphan_all 讓所有已登記迭代器的 proxy 變空、清空串列；
+        // _Getpfirst 回傳 &proxy->_Myfirstiter（無 proxy 為 NULL）；_Swap_all 交換兩容器的 proxy 並改回各自的容器指標。
+        const unsigned p=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(p*8);const bool swap=symbol.starts_with("?_Swap_all@");
+        const WindowsCall method(state,memory,(x86_?0U:1U)+(swap?1U:0U));
+        const auto self=x86_?state.reg(Gpr::Rcx)&UINT32_MAX:method(0);
+        const auto load=[&](std::uint64_t address){return memory.load(GuestAddress{address},bits);};
+        const auto store=[&](std::uint64_t address,std::uint64_t value){memory.store(GuestAddress{address},bits,value);};
+        if(symbol.starts_with("??0")){store(self,0);method.return_to(state,self);return std::nullopt;}
+        if(symbol.starts_with("??1") || symbol.starts_with("?_Orphan_all@")){
+            if(const auto proxy=load(self)){
+                for(auto iterator=load(proxy+p),guard=std::uint64_t{};iterator && guard<(UINT64_C(1)<<24);++guard){const auto next=load(iterator+p);store(iterator,0);iterator=next;}
+                store(proxy+p,0);
+            }
+            method.return_to(state,0);return std::nullopt;
+        }
+        if(symbol.starts_with("?_Getpfirst@")){const auto proxy=load(self);method.return_to(state,proxy?proxy+p:0);return std::nullopt;}
+        const auto other=method(x86_?0U:1U);const auto mine=load(self),theirs=load(other);
+        store(self,theirs);store(other,mine);if(theirs)store(theirs,self);if(mine)store(mine,other);
+        method.return_to(state,0);return std::nullopt;
+    }
 #include "msvcp100_streambuf_handlers.inc"
-    if(service.family=="internal-msvcp100" || service.family=="internal-msvcp140" || service.family=="internal-msvcp90" ||
+    if(service.family=="msvcp120.dll")if(const auto implementation=msvcp120_stream_implementation(symbol);!implementation.empty()){
+        auto mapped=service;mapped.symbol=implementation;return invoke_msvcp100(state,memory,mapped);
+    }
+    if(service.family=="internal-msvcp100" || service.family=="internal-msvcp140" || service.family=="internal-msvcp120" || service.family=="internal-msvcp90" ||
        (service.family=="msvcp90.dll" && msvcp90_stream::family(symbol)) ||
        (service.family=="msvcp100.dll" && !symbol.starts_with("?_Fiopen@") && symbol!="?uncaught_exception@std@@YA_NXZ") ||
        (service.family=="msvcp140.dll" && (symbol.find("basic_streambuf@")!=symbol.npos || symbol.find("basic_ios@")!=symbol.npos ||

@@ -160,6 +160,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 伊蘇 VIII -丹娜的隕涕日- | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 歧路旅人 II | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
+| 勇者鬥惡龍I & II HD-2D Remake | x64 | D3D12（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 勇者鬥惡龍III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 逆轉裁判123 成步堂精選集 | x86 | D3D11（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | FINAL FANTASY IX | x64 | D3D9（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
@@ -175,11 +176,15 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 電馭叛客 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 緋夜傳奇 | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 雙人成行 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| Control | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 死亡擱淺 DIRECTOR'S CUT | x64 | D3D12 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可開啟" title="可開啟"> |
 | 特警 Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可開啟" title="可開啟"> |
 | 潛水員戴夫 | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可開啟" title="可開啟"> |
+| 女神異聞錄5 皇家版 | x64 | 未知（保護層） | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="無法運作、處理中" title="無法運作、處理中"> |
+| 巫師三：狂獵 次世代版 | x64 | D3D12 | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="無法運作、處理中" title="無法運作、處理中"> |
 | 惡靈古堡 村莊 | x64 | D3D12（RE Engine） | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="無法運作、處理中" title="無法運作、處理中"> |
 
 「運作良好 (MetalFX)」表示開啟 Launcher 的畫面內插或 2 倍放大（MetalFX）後達到運作良好標準；未開啟時仍屬效率不高。

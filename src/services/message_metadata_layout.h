@@ -1,0 +1,7 @@
+#pragma once
+// TEB 私有區，避開 TLS 擴充槽、GDI 批次狀態及 CRT。
+#define X64ARM_MESSAGE_X86_BASE 0x3fb0
+#define X64ARM_MESSAGE_X64_BASE 0x4050
+#define X64ARM_MESSAGE_TIME 0
+#define X64ARM_MESSAGE_POSITION 4
+#define X64ARM_MESSAGE_EXTRA 8

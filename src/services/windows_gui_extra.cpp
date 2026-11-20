@@ -1,3 +1,4 @@
+#include "gui_cursor_bounds.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/unicode.hpp"
@@ -40,6 +41,27 @@ void WindowsServices::release_gui_clipboard(GuestState& state,GuestMemory& memor
     gui_.clipboard_stale=false;++gui_.clipboard_ole_generation;
 }
 
+std::uint32_t WindowsServices::gui_station_atom(std::u16string_view name,std::uint32_t id){
+    initialize_user_objects();
+    const auto station=gui_.user_handles.at(gui_.station_handle).object;
+    return clipboard_format_id(gui_,processes_ && runtime_.network.external_io?mapping_session():std::string{},
+                               gui_.user_objects.at(station).name,name,id);
+}
+
+std::uint32_t WindowsServices::gui_registered_message(std::u16string_view name){
+    if(name.empty()){last_error_=123;return 0;}
+    if(name.front()==u'#' && name.size()>1 && std::all_of(name.begin()+1,name.end(),[](char16_t ch){return ch>=u'0' && ch<=u'9';})){
+        std::uint16_t atom{};
+        for(auto ch:name.substr(1))atom=static_cast<std::uint16_t>(atom*10+ch-u'0');
+        if(atom && atom<0xc000)return atom;
+        last_error_=87;return 0;
+    }
+    if(name.size()>255){last_error_=87;return 0;}
+    const auto id=gui_station_atom(name,0);
+    if(!id)last_error_=8;
+    return id;
+}
+
 std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
     GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state, memory, service);
@@ -55,11 +77,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
         if(!arg(0)){last_error_=87;arg.return_to(state,0);return std::nullopt;}
         memory.store(GuestAddress{arg(0)},32,gui_.process_default_layout);arg.return_to(state,1);return std::nullopt;
     }
-    const auto format_id = [&](std::u16string_view name, std::uint32_t id) {
-        initialize_user_objects();
-        const auto station = gui_.user_handles.at(gui_.station_handle).object;
-        return clipboard_format_id(gui_, processes_ && runtime_.network.external_io ? mapping_session() : std::string{},
-                                   gui_.user_objects.at(station).name, name, id);
+    const auto cursor_access=[&](unsigned access){
+        return interactive_station() && gui_.input_desktop==thread_desktop_object(threads_.current) &&
+               (!gui_.station_handle || (gui_.user_handles.at(gui_.station_handle).access&access));
     };
     const auto ui_limits=job_ui_restrictions();
     if((symbol=="GetClipboardData" && (ui_limits&2U)) || ((symbol=="SetClipboardData" || symbol=="EmptyClipboard") && (ui_limits&4U))){
@@ -102,6 +122,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
         return handle;
     };
 
+    const bool open_clipboard=symbol=="OpenClipboard" || symbol=="NtUserOpenClipboard";
+    if(open_clipboard || symbol=="EmptyClipboard" || symbol=="CloseClipboard" || symbol=="GetOpenClipboardWindow" ||
+       symbol=="GetClipboardOwner" || symbol=="GetClipboardViewer" || symbol=="SetClipboardViewer" || symbol=="ChangeClipboardChain" ||
+       symbol=="AddClipboardFormatListener" || symbol=="RemoveClipboardFormatListener" ||
+       symbol=="GetClipboardSequenceNumber" || symbol=="GetUpdatedClipboardFormats" ||
+       symbol=="CountClipboardFormats" || symbol=="EnumClipboardFormats" ||
+       symbol=="IsClipboardFormatAvailable" || symbol=="GetPriorityClipboardFormat"){
+        initialize_user_objects();
+        if(!(gui_.user_handles.at(gui_.station_handle).access&4U)){
+            fail(5);arg.return_to(state,symbol=="GetPriorityClipboardFormat"?UINT32_MAX:0);return std::nullopt;
+        }
+    }
     if(symbol.find("Clipboard")!=symbol.npos){refresh_clipboard();if(gui_.clipboard_stale){
         if(gui_.clipboard_ole_object){const auto retirement=release_com_proxy_owned(state,memory,{gui_.clipboard_ole_thread,gui_.clipboard_ole_object});if(retirement)queue_com_proxy_retirement(memory,retirement);gui_.clipboard_ole_object=gui_.clipboard_ole_thread=0;}
         release_clipboard();}}
@@ -140,16 +172,54 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
         if(first==second || !threads_.items.contains(first) || !threads_.items.contains(second))fail(87);
         else if(thread_desktop_object(first)!=thread_desktop_object(second))fail(5);
         else if(!gui_.message_threads.contains(first) || !gui_.message_threads.contains(second))fail(87);
-        else {const auto key=std::make_pair(std::min(first,second),std::max(first,second));if(arg(2))gui_.input_attachments.emplace(key.first,key.second);else gui_.input_attachments.erase({key.first,key.second});
+        else {
+            const auto target_cursor=threads_.input_queue(second).cursor;
+            const auto key=std::make_pair(std::min(first,second),std::max(first,second));
+            if(arg(2))gui_.input_attachments.emplace(key.first,key.second);
+            else if(!gui_.input_attachments.erase(key)){fail(87);arg.return_to(state,0);return std::nullopt;}
             if(arg(2)){auto* current=gui_caret(first);const auto generation=current?current->generation:0;
                 for(auto it=gui_.carets.begin();it!=gui_.carets.end();)if(gui_input_connected(it->first,first) && it->second.generation!=generation){draw_gui_caret(memory,it->second,false);it=gui_.carets.erase(it);}else ++it;}
-            gui_.mouse_clicks.clear();gui_.keyboard.fill(0);result=1;}
+            gui_.mouse_clicks.clear();
+            reset_input_queue(first);
+            if(!arg(2) && !gui_input_connected(first,second)){
+                reset_input_queue(second);
+                threads_.input_queue(first).cursor=0;
+            }
+            threads_.input_queue(second).cursor=target_cursor;
+            present_gui_cursor();
+            result=1;}
     }else if(symbol=="ClipCursor" || symbol=="GetClipCursor"){
-        if(symbol=="GetClipCursor"){
-            if(!arg(0))fail(87);else {const auto rect=gui_.cursor_clip.value_or(std::array<std::int32_t,4>{0,0,1440,900});for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(0)+i*4},32,static_cast<std::uint32_t>(rect[i]));result=1;}
-        }else if(!arg(0)){gui_.cursor_clip.reset();result=1;}
-        else {std::array<std::int32_t,4> rect{};for(unsigned i=0;i<4;++i)rect[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(0)+i*4},32));
-            if(rect[0]>=rect[2] || rect[1]>=rect[3])fail(87);else {gui_.cursor_clip=rect;auto point=gui_.pointer_position;if(native_gui_)if(auto current=native_gui_->cursor_position())point=*current;point[0]=std::clamp(point[0],rect[0],rect[2]-1);point[1]=std::clamp(point[1],rect[1],rect[3]-1);if(native_gui_)native_gui_->set_cursor_position(point[0],point[1]);gui_.pointer_position=point;result=1;}}
+        const auto screen=gui_virtual_screen_bounds(gui_monitors());
+        try {
+            if(!cursor_access(symbol=="GetClipCursor"?2U:0x10U))fail(5);
+            else if(symbol=="GetClipCursor"){
+                if(!arg(0))fail(87);
+                else {
+                    const auto rect=gui_.cursor_clip.value_or(screen);
+                    memory.check(GuestAddress{arg(0)},16,Access::Write);
+                    for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(0)+i*4},32,static_cast<std::uint32_t>(rect[i]));
+                    result=1;
+                }
+            }else{
+                auto rect=screen;
+                if(arg(0))for(unsigned i=0;i<4;++i)rect[i]=signed_word(memory.load(GuestAddress{arg(0)+i*4},32));
+                if(rect[0]>rect[2] || rect[1]>rect[3])fail(87);
+                else{
+                    for(unsigned i=0;i<2;++i){rect[i]=std::max(screen[i],rect[i]);rect[i+2]=std::min(screen[i+2],rect[i+2]);}
+                    if(rect[0]>rect[2] || rect[1]>rect[3])rect=screen;
+                    auto point=gui_.pointer_position;
+                    if(native_gui_)if(auto current=native_gui_->cursor_position())point=*current;
+                    const auto clipped=gui_clip_cursor_point(point,rect);
+                    if(native_gui_ && point!=clipped && !native_gui_->set_cursor_position(clipped[0],clipped[1]))fail(5);
+                    else{
+                        if(arg(0))gui_.cursor_clip=rect;else gui_.cursor_clip.reset();
+                        gui_.pointer_position=clipped;
+                        if(native_gui_ && point!=clipped)dinput_cursor_warped();
+                        result=1;
+                    }
+                }
+            }
+        }catch(const MemoryFault&){fail(998);}
     }else if(symbol=="DragFinish"){
         start_callbacks(state,memory,{{resolve("kernel32.dll","GlobalFree").value,{arg(0)}}},Continuation::Return,0);return std::nullopt;
     }else if(symbol.starts_with("DragQuery")){
@@ -301,10 +371,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
             }
         }
     } else if(symbol=="GetClipboardViewer" || symbol=="SetClipboardViewer" || symbol=="ChangeClipboardChain"){
-        initialize_user_objects();
-        if(!(gui_.user_handles.at(gui_.station_handle).access&4U))fail(5);
-        else if(symbol=="GetClipboardViewer")result=clipboard_notice(ClipboardNoticeAction::Viewer).state.viewer;
-        else {
+        if(symbol=="GetClipboardViewer")result=clipboard_notice(ClipboardNoticeAction::Viewer).state.viewer;
+        else if(symbol=="SetClipboardViewer" && !arg(0)){
+            result=clipboard_notice(ClipboardNoticeAction::AddViewer,0).previous;
+            gui_.clipboard_viewers.clear();
+        }else {
             const auto target=shared_gui_window(arg(0),false);
             const auto valid=[&](std::uint64_t hwnd){return gui_.windows.contains(hwnd) || shared_gui_window(hwnd,false).has_value();};
             if(!arg(0) || (!gui_.windows.contains(arg(0)) && !target))fail(1400);
@@ -313,7 +384,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
             else if(symbol=="SetClipboardViewer"){
                 const auto update=clipboard_notice(ClipboardNoticeAction::AddViewer,arg(0));
                 gui_.clipboard_viewers.insert(arg(0));
-                start_callbacks(state,memory,{{resolve("user32.dll","SendMessageW").value,{arg(0),0x308,0,0}}},Continuation::Return,update.previous);return std::nullopt;
+                start_callbacks(state,memory,{{resolve("user32.dll","SendMessageW").value,{arg(0),0x308,gui_.clipboard_owner,0}}},Continuation::Return,update.previous);return std::nullopt;
             }else if(arg(1) && !valid(arg(1)))fail(1400);
             else if(arg(0)==arg(1))fail(87);
             else {
@@ -325,7 +396,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
     } else if(symbol=="GetClipboardSequenceNumber")result=gui_.clipboard_sequence;
     else if(symbol=="GetOpenClipboardWindow")result=clipboard_notice(ClipboardNoticeAction::Viewer).state.open_window;
     else if(symbol=="AddClipboardFormatListener" || symbol=="RemoveClipboardFormatListener"){
-        if(!gui_.windows.contains(arg(0)))fail(1400);
+        const auto window=gui_.windows.find(arg(0));
+        if(window==gui_.windows.end())fail(1400);
+        else if(gui_.user_objects.at(window->second.desktop_object).station!=gui_.user_handles.at(gui_.station_handle).object)fail(5);
         else if(symbol=="AddClipboardFormatListener") {if(!gui_.clipboard_listeners.insert(arg(0)).second)fail(87);else result=1;}
         else if(!gui_.clipboard_listeners.erase(arg(0)))fail(87);else result=1;
     }else if(symbol=="CountClipboardFormats" || symbol=="EnumClipboardFormats" || symbol=="GetUpdatedClipboardFormats" || symbol=="GetPriorityClipboardFormat"){
@@ -333,20 +406,77 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
         if(symbol=="CountClipboardFormats")result=formats.size();
         else if(symbol=="EnumClipboardFormats"){
             if(gui_.clipboard_open_thread!=threads_.current)fail(1418);
-            else if(!dword(0)){result=formats.empty()?0:formats.front();if(!result)last_error_=0;}
-            else {const auto found=std::find(formats.begin(),formats.end(),dword(0));if(found==formats.end())fail(87);else {result=std::next(found)==formats.end()?0:*std::next(found);if(!result)last_error_=0;}}
+            else{
+                auto next=formats.begin();
+                if(dword(0)){
+                    next=std::find(next,formats.end(),dword(0));
+                    if(next!=formats.end())++next;
+                }
+                result=next==formats.end()?0:*next;last_error_=0;
+            }
         }else if(symbol=="GetUpdatedClipboardFormats"){
-            if(!arg(2) || (dword(1) && !arg(0)))fail(87);
-            else {memory.store(GuestAddress{arg(2)},32,formats.size());if(dword(1)<formats.size())fail(122);else {memory.check(GuestAddress{arg(0)},formats.size()*4,Access::Write);for(std::size_t i=0;i<formats.size();++i)memory.store(GuestAddress{arg(0)+4*i},32,formats[i]);result=1;}}
-        }else if(dword(1)>65536 || (dword(1) && !arg(0))){last_error_=87;result=UINT32_MAX;}
-        else if(!formats.empty()){memory.check(GuestAddress{arg(0)},static_cast<std::size_t>(dword(1))*4,Access::Read);result=UINT32_MAX;for(unsigned i=0;i<dword(1);++i){const auto format=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+4ULL*i},32));if(std::find(formats.begin(),formats.end(),format)!=formats.end()){result=format;break;}}}
-    }else if(symbol.starts_with("GetClipboardFormatName")){
-        const auto found=gui_.clipboard_format_names.find(format_id({}, dword(0)));const bool wide=symbol.ends_with('W');
-        if(found==gui_.clipboard_format_names.end() || !arg(1) || signed_word(arg(2))<=0)fail(87);
-        else {const auto narrow=wide?std::string{}:utf16_to_utf8(found->second);const auto length=wide?found->second.size():narrow.size();result=std::min<std::size_t>(length,dword(2)-1);memory.check(GuestAddress{arg(1)},(result+1)*(wide?2:1),Access::Write);for(std::size_t i=0;i<result;++i)memory.store(GuestAddress{arg(1)+i*(wide?2:1)},wide?16:8,wide?found->second[i]:static_cast<unsigned char>(narrow[i]));memory.store(GuestAddress{arg(1)+result*(wide?2:1)},wide?16:8,0);}
-    } else if (symbol == "OpenClipboard") {
-        if (arg(0) && !gui_.windows.contains(arg(0))) fail(1400);
-        else if (gui_.clipboard_open_thread) fail(5);
+            try{
+                memory.store(GuestAddress{arg(2)},32,formats.size());
+                if(!formats.empty() && !arg(0))fail(998);
+                else if(dword(1)<formats.size())fail(122);
+                else{
+                    if(!formats.empty())memory.check(GuestAddress{arg(0)},formats.size()*4,Access::Write);
+                    for(std::size_t i=0;i<formats.size();++i)memory.store(GuestAddress{arg(0)+4*i},32,formats[i]);
+                    result=1;
+                }
+            }catch(const MemoryFault&){fail(998);}
+        }else if(!formats.empty()){
+            result=UINT32_MAX;
+            try{
+                const auto count=signed_word(arg(1));
+                for(std::int32_t i=0;i<count;++i){
+                    const auto format=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+sizeof(std::uint32_t)*static_cast<std::size_t>(i)},32));
+                    if(std::find(formats.begin(),formats.end(),format)!=formats.end()){result=format;break;}
+                }
+            }catch(const MemoryFault&){last_error_=998;}
+        }
+    }else if(symbol.starts_with("GetClipboardFormatName") || symbol=="NtUserGetClipboardFormatName" || symbol=="NtUserGetAtomName"){
+        const bool descriptor=symbol=="NtUserGetAtomName";
+        const bool native=descriptor || symbol=="NtUserGetClipboardFormatName";
+        const bool ansi=symbol.ends_with('A');
+        const auto atom=native?static_cast<std::uint16_t>(dword(0)):dword(0);
+        std::u16string integral;
+        std::u16string_view name;
+        if(native && atom && atom<0xc000){
+            integral=u"#"+utf8_to_utf16(std::to_string(atom));name=integral;
+        }else if(atom>=0xc000 && atom<=0xffff){
+            const auto id=gui_station_atom({},atom);
+            if(id)name=gui_.clipboard_format_names.at(id);
+            else fail(6);
+        }else if(native)fail(87);
+        if(!name.empty()){
+            auto output=arg(1);
+            auto capacity=descriptor?0U:dword(2);
+            if(descriptor){
+                if(!output){fail(87);arg.return_to(state,0);return {};}
+                capacity=static_cast<std::uint32_t>(memory.load(GuestAddress{output+2},16));
+                output=memory.load(GuestAddress{output+(x86_?4:8)},x86_?32:64);
+            }
+            if(native)capacity=static_cast<std::uint16_t>(capacity)/2;
+            if(!capacity || (!native && signed_word(capacity)<=0))fail(ansi?234:122);
+            else if(!output)fail(87);
+            else if(ansi){
+                const auto text=utf16_to_utf8_lossy(name);
+                result=std::min<std::size_t>(text.size(),capacity-1);
+                while(result && result<text.size() && (static_cast<unsigned char>(text[result])&0xc0U)==0x80U)--result;
+                memory.write(GuestAddress{output},{reinterpret_cast<const std::uint8_t*>(text.data()),static_cast<std::size_t>(result)});
+                memory.store(GuestAddress{output+result},8,0);
+            }else{
+                result=std::min<std::size_t>(name.size(),capacity-1);
+                memory.write(GuestAddress{output},utf16_bytes(name.substr(0,result)));
+            }
+        }
+    } else if (open_clipboard) {
+        const auto local=gui_.windows.find(arg(0));
+        const auto remote=arg(0) && local==gui_.windows.end()?shared_gui_window(arg(0),false):std::nullopt;
+        if(arg(0) && local==gui_.windows.end() && !remote)fail(1400);
+        else if(remote && !allowed_gui_window(*remote))fail(5);
+        else if(local!=gui_.windows.end() && gui_.user_objects.at(local->second.desktop_object).station!=gui_.user_handles.at(gui_.station_handle).object)fail(5);
         else if(const auto opened=clipboard_notice(ClipboardNoticeAction::Open,arg(0));opened.error)fail(opened.error);
         else {
             if (!(ui_limits&2U) && native_gui_ && interactive_station()) {
@@ -356,30 +486,38 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
                 }
             }
             gui_.clipboard_open_thread = threads_.current;
-            gui_.clipboard_open_window = arg(0); result = 1;
+            gui_.clipboard_open_window = arg(0);gui_.clipboard_dirty=opened.state.pending_publication;result = 1;
         }
     } else if (symbol == "CloseClipboard") {
         if (gui_.clipboard_open_thread != threads_.current) fail(1418);
         else if(const auto closed=clipboard_notice(ClipboardNoticeAction::Close);closed.error)fail(closed.error);
-        else { gui_.clipboard_open_thread = gui_.clipboard_open_window = 0;if(gui_.clipboard_dirty)notify_clipboard(); result = 1; }
+        else { gui_.clipboard_open_thread = gui_.clipboard_open_window = 0;if(closed.notify)notify_clipboard(&closed); result = 1; }
     } else if (symbol == "EmptyClipboard") {
         if (gui_.clipboard_open_thread != threads_.current) fail(1418);
         else if (native_gui_ && interactive_station() && !native_gui_->clear_clipboard()) fail(5);
         else {
-            const auto previous_owner=gui_.clipboard_owner;
+            const auto previous_owner=gui_.clipboard_notices.owner_window;
             release_clipboard(); gui_.clipboard_owner = gui_.clipboard_open_window;
             gui_.clipboard_native_text.reset();refresh_clipboard(true); result = 1;
-            if(previous_owner && gui_.windows.contains(previous_owner)){
+            if(previous_owner){
                 start_callbacks(state,memory,{{resolve("user32.dll","SendMessageW").value,{previous_owner,0x307,0,0}}},Continuation::Return,1);return std::nullopt;
             }
         }
-    } else if (symbol == "GetClipboardOwner") result = gui_.clipboard_owner;
-    else if (symbol.starts_with("RegisterClipboardFormat")) {
-        if (!arg(0)) fail(87);
-        else {
-            const auto original=symbol.ends_with('W') ? read_utf16(memory, GuestAddress{arg(0)}) : utf8_to_utf16_lossy(read_ansi(memory, arg(0)));
-            if (original.empty() || original.size() > 255) fail(87);
-            else if (!(result = format_id(original, 0))) fail(8);
+    } else if (symbol == "GetClipboardOwner") result = gui_.clipboard_notices.owner_window;
+    else if (symbol.starts_with("RegisterClipboardFormat") || symbol.starts_with("RegisterWindowMessage") || symbol=="NtUserRegisterWindowMessage") {
+        if(!arg(0))fail(87);
+        else if(symbol=="NtUserRegisterWindowMessage"){
+            const auto address=memory.load(GuestAddress{arg(0)+(x86_?4:8)},x86_?32:64);
+            const auto length=memory.load(GuestAddress{arg(0)},16)/2;
+            if(address<=0xffff){if(address && address<0xc000)result=address;else fail(87);}
+            else {
+                std::u16string name(length,0);
+                if(length)memory.read(GuestAddress{address},{reinterpret_cast<std::uint8_t*>(name.data()),length*2});
+                result=gui_registered_message(name);
+            }
+        }else{
+            const auto name=symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16_lossy(read_ansi(memory,arg(0)));
+            result=gui_registered_message(name);
         }
     } else if (symbol == "SetClipboardData") {
         const auto format=dword(0),type=(format==2 || format==9)?16U:format==14?64U:1U;
@@ -417,16 +555,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
                 refresh_clipboard(true);result = arg(1);
             }
         }
-    } else if (symbol == "GetClipboardData" || symbol == "IsClipboardFormatAvailable") {
-        const bool get = symbol == "GetClipboardData";
-        if (get && gui_.clipboard_open_thread != threads_.current) fail(1418);
-        else if (const auto found = gui_.clipboard.find(dword(0)); found != gui_.clipboard.end()) result = get ? found->second : 1;
+    } else if(symbol=="IsClipboardFormatAvailable"){
+        const auto format=dword(0);
+        result=gui_.clipboard.contains(format) || ((format==1 || format==13) &&
+               (gui_.clipboard_native_text || gui_.clipboard.contains(format==1?13:1)));
+    } else if (symbol == "GetClipboardData") {
+        if (gui_.clipboard_open_thread != threads_.current) fail(1418);
+        else if (const auto found = gui_.clipboard.find(dword(0)); found != gui_.clipboard.end()) result = found->second;
         else if (dword(0) == 1 || dword(0) == 13) {
             std::optional<std::u16string> text;
             const auto other = gui_.clipboard.find(dword(0) == 13 ? 1 : 13);
             if (other != gui_.clipboard.end()) text = global_text(other->second, other->first);
             else text = native_gui_ && interactive_station() ? native_gui_->clipboard_text() : gui_.clipboard_native_text;
-            if (text) { result = get ? cache_text(dword(0), *text) : 1; if (!result) last_error_ = 8; }
+            if (text) { result = cache_text(dword(0), *text); if (!result) last_error_ = 8; }
         }
     } else if(symbol=="TrackMouseEvent" || symbol=="_TrackMouseEvent"){
         const unsigned size=x86_?16U:24U,hover_offset=x86_?12U:16U;const std::uint8_t bits=x86_?32:64;
@@ -437,15 +578,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
                 if(flags&0x40000000U){memory.check(GuestAddress{arg(0)},size,Access::Write);const auto found=gui_.mouse_tracking.find(threads_.current);const auto track=found==gui_.mouse_tracking.end()?GuiMouseTracking{}:found->second;memory.store(GuestAddress{arg(0)+4},32,track.flags);memory.store(GuestAddress{arg(0)+8},bits,track.window);memory.store(GuestAddress{arg(0)+hover_offset},32,track.hover_time);result=1;}
                 else if(flags&~0x80000013U)fail(87);
                 else if(!gui_.windows.contains(handle))fail(1400);
-                else if(gui_.windows.at(handle).thread!=threads_.current)fail(5);
-                else if(flags&0x80000000U){const auto found=gui_.mouse_tracking.find(threads_.current);if(found!=gui_.mouse_tracking.end() && found->second.window==handle && ((found->second.flags^flags)&16)==0){found->second.flags&=~(flags&3U);if(!(found->second.flags&3))gui_.mouse_tracking.erase(found);}result=1;}
-                else if(!(flags&3))result=1;
+                else if(flags&0x80000000U){
+                    const auto found=gui_.mouse_tracking.find(gui_.windows.at(handle).thread);
+                    if(found!=gui_.mouse_tracking.end() && found->second.window==handle){
+                        found->second.flags&=~(flags&0x13U);
+                        if(!(found->second.flags&3))gui_.mouse_tracking.erase(found);
+                    }
+                    result=1;
+                }else if(!(flags&3))result=1;
                 else {
+                    const auto owner=gui_.windows.at(handle).thread;
+                    pump_mouse_tracking();
                     if(native_gui_)if(const auto point=native_gui_->cursor_position())gui_.pointer_position=*point;
-                    auto& track=gui_.mouse_tracking[threads_.current];if(track.window!=handle || ((track.flags^flags)&16)){track={};track.window=handle;track.flags=flags&16;}
-                    track.flags|=flags&3;
-                    if(flags&1){const auto requested=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+hover_offset},32));track.hover_time=requested==UINT32_MAX?gui_.mouse_hover_time:requested;track.deadline=runtime_.clock_ticks+std::uint64_t{track.hover_time}*10000;track.anchor=gui_.pointer_position;}
-                    pump_mouse_tracking();result=1;
+                    const auto point=gui_.pointer_position;
+                    const auto hit=gui_mouse_hit(gui_,point[0],point[1],gui_.input_desktop);
+                    const bool inside=hit.first==handle && ((hit.second!=1)==bool(flags&16));
+                    if(!inside && (flags&2)){
+                        GuiMessage leave{handle,0,0,(flags&16)?0x2a2U:0x2a3U};
+                        leave.thread=owner;leave.queue_priority=1;enqueue_gui_message(std::move(leave));
+                    }else if(inside){
+                        const auto requested=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+hover_offset},32));
+                        const auto time=(flags&1) && requested && requested!=UINT32_MAX?requested:gui_.mouse_hover_time;
+                        gui_.mouse_tracking[owner]={handle,runtime_.clock_ticks+std::uint64_t{time}*10000,flags,time,point};
+                    }else gui_.mouse_tracking.erase(owner);
+                    result=1;
                 }
             }
         }catch(const MemoryFault&){fail(998);}
@@ -465,23 +621,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
                 memory.store(GuestAddress{arg(0)+4},32,static_cast<std::uint32_t>(tick));result=1;}
         }catch(const MemoryFault&){fail(998);}
     } else if(symbol=="SetCursorPos" || symbol=="SetPhysicalCursorPos"){ // 虛擬桌面固定 96 DPI，實體座標與邏輯座標相同。
-        if(!interactive_station() || gui_.input_desktop!=thread_desktop_object(threads_.current) || (gui_.station_handle && !(gui_.user_handles.at(gui_.station_handle).access&0x10)))fail(5);
-        else {auto x=signed_word(arg(0)),y=signed_word(arg(1));if(gui_.cursor_clip){const auto& rect=*gui_.cursor_clip;x=std::clamp(x,rect[0],rect[2]-1);y=std::clamp(y,rect[1],rect[3]-1);}
-            if(native_gui_ && !native_gui_->set_cursor_position(x,y))fail(5);else{gui_.pointer_position={x,y};if(native_gui_)dinput_cursor_warped();result=1;}}
-    } else if(symbol=="GetCursorInfo"){
+        if(!cursor_access(0x10))fail(5);
+        else {
+            const auto rect=gui_.cursor_clip?*gui_.cursor_clip:gui_virtual_screen_bounds(gui_monitors());
+            const auto point=gui_clip_cursor_point({signed_word(arg(0)),signed_word(arg(1))},rect);
+            if(native_gui_ && !native_gui_->set_cursor_position(point[0],point[1]))fail(5);
+            else{gui_.pointer_position=point;record_mouse_move_point(point[0],point[1],static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0);if(native_gui_)dinput_cursor_warped();result=1;}
+        }
+    } else if(symbol=="GetCursorInfo" || symbol=="NtUserGetCursorInfo"){
+        const bool native=symbol=="NtUserGetCursorInfo";
         const unsigned size=x86_?20:24,point=x86_?12:16;
-        if(!arg(0) || memory.load(GuestAddress{arg(0)},32)!=size)fail(87);
+        if(!arg(0)){if(!native)fail(87);}
+        else if(!native && memory.load(GuestAddress{arg(0)},32)!=size)fail(87);
         else {memory.check(GuestAddress{arg(0)},size,Access::Write);if(native_gui_)if(const auto position=native_gui_->cursor_position())gui_.pointer_position=*position;
-            memory.store(GuestAddress{arg(0)+4},32,gui_.cursor && gui_.cursor_count>=0?1:0);memory.store(GuestAddress{arg(0)+8},x86_?32:64,gui_.cursor);
+            memory.store(GuestAddress{arg(0)+4},32,(native || gui_.cursor) && gui_.cursor_count>=0?1:0);memory.store(GuestAddress{arg(0)+8},x86_?32:64,gui_.cursor);
             memory.store(GuestAddress{arg(0)+point},32,static_cast<std::uint32_t>(gui_.pointer_position[0]));memory.store(GuestAddress{arg(0)+point+4},32,static_cast<std::uint32_t>(gui_.pointer_position[1]));result=1;}
     } else if (symbol == "GetCursorPos" || symbol == "GetPhysicalCursorPos") {
-        if (!arg(0)) fail(87);
-        else {
-            memory.check(GuestAddress{arg(0)}, 8, Access::Write);
-            if (native_gui_) if (const auto position = native_gui_->cursor_position()) gui_.pointer_position = *position;
-            memory.store(GuestAddress{arg(0)}, 32, static_cast<std::uint32_t>(gui_.pointer_position[0]));
-            memory.store(GuestAddress{arg(0) + 4}, 32, static_cast<std::uint32_t>(gui_.pointer_position[1])); result = 1;
-        }
+        if(!cursor_access(2))fail(5);
+        else if(!arg(0))fail(87);
+        else try{
+            memory.check(GuestAddress{arg(0)},8,Access::Write);
+            if(native_gui_)if(const auto position=native_gui_->cursor_position())gui_.pointer_position=*position;
+            if(gui_.cursor_clip)gui_.pointer_position=gui_clip_cursor_point(gui_.pointer_position,*gui_.cursor_clip);
+            for(unsigned i=0;i<2;++i)memory.store(GuestAddress{arg(0)+4*i},32,static_cast<std::uint32_t>(gui_.pointer_position[i]));
+            result=1;
+        }catch(const MemoryFault&){fail(998);}
     } else if (symbol == "GlobalMemoryStatus" || symbol == "GlobalMemoryStatusEx") {
         const bool extended = symbol.ends_with("Ex");
         if (!arg(0) || (extended && memory.load(GuestAddress{arg(0)}, 32) != 64)) fail(87);

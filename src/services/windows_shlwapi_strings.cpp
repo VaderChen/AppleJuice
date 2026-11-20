@@ -20,18 +20,18 @@ struct ShellText {
     std::u16string joined(std::size_t first=0,std::size_t last=SIZE_MAX) const {
         std::u16string out;last=std::min(last,characters.size());for(auto i=first;i<last;++i)out+=characters[i].text;return out;}
 };
-ShellText shell_text(const GuestMemory& memory,std::uint64_t address,bool wide,std::size_t limit=SIZE_MAX){
+ShellText shell_text(const GuestMemory& memory,std::uint64_t address,bool wide,std::size_t limit=SIZE_MAX,std::size_t byte_limit=SIZE_MAX){
     ShellText result;result.wide=wide;
     if(wide){
         // 讀到 NUL 或上限為止（N 版的上限內可以沒有 NUL）。
-        std::u16string text;const auto cap=std::min<std::size_t>(limit,1U<<20);
+        std::u16string text;const auto cap=std::min({limit,byte_limit/2,std::size_t{1U<<20}});
         for(std::size_t i=0;i<cap;++i){const auto c=static_cast<char16_t>(memory.load(GuestAddress{address+i*2},16));if(!c)break;text.push_back(c);}
         result.characters.reserve(text.size());
         for(std::size_t i=0;i<text.size();++i)result.characters.push_back({std::u16string(1,text[i]),i*2,2});
         result.bytes=text.size()*2;return result;
     }
     std::string bytes;
-    for(std::size_t i=0;i<(1U<<22);++i){const auto c=static_cast<char>(memory.load(GuestAddress{address+i},8));if(!c)break;bytes.push_back(c);}
+    for(std::size_t i=0;i<std::min<std::size_t>(byte_limit,1U<<22);++i){const auto c=static_cast<char>(memory.load(GuestAddress{address+i},8));if(!c)break;bytes.push_back(c);}
     const auto view=std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()),bytes.size());
     for(std::size_t at=0;at<view.size() && result.characters.size()<limit;){
         const auto decoded=windows_crt_decode(view.subspan(at),65001);
@@ -70,6 +70,7 @@ std::span<const WindowsServiceDescriptor> shlwapi_string_service_descriptors(){
         {"shlwapi.dll","StrRChrIA",3,0,0,0x4},{"shlwapi.dll","StrRChrIW",3,0,0,0x4},
         {"shlwapi.dll","StrCSpnA",2},{"shlwapi.dll","StrCSpnW",2},{"shlwapi.dll","StrCSpnIA",2},{"shlwapi.dll","StrCSpnIW",2},
         {"shlwapi.dll","StrSpnA",2},{"shlwapi.dll","StrSpnW",2},{"shlwapi.dll","StrPBrkA",2},{"shlwapi.dll","StrPBrkW",2},
+        {"shell32.dll","StrRStrA",3},{"shell32.dll","StrRStrW",3},
         {"shlwapi.dll","StrRStrIA",3},{"shlwapi.dll","StrRStrIW",3},
         {"shlwapi.dll","StrCmpCA",2},{"shlwapi.dll","StrCmpCW",2},{"shlwapi.dll","StrCmpICA",2},{"shlwapi.dll","StrCmpICW",2},
         {"shlwapi.dll","StrCmpNCA",3,0,0,0x4},{"shlwapi.dll","StrCmpNCW",3,0,0,0x4},{"shlwapi.dll","StrCmpNICA",3,0,0,0x4},{"shlwapi.dll","StrCmpNICW",3,0,0,0x4},
@@ -142,7 +143,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_string(GuestState& 
             const auto value=shell_character(arg(reverse?2:1),wide);
             auto source=text(arg(0),name=="StrChrNW"?u32(2):SIZE_MAX);
             std::size_t count=source.characters.size();
-            if(reverse && arg(1) && arg(1)>=arg(0)){const auto end=arg(1)-arg(0);count=static_cast<std::size_t>(std::find_if(source.characters.begin(),source.characters.end(),[&](const auto& c){return c.offset>=end;})-source.characters.begin());}
+            if(reverse && arg(1)){
+                if(arg(1)<arg(0))return done(0);
+                // 參考實作的 A 版包含 end 指向的字元，W 版則以 end 為上限。
+                const auto end=arg(1)-arg(0);
+                const auto stop=std::find_if(source.characters.begin(),source.characters.end(),
+                    [&](const auto& c){return wide?c.offset>=end:c.offset>end;});
+                count=static_cast<std::size_t>(stop-source.characters.begin());
+            }
             if(reverse){for(std::size_t i=count;i-->0;)if(shell_equal(source.characters[i].text,value,fold))return done(arg(0)+source.characters[i].offset);}
             else for(std::size_t i=0;i<count;++i)if(shell_equal(source.characters[i].text,value,fold))return done(arg(0)+source.characters[i].offset);
             return done(0);
@@ -156,15 +164,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_string(GuestState& 
             for(const auto& c:source.characters)if(member(c)!=span){if(pbrk)return done(arg(0)+c.offset);return done(c.offset/unit);}
             return done(pbrk?0:source.bytes/unit);
         }
-        if(name.starts_with("StrRStrI")){
-            // (Source, Last 可為 NULL, Search)：不分大小寫，回傳 Last 之前最後一次出現的位置。
-            if(!arg(0) || !arg(2))return done(0);
-            const auto source=text(arg(0)),search=text(arg(2));if(search.characters.empty())return done(0);
-            const auto limit=arg(1) && arg(1)>=arg(0)?arg(1)-arg(0):source.bytes;
-            const auto needle=search.joined();const auto count=search.characters.size();
+        if(name.starts_with("StrRStr")){
+            const auto start=arg(0),end=arg(1);
+            const bool fold=name.ends_with("IA") || name.ends_with("IW");
+            if(!start || !arg(2) || (end && end<=start))return done(0);
+            const auto search=text(arg(2));
+            if(fold && !search.bytes)return done(0);
+            // Last 限制候選起點；已開始的比對仍可跨過 Last。
+            const auto limit=end?end-start:UINT64_MAX;
+            const auto extra=search.bytes>unit?search.bytes-unit:0;
+            const auto byte_limit=limit+std::min<std::uint64_t>(UINT64_MAX-limit,extra);
+            const auto source=shell_text(memory,start,wide,SIZE_MAX,byte_limit);
+            const auto needle=search.joined();
+            const auto count=search.characters.size();
             for(std::size_t i=source.characters.size();i-->0;){
-                if(source.characters[i].offset>=limit || i+count>source.characters.size())continue;
-                if(shell_equal(source.joined(i,i+count),needle,true))return done(arg(0)+source.characters[i].offset);
+                const auto offset=source.characters[i].offset;
+                if(offset>=limit || count>source.characters.size()-i)continue;
+                if(shell_equal(source.joined(i,i+count),needle,fold))return done(start+offset);
             }
             return done(0);
         }
@@ -288,7 +304,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_string(GuestState& 
             if(!arg(0) || !arg(1) || capacity<=0)return done(0);
             const auto source=read_utf16(memory,GuestAddress{arg(0)},1U<<20);
             const auto written=write_as(arg(1),source,static_cast<std::size_t>(capacity),false);
-            // 以 MAX_PATH 個 WCHAR（含 NUL）作反向轉換。
+            // 參考實作使用 MAX_PATH 個 WCHAR（含 NUL）作反向轉換。
             if(source.size()>=260)return done(0);
             const auto encoded=read_ansi(memory,arg(1),written+1);
             return done(utf8_to_utf16_lossy(encoded)==source);

@@ -114,6 +114,7 @@ std::optional<std::uint32_t> WindowsServices::finish_gui_window_pos(GuestState& 
                 const auto relative=item.after>=UINT64_MAX-1?0:item.after;std::erase(gui_.z_order,item.window);
                 auto at=relative==1?gui_.z_order.end():relative?std::find(gui_.z_order.begin(),gui_.z_order.end(),relative):gui_.z_order.begin();
                 if(relative>1 && at!=gui_.z_order.end())++at;gui_.z_order.insert(at,item.window);
+                publish_window_order(shared_windows_.get(),item.window,relative);
                 if(native_gui_)native_gui_->reorder(item.window,relative);
             }
             const auto outer=gui_outer_size(window);item.width=outer[0];item.height=outer[1];write(item);

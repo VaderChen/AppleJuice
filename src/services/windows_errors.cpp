@@ -1,14 +1,16 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "crt_os_error.hpp"
+#include "message_table_entry.hpp"
 #include "x64arm/windows_error_support.hpp"
 #include <algorithm>
-#include <charconv>
+#include "message_insert.hpp"
 
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> error_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
         {"kernel32.dll","FormatMessageA",7},{"kernel32.dll","FormatMessageW",7},
+        {"ntdll.dll","RtlFormatMessage",9,0,0,0x9e},{"ntdll.dll","RtlFormatMessageEx",10,0,0,0x29e},
         {"ntdll.dll","RtlNtStatusToDosError",1},
         {"crt","__doserrno",0},{"crt","_get_errno",1},{"crt","_set_errno",1},
         {"crt","_get_doserrno",1},{"crt","_set_doserrno",1},
@@ -97,53 +99,106 @@ std::string_view system_message(std::uint32_t code) {
     default:return {};
     }
 }
-std::u16string format_message(const GuestMemory& memory,std::u16string_view text,std::uint64_t arguments,bool array,bool wide,bool ignore) {
-    std::u16string result;
+void format_message(GuestMemory& memory,std::u16string_view text,std::uint64_t arguments,bool array,bool wide,bool ignore,
+                    std::uint32_t line_width,std::size_t capacity,bool native,std::u16string& result) {
     const unsigned unit=memory.execution_mode()==ExecutionMode::X86?4U:8U;
     const auto bits=static_cast<std::uint8_t>(unit*8);
-    for (std::size_t i=0;i<text.size();++i) {
-        if (result.size()>65535) throw std::length_error("訊息過長");
-        if (text[i]!='%' || i+1==text.size()) {result+=text[i];continue;}
-        const auto c=text[++i];
-        if (c=='0') break;
-        if (c>='1' && c<='9') {
-            const auto begin=i-1;unsigned index=static_cast<unsigned>(c-'0');
-            if (i+1<text.size() && text[i+1]>='0' && text[i+1]<='9') index=index*10+static_cast<unsigned>(text[++i]-'0');
-            std::u16string pattern=u"s";
-            if (i+1<text.size() && text[i+1]=='!') {
-                const auto end=text.find(u'!',i+2);if (end==text.npos) throw std::invalid_argument("不完整訊息插入格式");
-                pattern=text.substr(i+2,end-i-2);i=end;
+    std::vector<std::uint64_t> fetched;
+    std::uint64_t cursor=0;
+    std::size_t array_end=0;
+    const auto take=[&](std::size_t index,unsigned width){
+        // Win32 x86 的插入編號以 DWORD 為單位；同一編號可重新解讀成 I64。
+        const bool split=!native && width>unit;
+        const unsigned step=split?unit:width;
+        while(fetched.size()<index+(split?1U:0U)){
+            if(fetched.empty() && !cursor)cursor=memory.load(GuestAddress{arguments},bits);
+            fetched.push_back(memory.load(GuestAddress{cursor},static_cast<std::uint8_t>(step*8)));
+            cursor+=step;
+            if(native)memory.store(GuestAddress{arguments},bits,cursor);
+        }
+        return split?fetched[index-1]|(fetched[index]<<32):fetched[index-1];
+    };
+    std::size_t line=0,space=text.npos;
+    for(std::size_t i=0;i<text.size();++i){
+        const auto start=result.size();
+        const auto ch=text[i];
+        if(ch=='\r' || ch=='\n'){
+            if(ch=='\r' && i+1<text.size() && text[i+1]=='\n')++i;
+            if(line_width){space=start;result+=u' ';}
+            else{result+=u"\r\n";line=result.size();space=text.npos;}
+        }else if(ch!='%'){
+            if(ch==' ' || (ch=='\t' && start && space==start-1))space=start;
+            result+=ch;
+        }else{
+            if(i+1==text.size())throw std::invalid_argument("不完整的訊息逸出字元");
+            const auto c=text[++i];
+            if(c=='0')break;
+            if(c>='1' && c<='9' && !ignore){
+                unsigned index=static_cast<unsigned>(c-'0');
+                if (i+1<text.size() && text[i+1]>='0' && text[i+1]<='9') index=index*10+static_cast<unsigned>(text[++i]-'0');
+                std::u16string pattern=u"s";
+                if (i+1<text.size() && text[i+1]=='!') {
+                    const auto end=text.find(u'!',i+2);if (end==text.npos) throw std::invalid_argument("不完整訊息插入格式");
+                    pattern=text.substr(i+2,end-i-2);i=end;
+                }
+                if (!arguments) throw std::invalid_argument("缺少訊息插入參數");
+                if(pattern.empty() || pattern.size()>30 ||
+                   std::u16string_view(u"cCsSdiouxXp").find(pattern.back())==pattern.npos)
+                    throw std::invalid_argument("訊息插入格式無效");
+                const auto modifier=pattern.find_first_not_of(u"-+ #0*.123456789");
+                const auto length=std::u16string_view(pattern).substr(modifier,pattern.size()-modifier-1);
+                if(!length.empty() && length!=u"h" && length!=u"hh" && length!=u"l" && length!=u"ll" &&
+                   length!=u"I64" && length!=u"I32" && length!=u"I" && length!=u"w" && length!=u"z" && length!=u"t")
+                    throw std::invalid_argument("訊息插入長度修飾子無效");
+                const auto stars=static_cast<unsigned>(std::count(pattern.begin(),pattern.end(),u'*'));
+                if(stars>2)throw std::invalid_argument("訊息插入最多兩個動態欄位");
+                const bool long64=length==u"I64" || length==u"ll";
+                const unsigned value_width=long64?8U:unit;
+                std::array<std::uint64_t,4> values{};
+                if(array){
+                    if(long64 && !native)throw std::invalid_argument("I64 訊息插入需要 va_list");
+                    const auto element=[&](std::size_t slot){return memory.load(GuestAddress{arguments+slot*unit},bits);};
+                    values[0]=element(index-1);
+                    array_end=std::max(array_end,static_cast<std::size_t>(index));
+                    // 32 位元原生 ABI 將第一個 I64 陣列項目零延伸，即使它代表欄寬。
+                    unsigned at=1+(native && long64 && unit==4?1U:0U);
+                    for(unsigned n=0;n<stars;++n)values[at++]=element(array_end++);
+                    if(long64 && unit==4)values[stars]|=values[stars+1]<<32;
+                }else{
+                    if(index>1 && fetched.size()<index-1)(void)take(index-1,native?value_width:unit);
+                    std::size_t slot=index;
+                    for(unsigned n=0;n<stars;++n){
+                        values[n]=take(slot,unit);
+                        slot=fetched.size()+1;
+                    }
+                    // 使用星號的 va_list 會以實際值覆蓋最後一個欄寬或精度的邏輯位置。
+                    if(stars){fetched.pop_back();slot=fetched.size()+1;}
+                    values[stars]=take(slot,value_width);
+                }
+                result+=render_message_insert(memory,pattern,wide,std::span(values).first(stars+1));
+            }else if(c=='n' || (c=='t' && line_width)){
+                result+=u"\r\n";line=result.size();space=text.npos;
+            }else if(c=='r'){result+=u'\r';line=result.size();space=text.npos;}
+            else if(c=='t')result+=u'\t';
+            else{
+                if(ignore && (native || c!='%'))result+=u'%';
+                result+=c;
             }
-            if (ignore) {result+=text.substr(begin,i-begin+1);continue;}
-            if (!arguments) throw std::invalid_argument("缺少訊息插入參數");
-            const auto base=array?arguments:memory.load(GuestAddress{arguments},bits);
-            const auto address=base+(index-1)*unit;
-            auto value=memory.load(GuestAddress{address},bits);
-            if (pattern==u"s" || pattern==u"ls" || pattern==u"ws" || pattern==u"hs") {
-                const bool utf16=pattern==u"ls" || pattern==u"ws" || (wide && pattern!=u"hs");
-                result+=utf16?read_utf16(memory,GuestAddress{value}):utf8_to_utf16(read_ansi(memory,value));
-            } else {
-                if (pattern.empty()) throw std::invalid_argument("空的訊息插入格式");
-                const auto type=pattern.back();if (type!='d' && type!='i' && type!='u' && type!='x' && type!='X') throw std::invalid_argument("未支援訊息插入格式");
-                pattern.pop_back();bool long64=false;
-                if (pattern.ends_with(u"I64")) {long64=true;pattern.resize(pattern.size()-3);}
-                else if (pattern.ends_with(u"l")) pattern.pop_back();
-                // ARGUMENT_ARRAY 是 DWORD_PTR 陣列；I64 只能由 va_list 提供。
-                // Win32 的 I64 佔兩個連續 32-bit slots，不將一般指標或整數讀成 64-bit。
-                if(long64){if(array)throw std::invalid_argument("I64 訊息插入需要 va_list");value=memory.load(GuestAddress{address},64);}
-                const bool zero=!pattern.empty() && pattern[0]=='0';unsigned width=0;
-                for (const auto digit:pattern) {if (digit<'0' || digit>'9' || width>6553) throw std::invalid_argument("訊息欄寬無效");width=width*10+static_cast<unsigned>(digit-'0');}
-                auto magnitude=long64?value:static_cast<std::uint32_t>(value);bool negative=false;
-                if (type=='d' || type=='i') {negative=long64?(value>>63)!=0:(value&0x80000000)!=0;if (negative) magnitude=long64?~value+1:static_cast<std::uint32_t>(~value+1);}
-                std::array<char,32> buffer{};const auto [end,error]=std::to_chars(buffer.data(),buffer.data()+buffer.size(),magnitude,type=='x' || type=='X'?16:10);(void)error;
-                std::string digits(buffer.data(),end);if (type=='X') for (auto& digit:digits) if (digit>='a' && digit<='f') digit=static_cast<char>(digit-'a'+'A');
-                const auto padding=width>digits.size()+negative?width-digits.size()-negative:0;
-                if (!zero) result.append(padding,u' ');if (negative) result+=u'-';if (zero) result.append(padding,u'0');result+=utf8_to_utf16(digits);
-            }
-        } else if (c=='n') result+=u"\r\n";
-        else if (c=='r') result+=u'\r';else if (c=='t') result+=u'\t';else result+=c;
+        }
+        if(result.size()>capacity){
+            result.resize(start);
+            throw std::length_error("訊息超出緩衝區");
+        }
+        if(line_width && result.size()-line>=line_width){
+            const auto next=space==text.npos?result.size():space+1;
+            auto split=space==text.npos?next:space;
+            while(space!=text.npos && split>line && (result[split-1]==' ' || result[split-1]=='\t'))--split;
+            if(result.size()-(next-split)+2>capacity)throw std::length_error("訊息折行超出緩衝區");
+            result.replace(split,next-split,u"\r\n");
+            line=split+2;space=text.npos;
+        }
     }
-    return result;
+    if(result.size()>=capacity)throw std::length_error("訊息缺少結尾空間");
 }
 }
 std::string_view windows_crt_error_message(std::uint32_t code){return crt_message(code);}
@@ -240,6 +295,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,Gue
                 else {message+='\0';memory.write(GuestAddress{result},std::span(reinterpret_cast<const std::uint8_t*>(message.data()),message.size()));}
             }
         }
+    } else if(service.symbol.starts_with("RtlFormatMessage")){
+        std::u16string formatted;
+        if(!arg(0) || !arg(6) || !arg(8))result=0xc000000dU;
+        else{
+            try{
+                format_message(memory,read_utf16(memory,GuestAddress{arg(0)}),arg(5),(arg(4)&255)!=0,(arg(3)&255)==0,
+                               (arg(2)&255)!=0,static_cast<std::uint32_t>(arg(1)),static_cast<std::uint32_t>(arg(7))/2,true,formatted);
+                memory.write(GuestAddress{arg(6)},utf16_bytes(formatted));
+                memory.store(GuestAddress{arg(8)},32,(formatted.size()+1)*2);
+            }catch(const std::length_error&){result=0x80000005U;}
+            catch(const std::invalid_argument&){result=0xc000000dU;}
+            if(result && !formatted.empty()){
+                auto bytes=utf16_bytes(formatted);bytes.resize(bytes.size()-2);memory.write(GuestAddress{arg(6)},bytes);
+            }
+        }
     } else if (service.symbol=="RtlNtStatusToDosError") {
         switch (static_cast<std::uint32_t>(arg(0))) {
         case 0:result=0;break;case 0x103:result=997;break;case 0x10c:result=1022;break;case 0x105:result=234;break;case 0x80000005:result=234;break;
@@ -266,16 +336,51 @@ std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,Gue
         if (flags&~0x3fffU || !(flags&0x1c00) || ((flags&0x400) && (flags&0x1800))) fail(87);
         // LANG_NEUTRAL 的預設／系統預設是資源選擇規則，不能當成不存在的具體語言。
         // 內建系統訊息的預設資源為英文，明確指定其他具體語言仍回報資源不存在。
-        else if (arg(3) && arg(3)!=0x400 && arg(3)!=0x800 && arg(3)!=0x409 && !(flags&0x400)) fail(1815);
+        else if (arg(3) && arg(3)!=0x400 && arg(3)!=0x800 && arg(3)!=0x409 && !(flags&0xc00)) fail(1815);
         else {
             std::u16string text;
-            if (flags&0x400) text=wide?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16(read_ansi(memory,arg(1)));
-            else if (flags&0x1000) text=windows_error_message(static_cast<std::uint32_t>(arg(2)));
-            if (text.empty() && !(flags&0x400)) fail(flags&0x1000?317:1813);
+            bool found=false;
+            std::uint32_t missing=1813;
+            if(flags&0x400){
+                text=wide?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16(read_ansi(memory,arg(1)));
+                found=true;
+            }else if(flags&0x800){
+                const auto language=static_cast<std::uint16_t>(arg(3));
+                const auto selected=language==0x400 || language==0x800?0x409:language;
+                const auto resource=gui_resource(memory,arg(1),1,11,true,false,selected?selected:-1);
+                if(resource){
+                    const auto* image=resource_image(arg(1)?arg(1):runtime_.image.base);
+                    const auto rva=memory.load(GuestAddress{resource},32),size=memory.load(GuestAddress{resource+4},32);
+                    missing=317;
+                    if(image && rva<=image->size && size<=image->size-rva){
+                        const auto entry=message_table_entry(memory,image->base+rva,static_cast<std::uint32_t>(size),static_cast<std::uint32_t>(arg(2)));
+                        if(entry){
+                            const auto length=memory.load(GuestAddress{entry},16)-4;
+                            const auto unicode=memory.load(GuestAddress{entry+2},16)&1U;
+                            std::string ansi;
+                            const unsigned step=unicode?2U:1U;
+                            for(std::uint64_t at=0;at+step<=length;at+=step){
+                                const auto c=memory.load(GuestAddress{entry+4+at},unicode?16:8);
+                                if(!c)break;
+                                if(unicode)text+=static_cast<char16_t>(c);else ansi+=static_cast<char>(c);
+                            }
+                            if(!unicode)text=utf8_to_utf16_lossy(ansi);
+                            found=true;
+                        }
+                    }
+                }else if(language && gui_resource(memory,arg(1),1,11,true))missing=1815;
+            }
+            if(!found && (flags&0x1000)){
+                text=windows_error_message(static_cast<std::uint32_t>(arg(2)));
+                found=!text.empty();missing=317;
+            }
+            if(!found)fail(missing);
             else try {
-                text=format_message(memory,text,arg(6),(flags&0x2000)!=0,wide,(flags&0x200)!=0);
-                // 固定寬度折行需要保留 %n 與一般換行的差異，尚未提供時回報錯誤。
-                if ((flags&0xff)!=0 && (flags&0xff)!=255) throw std::invalid_argument("未支援固定欄寬折行");
+                std::u16string formatted;
+                const auto width=flags&255U;
+                format_message(memory,text,arg(6),(flags&0x2000)!=0,wide,(flags&0x200)!=0,
+                               width==255?UINT32_MAX:width,65536,false,formatted);
+                text=std::move(formatted);
                 auto bytes=wide?utf16_bytes(text):std::vector<std::uint8_t>{};
                 if (!wide) {const auto narrow=utf16_to_utf8(text);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
                 const auto length=bytes.size()/(wide?2:1)-1;

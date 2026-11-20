@@ -3,6 +3,12 @@ bool MetalGl::graphics_timestamp_supported()const{return metal_timestamp_support
 GraphicsTimestamp MetalGl::graphics_timestamp(){@autoreleasepool{
     begin_commands(true,"timestamp");auto commands=commands_;return metal_timestamp_sample(device_,commands,[&]{flush(true);});
 }}
+// MTLDevice sampleTimestamps 同時取 CPU 與 GPU 時鐘；GPU 值與計數器取樣緩衝的時間戳同一時基（Metal 用來對齊兩者的介面）。
+std::optional<std::uint64_t> MetalGl::graphics_gpu_clock(){@autoreleasepool{
+    if(!metal_timestamp_supported(device_))return std::nullopt;
+    MTLTimestamp cpu=0,gpu=0;[device_ sampleTimestamps:&cpu gpuTimestamp:&gpu];(void)cpu;
+    if(!gpu)return std::nullopt;return gpu;
+}}
 // 非同步：取樣編在目前命令緩衝（沒有待提交工作時建立一個只含取樣的緩衝），提交後由完成回呼解析。
 // 不等待 GPU；Steam 的 Chromium 每幀約兩對 TIMESTAMP／DISJOINT 查詢，同步版每次 End 要等 GPU 閒置約 0.4 ms。
 std::shared_ptr<const GraphicsTimestampFuture> MetalGl::graphics_timestamp_future(){

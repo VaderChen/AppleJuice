@@ -1031,5 +1031,85 @@ copy_nx StrCpyNXW, 2
 #include "guest_shell_security.inc"
 #include "guest_shell_copy_encoding.inc"
 
+
+// 批次推入：每次 CAS 重試將末項接到最新首項，深度以 16 位元回繞，序號只增加一次。
+.macro push_list name
+entry \name
+    test rcx, 15
+    jnz 2f
+    test rdx, rdx
+    jz 2f
+    test rdx, 15
+    jnz 2f
+    test r8, r8
+    jz 2f
+    test r8, 15
+    jnz 2f
+    test rcx, rcx
+    jz 2f
+    mov r10, rcx
+    mov r11, rdx
+    mov [rsp + 8], rbx
+    mov rax, [r10]
+    mov rdx, [r10 + 8]
+1:
+    mov rcx, rdx
+    and rcx, -16
+    mov [r8], rcx
+    lea rbx, [rax + 65536]
+    add bx, r9w
+    mov ecx, edx
+    and ecx, 15
+    or rcx, r11
+    lock cmpxchg16b xmmword ptr [r10]
+    jne 1b
+    mov rax, rdx
+    and rax, -16
+    mov rbx, [rsp + 8]
+    ret
+2:
+slow_end \name
+.endm
+push_list InterlockedPushListSList
+push_list InterlockedPushListSListEx
+
+#include "guest_rtl_run_string.inc"
+#include "ole_build_version.h"
+
+#include "message_metadata_layout.h"
+entry GetMessagePos
+    mov eax, dword ptr gs:[X64ARM_MESSAGE_X64_BASE+X64ARM_MESSAGE_POSITION]
+    ret
+end GetMessagePos
+entry GetMessageTime
+    mov eax, dword ptr gs:[X64ARM_MESSAGE_X64_BASE+X64ARM_MESSAGE_TIME]
+    ret
+end GetMessageTime
+entry GetMessageExtraInfo
+    mov rax, qword ptr gs:[X64ARM_MESSAGE_X64_BASE+X64ARM_MESSAGE_EXTRA]
+    ret
+end GetMessageExtraInfo
+entry SetMessageExtraInfo
+    mov rax, qword ptr gs:[X64ARM_MESSAGE_X64_BASE+X64ARM_MESSAGE_EXTRA]
+    mov qword ptr gs:[X64ARM_MESSAGE_X64_BASE+X64ARM_MESSAGE_EXTRA], rcx
+    ret
+end SetMessageExtraInfo
+
+#include "../../include/x64arm/windows_keyboard_model.h"
+
+entry SwapMouseButton
+    .byte 0x48,0xba
+Lswap_patch:
+    .quad 0
+    mov rdx, qword ptr [rdx]
+    xor eax, eax
+    test ecx, ecx
+    setne al
+    xchg dword ptr [rdx+X64ARM_GUI_MOUSE_SWAP_OFFSET], eax
+    ret
+end SwapMouseButton
+.globl _guest_SwapMouseButton_gui_timing_patch
+.set _guest_SwapMouseButton_gui_timing_patch, Lswap_patch - _guest_SwapMouseButton
+
 .globl _guest_thread_end
 _guest_thread_end:

@@ -1,7 +1,10 @@
+#include "x64arm/windows_icon.hpp"
 #include "x64arm/windows_services.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/unicode.hpp"
 #include <cmath>
+#include "shared_window_order.hpp"
+#include "gui_message_contract.hpp"
 
 // user32 補充家族：舊式掛鉤、MessageBoxEx、非同步顯示、輸入狀態、視窗模組路徑、DPI 程序查詢與主控執行緒行為。
 // 全部轉接既有 user32／kernel32 實作；需要傳送視窗訊息（可能回呼客體視窗程序）者經 nested_continuation 續行。
@@ -16,12 +19,14 @@ std::span<const WindowsServiceDescriptor> user32_extra_service_descriptors(){
         {"user32.dll","GetThreadDpiHostingBehavior",0},{"user32.dll","GetWindowDpiHostingBehavior",1},{"user32.dll","SetThreadDpiHostingBehavior",1,0,0,0x1},
         // 視窗屬性列舉、執行緒 GUI 狀態、標題列、視窗字組、說明 ID、內部文字、切換與排列、圖示資訊、手勢設定、Shell 視窗與舊式 IME。
         {"user32.dll","EnumPropsA",2},{"user32.dll","EnumPropsW",2},{"user32.dll","EnumPropsExA",3},{"user32.dll","EnumPropsExW",3},
+        {"win32u.dll","NtUserSetClassLong",4},{"win32u.dll","NtUserSetClassLongPtr",4},
+        {"win32u.dll","NtUserSetWindowLong",4},{"win32u.dll","NtUserSetWindowLongPtr",4},
         {"user32.dll","GetGUIThreadInfo",2},{"user32.dll","GetTitleBarInfo",2},{"user32.dll","GetWindowWord",2},{"user32.dll","SetWindowWord",3},
-        {"user32.dll","GetWindowContextHelpId",1},{"user32.dll","SetWindowContextHelpId",2},{"user32.dll","InternalGetWindowText",3},{"user32.dll","IsGUIThread",1},
+        {"user32.dll","GetWindowContextHelpId",1},{"user32.dll","SetWindowContextHelpId",2},{"user32.dll","InternalGetWindowText",3},{"win32u.dll","NtUserDefSetText",2},{"user32.dll","IsGUIThread",1},
         {"user32.dll","SwitchToThisWindow",2},{"user32.dll","IsWindowArranged",1},{"user32.dll","AnyPopup",0},{"user32.dll","GetAltTabInfoA",5},{"user32.dll","GetAltTabInfoW",5},
         {"user32.dll","GetAltTabInfo",5},{"user32.dll","GetListBoxInfo",1},{"user32.dll","CascadeWindows",5},{"user32.dll","TileWindows",5},
         {"user32.dll","CascadeChildWindows",2},{"user32.dll","TileChildWindows",2},{"user32.dll","ArrangeIconicWindows",1},
-        {"user32.dll","GetIconInfoExA",2},{"user32.dll","GetIconInfoExW",2},{"user32.dll","OemKeyScan",1},{"user32.dll","GetDpiAwarenessContextForProcess",1},
+        {"win32u.dll","NtUserGetIconSize",4},{"win32u.dll","NtUserGetIconInfo",6},{"user32.dll","GetIconInfoExA",2},{"user32.dll","GetIconInfoExW",2},{"user32.dll","OemKeyScan",1},{"user32.dll","GetDpiAwarenessContextForProcess",1},
         {"user32.dll","SystemParametersInfoForDpi",5},{"user32.dll","GetGestureConfig",6},{"user32.dll","SetGestureConfig",5},{"user32.dll","GetGestureInfo",2},
         {"user32.dll","GetGestureExtraArgs",3},{"user32.dll","CloseGestureInfoHandle",1},{"user32.dll","GetProgmanWindow",0},{"user32.dll","SetProgmanWindow",1},
         {"user32.dll","GetTaskmanWindow",0},{"user32.dll","SetTaskmanWindow",1},{"user32.dll","WINNLSEnableIME",2},{"user32.dll","WINNLSGetEnableStatus",1},
@@ -31,6 +36,21 @@ std::span<const WindowsServiceDescriptor> user32_extra_service_descriptors(){
 std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const auto name=service.symbol;
     // 會傳送視窗訊息或呼叫客體回呼的項目經協程續行。
+    if(name=="NtUserSetWindowLong" || name=="NtUserSetWindowLongPtr" ||
+       name=="NtUserSetClassLong" || name=="NtUserSetClassLongPtr"){
+        return nested_continuation(state,memory,"SetLong",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);
+            const bool class_data=service.symbol.starts_with("NtUserSetClass");
+            const bool menu=class_data && static_cast<std::int32_t>(call(1))==-8;
+            const bool ansi=!menu && static_cast<std::uint32_t>(call(3))!=0;
+            const bool pointer=service.symbol.ends_with("Ptr") && !x86_;
+            std::string target=class_data?"SetClassLong":"SetWindowLong";
+            if(pointer)target+="Ptr";
+            target+=ansi?'A':'W';
+            const auto result=co_await service_callback::call_value(resolve("user32.dll",target).value,{call(0),call(1),call(2)});
+            call.return_to(s,result);co_return std::nullopt;
+        });
+    }
     if(name.starts_with("EnumProps")){
         return nested_continuation(state,memory,"User32Props",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
             const WindowsCall call(s,m,service);const bool wide=service.symbol.ends_with('W'),extended=service.symbol.starts_with("EnumPropsEx");
@@ -38,12 +58,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
             const auto window=gui_.windows.find(call(0));if(window==gui_.windows.end()){last_error_=1400;co_return done(UINT32_MAX);}
             if(!call(1)){last_error_=87;co_return done(UINT32_MAX);}
             // 先取快照：回呼中可安全增刪屬性。字串 atom 傳名稱，整數 atom 直接傳數值；沒有屬性時回 -1。
-            std::vector<std::pair<std::uint16_t,std::uint64_t>> entries;for(const auto& [key,property]:window->second.properties)entries.push_back({key.second,property.value});
-            GuestScratch scratch(*this,m,s);const auto buffer=scratch.allocate(512);std::uint64_t result=UINT32_MAX;
+            struct Entry {std::uint16_t atom;std::uint64_t value;bool string_name;};
+            std::vector<Entry> entries;
+            for(const auto& [key,property]:window->second.properties)entries.push_back({key.second,property.value,property.string_name});
+            // Atom 名稱最多 255 個 UTF-16 碼元；UTF-8 每碼元至多三個位元組，另留結尾零。
+            const std::uint64_t capacity=wide?256:255*3+1;
+            GuestScratch scratch(*this,m,s);const auto buffer=scratch.allocate(capacity*(wide?2:1));std::uint64_t result=UINT32_MAX;
             const auto atom_name=resolve("kernel32.dll",wide?"GlobalGetAtomNameW":"GlobalGetAtomNameA").value;
-            for(const auto& [atom,value]:entries){
+            for(const auto& [atom,value,string_name]:entries){
                 std::uint64_t text=atom;
-                if(atom>=0xc000){const auto length=co_await service_callback::call(atom_name,{atom,buffer,255});if(!length)continue;text=buffer;}
+                if(string_name){const auto length=co_await service_callback::call(atom_name,{atom,buffer,capacity});if(!length)continue;text=buffer;}
                 std::vector<std::uint64_t> args{call(0),text,value};if(extended)args.push_back(call(2));
                 result=static_cast<std::uint32_t>(co_await service_callback::call(call(1),std::move(args)));if(!result)break;
             }
@@ -62,29 +86,70 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
                 if(window->second.style&0x20000000U)(void)co_await service_callback::call(user("ShowWindow"),{call(0),9});
                 (void)co_await service_callback::call(user("SetForegroundWindow"),{call(0)});co_return done(0);
             }
+            if(symbol=="ArrangeIconicWindows"){
+                const auto parent=call(0),desktop=thread_desktop_object(threads_.current);
+                if(!parent)co_return done(0);
+                std::array<std::int32_t,4> area{};
+                if(parent==gui_.desktop)area=gui_work_area();
+                else{
+                    GuestScratch scratch(*this,m,s);const auto rect=scratch.allocate(16);
+                    if(!co_await service_callback::call(user("GetClientRect"),{parent,rect}))co_return done(0);
+                    for(unsigned i=0;i<4;++i)area[i]=static_cast<std::int32_t>(m.load(GuestAddress{rect+i*4},32));
+                }
+                const auto settings=gui_.minimized_metrics;
+                const bool right=settings[3]&1U,top=settings[3]&2U,vertical=settings[3]&4U;
+                const std::int64_t width=system_metric(m,57),height=system_metric(m,58);
+                const auto dx=width+settings[1],dy=height+settings[2];
+                const auto first_x=right?area[2]-dx:std::int64_t{area[0]}+settings[1];
+                const auto first_y=top?std::int64_t{area[1]}+settings[2]:area[3]-dy;
+                const auto step_x=right?-dx:dx,step_y=top?dy:-dy;
+                auto x=first_x,y=first_y;
+                const auto expected_parent=parent==gui_.desktop?0:parent;
+                initialize_shared_windows();
+                const auto handles=snapshot_window_order(shared_windows_.get(),gui_.z_order);
+                std::uint32_t count=0;
+                for(const auto handle:handles){
+                    const auto it=gui_.windows.find(handle);
+                    const bool local=it!=gui_.windows.end();
+                    if(local){
+                        const auto& w=it->second;
+                        if(w.destroying || w.desktop_object!=desktop || w.parent!=expected_parent || !(w.style&0x20000000U))continue;
+                    }else{
+                        const auto w=shared_gui_window(handle);
+                        if(!w || w->desktop!=desktop || w->parent!=expected_parent || !(w->style&0x20000000U))continue;
+                    }
+                    const auto px=static_cast<std::uint32_t>(x),py=static_cast<std::uint32_t>(y);
+                    if(local && it->second.thread==threads_.current)
+                        (void)co_await service_callback::call(user("SetWindowPos"),{handle,0,px,py,0,0,0x15});
+                    else (void)co_await service_callback::call(user("SendMessageW"),{handle,gui_move_minimized_window,px,py});
+                    ++count;
+                    if(vertical){
+                        y+=step_y;
+                        if(top?y+height>area[3]:y<area[1]){y=first_y;x+=step_x;}
+                    }else{
+                        x+=step_x;
+                        if(right?x<area[0]:x+width>area[2]){x=first_x;y+=step_y;}
+                    }
+                }
+                co_return done(count);
+            }
             // (parent, how, rect, count, kids)；Cascade／TileChildWindows 為 (parent, how)。NULL 父視窗為桌面（排列本程序的頂層視窗）。
-            const bool children_only=symbol.ends_with("ChildWindows"),iconic=symbol=="ArrangeIconicWindows";const auto parent=call(0);const auto how=iconic?0U:static_cast<std::uint32_t>(call(1));
+            const bool children_only=symbol.ends_with("ChildWindows");const auto parent=call(0);const auto how=static_cast<std::uint32_t>(call(1));
             if(parent && !gui_.windows.contains(parent)){last_error_=1400;co_return done(0);}
             std::vector<std::uint64_t> targets;
-            if(!children_only && !iconic && call(3) && call(4)){for(std::uint32_t i=0;i<static_cast<std::uint32_t>(call(3));++i)targets.push_back(m.load(GuestAddress{call(4)+i*(x86_?4U:8U)},x86_?32:64));}
+            if(!children_only && call(3) && call(4)){for(std::uint32_t i=0;i<static_cast<std::uint32_t>(call(3));++i)targets.push_back(m.load(GuestAddress{call(4)+i*(x86_?4U:8U)},x86_?32:64));}
             else for(const auto& [handle,window]:gui_.windows)if(window.parent==parent && window.visible && !window.destroying && (parent || !window.owner || window.style&0x00C00000U))targets.push_back(handle);
             // 依目前 Z 序之外的建立順序排列；略過最小化（排列圖示時只取最小化）、以及 MDITILE_SKIPDISABLED（2）時停用的視窗。
             std::erase_if(targets,[&](std::uint64_t h){const auto w=gui_.windows.find(h);if(w==gui_.windows.end())return true;const bool minimized=w->second.style&0x20000000U;
-                return iconic?!minimized:(minimized || ((how&2U) && !w->second.enabled));});
+                return minimized || ((how&2U) && !w->second.enabled);});
             std::array<std::int32_t,4> area{};GuestScratch scratch(*this,m,s);const auto rect=scratch.allocate(16);
-            if(!children_only && !iconic && call(2))for(unsigned i=0;i<4;++i)area[i]=static_cast<std::int32_t>(m.load(GuestAddress{call(2)+i*4},32));
+            if(!children_only && call(2))for(unsigned i=0;i<4;++i)area[i]=static_cast<std::int32_t>(m.load(GuestAddress{call(2)+i*4},32));
             else if(parent){(void)co_await service_callback::call(user("GetClientRect"),{parent,rect});for(unsigned i=0;i<4;++i)area[i]=static_cast<std::int32_t>(m.load(GuestAddress{rect+i*4},32));}
             else {(void)co_await service_callback::call(user("SystemParametersInfoW"),{0x30,0,rect,0});for(unsigned i=0;i<4;++i)area[i]=static_cast<std::int32_t>(m.load(GuestAddress{rect+i*4},32));}
             const auto metric=[&](std::uint32_t index)->service_callback::Task<std::int32_t>{co_return static_cast<std::int32_t>(co_await service_callback::call(user("GetSystemMetrics"),{index}));};
             const auto width=area[2]-area[0],height=area[3]-area[1];std::uint32_t arranged=0;
             const auto place=[&](std::uint64_t h,std::int32_t x,std::int32_t y,std::int32_t w,std::int32_t hgt,std::uint32_t flags)->service_callback::Task<bool>{
                 co_return co_await service_callback::call(user("SetWindowPos"),{h,0,static_cast<std::uint32_t>(x),static_cast<std::uint32_t>(y),static_cast<std::uint32_t>(w),static_cast<std::uint32_t>(hgt),flags})!=0;};
-            if(iconic){
-                // 最小化的子視窗沿工作區底邊由左至右排列；回傳一列的高度。
-                const auto spacing_x=co_await metric(47),spacing_y=co_await metric(48);std::int32_t x=area[0];std::int32_t y=area[3]-spacing_y;
-                for(const auto h:targets){if(co_await place(h,x,y,0,0,0x15))++arranged;x+=spacing_x;if(x+spacing_x>area[2]){x=area[0];y-=spacing_y;}}
-                co_return done(targets.empty()?0:static_cast<std::uint32_t>(spacing_y));
-            }
             if(targets.empty())co_return done(0);
             if(symbol.starts_with("Cascade")){
                 // 每個視窗相對前一個右下移一個標題列加框寬；大小為排列區域的四分之三。
@@ -101,7 +166,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
             co_return done(arranged);
         });
     }
-    if(name.starts_with("MessageBoxEx") || name=="ShowWindowAsync" || name=="CloseWindow"){
+    if(name=="ShowWindowAsync")return invoke_gui(state,memory,service);
+    if(name.starts_with("MessageBoxEx") || name=="CloseWindow"){
         return nested_continuation(state,memory,"User32Extra",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
             const WindowsCall call(s,m,service);const auto symbol=service.symbol;
             const auto user=[&](std::string_view target){const auto stub=host_service_stub("user32.dll",target);return stub.value?stub.value:resolve("user32.dll",target).value;};
@@ -110,9 +176,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
                 // (Owner, Text, Caption, Type, LanguageId)：語言識別碼只影響按鈕文字的語系選擇，與 MessageBox 同一流程。
                 co_return done(co_await service_callback::call(user(symbol.ends_with('A')?"MessageBoxA":"MessageBoxW"),{call(0),call(1),call(2),static_cast<std::uint32_t>(call(3))}));
             }
-            // ShowWindowAsync 對本程序視窗直接套用顯示狀態並回 TRUE；CloseWindow 為最小化（SW_MINIMIZE）。
+            // CloseWindow 以 SW_MINIMIZE 最小化視窗。
             if(!co_await service_callback::call(user("IsWindow"),{call(0)})){last_error_=1400;co_return done(0);}
-            (void)co_await service_callback::call(user("ShowWindow"),{call(0),symbol=="CloseWindow"?6U:static_cast<std::uint32_t>(call(1))});
+            (void)co_await service_callback::call(user("ShowWindow"),{call(0),6U});
             co_return done(1);
         });
     }
@@ -137,10 +203,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
         return done((host("user32.dll","GetQueueStatus",{0x5U})>>16)!=0?1U:0U);
     }
     if(name.starts_with("GetWindowModuleFileName")){
-        // 視窗建立時的 HINSTANCE 所屬模組路徑；無尾碼版本為 ANSI。
-        if(!host("user32.dll","IsWindow",{arg(0)})){last_error_=1400;return done(0);}
-        const auto instance=host("user32.dll","GetWindowLongPtrW",{arg(0),x86_?UINT32_MAX-5U:UINT64_MAX-5U});
-        return done(host("kernel32.dll",name.ends_with('W')?"GetModuleFileNameW":"GetModuleFileNameA",{instance,arg(1),u32(2)}));
+        // GWLP_HINSTANCE 只在擁有視窗的程序內有意義。
+        const auto window=gui_.windows.find(arg(0));
+        if(window==gui_.windows.end()){last_error_=1400;return done(0);}
+        return done(host("kernel32.dll",name.ends_with('W')?"GetModuleFileNameW":"GetModuleFileNameA",
+                         {window->second.instance,arg(1),u32(2)}));
     }
     if(name=="SetMessageQueue")return done(u32(0)?1U:0U); // 32 位元 Windows 的訊息佇列自動擴充；此函式只為相容保留
     if(name=="IsImmersiveProcess"){
@@ -149,7 +216,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
         last_error_=0;return done(0);
     }
     if(name=="GetSystemDpiForProcess"){
-        if(arg(0)!=(x86_?UINT32_MAX:UINT64_MAX) && !process_handle_pid(arg(0),0x1000U))return done(0);
+        if(arg(0) && arg(0)!=(x86_?UINT32_MAX:UINT64_MAX) && !process_handle_pid(arg(0),0x1000U))return done(0);
         return done(host("user32.dll","GetDpiForSystem",{}));
     }
     if(name=="GetThreadDpiHostingBehavior")return done(dpi_hosting_behavior_[threads_.current]);
@@ -167,12 +234,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
         std::uint64_t thread=0;
         if(!u32(0)){const auto active=gui_.windows.find(gui_.active);if(active==gui_.windows.end()){last_error_=87;return done(0);}thread=active->second.thread;}
         else {thread=thread_from_identifier(u32(0));if(!thread){last_error_=87;return done(0);}}
-        const auto owned=[&](std::uint64_t h){const auto w=gui_.windows.find(h);return w!=gui_.windows.end() && w->second.thread==thread?h:0;};
+        const auto owned=[&](std::uint64_t h){const auto w=gui_.windows.find(h);return w!=gui_.windows.end() && gui_input_connected(thread,w->second.thread)?h:0;};
         std::uint32_t flags=0;std::uint64_t menu_owner=0,move_size=0,caret_window=0;std::array<std::int32_t,4> caret{};
         for(const auto& [id,track]:gui_.menu_tracks){(void)id;if(track.thread==thread && !track.cancelled){menu_owner=track.owner;flags|=track.main_bar?4U:0x14U;}}
         for(const auto& [id,operation]:gui_.move_sizes){(void)id;if(operation.thread==thread){move_size=operation.window;flags|=2U;}}
         if(const auto found=gui_.carets.find(thread);found!=gui_.carets.end()){caret_window=found->second.window;caret={found->second.x,found->second.y,found->second.x+static_cast<std::int32_t>(found->second.width),found->second.y+static_cast<std::int32_t>(found->second.height)};if(!found->second.hidden)flags|=1U;}
-        const std::array<std::uint64_t,6> windows{owned(gui_.active),owned(gui_.focus),owned(gui_.capture),menu_owner,move_size,caret_window};
+        const auto captured=gui_.windows.find(gui_.capture);
+        const auto capture=captured!=gui_.windows.end() && threads_.items.contains(captured->second.thread) &&
+            &threads_.input_queue(captured->second.thread)==&threads_.input_queue(thread)?gui_.capture:0;
+        const std::array<std::uint64_t,6> windows{owned(gui_.active),owned(gui_.focus),capture,menu_owner,move_size,caret_window};
         memory.store(GuestAddress{arg(1)+4},32,flags);for(unsigned i=0;i<6;++i)memory.store(GuestAddress{arg(1)+8+i*unit},x86_?32:64,windows[i]);
         for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(1)+8+6*unit+i*4},32,static_cast<std::uint32_t>(caret[i]));return done(1);
     }
@@ -198,6 +268,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
     if(name=="GetWindowWord" || name=="SetWindowWord"){
         // 正位移讀寫額外視窗記憶體的 16 位元值；GetWindowWord 另接受 GWL_HINSTANCE（-6）、GWL_HWNDPARENT（-8）與 GWL_ID（-12）取低位字。
         auto* window=window_of(arg(0));if(!window)return done(0);const auto index=std::bit_cast<std::int32_t>(u32(1));
+        if(index==-21){
+            const auto previous=static_cast<std::uint16_t>(window->user_data);
+            if(name=="SetWindowWord")window->user_data=(static_cast<std::uint32_t>(window->user_data)&0xffff0000U)|static_cast<std::uint16_t>(u32(2));
+            return done(previous);
+        }
         if(index<0){if(name=="SetWindowWord" || (index!=-6 && index!=-8 && index!=-12)){last_error_=1413;return done(0);}
             return done(host("user32.dll","GetWindowLongPtrW",{arg(0),static_cast<std::uint64_t>(static_cast<std::int64_t>(index))})&0xffffU);}
         if(static_cast<std::size_t>(index)+2>window->extra.size()){last_error_=1413;return done(0);}
@@ -205,13 +280,54 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
         if(name=="SetWindowWord"){window->extra[static_cast<std::size_t>(index)]=static_cast<std::uint8_t>(u32(2));window->extra[static_cast<std::size_t>(index)+1]=static_cast<std::uint8_t>(u32(2)>>8);}
         return done(previous);
     }
-    if(name=="GetWindowContextHelpId"){auto* window=window_of(arg(0));return done(window?window->context_help_id:0U);}
-    if(name=="SetWindowContextHelpId"){auto* window=window_of(arg(0));if(!window)return done(0);window->context_help_id=u32(1);return done(1);}
+    if(name=="GetWindowContextHelpId" || name=="SetWindowContextHelpId"){
+        if(arg(0)==gui_.desktop)return done(0);
+        auto* window=window_of(arg(0));
+        if(!window)return done(0);
+        if(name=="GetWindowContextHelpId")return done(window->context_help_id);
+        window->context_help_id=u32(1);
+        return done(1);
+    }
+    if(name=="NtUserDefSetText"){
+        if(!arg(1))return done(1);
+        auto* window=window_of(arg(0));
+        if(!window)return done(0);
+        // LARGE_STRING 的兩個 DWORD 後是客體指標，MaximumLength 的最高位指定 ANSI。
+        std::u16string text;
+        try {
+            const auto descriptor=arg(1);
+            const auto bytes=memory.load(GuestAddress{descriptor},32);
+            const auto flags=memory.load(GuestAddress{descriptor+4},32);
+            const auto data=memory.load(GuestAddress{descriptor+8},x86_?32:64);
+            const bool ansi=(flags&0x80000000U)!=0;
+            if(bytes>(flags&0x7fffffffU) || bytes>output_limit || (!ansi && (bytes&1))){
+                last_error_=87;return done(0);
+            }
+            if(data && bytes){
+                if(ansi){
+                    memory.check(GuestAddress{data},bytes,Access::Read);
+                    std::string value(bytes,'\0');
+                    memory.read(GuestAddress{data},{reinterpret_cast<std::uint8_t*>(value.data()),value.size()});
+                    text=utf8_to_utf16_lossy(value);
+                }else text=read_utf16_counted(memory,GuestAddress{data},bytes/2);
+            }
+        } catch(const MemoryFault&){last_error_=998;return done(0);}
+        window->title=std::move(text);
+        present_gui(arg(0));
+        return done(1);
+    }
     if(name=="InternalGetWindowText"){
-        // 直接取視窗標題，不傳送 WM_GETTEXT；回傳複製的字元數。
-        auto* window=window_of(arg(0));if(!window)return done(0);const auto capacity=std::bit_cast<std::int32_t>(u32(2));if(!arg(1) || capacity<=0){last_error_=87;return done(0);}
-        auto text=window->title.substr(0,static_cast<std::size_t>(capacity-1));for(std::size_t i=0;i<text.size();++i)memory.store(GuestAddress{arg(1)+i*2},16,text[i]);
-        memory.store(GuestAddress{arg(1)+text.size()*2},16,0);return done(text.size());
+        // 直接讀取標題，不傳送 WM_GETTEXT。跨程序標題與一般查詢共用已發布的資料。
+        const auto capacity=std::bit_cast<std::int32_t>(u32(2));
+        if(capacity<=0)return done(0);
+        if(invoke_remote_gui(state,memory,service))return std::nullopt;
+        auto* window=window_of(arg(0));
+        if(!window)return done(0);
+        if(!arg(1)){last_error_=87;return done(0);}
+        const auto end=window->title.find(u'\0');
+        const auto length=std::min({window->title.size(),end,static_cast<std::size_t>(capacity-1)});
+        memory.write(GuestAddress{arg(1)},utf16_bytes(window->title.substr(0,length)));
+        return done(length);
     }
     if(name=="IsGUIThread"){
         // 已有訊息佇列的執行緒為 GUI 執行緒；bConvert 時建立佇列。
@@ -227,22 +343,82 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
         // 只有 Alt+Tab 切換視窗本身可查詢；本桌面沒有這個視窗。
         last_error_=1400;return done(0);
     }
+    if(name=="NtUserGetIconSize"){
+        const auto found=gui_.icons.find(arg(0));
+        const auto system=found==gui_.icons.end()?resolve_system_cursor(gui_,arg(0)):std::nullopt;
+        const GuiIcon* icon=system?&*system:found!=gui_.icons.end()?&found->second:nullptr;
+        if(icon && !icon->animation_sequence.empty()){
+            const auto step=u32(1);
+            icon=step<icon->animation_sequence.size()?&icon->animation_frames.at(icon->animation_sequence[step]):nullptr;
+        }
+        if(!icon){last_error_=1402;return done(0);}
+        memory.check(GuestAddress{arg(2)},4,Access::Write);
+        memory.check(GuestAddress{arg(3)},4,Access::Write);
+        memory.store(GuestAddress{arg(2)},32,icon->width);
+        memory.store(GuestAddress{arg(3)},32,icon->height*2);
+        return done(1);
+    }
+    if(name=="NtUserGetIconInfo"){
+        const auto handle=arg(0);
+        const auto found=gui_.icons.find(handle);
+        const bool stock=found==gui_.icons.end() && handle>=0xd000 && gui_system_cursor_id(handle-0xd000);
+        if(found==gui_.icons.end() && !stock){last_error_=1402;return done(0);}
+        const auto* icon=stock?nullptr:&found->second;
+        const auto stock_id=stock?handle-0xd000:icon->system;
+        const auto id=stock_id?stock_id:icon->resource_name_id;
+        std::u16string module;
+        if(stock_id)module=u"C:\\Windows\\System32\\user32.dll";
+        else if(icon->resource_instance){
+            GuestScratch scratch(*this,memory,state);
+            const auto buffer=scratch.allocate(522);
+            const auto count=host("kernel32.dll","GetModuleFileNameW",{icon->resource_instance,buffer,260});
+            for(unsigned i=0;i<count;++i)module.push_back(static_cast<char16_t>(memory.load(GuestAddress{buffer+2*i},16)));
+        }
+        const auto output_string=[&](std::uint64_t desc,std::u16string_view value,bool ordinal){
+            if(!desc)return;
+            const auto unit=x86_?4U:8U;
+            memory.check(GuestAddress{desc},2*unit,Access::Write);
+            const auto length=std::min<std::size_t>(memory.load(GuestAddress{desc+2},16),2*value.size());
+            if(ordinal)memory.store(GuestAddress{desc+unit},(x86_?32:64),module.empty()?0:id);
+            else if(length){
+                const auto ptr=memory.load(GuestAddress{desc+unit},(x86_?32:64));
+                memory.check(GuestAddress{ptr},length,Access::Write);
+                for(std::size_t i=0;i<length;++i)memory.store(GuestAddress{ptr+i},8,value[i/2]>>((i%2)*8));
+            }
+            memory.store(GuestAddress{desc},16,length/2);
+        };
+        if(!arg(1)){last_error_=87;return done(0);}
+        memory.check(GuestAddress{arg(1)},x86_?20:32,Access::Write);
+        output_string(arg(2),module,false);
+        const std::u16string_view resource=icon?std::u16string_view(icon->resource_name):std::u16string_view{};
+        output_string(arg(3),resource,resource.empty());
+        return done(host("user32.dll","GetIconInfo",{handle,arg(1)}));
+    }
     if(name=="GetIconInfoExA" || name=="GetIconInfoExW"){
-        // ICONINFOEX：ICONINFO 欄位後接 wResID、szModName[MAX_PATH]、szResName[MAX_PATH]（A 為字元、W 為 WCHAR）。
         const bool wide=name.ends_with('W');const unsigned unit=x86_?4U:8U,fixed=16+2*unit,character=wide?2U:1U;
         const auto size=(fixed+2+520*character+unit-1)/unit*unit;if(!arg(1) || memory.load(GuestAddress{arg(1)},32)!=size){last_error_=87;return done(0);}
-        GuestScratch scratch(*this,memory,state);const auto info=scratch.allocate(x86_?20:32);if(!host("user32.dll","GetIconInfo",{arg(0),info}))return done(0);
-        const auto icon=gui_.icons.find(arg(0));
-        const auto resource_instance=icon==gui_.icons.end()?0:icon->second.resource_instance;
-        const auto resource_id=icon==gui_.icons.end()?static_cast<std::uint32_t>(arg(0)-0xd000):icon->second.resource_name_id;
-        const auto resource_name=icon==gui_.icons.end()?std::u16string{}:icon->second.resource_name;
-        memory.store(GuestAddress{arg(1)+4},32,memory.load(GuestAddress{info},32));memory.store(GuestAddress{arg(1)+8},32,memory.load(GuestAddress{info+4},32));memory.store(GuestAddress{arg(1)+12},32,memory.load(GuestAddress{info+8},32));
-        memory.store(GuestAddress{arg(1)+16},x86_?32:64,memory.load(GuestAddress{info+(x86_?12U:16U)},x86_?32:64));memory.store(GuestAddress{arg(1)+16+unit},x86_?32:64,memory.load(GuestAddress{info+(x86_?16U:24U)},x86_?32:64));
-        memory.store(GuestAddress{arg(1)+fixed},16,resource_id);memory.fill(GuestAddress{arg(1)+fixed+2},0,520*character);
-        if(resource_instance)(void)host("kernel32.dll",wide?"GetModuleFileNameW":"GetModuleFileNameA",{resource_instance,arg(1)+fixed+2,260});
-        const auto names=arg(1)+fixed+2+260*character;
-        if(wide)for(std::size_t i=0;i<std::min<std::size_t>(resource_name.size(),259);++i)memory.store(GuestAddress{names+i*2},16,resource_name[i]);
-        else {const auto narrow=utf16_to_utf8_lossy(resource_name);for(std::size_t i=0;i<std::min<std::size_t>(narrow.size(),259);++i)memory.store(GuestAddress{names+i},8,static_cast<std::uint8_t>(narrow[i]));}
+        memory.check(GuestAddress{arg(1)},size,Access::Write);
+        GuestScratch scratch(*this,memory,state);
+        const auto info=scratch.allocate(x86_?20:32);
+        const auto strings=scratch.allocate(4*unit+1040);
+        const auto res=strings+2*unit;
+        for(const auto desc:{strings,res}){
+            memory.store(GuestAddress{desc+2},16,518);
+            memory.store(GuestAddress{desc+unit},(x86_?32:64),strings+4*unit+(desc==res?520:0));
+        }
+        if(!host("win32u.dll","NtUserGetIconInfo",{arg(0),info,strings,res,0,0}))return done(0);
+        for(unsigned i=0;i<3;++i)memory.store(GuestAddress{arg(1)+4+i*4},32,memory.load(GuestAddress{info+i*4},32));
+        for(unsigned i=0;i<2;++i)memory.store(GuestAddress{arg(1)+16+i*unit},(x86_?32:64),memory.load(GuestAddress{info+(x86_?12U:16U)+i*unit},(x86_?32:64)));
+        const auto ordinal=memory.load(GuestAddress{res},16)?0:memory.load(GuestAddress{res+unit},(x86_?32:64));
+        memory.store(GuestAddress{arg(1)+fixed},16,ordinal);
+        for(const auto desc:{strings,res}){
+            const auto target=arg(1)+fixed+2+(desc==res?260*character:0);
+            const auto length=memory.load(GuestAddress{desc},16);
+            const auto buffer=strings+4*unit+(desc==res?520:0);
+            memory.store(GuestAddress{buffer+2*length},16,0);
+            if(wide){for(unsigned i=0;i<=length;++i)memory.store(GuestAddress{target+2*i},16,memory.load(GuestAddress{buffer+2*i},16));}
+            else (void)host("kernel32.dll","WideCharToMultiByte",{0,0,buffer,UINT32_MAX,target,260,0,0});
+        }
         return done(1);
     }
     if(name=="OemKeyScan"){
@@ -292,10 +468,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
         // HGESTUREINFO 只隨 WM_GESTURE 產生；本輸入路徑不合成手勢訊息，因此不存在有效 handle。
         last_error_=6;return done(0);
     }
-    if(name=="GetProgmanWindow")return done(gui_.progman_window);
-    if(name=="GetTaskmanWindow")return done(gui_.taskman_window);
-    if(name=="SetProgmanWindow" || name=="SetTaskmanWindow"){
-        if(arg(0) && !gui_.windows.contains(arg(0))){last_error_=1400;return done(0);}(name=="SetProgmanWindow"?gui_.progman_window:gui_.taskman_window)=arg(0);return done(arg(0));}
+    if(name=="GetProgmanWindow" || name=="GetTaskmanWindow")return done(desktop_manager_window(name=="GetTaskmanWindow",std::nullopt));
+    if(name=="SetProgmanWindow" || name=="SetTaskmanWindow")return done(desktop_manager_window(name=="SetTaskmanWindow",arg(0)));
     if(name=="WINNLSEnableIME"){const auto previous=gui_.legacy_ime_enabled;gui_.legacy_ime_enabled=u32(1)!=0;return done(previous?1U:0U);}
     if(name=="WINNLSGetEnableStatus")return done(gui_.legacy_ime_enabled?1U:0U);
     if(name=="PaintDesktop"){

@@ -1,3 +1,5 @@
+#include "gpu_budget_request.hpp"
+#include "x64arm/gpu_memory.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/unicode.hpp"
@@ -30,6 +32,14 @@ std::span<const WindowsServiceDescriptor> nt_process_service_descriptors(){
 }
 std::uint32_t WindowsServices::local_process_information(std::uint32_t operation,std::array<std::uint64_t,5>& values,std::uint32_t& bits,int descriptor){
     bits=x86_?32U:64U;
+    if(operation==gpu_budget_request::query || operation==gpu_budget_request::change){
+        if(values[0]>1)return 87;
+        const bool local=values[0]==0;
+        if(operation==gpu_budget_request::change)return set_gpu_memory_reservation(local,values[1])?0U:87U;
+        const auto budget=gpu_memory_budget(local);
+        values={budget.budget,budget.usage,budget.reservation,budget.available,0};
+        return 0;
+    }
     if(operation==15){
         // 來源已核對 PROCESS_SET_INFORMATION 與程序出生身分；不同指標寬度不能截斷入口。
         if(values[1]!=bits)return 50;

@@ -8,8 +8,8 @@
 namespace x64arm {
 // 引擎既有全域／session 具名物件的目錄；獨立控制代碼，不能當作可等待事件。
 // 索引 0～4 沿用既有紀錄（object-directory-<n>）；5 起為新增的內建目錄，不改變既有索引。
-inline constexpr std::array<std::u16string_view,8> builtin_object_directories{
-    u"\\",u"\\Sessions",u"\\Sessions\\1",u"\\Sessions\\1\\BaseNamedObjects",u"\\BaseNamedObjects",u"\\GLOBAL??",u"\\KnownDlls",u"\\KnownDlls32"};
+inline constexpr std::array<std::u16string_view,10> builtin_object_directories{
+    u"\\",u"\\Sessions",u"\\Sessions\\1",u"\\Sessions\\1\\BaseNamedObjects",u"\\BaseNamedObjects",u"\\GLOBAL??",u"\\KnownDlls",u"\\KnownDlls32",u"\\Sessions\\1\\Windows",u"\\Sessions\\1\\Windows\\WindowStations"};
 enum class ObjectNamespaceKind:std::uint32_t{Directory=1,SymbolicLink=2};
 // 命名空間項目旗標：永久物件、私有命名空間（不經路徑查詢、沒有顯示名稱）、內建符號連結（隨需建立、永久）、無名項目（鍵為內部路徑）。
 inline constexpr std::uint32_t object_namespace_permanent=1,object_namespace_private=2,object_namespace_builtin=4,object_namespace_anonymous=8;

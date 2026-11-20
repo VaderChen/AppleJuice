@@ -8,6 +8,7 @@
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> property_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"win32u.dll","NtUserBuildPropList",4},
         {"user32.dll","GetPropA",2},{"user32.dll","GetPropW",2},
         {"user32.dll","SetPropA",3},{"user32.dll","SetPropW",3},
         {"user32.dll","RemovePropA",2},{"user32.dll","RemovePropW",2},
@@ -46,8 +47,36 @@ std::uint16_t gui_atom_table_add(std::map<std::uint16_t,GuiAtom>& atoms,std::map
 }
 std::optional<std::uint32_t> WindowsServices::invoke_properties(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
+    if(symbol=="NtUserBuildPropList"){
+        const auto capacity=static_cast<std::uint32_t>(arg(1));
+        const auto buffer=arg(2),count=arg(3);
+        const auto window=gui_.windows.find(arg(0));
+        std::uint32_t status=0;
+        if(!buffer || !count)status=0xc000000dU;
+        else if(window==gui_.windows.end())status=0xc0010000U | 1400U;
+        else {
+            const auto& properties=window->second.properties;
+            std::uint64_t index=0;
+            for(const auto& [key,entry]:properties){
+                if(index==capacity)break;
+                // 兩種 ABI 共用 16 位元組記錄；尾端填充保留呼叫端的內容。
+                const auto address=buffer+16*index++;
+                memory.store(GuestAddress{address},64,entry.value);
+                memory.store(GuestAddress{address+8},16,key.second);
+                memory.store(GuestAddress{address+10},8,entry.string_name);
+            }
+            memory.store(GuestAddress{count},32,properties.size());
+            if(properties.size()>capacity)status=0xc0000023U;
+        }
+        arg.return_to(state,status);return std::nullopt;
+    }
     const bool wide=symbol.ends_with('W'),property=service.family=="user32.dll";
     std::uint64_t result=0;
+    // 整數 atom 以低位指標表示；值零直接回零，不能把它當作空字串加入表中。
+    if(!property && !arg(0) && (symbol.starts_with("AddAtom") || symbol.starts_with("FindAtom") ||
+       symbol.starts_with("GlobalAddAtom") || symbol.starts_with("GlobalFindAtom"))){
+        arg.return_to(state,0);return std::nullopt;
+    }
     const auto atom_job=job_atom_table();const auto atom_namespace=atom_job?atom_job->snapshot().identity:0;
     struct Failure {std::uint32_t error;};
     // 名稱解析共用：整數 atom（指標值 ≤ 0xFFFF 或 "#十進位"）回 {atom, 空字串}，字串 atom 回 {0, 名稱}。
@@ -120,9 +149,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_properties(GuestState& stat
             if(set){
                 if(found!=properties.end()){
                     found->second.value=arg(2);
+                    found->second.string_name=arg(1)>65535;
                     if(acquired){if(found->second.owns_atom)release_gui_atom(atom,atom_job);else {found->second.owns_atom=true;found->second.atom_job=atom_job;}}
                 }else {
-                    try{properties.emplace(key,GuiProperty{arg(2),acquired,atom_job});}
+                    try{properties.emplace(key,GuiProperty{arg(2),acquired,arg(1)>65535,atom_job});}
                     catch(...){if(acquired)release_gui_atom(atom,atom_job);throw;}
                 }
                 result=1;

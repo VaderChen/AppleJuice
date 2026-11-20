@@ -116,9 +116,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_digest(GuestState& state,Gu
         }else if(symbol.starts_with("InitializeSecurityContext") || symbol=="AcceptSecurityContext"){
             const bool server=symbol=="AcceptSecurityContext";const auto flags=static_cast<std::uint32_t>(arg(3));
             const auto input_pointer=arg(server?2:6),output_pointer=arg(server?6:9),new_context=arg(server?5:8),attributes=arg(server?7:10),expiry=arg(server?8:11);
-            const auto supported=0x1000090eU|(server?0x28000U:0x14000U);require(!(flags&~supported) && !arg(server?4:5),0x80090332);
+            // 用戶端也接受 Windows SDK 定義的 ISC_REQ_USE_HTTP_STYLE；伺服端保留原有旗標。
+            const auto http_flags=server?0x10000000U:0x11000000U;
+            const auto supported=http_flags|0x90eU|(server?0x28000U:0x14000U);const auto representation=arg(server?4:5);
+            require(!(flags&~supported) && (representation==0 || representation==16),0x80090332);
             if(!server)require(!arg(4) && !arg(7),invalid_parameter);
-            const bool http=(flags&0x10000000U)!=0;require(http || !(flags&(server?0x2000cU:0x1000cU)),digest::unsupported);
+            const bool http=(flags&http_flags)!=0;require(http || !(flags&(server?0x2000cU:0x1000cU)),digest::unsupported);
             output_sites(new_context,attributes,expiry);require(attributes,invalid_parameter);const auto out=token(buffers(memory,output_pointer,true));
             const auto id=handle(memory,arg(1));auto found=all.contexts.find(id);digest::Context context;bool creating=!arg(1);
             if(creating){require(all.contexts.size()<1024 && all.next<=UINT32_MAX,no_memory);const auto credential=all.credentials.find(handle(memory,arg(0)));require(credential!=all.credentials.end(),digest::invalid_handle);require((credential->second.use&(server?1U:2U))!=0,digest::no_credentials);context.credentials=credential->second;context.server=server;context.http=http;context.flags=flags;}
@@ -149,6 +152,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_digest(GuestState& state,Gu
                 const auto reply=digest::complete(context,incoming.token,incoming.method,incoming.entity);emit_token(outgoing,reply.token,false);found->second=std::move(context);
             }else if(symbol.starts_with("QueryContextAttributes")){
                 const auto kind=static_cast<std::uint32_t>(arg(1));const auto at=arg(2);require(at,invalid_parameter);const auto& context=found->second;const bool established=context.phase==digest::Context::Phase::Established;
+                if(symbol.starts_with("QueryContextAttributesEx")){
+                    unsigned required=0;
+                    switch(kind){
+                    case 0: case 2: required=16; break;
+                    case 1: case 10: required=unit; break;
+                    case 14: required=4; break;
+                    default: throw digest::Error{digest::unsupported};
+                    }
+                    require(arg(3)>=required,small_buffer);
+                }
                 if(kind==10){memory.check(GuestAddress{at},unit,Access::Write);const auto [pointer,count]=package_info(symbol.ends_with('W'),false,"WDigest");(void)count;memory.store(GuestAddress{at},static_cast<std::uint8_t>(unit*8),pointer);}
                 else {require(established,digest::out_of_sequence);
                     if(kind==0){memory.check(GuestAddress{at},16,Access::Write);for(unsigned i=0;i<4;++i)memory.store(GuestAddress{at+i*4},32,i==0?65536:i==2?1:0);}

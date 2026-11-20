@@ -21,11 +21,11 @@ inline std::uint32_t gui_system_metric(std::uint32_t index,std::uint32_t dpi=96)
     switch(index){
     case 0:case 16:case 78:return 1440;case 1:case 17:case 79:return 900;
     case 80:return 1;
-    case 2:case 3:case 20:case 21:value=16;break;case 4:value=24;break;
+    case 2:case 3:case 20:case 21:case 49:case 50:value=16;break;case 4:value=24;break;
     case 5:case 6:case 45:case 46:value=1;break;
     case 11:case 12:case 13:case 14:value=32;break;
     case 7:case 8:case 32:case 33:value=4;break;case 15:value=20;break;
-    case 38:case 39:value=75;break;case 49:case 71:case 72:value=18;break;default:return 0;
+    case 38:case 39:value=75;break;case 71:case 72:value=18;break;default:return 0;
     }return gui_scale_metric(value,dpi);
 }
 struct GuiInsets {std::uint32_t left{},top{},right{},bottom{};};
@@ -38,7 +38,7 @@ inline GuiInsets gui_frame_insets(std::uint32_t style,std::uint32_t extended,boo
     GuiInsets result{border,border,border,border};
     if((style&0xc00000U)==0xc00000U)result.top+=(extended&0x80U)?18U:24U;
     if(menu && !(style&0x40000000U))result.top+=20;
-    if(scrollbars){if(style&0x100000U){if(extended&0x4000U)result.left+=16;else result.right+=16;}if(style&0x200000U)result.bottom+=16;}
+    if(scrollbars){if(style&0x200000U){if(extended&0x4000U)result.left+=16;else result.right+=16;}if(style&0x100000U)result.bottom+=16;}
     return result;
 }
 inline GuiInsets gui_frame_insets_for_dpi(std::uint32_t style,std::uint32_t extended,bool menu,std::uint32_t dpi) {
@@ -51,7 +51,16 @@ inline GuiInsets gui_default_frame_insets(const GuiWindow& window) {
     const auto& cls=gui_control_class(window);const bool combo=cls==u"combobox" || cls==u"comboboxex32";
     return gui_frame_insets(window.style,window.ex_style,window.menu!=0,!combo);
 }
-inline GuiInsets gui_frame_insets(const GuiWindow& window) {if(window.frame_insets){const auto& a=*window.frame_insets;return {a[0],a[1],a[2],a[3]};}return gui_default_frame_insets(window);}
+inline GuiInsets gui_frame_insets(const GuiWindow& window) {
+    const auto& cached=window.frame_insets;
+    auto inset=cached?GuiInsets{(*cached)[0],(*cached)[1],(*cached)[2],(*cached)[3]}:gui_default_frame_insets(window);
+    if(window.show_command==2){
+        // 最小化標題列加六個圖框像素；不使用正常視窗的可調大小邊框或捲軸。
+        inset.left=std::min(inset.left,3U);inset.right=std::min(inset.right,3U);
+        inset.top=std::min(inset.top,27U);inset.bottom=std::min(inset.bottom,3U);
+    }
+    return inset;
+}
 // NCCALCSIZE 回傳的客戶區與外框共用尺寸／座標模型；不得再依 style 重複扣框。
 inline void gui_calculated_frame(GuiWindow& window,const std::array<std::int32_t,4>& outer,const std::array<std::int32_t,4>& client) {
     const auto width=std::max<std::int64_t>(0,std::int64_t{outer[2]}-outer[0]),height=std::max<std::int64_t>(0,std::int64_t{outer[3]}-outer[1]);
@@ -102,7 +111,7 @@ inline unsigned gui_window_hit(const GuiState& gui,std::uint64_t handle,std::int
             if((w.style&0x80000U) && x>=right-border-20)return 20;
             if((w.style&0x10000U) && x>=right-border-40)return 9;
             if((w.style&0x20000U) && x>=right-border-((w.style&0x10000U)?60:40))return 8;return 2;}
-        if(w.menu && y<origin[1])return 5;if((w.style&0x100000U) && (x>=origin[0]+w.width || x<origin[0]))return 7;if((w.style&0x200000U) && y>=origin[1]+w.height)return 6;return 18;
+        if(w.menu && y<origin[1])return 5;if((w.style&0x200000U) && (x>=origin[0]+w.width || x<origin[0]))return 7;if((w.style&0x100000U) && y>=origin[1]+w.height)return 6;return 18;
     }return 0;
 }
 inline std::pair<std::uint64_t,unsigned> gui_mouse_hit(const GuiState& gui,std::int64_t x,std::int64_t y,std::uint64_t desktop) {

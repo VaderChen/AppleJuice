@@ -137,7 +137,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt_gamepad(GuestState& s
                     output(call(1),unit);m.store(GuestAddress{call(1)},bits,0);
                     const std::u16string text=object->kind==WinrtGamepadObject::Kind::Vector?u"AppleJuice.Collections.GamepadVectorView":object->kind==WinrtGamepadObject::Kind::Iterator?u"AppleJuice.Collections.GamepadIterator":u"Windows.Gaming.Input.Gamepad";
                     const auto bytes=utf16_bytes(text);const auto handle=allocate_heap(m,24+bytes.size());if(!handle)throw std::bad_alloc{};
-                    m.write(GuestAddress{handle+24},bytes);runtime_.winrt_strings.emplace(handle,WinrtString{handle+24,static_cast<std::uint32_t>(text.size()),1});
+                    m.write(GuestAddress{handle+24},bytes);winrt_header::write(m,handle,handle+24,static_cast<std::uint32_t>(text.size()),false);runtime_.winrt_strings.emplace(handle,WinrtString{handle+24,static_cast<std::uint32_t>(text.size()),1});
                     m.store(GuestAddress{call(1)},bits,handle);co_return finish(0);
                 }
                 if(name=="Winrt.GetTrustLevel"){output(call(1),4);m.store(GuestAddress{call(1)},32,0);co_return finish(0);}

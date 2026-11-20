@@ -10,7 +10,7 @@ void WindowsServices::initialize_gui_timing(GuestMemory& memory,bool shared){
     if(!shared || !runtime_.network.external_io)return;
 #if !defined(_WIN32)
     std::array<std::uint8_t,4096> initial{};
-    for(unsigned i=0;i<2;++i){const auto value=gui_timing(memory,i);for(unsigned n=0;n<4;++n)initial[i*4+n]=static_cast<std::uint8_t>(value>>(n*8));}
+    for(unsigned i=0;i<3;++i){const auto value=gui_timing(memory,i);for(unsigned n=0;n<4;++n)initial[i*4+n]=static_cast<std::uint8_t>(value>>(n*8));}
     const auto saved=last_error_;
     const auto address=map_shared_table(memory,u"Win32InputTiming",u"v1",initial,true);
     if(!address)throw HostCallFault("無法建立共用 GUI 時序設定，錯誤 "+std::to_string(last_error_));
@@ -19,6 +19,10 @@ void WindowsServices::initialize_gui_timing(GuestMemory& memory,bool shared){
 }
 std::uint32_t WindowsServices::gui_timing(const GuestMemory& memory,unsigned index) const {
     return static_cast<std::uint32_t>(memory.load(GuestAddress{memory.load(gui_timing_cell_,x86_?32:64)+index*4},32));
+}
+bool WindowsServices::exchange_mouse_buttons(GuestMemory& memory,bool swap){
+    const auto table=memory.load(gui_timing_cell_,x86_?32:64);
+    return memory.atomic_rmw(GuestAddress{table+X64ARM_GUI_MOUSE_SWAP_OFFSET},32,GuestMemory::AtomicRmw::Exchange,swap?1:0)!=0;
 }
 void WindowsServices::set_gui_timing(GuestMemory& memory,unsigned index,std::uint32_t value){
     if(!index)value=value?std::min(value,5000U):500U;
@@ -112,7 +116,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_caret(GuestState& state
         else if(call(1)<=1 && (width<0 || height<0 || width>16384 || height>16384))fail(87);
         else {
             GuiCaret next;next.window=call(0);next.bitmap=call(1);next.generation=++gui_.caret_generation;
-            next.width=width?static_cast<std::uint32_t>(width):system_metric(5);next.height=height?static_cast<std::uint32_t>(height):system_metric(6);
+            next.width=width?static_cast<std::uint32_t>(width):system_metric(memory,5);next.height=height?static_cast<std::uint32_t>(height):system_metric(memory,6);
             if(call(1)>1){sync_raster_bitmap(memory,call(1));next.mask=bitmap->second;next.width=next.mask.width;next.height=next.mask.height;}
             else if(call(1)==1){next.mask.width=next.width;next.mask.height=next.height;next.mask.pixels.resize(std::size_t{next.width}*next.height);
                 for(unsigned y=0;y<next.height;++y)for(unsigned x=0;x<next.width;++x)next.mask.pixels[std::size_t{y}*next.width+x]=((x+y)&1)?0:0xffffff;}
@@ -152,7 +156,7 @@ void WindowsServices::classify_gui_click(GuestMemory& memory,GuiMessage& message
     const auto time=message.mouse_time.value_or(message.queued_time);
     const auto point=message.has_point?message.point:message.queued_cursor;
     const auto dx=std::int64_t{point[0]}-previous.point[0],dy=std::int64_t{point[1]}-previous.point[1];
-    const auto width=std::max(1U,system_metric(36)),height=std::max(1U,system_metric(37));
+    const auto width=std::max(1U,system_metric(memory,36)),height=std::max(1U,system_metric(memory,37));
     const bool doubled=allowed && previous.valid && previous.released && previous.window==message.window && previous.message==code && previous.detail==detail && previous.hit==hit &&
         static_cast<std::uint32_t>(time-previous.time)<=gui_timing(memory,0) && dx>=-std::int64_t{width/2} && dx<std::int64_t{(width+1)/2} && dy>=-std::int64_t{height/2} && dy<std::int64_t{(height+1)/2};
     previous={message.window,detail,code,time,hit,point,control,allowed && !doubled};

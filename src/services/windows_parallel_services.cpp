@@ -320,7 +320,16 @@ bool msvcp_exception_ptr_worker_service(std::string_view symbol) noexcept {
 bool msvcp_thread_id_worker_service(std::string_view symbol) noexcept {return msvcp_once_worker_enabled() && symbol=="_Thrd_id";}
 // type_info::name()：第一次解修飾後名稱指標快取在 type_info 資料的第一個字組，之後每次只讀回該指標（與 provider 的快取分支相同）。
 // 尚未快取（要配置並掛入串列）時交回協調者。Control 每秒數千次。與上列同一開關。
-bool type_info_name_worker_service(std::string_view symbol) noexcept {return msvcp_once_worker_enabled() && symbol=="__std_type_info_name";}
+// type_info 名稱：__std_type_info_name 讀名稱格；VC12 以前的 name()／_name_internal_method 讀 this+8 的反修飾名稱快取。
+// 快取尚空（第一次要反修飾並配置）時交回協調者。locale::id 的轉換運算子在 id 已配發時只讀回該值，未配發要取鎖遞增計數。
+//《緋夜傳奇》序章每秒上千次 _name_internal_method、標題每幀大量 use_facet 的 locale::id 原本都經協調者往返。
+static bool type_info_member_name(std::string_view symbol) noexcept {
+    return symbol=="?_name_internal_method@type_info@@QEBAPEBDPEAU__type_info_node@@@Z" || symbol=="?name@type_info@@QEBAPEBDPEAU__type_info_node@@@Z" || symbol=="?name@type_info@@QEBAPEBDXZ";
+}
+static bool locale_id_service(std::string_view symbol) noexcept {return symbol=="??Bid@locale@std@@QEAA_KXZ";}
+bool type_info_name_worker_service(std::string_view symbol) noexcept {
+    return msvcp_once_worker_enabled() && (symbol=="__std_type_info_name" || type_info_member_name(symbol) || locale_id_service(symbol));
+}
 // __RTDynamicCast（Win64）：只讀物件的 RTTI 定位表與類別階層後回傳指標，原本每次交回協調者並全停（Control 遊玩中是
 // 全停的最大宗，每秒數百次）。轉型成功、空物件與指標轉型失敗（回傳 NULL）在 worker 完成；參考轉型失敗（要拋 bad_cast）、
 // 無效 RTTI 與記憶體故障交回完整路徑。GetKeyState 只讀鍵盤狀態表（協調者持獨占映射鎖時才更新）。X64ARM_PARALLEL_RTTI_CAST=0 關閉。
@@ -477,6 +486,7 @@ bool worker_critical_object_waits() noexcept {
 // （DQ3 強制平行在 13～16 秒崩潰；停用本地映射服務即不再發生）。worker 服務持共享鎖，本地映射服務持獨占鎖。
 ParallelMappingLock& parallel_mapping_mutex() noexcept {static ParallelMappingLock lock;return lock;}
 std::shared_lock<ParallelMappingLock>*& d3d11_worker_mapping_guard() noexcept {thread_local std::shared_lock<ParallelMappingLock>* value{};return value;}
+D3D9WorkerRelease& d3d9_worker_release() noexcept {thread_local D3D9WorkerRelease value{};return value;}
 }
 namespace x64arm {
 // CRT memcpy／memmove／memset 只讀寫呼叫者傳入的客體範圍：較長的複製在單核時於常駐框架內執行，平行時若交回協調者，
@@ -593,6 +603,56 @@ static bool vulkan_worker_symbol(std::string_view symbol) noexcept {
         "vkResetDescriptorPool","vkResetQueryPool","vkResetQueryPoolEXT","vkFlushMappedMemoryRanges","vkInvalidateMappedMemoryRanges"};
     return std::find(std::begin(names),std::end(names),symbol)!=std::end(names);
 }
+// D3DX 的向量、矩陣、四元數、平面與色彩運算：只讀輸入、寫入參數指向的固定大小輸出，不寫 errno 也不配置。
+// 陣列版本的輸出可跨越多頁，留在協調者；矩陣堆疊是物件。指標參數頁都不得是寫入時複製頁（執行前核對）。
+//《緋夜傳奇》標題場景每秒數萬次 D3DXVec3／Vec4Transform 原本每次都經協調者往返。X64ARM_WORKER_D3DX_MATH=0 關閉。
+static bool d3dx_math_worker_service(const WindowsServiceDescriptor& descriptor) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_WORKER_D3DX_MATH");return !value || std::string_view(value)!="0";}();
+    if(!enabled || !descriptor.family.starts_with("d3dx9_"))return false;
+    const auto symbol=descriptor.symbol;
+    if(symbol.find("Array")!=std::string_view::npos || symbol.starts_with("D3DXMatrixStack"))return false;
+    return symbol.starts_with("D3DXVec") || symbol.starts_with("D3DXMatrix") || symbol.starts_with("D3DXQuaternion") ||
+           symbol.starts_with("D3DXPlane") || symbol.starts_with("D3DXColor");
+}
+// 參數中所有像指標的值（含堆疊參數）起算 4 KiB 的首尾頁都不是寫入時複製頁；讀取參數故障時視為不通過。
+static bool worker_pointer_arguments_private(const GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& descriptor) noexcept {
+    try{
+        const WindowsCall arg(state,memory,descriptor);
+        const auto address_mask=memory.execution_mode()==ExecutionMode::X86?UINT64_C(0xffffffff):UINT64_MAX;
+        for(unsigned i=0;i<descriptor.arguments;++i){
+            const auto value=arg(i);
+            if(value<0x10000)continue;
+            if(value>address_mask-4095)return false;
+            if(memory.is_copy_on_write(GuestAddress{value}) || memory.is_copy_on_write(GuestAddress{value+4095}))return false;
+        }
+    }catch(...){return false;}
+    return true;
+}
+// D3D9：協調者本地資格的方法（d3d9_local_eligible：純狀態、綁定、Draw、Begin／EndScene／Clear、換目標、取子表面、
+// 表面參考計數與常駐映射緩衝的 Lock／Unlock）改在呼叫執行緒的 worker 上執行，不再排隊等協調者單執行緒。
+// 鎖序與 D3D11 worker 相同（映射共用 → 圖形），與協調者的本地／完整路徑（映射獨占）互斥。X64ARM_WORKER_D3D9=0 關閉。
+static bool d3d9_worker_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_WORKER_D3D9");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
+// 一般檔案的同步 ReadFile 在 worker 執行（見 file_read_worker）。X64ARM_WORKER_READFILE=1 開啟（待驗證，預設關閉）。
+static bool file_read_worker_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_WORKER_READFILE");return value && std::string_view(value)=="1";}();
+    return enabled;
+}
+// PeekNamedPipe 在 worker 執行（見 pipe_peek_worker）。X64ARM_WORKER_PIPE_PEEK=0 關閉。
+static bool pipe_peek_worker_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_WORKER_PIPE_PEEK");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
+// DirectSound 緩衝的音量、聲像、頻率與位置／狀態查詢：實際資格（非主緩衝等）在 worker 執行時核對，不符交回協調者。
+// X64ARM_WORKER_DSOUND=0 關閉。
+static bool dsound_worker_symbol(const WindowsServiceDescriptor& descriptor) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_WORKER_DSOUND");return !value || std::string_view(value)!="0";}();
+    if(!enabled || descriptor.family!="internal-dsound")return false;
+    constexpr std::string_view names[]{"GetCurrentPosition","GetVolume","GetPan","GetFrequency","GetStatus","SetVolume","SetPan","SetFrequency"};
+    return std::find(std::begin(names),std::end(names),descriptor.symbol)!=std::end(names);
+}
 bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_PARALLEL_SERVICES");return !setting || std::string_view(setting)!="0";}();
     if(!enabled || !runtime_.host_clock || !trace_services_.empty() || startup_profile::enabled() || runtime_.forced_exit_code())return false;
@@ -614,6 +674,9 @@ bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
 }
 bool WindowsServices::parallel_service_static(GuestAddress address) const noexcept {
     if(parallel_crt_format_service(address))return true;
+    if(!x86_)if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,address);runtime &&
+       (dsound_worker_symbol(*runtime) || d3dx_math_worker_service(*runtime) || (d3d9_worker_enabled() && runtime->family=="internal-d3d9") ||
+        (pipe_peek_worker_enabled() && runtime->family=="kernel32.dll" && runtime->symbol=="PeekNamedPipe")))return true;
     if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,address);runtime &&
        (crt_pure_worker_service(*runtime) || (x86_ && crt_x87_worker_service(*runtime)) ||
         (!x86_ && (crt_random_worker_service(*runtime) || crt_split_worker_service(*runtime) ||
@@ -641,6 +704,10 @@ bool WindowsServices::parallel_service_static(GuestAddress address) const noexce
         symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue" ||
         symbol=="InitOnceBeginInitialize" || symbol=="InitOnceExecuteOnce" ||
         symbol=="WakeConditionVariable" || symbol=="WakeAllConditionVariable" || symbol=="SwitchToThread" ||
+        // Sleep：worker 只處理 0 毫秒（與 SwitchToThread 同一讓出判斷），非零的計時睡眠交回協調者。
+        //《緋夜傳奇》主執行緒以 Sleep(0) 輪詢，標題場景每秒數萬次原本都經協調者往返。
+        (symbol=="Sleep" && parallel_sleep_zero_enabled()) ||
+        (symbol=="ReadFile" && file_read_worker_enabled()) ||
         symbol=="WakeByAddressSingle" || symbol=="WakeByAddressAll" ||
         symbol=="_control87" || symbol=="_controlfp" ||
         symbol=="GetLastError" || symbol=="SetLastError" || symbol=="GetCurrentThreadId" ||
@@ -734,6 +801,36 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         try{
             if(invoke_vulkan(state,memory,*runtime))throw std::logic_error("worker 上的 Vulkan 服務意外終止客體");
         }catch(const MemoryFault&){count_scope.accepted=false;return false;}catch(const HostCallFault&){count_scope.accepted=false;return false;}
+        state.rep_compare={};return true;
+    }
+    if(!x86_ && d3d9_worker_enabled())if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,state.rip);runtime && runtime->family=="internal-d3d9"){
+        std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+        // 資格不符或輸出頁是寫入時複製頁時交回協調者（本地或完整路徑），尚未改任何狀態。
+        if(!d3d9_local_eligible(state,memory,*runtime) || !worker_pointer_arguments_private(state,memory,*runtime)){count_scope.accepted=false;return false;}
+        // 失去最後引用／綁定的物件延到下一次完整呼叫銷毀（同協調者本地路徑）；旗標只在持圖形鎖的執行者間傳遞。
+        struct LocalCall {WindowsServices& self;~LocalCall(){self.d3d9_local_call_=false;detail::d3d9_worker_release()={};}} local_call{*this};d3d9_local_call_=true;
+        // 繪製前放開映射共用鎖時，返回位址先在持鎖時讀好（x64 的 [rsp]）。
+        detail::d3d9_worker_release()={&mapping_guard,memory.load(GuestAddress{state.reg(Gpr::Rsp)},64),false};
+        try{
+            if(invoke_runtime(state,memory,*runtime))throw std::logic_error("worker 上的 D3D9 服務意外終止客體");
+        }catch(const MemoryFault&){if(detail::d3d9_worker_release().released)throw;count_scope.accepted=false;return false;}
+        catch(const HostCallFault&){if(detail::d3d9_worker_release().released)throw;count_scope.accepted=false;return false;}
+        state.rep_compare={};return true;
+    }
+    if(!x86_ && pipe_peek_worker_enabled())if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,state.rip);runtime && runtime->family=="kernel32.dll" && runtime->symbol=="PeekNamedPipe"){
+        // 輸出頁核對與管線錯誤（要設 LastError）都交回協調者；偷看沒有副作用，可重做。
+        try{
+            if(!worker_pointer_arguments_private(state,memory,*runtime) || !pipe_peek_worker(state,memory,*runtime)){count_scope.accepted=false;return false;}
+        }catch(const MemoryFault&){count_scope.accepted=false;return false;}catch(const HostCallFault&){count_scope.accepted=false;return false;}
+        catch(const std::runtime_error&){count_scope.accepted=false;return false;}
+        state.rep_compare={};return true;
+    }
+    if(!x86_)if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,state.rip);runtime && dsound_worker_symbol(*runtime)){
+        // 輸出參數頁不得是寫入時複製頁（共用映射鎖下不可私有化）；物件資格或參數不符時交回協調者重做。
+        try{
+            if(!graphics_worker_outputs_private(state,memory,*runtime) || !invoke_dsound_worker(state,memory,*runtime)){count_scope.accepted=false;return false;}
+        }catch(const MemoryFault&){count_scope.accepted=false;return false;}catch(const HostCallFault&){count_scope.accepted=false;return false;}
+        catch(const std::invalid_argument&){count_scope.accepted=false;return false;}
         state.rep_compare={};return true;
     }
     if(const auto* graphics=graphics_worker_service(state.rip)){
@@ -895,6 +992,16 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         state.rep_compare={};
         return true;
     }
+    if(const auto* runtime=x86_?nullptr:detail::runtime_stub_descriptor(stub_base_,state.rip);runtime && d3dx_math_worker_service(*runtime)){
+        std::optional<std::uint32_t> result;
+        try{
+            if(!worker_pointer_arguments_private(state,memory,*runtime))return false;
+            result=invoke_runtime(state,memory,*runtime);
+        }catch(...){return false;}
+        if(result)throw std::logic_error("worker 上的 D3DX 數學服務意外終止客體");
+        state.rep_compare={};
+        return true;
+    }
     if(const auto* runtime=x86_?nullptr:detail::runtime_stub_descriptor(stub_base_,state.rip);runtime && crt_split_worker_service(*runtime)){
         std::optional<std::uint32_t> result;
         try{
@@ -925,9 +1032,12 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     // （slot 0）不在索引中，沿用目前執行緒。
     // 客體執行緒多於 vCPU 時，同一條 worker 輪流執行多個客體執行緒：單一格快取每次換人都要取全域索引鎖
     // （《電馭叛客》重場景每條 vCPU 約 3% 耗在這把鎖的喚醒）。改為依 context 位址直接對映的 16 格。
+    // 《緋夜傳奇》約 40 條客體執行緒輪流使用 2 顆 vCPU，16 格直接對映常互相擠掉而反覆取鎖（vCPU 約 8% 等這把鎖）；
+    // 改 64 格並混入頁內與頁號位元（GuestState 遠大於快取線，只取低位元時多數 context 落在少數格）。
     struct IdentityCache {const WindowsServices* owner;const GuestState* state;std::uint64_t key;};
-    thread_local std::array<IdentityCache,16> identities{};
-    auto& identity=identities[(reinterpret_cast<std::uintptr_t>(&state)>>6U)&15U];
+    thread_local std::array<IdentityCache,64> identities{};
+    const auto identity_address=reinterpret_cast<std::uintptr_t>(&state);
+    auto& identity=identities[((identity_address>>6U)^(identity_address>>12U)^(identity_address>>18U))&63U];
     const auto teb=x86_?state.fs_base:state.gs_base;
     auto key=threads_.current;bool cached=identity.owner==this && identity.state==&state;
     if(cached)key=identity.key;
@@ -963,6 +1073,14 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         if(result)throw std::logic_error("worker 上的 CRT x87 數學服務意外終止客體");
         count_scope.accepted=true;state.rep_compare={};
         return true;
+    }
+    if(!x86_ && symbol=="ReadFile"){
+        bool completed=false;
+        try{completed=file_read_worker(state,memory);}catch(const MemoryFault&){completed=false;}catch(const HostCallFault&){completed=false;}
+        catch(const std::runtime_error&){completed=false;}
+        count_scope.accepted=completed;
+        if(completed)state.rep_compare={};
+        return completed;
     }
     if(!x86_ && (symbol=="fread" || symbol=="fseek" || symbol=="_fseeki64")){
         const auto* descriptor=detail::runtime_stub_descriptor(stub_base_,state.rip);
@@ -1618,10 +1736,13 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         result=1;
     }else if(key_state_worker_service(symbol)){
         const auto virtual_key=static_cast<std::uint32_t>(first);
-        result=virtual_key<256?((gui_.keyboard[virtual_key]&128)?0x8000U:0U)|(gui_.keyboard[virtual_key]&1U):0;
+        const auto& queue=thread.keyboard_queue_owner?threads_.items.at(thread.keyboard_queue_owner).keyboard_queue:thread.keyboard_queue;
+        const auto byte=virtual_key<256?queue.keys[virtual_key]:0U;
+        result=((byte&0x80U)?0x8000U:0U)|(byte&1U);
     }
     else if(type_info_name_worker_service(symbol)){
-        const auto* name_cell=pointer(first,8,1);if(!first || !name_cell)return false;
+        if(!first)return false;
+        const auto* name_cell=pointer(type_info_member_name(symbol)?first+8:first,8,1);if(!name_cell)return false;
         result=load(name_cell,8);if(!result)return false;
     }
     else if(msvcp_exception_ptr_worker_service(symbol)){

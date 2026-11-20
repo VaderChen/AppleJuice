@@ -1,19 +1,88 @@
 #include "windows_storage_state.hpp"
+#include "property_set_dictionary.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/windows_paths.hpp"
 #include <algorithm>
 
 namespace x64arm {
+namespace {
+using PropertyGuid=std::array<std::uint8_t,16>;
+struct PropertyName {PropertyGuid guid;std::u16string_view name;};
+constexpr PropertyName property_names[]{
+    {{0xe0,0x85,0x9f,0xf2,0xf9,0x4f,0x68,0x10,0xab,0x91,8,0,0x2b,0x27,0xb3,0xd9},u"SummaryInformation"},
+    {{2,0xd5,0xcd,0xd5,0x9c,0x2e,0x1b,0x10,0x93,0x97,8,0,0x2b,0x2c,0xf9,0xae},u"DocumentSummaryInformation"},
+    // 使用者自訂區段共用文件摘要串流，反查時取前一筆的 FMTID。
+    {{5,0xd5,0xcd,0xd5,0x9c,0x2e,0x1b,0x10,0x93,0x97,8,0,0x2b,0x2c,0xf9,0xae},u"DocumentSummaryInformation"},
+    {{0,0x6f,0x61,0x56,0x54,0xc1,0xce,0x11,0x85,0x53,0,0xaa,0,0xa1,0xf9,0x5b},u"Global Info"},
+    {{0,0x64,0x61,0x56,0x54,0xc1,0xce,0x11,0x85,0x53,0,0xaa,0,0xa1,0xf9,0x5b},u"Image Contents"},
+    {{0,0x65,0x61,0x56,0x54,0xc1,0xce,0x11,0x85,0x53,0,0xaa,0,0xa1,0xf9,0x5b},u"Image Info"}
+};
+constexpr std::u16string_view property_alphabet=u"abcdefghijklmnopqrstuvwxyz012345";
+char16_t property_lower(char16_t c){return c>=u'A' && c<=u'Z'?static_cast<char16_t>(c+32):c;}
+std::u16string property_set_name(const PropertyGuid& guid){
+    std::u16string text(1,5);
+    for(const auto& entry:property_names)if(entry.guid==guid)return text.append(entry.name);
+    // 每五個位元產生一個字元；從位元組邊界開始的字母使用大寫。
+    for(unsigned bit=0;bit<128;bit+=5){
+        unsigned digit=0;
+        for(unsigned k=0;k<5 && bit+k<128;++k)digit|=((guid[(bit+k)/8]>>((bit+k)%8))&1U)<<k;
+        auto c=property_alphabet[digit];
+        if(bit%8==0 && c>=u'a' && c<=u'z')c=static_cast<char16_t>(c-32);
+        text.push_back(c);
+    }
+    return text;
+}
+}
 std::span<const WindowsServiceDescriptor> storage_service_descriptors(){
     static constexpr WindowsServiceDescriptor descriptors[]{
         {"ole32.dll","StgCreateDocfileOnILockBytes",4},{"ole32.dll","StgOpenStorageOnILockBytes",6},{"ole32.dll","StgIsStorageILockBytes",1},
         {"ole32.dll","StgCreateDocfile",4,0,0,0x6},{"ole32.dll","StgOpenStorage",6,0,0,0x14},{"ole32.dll","StgIsStorageFile",1},
         {"ole32.dll","StgCreateStorageEx",8,0,0,0xe},{"ole32.dll","StgOpenStorageEx",8,0,0,0xe},{"ole32.dll","StgSetTimes",4},
+        {"ntdll.dll","RtlGuidToPropertySetName",2},{"ntdll.dll","RtlPropertySetNameToGuid",3,0,0,1},
         {"ole32.dll","ReadClassStg",2},{"ole32.dll","WriteClassStg",2},{"ole32.dll","FmtIdToPropStgName",2},{"ole32.dll","PropStgNameToFmtId",2},
+        {"ole32.dll","StgCreatePropSetStg",3,0,0,0x2},
+        {"ole32.dll","StgCreatePropStg",6,0,0,0x18},
+        {"ole32.dll","StgOpenPropStg",5,0,0,0xc},
+        {"internal-prop-enum","QueryInterface",3},
+        {"internal-prop-enum","AddRef",1},
+        {"internal-prop-enum","Release",1},
+        {"internal-prop-enum","Next",4,0,0,2},
+        {"internal-prop-enum","Skip",2,0,0,2},
+        {"internal-prop-enum","Reset",1},
+        {"internal-prop-enum","Clone",2},
+        {"internal-prop-set-enum","QueryInterface",3},
+        {"internal-prop-set-enum","AddRef",1},
+        {"internal-prop-set-enum","Release",1},
+        {"internal-prop-set-enum","Next",4,0,0,2},
+        {"internal-prop-set-enum","Skip",2,0,0,2},
+        {"internal-prop-set-enum","Reset",1},
+        {"internal-prop-set-enum","Clone",2},
+        {"internal-prop-set","QueryInterface",3},
+        {"internal-prop-set","AddRef",1},
+        {"internal-prop-set","Release",1},
+        {"internal-prop-set","Create",6,0,0,0x18},
+        {"internal-prop-set","Open",4,0,0,0x4},
+        {"internal-prop-set","Delete",2},
+        {"internal-prop-set","Enum",2},
+        {"internal-prop-storage","QueryInterface",3},
+        {"internal-prop-storage","AddRef",1},
+        {"internal-prop-storage","Release",1},
+        {"internal-prop-storage","ReadMultiple",4,0,0,0x2},
+        {"internal-prop-storage","WriteMultiple",5,0,0,0x12},
+        {"internal-prop-storage","DeleteMultiple",3,0,0,0x2},
+        {"internal-prop-storage","ReadPropertyNames",4,0,0,0x2},
+        {"internal-prop-storage","WritePropertyNames",4,0,0,0x2},
+        {"internal-prop-storage","DeletePropertyNames",3,0,0,0x2},
+        {"internal-prop-storage","Commit",2,0,0,0x2},
+        {"internal-prop-storage","Revert",1},
+        {"internal-prop-storage","Enum",2},
+        {"internal-prop-storage","SetTimes",4},
+        {"internal-prop-storage","SetClass",2},
+        {"internal-prop-storage","Stat",2},
         {"internal-storage","QueryInterface",3},{"internal-storage","AddRef",1},{"internal-storage","Release",1},
-        {"internal-storage","CreateStream",6},{"internal-storage","OpenStream",6},{"internal-storage","CreateStorage",6},{"internal-storage","OpenStorage",7},
+        {"internal-storage","CreateStream",6,0,0,0x1c},{"internal-storage","OpenStream",6,0,0,0x18},{"internal-storage","CreateStorage",6,0,0,0x1c},{"internal-storage","OpenStorage",7,0,0,0x28},
         {"internal-storage","CopyTo",5},{"internal-storage","MoveElementTo",5},{"internal-storage","Commit",2},{"internal-storage","Revert",1},
-        {"internal-storage","EnumElements",5},{"internal-storage","DestroyElement",2},{"internal-storage","RenameElement",3},
+        {"internal-storage","EnumElements",5,0,0,0xa},{"internal-storage","DestroyElement",2},{"internal-storage","RenameElement",3},
         {"internal-storage","SetElementTimes",5},{"internal-storage","SetClass",2},{"internal-storage","SetStateBits",3},{"internal-storage","Stat",3},
         {"internal-storage-stream","QueryInterface",3},{"internal-storage-stream","AddRef",1},{"internal-storage-stream","Release",1},
         {"internal-storage-stream","Read",4},{"internal-storage-stream","Write",4},{"internal-storage-stream","Seek",4,2},{"internal-storage-stream","SetSize",2,2},
@@ -58,36 +127,68 @@ void WindowsServices::storage_stat(GuestState& state,GuestMemory& memory,std::ui
     }catch(...){if(name)(void)free_heap(memory,name,state);throw;}
 }
 std::optional<std::uint32_t> WindowsServices::invoke_storage(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+#include "windows_property_storage.inc"
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const auto bits=static_cast<std::uint8_t>(x86_?32:64);
     const auto done=[&](std::uint64_t result){arg.return_to(state,result);return std::optional<std::uint32_t>{};};
     const auto d=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
-    try{auto& bridge=storage_bridge();
-        if(name=="FmtIdToPropStgName" || name=="PropStgNameToFmtId"){
-            // 屬性集名稱（MS-OLEPS）：SummaryInformation 與 DocumentSummaryInformation（含使用者定義區段）為固定名稱；其他 FMTID 以 0x0005 開頭，
-            // 依位元組順序、每位元組由低位起每 5 位元取一字元（"abcdefghijklmnopqrstuvwxyz012345"），共 26 字元。反向轉換不分大小寫。
-            constexpr std::array<std::uint8_t,16> summary{0xe0,0x85,0x9f,0xf2,0xf9,0x4f,0x68,0x10,0xab,0x91,0x08,0x00,0x2b,0x27,0xb3,0xd9};
-            constexpr std::array<std::uint8_t,16> document{0x02,0xd5,0xcd,0xd5,0x9c,0x2e,0x1b,0x10,0x93,0x97,0x08,0x00,0x2b,0x2c,0xf9,0xae};
-            constexpr std::array<std::uint8_t,16> user{0x05,0xd5,0xcd,0xd5,0x9c,0x2e,0x1b,0x10,0x93,0x97,0x08,0x00,0x2b,0x2c,0xf9,0xae};
-            constexpr std::u16string_view alphabet=u"abcdefghijklmnopqrstuvwxyz012345";
-            if(!arg(0) || !arg(1))return done(storage::invalid_parameter);
-            if(name=="FmtIdToPropStgName"){
-                std::array<std::uint8_t,16> id{};memory.read(GuestAddress{arg(0)},id);std::u16string text(1,u'\x0005');
-                if(id==summary)text+=u"SummaryInformation";else if(id==document || id==user)text+=u"DocumentSummaryInformation";
-                else {unsigned bit=0;for(unsigned i=0;i<26;++i){unsigned value=0;for(unsigned k=0;k<5 && bit<128;++k,++bit)value|=((id[bit/8]>>(bit%8))&1U)<<k;text.push_back(alphabet[value]);}}
-                memory.write(GuestAddress{arg(1)},utf16_bytes(text));return done(0);
+    try{
+        const bool rtl=service.family=="ntdll.dll";
+        const bool encode=name=="FmtIdToPropStgName" || name=="RtlGuidToPropertySetName";
+        if(encode || name=="PropStgNameToFmtId" || name=="RtlPropertySetNameToGuid"){
+            constexpr std::uint32_t invalid_argument=0x80070057U,invalid_nt_parameter=0xc000000dU;
+            if(encode){
+                if(!arg(0) || !arg(1))return done(rtl?0U:invalid_argument);
+                PropertyGuid guid{};
+                memory.read(GuestAddress{arg(0)},guid);
+                const auto text=property_set_name(guid);
+                memory.write(GuestAddress{arg(1)},utf16_bytes(text));
+                return done(rtl?text.size():0);
             }
-            const auto text=read_utf16(memory,GuestAddress{arg(0)},64);if(text.empty() || text[0]!=5)return done(storage::invalid_name);
-            auto folded=text.substr(1);for(auto& c:folded)c=unicode_case_unit(c,false);
-            if(folded==u"summaryinformation"){memory.write(GuestAddress{arg(1)},summary);return done(0);}
-            if(folded==u"documentsummaryinformation"){memory.write(GuestAddress{arg(1)},document);return done(0);}
-            if(folded.size()!=26)return done(storage::invalid_name);std::array<std::uint8_t,16> id{};unsigned bit=0;
-            for(const auto c:folded){const auto at=alphabet.find(c);if(at==alphabet.npos)return done(storage::invalid_name);for(unsigned k=0;k<5 && bit<128;++k,++bit)if((at>>k)&1U)id[bit/8]|=static_cast<std::uint8_t>(1U<<(bit%8));}
-            memory.write(GuestAddress{arg(1)},id);return done(0);
+            const auto input=arg(rtl?1:0),output=arg(rtl?2:1);
+            if(!output)return done(rtl?invalid_nt_parameter:invalid_argument);
+            const auto invalid_name=rtl?invalid_nt_parameter:storage::invalid_name;
+            if(!input || (rtl && (!d(0) || d(0)>27)))return done(invalid_name);
+            std::u16string text;
+            if(rtl)text=read_utf16_counted(memory,GuestAddress{input},d(0));
+            else{
+                try{text=read_utf16(memory,GuestAddress{input},27);}
+                catch(const std::invalid_argument&){return done(invalid_name);}
+            }
+            if(text.empty() || text.front()!=5)return done(invalid_name);
+            const std::u16string_view suffix=std::u16string_view{text}.substr(1);
+            for(const auto& entry:property_names){
+                if(suffix.size()==entry.name.size() && std::equal(suffix.begin(),suffix.end(),entry.name.begin(),
+                    [](char16_t a,char16_t b){return property_lower(a)==property_lower(b);})){
+                    memory.write(GuestAddress{output},entry.guid);
+                    return done(0);
+                }
+            }
+            if(suffix.size()!=26)return done(invalid_name);
+            PropertyGuid guid{};
+            for(unsigned i=0;i<26;++i){
+                const auto digit=property_alphabet.find(property_lower(suffix[i]));
+                if(digit==property_alphabet.npos || (i==25 && digit>7)){
+                    memory.write(GuestAddress{output},guid);
+                    return done(invalid_name);
+                }
+                for(unsigned k=0;k<5 && i*5+k<128;++k){
+                    const auto bit=i*5+k;
+                    if(digit&(1U<<k))guid[bit/8]|=static_cast<std::uint8_t>(1U<<(bit%8));
+                }
+            }
+            memory.write(GuestAddress{output},guid);
+            return done(0);
         }
-        if(name=="WriteClassStg"){if(!arg(0))return done(storage::invalid_parameter);state.rip=GuestAddress{storage::method(memory,arg(0),15)};return std::nullopt;} // 同 IStorage::SetClass 的參數配置
+        auto& bridge=storage_bridge();
+        if(name=="WriteClassStg"){
+            if(!arg(0))return done(0x80070057U);
+            if(!arg(1))return done(storage::pointer_error);
+            state.rip=GuestAddress{storage::method(memory,arg(0),15)}; // IStorage::SetClass 共用原呼叫框架。
+            return std::nullopt;
+        }
         if(name=="ReadClassStg"){
             // IStorage::Stat(STATFLAG_NONAME) 的 clsid（x86 位移 48、x64 位移 56）。
-            if(!arg(0) || !arg(1))return done(storage::invalid_parameter);
+            if(!arg(0) || !arg(1))return done(0x80070057U);
             return nested_continuation(state,memory,"ReadClassStg",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
                 const WindowsCall call(s,m,service);GuestScratch scratch(*this,m,s);const auto stat=scratch.allocate(96);if(!stat){call.return_to(s,std::uint64_t{storage::no_memory});co_return std::nullopt;}
                 const auto status=static_cast<std::uint32_t>(co_await service_callback::call(storage::method(m,call(0),17),{call(0),stat,1}));

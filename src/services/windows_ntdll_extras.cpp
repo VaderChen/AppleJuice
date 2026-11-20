@@ -20,6 +20,7 @@
 // - NtSetInformationVirtualMemory（Zw*）：VmPrefetchInformation（0）轉 PrefetchVirtualMemory（旗標 ULONG 必須為 0）；其他類別 STATUS_INVALID_INFO_CLASS。
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "message_table_entry.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/windows_api_sets.hpp"
 #include <openssl/evp.h>
@@ -249,21 +250,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_ntdll_extras(GuestState& st
             status=static_cast<std::uint32_t>(co_await service_callback::call(entry("ntdll.dll","LdrAccessResource"),{module,m.load(GuestAddress{data_entry},bits),address,length}));
             if(status)co_return done(status);
             const auto base=m.load(GuestAddress{address},bits);const auto size=static_cast<std::uint32_t>(m.load(GuestAddress{length},32));
-            if(size<4)co_return done(status_message_not_found);
-            const auto count=static_cast<std::uint32_t>(m.load(GuestAddress{base},32));
-            for(std::uint32_t block=0;block<count && 4+(block+1)*12<=size;++block){
-                const auto at=base+4+block*12U;
-                const auto low=static_cast<std::uint32_t>(m.load(GuestAddress{at},32)),high=static_cast<std::uint32_t>(m.load(GuestAddress{at+4},32));
-                if(id<low || id>high)continue;
-                auto offset=static_cast<std::uint32_t>(m.load(GuestAddress{at+8},32));
-                for(std::uint32_t n=low;n<id;++n){
-                    if(offset+4>size)co_return done(status_message_not_found);
-                    const auto item=static_cast<std::uint32_t>(m.load(GuestAddress{base+offset},16));if(item<4)co_return done(status_message_not_found);
-                    offset+=item;
-                }
-                if(offset+4>size)co_return done(status_message_not_found);
-                m.store(GuestAddress{output},bits,base+offset);co_return done(0);
-            }
+            const auto found=message_table_entry(m,base,size,id);
+            if(found){m.store(GuestAddress{output},bits,found);co_return done(0);}
             co_return done(status_message_not_found);
         }
         co_return done(status_invalid_parameter);

@@ -68,7 +68,12 @@ try {
                     for(unsigned i=0;i<width;++i)result|=std::uint64_t{cls->extra[offset+i]}<<(8*i);
                     if(set)for(unsigned i=0;i<width;++i)cls->extra[offset+i]=static_cast<std::uint8_t>(arg(2)>>(8*i));
                 }
-            }else if(word){if(!set && index==-32)result=cls->atom;else fail(1413);}
+            }else if(word){
+                if(index==-20 && set)fail(87);
+                else if(!set && index==-32)result=cls->atom;
+                else if(index==-26){result=static_cast<std::uint16_t>(cls->style);if(set)cls->style=static_cast<std::uint16_t>(d(2));}
+                else fail(1413);
+            }
             else {
                 std::uint64_t* field=nullptr;
                 switch(index){case -12:field=&cls->cursor;break;case -10:field=&cls->background;break;case -16:field=&cls->instance;break;case -24:field=&cls->procedure;break;case -14:field=&cls->icon;break;case -34:field=&cls->small_icon;break;default:break;}
@@ -78,7 +83,7 @@ try {
                     if(set){if(!x86_ && !pointer)fail(1413);else {*field=x86_?d(2):arg(2);if(index==-24)cls->unicode=wide;}}
                 }else if(index==-26){result=cls->style;if(set)cls->style=d(2);}
                 else if(index==-18){result=cls->extra_size;if(set)cls->extra_size=d(2);}
-                else if(index==-20){result=cls->class_extra_size;if(set)cls->class_extra_size=d(2);}
+                else if(index==-20){if(set)fail(87);else result=cls->class_extra_size;}
                 else if(!set && index==-32)result=cls->atom;
                 else if(index==-8){
                     result=cls->menu_name.empty()?cls->menu_ordinal:string_buffer(cls->menu_name,cls->menu_buffers);

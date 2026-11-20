@@ -491,11 +491,12 @@ void WindowsServices::discard_gui_control_notify(const GuiMessage& msg){
 namespace {
 constexpr std::string_view master_subclass_procedure="__x64arm_master_subclass_proc";
 // 鏈已清空且沒有執行中的子類別程序時，還原原本的 GWLP_WNDPROC（只在目前仍是主程序時還原，不覆蓋應用程式後來自行設定的程序）。
-void release_subclass_chain(GuiState& gui,std::uint64_t window,std::uint64_t master){
-    const auto chain=gui.subclasses.find(window);if(chain==gui.subclasses.end() || !chain->second.entries.empty())return;
-    if(std::any_of(gui.subclass_frames.begin(),gui.subclass_frames.end(),[&](const auto& frame){return frame.window==window;}))return;
+bool release_subclass_chain(GuiState& gui,std::uint64_t window,std::uint64_t master){
+    const auto chain=gui.subclasses.find(window);if(chain==gui.subclasses.end() || !chain->second.entries.empty())return false;
+    if(std::any_of(gui.subclass_frames.begin(),gui.subclass_frames.end(),[&](const auto& frame){return frame.window==window;}))return false;
     if(const auto found=gui.windows.find(window);found!=gui.windows.end() && found->second.procedure==master){found->second.procedure=chain->second.restore;found->second.unicode=chain->second.restore_unicode;}
     gui.subclasses.erase(chain);
+    return true;
 }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_control_api(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -532,7 +533,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_control_api(GuestState& sta
                 else value=co_await service_callback::call_value(resolve("user32.dll","DefWindowProcW").value,{window,message,wparam,lparam});
                 // WM_NCDESTROY：與 comctl32 相同，原程序處理完後自動移除整條鏈。
                 if(!defer && static_cast<std::uint32_t>(message)==0x82)if(const auto chain=gui_.subclasses.find(window);chain!=gui_.subclasses.end())chain->second.entries.clear();
-                release_subclass_chain(gui_,window,master);
+                if(release_subclass_chain(gui_,window,master))publish_gui_window(window);
                 call.return_to(state,value);co_return std::optional<std::uint32_t>{};
             });
     }
@@ -549,7 +550,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_control_api(GuestState& sta
         if(symbol=="SetWindowSubclass"){
             if(chain==gui_.subclasses.end()){
                 GuiSubclassChain created;created.original=gui_window_procedure(arg(0),true);created.restore=window->second.procedure;created.restore_unicode=window->second.unicode;
-                chain=gui_.subclasses.emplace(arg(0),std::move(created)).first;window->second.procedure=master;window->second.unicode=true;
+                chain=gui_.subclasses.emplace(arg(0),std::move(created)).first;window->second.procedure=master;window->second.unicode=true;publish_gui_window(arg(0));
             }
             auto& entries=chain->second.entries;
             const auto found=std::find_if(entries.begin(),entries.end(),[&](const auto& e){return e.procedure==arg(1) && e.id==arg(2);});
@@ -562,7 +563,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_control_api(GuestState& sta
         const auto found=std::find_if(entries.begin(),entries.end(),[&](const auto& e){return e.procedure==arg(1) && e.id==arg(2);});
         if(found==entries.end())return finish(0);
         if(symbol=="GetWindowSubclass"){if(arg(3))memory.store(GuestAddress{arg(3)},x86_?32:64,found->reference);return finish(1);}
-        entries.erase(found);release_subclass_chain(gui_,arg(0),master);return finish(1);
+        entries.erase(found);if(release_subclass_chain(gui_,arg(0),master))publish_gui_window(arg(0));return finish(1);
     }
     const GuiControlAbi abi(x86_);
     const auto d=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
@@ -782,8 +783,36 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
     if(m==0x30){w.font=msg.wparam;if(lp && ((gui_control_class(w)==u"button" && (w.style&15U)==11) || cls==u"msctls_statusbar32"))invalidate_window(msg.window);return update(0);} // WM_SETFONT
     if(m==0x31)return w.font;
     if(m==0xb){w.redraw=msg.wparam!=0;return update(0);}
-    if(m==0x80){if(wp>1 || (lp && !gui_.icons.contains(lp)))return 0;auto& icon=wp?w.window_icon:w.window_small_icon;const auto previous=icon;icon=lp;return update(previous);}
-    if(m==0x7f)return wp==1?w.window_icon:wp==0 || wp==2?w.window_small_icon:0;
+    if(m==0x80){
+        if(wp>1 || (lp && !gui_.icons.contains(lp)))return 0;
+        auto& selected=wp?w.window_icon:w.window_small_icon;
+        const auto previous=selected;
+        selected=lp;
+        if(wp || lp || previous){
+            if(w.generated_small_icon){
+                release_cursor_frames(w.generated_small_icon);
+                gui_.icons.erase(w.generated_small_icon);
+                w.generated_small_icon=0;
+            }
+            if(w.window_icon && !w.window_small_icon){
+                if(const auto large=gui_.icons.find(w.window_icon);large!=gui_.icons.end()){
+                    try{
+                        auto copy=large->second;
+                        copy.shared=false;copy.system=0;
+                        resize_icon(copy,system_metric(memory,49),system_metric(memory,50));
+                        w.generated_small_icon=store_gui_icon(std::move(copy));
+                    }catch(const std::bad_alloc&){last_error_=8;}
+                    catch(const std::invalid_argument&){last_error_=87;}
+                }
+            }
+        }
+        return update(previous);
+    }
+    if(m==0x7f){
+        if(wp==1)return w.window_icon;
+        if(wp==0 || (wp==2 && w.window_small_icon))return w.window_small_icon;
+        return wp==2?w.generated_small_icon:0;
+    }
     if(w.dialog && m==0x401){w.default_id=msg.wparam;return 1;}
     if(w.dialog && m==0x400)return w.default_id?(0x534b0000|w.default_id):0;
     if(!w.builtin)return std::nullopt;
@@ -1120,6 +1149,7 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
             const auto repaint=[&]{invalidate_window(msg.window);return update(0);};
             const auto inside=[&]{const auto x=std::bit_cast<std::int16_t>(static_cast<std::uint16_t>(lp)),y=std::bit_cast<std::int16_t>(static_cast<std::uint16_t>(lp>>16));return x>=0 && y>=0 && static_cast<std::uint32_t>(x)<w.width && static_cast<std::uint32_t>(y)<w.height;};
             if(m==7 || m==8){if(m==7)gui_.focus=msg.window;else {if(gui_.focus==msg.window)gui_.focus=0;w.button_pressed=false;w.button_armed=false;if(gui_.capture==msg.window)gui_.capture=0;}return repaint();}
+            if(m==0x215 && lp==msg.window)return 0;
             if(m==0x1f || m==0x215 || m==0xa){w.button_pressed=false;w.button_armed=false;if(gui_.capture==msg.window)gui_.capture=0;return repaint();}
             if(!w.enabled && (m==0x201 || m==0x202 || m==0x200 || m==0x100 || m==0x101))return 0;
             if(m==0x201 || (m==0x100 && wp==32)){w.button_armed=true;w.button_pressed=true;gui_.capture=msg.window;return repaint();}

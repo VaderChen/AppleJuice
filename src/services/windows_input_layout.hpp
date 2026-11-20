@@ -1,6 +1,7 @@
 #pragma once
 #include "x64arm/windows_keyboard.hpp"
 namespace x64arm {
+std::uint32_t windows_physical_scan(std::uint32_t key);
 inline bool windows_input_layout_supported(std::uint64_t layout){
     if(!layout || layout==0x04090409)return true;
     const auto low=static_cast<std::uint32_t>(layout);

@@ -2,11 +2,15 @@
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
+#include "guest_counted_string.hpp"
 #include <algorithm>
 
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> winstation_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"win32u.dll","NtUserBuildNameList",4},
+        {"win32u.dll","NtUserCreateDesktopEx",6},{"win32u.dll","NtUserOpenDesktop",3},
+        {"win32u.dll","NtUserCreateWindowStation",7},{"win32u.dll","NtUserOpenWindowStation",2},
         {"user32.dll","CreateWindowStationA",4},{"user32.dll","CreateWindowStationW",4},{"user32.dll","OpenWindowStationA",3},{"user32.dll","OpenWindowStationW",3},
         {"user32.dll","CloseWindowStation",1},{"user32.dll","GetProcessWindowStation",0},{"user32.dll","SetProcessWindowStation",1},
         {"user32.dll","CreateDesktopA",6},{"user32.dll","CreateDesktopW",6},{"user32.dll","OpenDesktopA",4},{"user32.dll","OpenDesktopW",4},
@@ -57,10 +61,50 @@ void WindowsServices::show_native_window(std::uint64_t handle,bool visible,bool 
 }
 std::optional<std::uint32_t> WindowsServices::invoke_winstation(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     initialize_user_objects();
+    // station=0 列出視窗站；其餘列出指定視窗站內允許列舉的桌面。
+    const auto names_for=[this](std::uint64_t station){
+        std::vector<std::u16string> names;
+        for(const auto& [id,object]:gui_.user_objects){
+            if(object.station!=station)continue;
+            const std::array<std::uint32_t,4> mapping=station?std::array<std::uint32_t,4>{0x20041,0x200be,0x20100,0xf01ff}:
+                std::array<std::uint32_t,4>{id==1?0x20303U:0x20103U,id==1?0x2001cU:0x2000cU,0x20060,0xf037f};
+            try{(void)object_security_access(object.security_descriptor,station?0x40U:0x100U,mapping);}
+            catch(const SecurityDescriptorError& error){if(error.code==5)continue;throw;}
+            names.push_back(object.name);
+        }
+        return names;
+    };
+    if(service.symbol=="NtUserBuildNameList"){
+        const WindowsCall call(state,memory,service);
+        const auto done=[&](std::uint32_t status){call.return_to(state,status);return std::optional<std::uint32_t>{};};
+        const auto size=static_cast<std::uint32_t>(call(1));
+        if(size<=10)return done(0xc0000008U);
+        std::uint64_t station=0;
+        if(call(0)){
+            const auto it=gui_.user_handles.find(call(0));
+            if(it==gui_.user_handles.end() || gui_.user_objects.at(it->second.object).station)return done(0xc0000008U);
+            if(!(it->second.access&1U))return done(0xc0000022U);
+            station=it->second.object;
+        }
+        try{
+            const auto names=names_for(station);
+            std::vector<std::uint8_t> data;
+            std::uint32_t required=10;
+            for(const auto& name:names){
+                required+=static_cast<std::uint32_t>((name.size()+1)*2);
+                if(required<=size){const auto bytes=utf16_bytes(name);data.insert(data.end(),bytes.begin(),bytes.end());}
+            }
+            const auto used=static_cast<std::uint32_t>(10+data.size());
+            memory.check(GuestAddress{call(2)},used,Access::Write);memory.check(GuestAddress{call(3)},4,Access::Write);
+            memory.store(GuestAddress{call(2)},32,used);memory.store(GuestAddress{call(2)+4},32,names.size());
+            memory.write(GuestAddress{call(2)+8},data);memory.store(GuestAddress{call(2)+used-2},16,0);
+            memory.store(GuestAddress{call(3)},32,required);return done(required>size?0xc0000023U:0);
+        }catch(const MemoryFault&){return done(0xc0000005U);}catch(const std::bad_alloc&){return done(0xc0000017U);}
+    }
     if(service.symbol.starts_with("EnumWindowStations") || service.symbol.starts_with("EnumDesktopsA") || service.symbol.starts_with("EnumDesktopsW")){
         // EnumWindowStations(lpEnumFunc, lParam)／EnumDesktops(hwinsta, lpEnumFunc, lParam)：依名稱逐一呼叫回呼，回 FALSE 即停止；
         // 回傳最後一個回呼的值。EnumDesktops 的 NULL 為程序的視窗站，需 WINSTA_ENUMDESKTOPS。A 版名稱沿用本檔 GetUserObjectInformationA 的轉換。
-        return nested_continuation(state,memory,"視窗站列舉",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+        return nested_continuation(state,memory,"視窗站列舉",[this,service,names_for](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
             const WindowsCall call(s,m,service);const auto finish=[&](std::uint64_t value){call.return_to(s,value);return std::optional<std::uint32_t>{};};
             const bool desktops=service.symbol.starts_with("EnumDesktops"),wide=service.symbol.ends_with('W');
             const auto callback=call(desktops?1:0),parameter=call(desktops?2:1);
@@ -72,8 +116,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winstation(GuestState& stat
                 if(!(handle->second.access&1U)){last_error_=5;co_return finish(0);}
                 station=handle->second.object;
             }
-            std::vector<std::u16string> names;
-            for(const auto& [id,object]:gui_.user_objects){(void)id;if(desktops?object.station==station:object.station==0)names.push_back(object.name);}
+            const auto names=names_for(station);
             std::vector<std::uint64_t> blocks;
             struct Release {WindowsServices& self;GuestMemory& m;GuestState& s;std::vector<std::uint64_t>& blocks;~Release(){for(const auto block:blocks)(void)self.free_heap(m,block,s);}} release{*this,m,s,blocks};
             std::uint64_t result=1;
@@ -88,7 +131,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_winstation(GuestState& stat
             co_return finish(result);
         });
     }
-    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');
+    const WindowsCall arg(state,memory,service);const bool native=service.symbol.starts_with("NtUser");
+    const auto symbol=native?service.symbol.substr(6):service.symbol;const bool wide=symbol.ends_with('W');
     if(symbol=="GetUserObjectSecurity" || symbol=="SetUserObjectSecurity")return invoke_object_security(state,memory,service);
     std::uint64_t result=0;const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
     if((symbol.starts_with("CreateDesktop") || symbol=="SwitchDesktop") && (job_ui_restrictions()&0x40U)){fail(5);arg.return_to(state,result);return std::nullopt;}
@@ -104,29 +148,77 @@ std::optional<std::uint32_t> WindowsServices::invoke_winstation(GuestState& stat
         else result=thread->second.desktop_handle?thread->second.desktop_handle:gui_.initial_desktop_handle;
     }else if(symbol.starts_with("CreateWindowStation") || symbol.starts_with("OpenWindowStation") || symbol.starts_with("CreateDesktop") || symbol.starts_with("OpenDesktop") || symbol=="OpenInputDesktop"){
         const bool desktop=symbol.find("Desktop")!=symbol.npos,create=symbol.starts_with("Create"),input=symbol=="OpenInputDesktop";
-        const auto flags=input?d(0):desktop?d(create?3:1):create?d(1):0;
-        const auto security_address=create?arg(desktop?5:3):0;
-        bool inherit=create?false:arg(desktop && !input?2:1)!=0;
+        auto station_handle=gui_.station_handle;
+        std::uint32_t flags{},desired{};
+        bool inherit=false,ignore_case=true,create_only=false,invalid_device=false;
         std::uint64_t descriptor_address{};
-        if(security_address){const unsigned size=x86_?12:24;memory.check(GuestAddress{security_address},size,Access::Read);if(memory.load(GuestAddress{security_address},32)!=size)throw SecurityDescriptorError{87};inherit=memory.load(GuestAddress{security_address+(x86_?8:16)},32)!=0;descriptor_address=memory.load(GuestAddress{security_address+(x86_?4:8)},x86_?32:64);}
-        const auto desired=d(desktop && !input?(create?4:3):2),access=user_access(desired,desktop);
-        auto name=input?gui_.user_objects.at(gui_.input_desktop).name:string(arg(0));if(create && !desktop && name.empty())name=u"Service-0x0-3e7$";
+        std::u16string name;
+        if(native){
+            const unsigned unit=x86_?4U:8U;
+            const auto attr=arg(0);
+            if(!attr || memory.load(GuestAddress{attr},32)!=6*unit)throw SecurityDescriptorError{87};
+            const auto field=[&](unsigned index){return memory.load(GuestAddress{attr+unit*index},x86_?32:64);};
+            const auto root=field(1),name_ptr=field(2);
+            const auto attributes=memory.load(GuestAddress{attr+unit*3},32);
+            inherit=(attributes&2)!=0;ignore_case=(attributes&0x40)!=0;
+            create_only=create && !(attributes&0x80);
+            descriptor_address=field(4);
+            if(!name_ptr)throw SecurityDescriptorError{87};
+            const auto text=read_counted_header(memory,name_ptr,x86_);
+            if((text.length&1) || text.length>text.capacity || (!text.buffer && text.length))throw SecurityDescriptorError{87};
+            name=read_counted_wide(memory,text);
+            if(name.find(u'\0')!=name.npos)throw SecurityDescriptorError{87};
+            if(desktop){
+                if(root)station_handle=root;
+                flags=d(create?3:1);desired=d(create?4:2);
+                if(!create)desired|=0x81;
+                invalid_device=create && ((arg(1) && memory.load(GuestAddress{arg(1)},16)) || arg(2));
+            }else{
+                constexpr std::u16string_view directory=u"\\sessions\\1\\windows\\windowstations";
+                if(root){
+                    const auto it=runtime_.object_directories.find(root);
+                    if(it==runtime_.object_directories.end() || folded(std::u16string(it->second.object->path()))!=directory)throw SecurityDescriptorError{6};
+                    if(!(it->second.access&(create?4U:2U)))throw SecurityDescriptorError{5};
+                }else if(name.starts_with(u'\\')){
+                    const auto separator=name.find_last_of(u'\\');
+                    if(folded(name.substr(0,separator))!=directory)throw SecurityDescriptorError{3};
+                    name.erase(0,separator+1);
+                }
+                desired=d(1);
+            }
+        }else{
+            flags=input?d(0):desktop?d(create?3:1):create?d(1):0;
+            desired=d(desktop && !input?(create?4:3):2);
+            create_only=create && !desktop && (flags&1);
+            invalid_device=desktop && create && (arg(1) || arg(2));
+            if(create){
+                const auto sa=arg(desktop?5:3);
+                if(sa){inherit=read_security_attributes(memory,sa,x86_,false).inherit;
+                    descriptor_address=memory.load(GuestAddress{sa+(x86_?4:8)},x86_?32:64);}
+            }else inherit=arg(desktop && !input?2:1)!=0;
+            name=input?gui_.user_objects.at(gui_.input_desktop).name:string(arg(0));
+            if(create && !desktop && name.empty())name=u"Service-0x0-3e7$";
+        }
+        const auto parent=gui_.user_handles.find(station_handle);
+        if(parent==gui_.user_handles.end() || gui_.user_objects.at(parent->second.object).station)throw SecurityDescriptorError{6};
+        const auto parent_id=parent->second.object;
+        const auto access=user_access(desired,desktop);
         if(flags&~1U || name.empty() || name.size()>255 || name.find(u'\\')!=name.npos || access&~(desktop?0xf01ffU:0xf037fU))fail(87);
-        else if(desktop && create && (arg(1) || arg(2)))fail(87);
+        else if(invalid_device)fail(87);
         else if(desktop && !create && ((access&0xe0000) && (access&0x81)!=0x81))fail(5);
-        else if(desktop && create && (!(gui_.user_handles.at(gui_.station_handle).access&8) || !(access&2)))fail(5);
+        else if(desktop && create && (!(parent->second.access&8) || !(access&2)))fail(5);
         else if(input && station!=1)fail(5);
         else{
-            const auto object=std::find_if(gui_.user_objects.begin(),gui_.user_objects.end(),[&](const auto& item){return (item.second.station!=0)==desktop && (!desktop || item.second.station==station) && folded(item.second.name)==folded(name);});
+            const auto object=std::find_if(gui_.user_objects.begin(),gui_.user_objects.end(),[&](const auto& item){return (item.second.station!=0)==desktop && (!desktop || item.second.station==parent_id) && (ignore_case?folded(item.second.name)==folded(name):item.second.name==name);});
             const auto mapping=[&](bool interactive){return desktop?std::array<std::uint32_t,4>{0x20041,0x200be,0x20100,0xf01ff}:std::array<std::uint32_t,4>{interactive?0x20303U:0x20103U,interactive?0x2001cU:0x2000cU,0x20060,0xf037f};};
             if(object!=gui_.user_objects.end()){
-                if(create && !desktop && (flags&1))fail(183);else open(object->first,object_security_access(object->second.security_descriptor,desired,mapping(object->first==1)),inherit);
+                if(create_only)fail(183);else open(object->first,object_security_access(object->second.security_descriptor,desired,mapping(object->first==1)),inherit);
             }else if(!create)fail(2);
             else if(gui_.user_objects.size()>=256)fail(8);
             else{
-                auto descriptor=desktop && !descriptor_address?gui_.user_objects.at(station).security_descriptor:synchronization_descriptor(memory,security_address).bytes;
+                auto descriptor=desktop && !descriptor_address?gui_.user_objects.at(parent_id).security_descriptor:object_security_descriptor(descriptor_address?security::read_descriptor(memory,descriptor_address,x86_,true):security::SecurityDescriptor{},true,true);
                 const auto granted=object_security_access(descriptor,desired,mapping(false));
-                const auto id=gui_.next_user_object++;gui_.user_objects.emplace(id,GuiUserObject{std::move(name),desktop?station:0,desktop?flags:0,false,std::move(descriptor)});open(id,granted,inherit);
+                const auto id=gui_.next_user_object++;gui_.user_objects.emplace(id,GuiUserObject{std::move(name),desktop?parent_id:0,desktop?flags:0,false,std::move(descriptor)});open(id,granted,inherit);
             }
         }
     }else if(symbol=="AllowSetForegroundWindow" || symbol=="LockSetForegroundWindow"){
@@ -160,7 +252,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winstation(GuestState& stat
             else{threads_.items.at(threads_.current).desktop_handle=arg(0);result=1;}
         }else if(symbol=="SwitchDesktop"){
             if(!desktop)fail(6);else if(!(handle->second.access&0x100) || object.station!=1)fail(5);
-            else{gui_.input_desktop=handle->second.object;gui_.focus=gui_.active=gui_.capture=0;for(const auto& [hwnd,w]:gui_.windows){present_gui(hwnd);show_native_window(hwnd,w.visible);}result=1;}
+            else{gui_.input_desktop=handle->second.object;gui_.focus=gui_.active=gui_.capture=0;present_gui_cursor();for(const auto& [hwnd,w]:gui_.windows){present_gui(hwnd);show_native_window(hwnd,w.visible);}result=1;}
         }else if(symbol=="EnumDesktopWindows"){
             if(!desktop)fail(6);else if(!(handle->second.access&0x40))fail(5);else if(!arg(1))fail(87);
             else{std::vector<GuestCallback> callbacks;for(const auto hwnd:gui_.z_order){const auto w=gui_.windows.find(hwnd);if(w!=gui_.windows.end() && !w->second.parent && w->second.desktop_object==handle->second.object)callbacks.push_back({arg(1),{hwnd,arg(2)}});}if(callbacks.empty())result=1;else{start_callbacks(state,memory,std::move(callbacks),Continuation::WindowEnumeration);return std::nullopt;}}

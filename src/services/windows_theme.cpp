@@ -153,7 +153,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_theme(GuestState& state,Gue
         // 只支援 MSDN 列出的系統尺寸；有主題 handle 時依主題的 DPI 換算。
         constexpr std::array<std::uint32_t,11> supported{5,2,3,21,30,31,52,53,54,55,92};const auto id=static_cast<std::uint32_t>(arg(1));
         const auto theme=gui_.themes.find(arg(0));const auto dpi=theme!=gui_.themes.end()?theme->second.dpi:96U;
-        result=std::find(supported.begin(),supported.end(),id)!=supported.end()?system_metric(id,dpi):0U;
+        result=std::find(supported.begin(),supported.end(),id)!=supported.end()?system_metric(memory,id,dpi):0U;
     }else if(name=="GetThemeSysColorBrush"){
         // 主題系統色刷與 GetSysColorBrush 同源。
         result=nested_service(state,memory,"user32.dll","GetSysColorBrush",{static_cast<std::uint32_t>(arg(1))});
@@ -366,7 +366,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_theme(GuestState& state,Gue
                 std::uint32_t code=0; // HTNOWHERE
                 if(inside){
                     std::array<std::int32_t,4> margin{}; // 左、右、上、下
-                    if(options&0x200U){const auto cx=static_cast<std::int32_t>(system_metric(32,data.dpi)+system_metric(92,data.dpi)),cy=static_cast<std::int32_t>(system_metric(33,data.dpi)+system_metric(92,data.dpi));margin={cx,cx,cy,cy};}
+                    if(options&0x200U){const auto cx=static_cast<std::int32_t>(system_metric(memory,32,data.dpi)+system_metric(memory,92,data.dpi)),cy=static_cast<std::int32_t>(system_metric(memory,33,data.dpi)+system_metric(memory,92,data.dpi));margin={cx,cx,cy,cy};}
                     else margin={std::max(0,info->content[0]),std::max(0,size[0]-info->content[2]),std::max(0,info->content[1]),std::max(0,size[1]-info->content[3])};
                     const bool left=x<rect[0]+margin[0],right=x>=rect[2]-margin[1],top=y<rect[1]+margin[2],bottom=y>=rect[3]-margin[3];
                     const bool l=options&0x10U,t=options&0x20U,r=options&0x40U,b=options&0x80U;

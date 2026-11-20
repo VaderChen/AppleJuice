@@ -31,6 +31,8 @@ std::span<const WindowsServiceDescriptor> console_screen_service_descriptors(){
         {"kernel32.dll","GetConsoleAliasesLengthA",1},{"kernel32.dll","GetConsoleAliasesLengthW",1},
         {"kernel32.dll","GetConsoleAliasExesA",2,0,0,2},{"kernel32.dll","GetConsoleAliasExesW",2,0,0,2},
         {"kernel32.dll","GetConsoleAliasExesLengthA",0},{"kernel32.dll","GetConsoleAliasExesLengthW",0},
+        {"kernel32.dll","SetConsoleCommandHistoryMode",1,0,0,1},
+        {"kernel32.dll","SetConsoleNumberOfCommandsA",2,0,0,1},{"kernel32.dll","SetConsoleNumberOfCommandsW",2,0,0,1},
         {"kernel32.dll","GetConsoleCommandHistoryA",3,0,0,2},{"kernel32.dll","GetConsoleCommandHistoryW",3,0,0,2},
         {"kernel32.dll","GetConsoleCommandHistoryLengthA",1},{"kernel32.dll","GetConsoleCommandHistoryLengthW",1},
         {"kernel32.dll","ExpungeConsoleCommandHistoryA",1},{"kernel32.dll","ExpungeConsoleCommandHistoryW",1},
@@ -58,18 +60,23 @@ bool console_same_name(std::u16string_view left,std::u16string_view right){
     const auto compared=windows_nls_compare(left,right,0x7f,1);
     return compared ? *compared==0 : left==right;
 }
+static auto console_find_history(ConsoleBuffer& buffer,std::u16string_view exe){
+    return std::find_if(buffer.histories.begin(),buffer.histories.end(),[&](const auto& item){return console_same_name(item.exe,exe);});
+}
+static auto console_create_history(ConsoleBuffer& buffer,std::u16string_view exe){
+    if(buffer.histories.size()>=buffer.history_buffers)buffer.histories.erase(buffer.histories.begin());
+    buffer.histories.push_back({std::u16string(exe),{},buffer.history_size});
+    return buffer.histories.end()-1;
+}
 void console_remember_command(ConsoleBuffer& buffer,std::u16string_view exe,std::u16string_view command){
-    if(command.empty() || !buffer.history_size || !buffer.history_buffers)return;
-    auto found=std::find_if(buffer.histories.begin(),buffer.histories.end(),[&](const auto& item){return console_same_name(item.exe,exe);});
-    if(found==buffer.histories.end()){
-        // 歷程緩衝區數量有上限：超過時捨棄最早建立的執行檔歷程。
-        if(buffer.histories.size()>=buffer.history_buffers)buffer.histories.erase(buffer.histories.begin());
-        buffer.histories.push_back({std::u16string(exe),{}});found=buffer.histories.end()-1;
-    }
+    if(command.empty() || !buffer.history_buffers)return;
+    auto found=console_find_history(buffer,exe);
+    if(found==buffer.histories.end())found=console_create_history(buffer,exe);
     auto& commands=found->commands;
-    if(buffer.history_flags&1U)commands.erase(std::remove(commands.begin(),commands.end(),command),commands.end());   // HISTORY_NO_DUP_FLAG
+    if(!found->capacity || (!commands.empty() && commands.back()==command))return;
+    if(buffer.history_flags&1U)commands.erase(std::remove(commands.begin(),commands.end(),command),commands.end());
+    if(commands.size()==found->capacity)commands.pop_front();
     commands.emplace_back(command);
-    while(commands.size()>buffer.history_size)commands.pop_front();
 }
 std::u16string WindowsServices::console_input_exe() const {
     if(!console_input_exe_name_.empty())return console_input_exe_name_;
@@ -214,7 +221,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_screen(GuestState& 
     try{
         // 不需要主控台 handle 的查詢。
         if(name=="GetNumberOfConsoleMouseButtons"){
-            if(!arg(0))fail(87);else if(!attached)fail(6);else {memory.store(GuestAddress{arg(0)},32,system_metric(43));result=1;}
+            if(!arg(0))fail(87);else if(!attached)fail(6);else {memory.store(GuestAddress{arg(0)},32,system_metric(memory,43));result=1;}
             arg.return_to(state,result);return std::nullopt;
         }
         if(name=="GetNumberOfConsoleFonts"){result=attached?1:0;if(!attached)fail(6);arg.return_to(state,result);return std::nullopt;}
@@ -325,7 +332,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_screen(GuestState& 
                 const auto size=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+4},32)),buffers=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+8},32)),flags=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+12},32));
                 if(size>999 || buffers>999 || (flags&~1U))fail(87);
                 else {console.history_size=size;console.history_buffers=buffers;console.history_flags=flags;
-                    for(auto& history:console.histories)while(history.commands.size()>size)history.commands.pop_front();
+                    for(auto& history:console.histories)history.resize(size);
                     while(console.histories.size()>buffers)console.histories.erase(console.histories.begin());
                     result=1;}
             }
@@ -370,10 +377,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_screen(GuestState& 
                 if(!target)fail(31);   // ERROR_GEN_FAILURE：沒有此別名
                 else {result=put_strings({*target},arg(1),d(2),input_page,fits);if(!fits){fail(122);}}
             }
+        }else if(name=="SetConsoleCommandHistoryMode"){
+            console.input_mode=(console.input_mode&~0x20U)|((d(0)&1U)<<5);
+            result=1;
+        }else if(name.starts_with("SetConsoleNumberOfCommands")){
+            const auto exe=text_in(arg(1),input_page);
+            if(exe.empty() || d(0)>INT32_MAX)fail(87);
+            else{
+                auto history=console_find_history(console,exe);
+                if(history==console.histories.end() && console.history_buffers && console_same_name(exe,console_input_exe()))
+                    history=console_create_history(console,exe);
+                if(history!=console.histories.end()){
+                    history->resize(d(0));
+                    std::rotate(history,history+1,console.histories.end());
+                }
+                result=1;
+            }
         }else if(name.starts_with("GetConsoleCommandHistory") || name.starts_with("ExpungeConsoleCommandHistory")){
             const bool length=name.find("Length")!=name.npos,expunge=name.starts_with("Expunge");
             const auto exe=text_in(arg(length || expunge?0:2),input_page);
-            const auto history=std::find_if(console.histories.begin(),console.histories.end(),[&](const auto& item){return console_same_name(item.exe,exe);});
+            const auto history=console_find_history(console,exe);
             if(expunge){if(history!=console.histories.end())history->commands.clear();result=1;}
             else {
                 std::vector<std::u16string> items;if(history!=console.histories.end())items.assign(history->commands.begin(),history->commands.end());

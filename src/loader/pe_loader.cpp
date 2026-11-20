@@ -813,16 +813,17 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
     if (x86 && exception.rva) reject("PE32 不支援 AMD64 RUNTIME_FUNCTION table");
     if (exception.rva) {
         if (exception.rva % 4 || exception.size % 12) reject("RUNTIME_FUNCTION table 格式不合法");
-        std::uint64_t previous_begin = 0, previous_end = 0;
+        std::uint64_t previous_begin = 0;
         for (std::uint64_t at = exception.rva; at < std::uint64_t{exception.rva} + exception.size; at += 12) {
             const auto begin = image.integer(at, 4), end = image.integer(at + 4, 4), unwind = image.integer(at + 8, 4);
             // Linker／封裝工具可保留不涵蓋任何 PC 的 .pdata（begin >= end）。
             // Windows 查詢只會命中 begin <= PC < end；不使用這些記錄的 xdata。
             // 保留實體索引，不能刪除後改變 RtlLookupFunctionEntry 的客體表格地址。
             // ICF 可讓不同符號共用同一段程式碼，並各自保留 unwind 記錄。
-            // 保留所有實體索引；只容許完全相同的範圍，不接受部分相交或亂序。
-            const bool folded = !runtime.functions.empty() && begin == previous_begin && end == previous_end;
-            if (begin < previous_begin || (begin < end && begin < previous_end && !folded)) reject("RUNTIME_FUNCTION 範圍未排序或重疊");
+            // Windows 載入器不檢查範圍是否相交，RtlLookupFunctionEntry 以起點二分搜尋；封裝工具產生的 .pdata
+            // 可能有起點仍遞增、但落在前一筆範圍內的記錄（緋夜傳奇）。查詢同樣取最後一筆起點不大於 PC 的記錄，
+            // 所以只拒絕起點亂序（二分搜尋會失準），部分相交照常載入。
+            if (begin < previous_begin) reject("RUNTIME_FUNCTION 範圍未排序");
             runtime.functions.push_back({static_cast<std::uint32_t>(begin), static_cast<std::uint32_t>(end), static_cast<std::uint32_t>(unwind)});
             previous_begin = begin;
             if (begin >= end) continue;
@@ -836,7 +837,6 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
             const auto tail = unwind + 4 + slots * 2;
             if (header & 32) image.check(tail, 12);
             else if (header & 24) { const auto handler = image.integer(tail, 4); image.check(handler, 1); }
-            previous_end = end;
         }
     }
     const auto tls = directories[9];

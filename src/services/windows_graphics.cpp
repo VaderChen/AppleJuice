@@ -186,14 +186,19 @@ std::vector<std::uint8_t> graphics_signature_blob(std::span<const std::uint8_t> 
     if(vkd3d_shader_parse_dxbc(&input,0,&desc,nullptr)<0)throw std::invalid_argument("DXBC signature 容器不合法");
     vkd3d_shader_code output{};
     try{
+        unsigned seen=0;
         std::vector<vkd3d_shader_dxbc_section_desc> sections;
         for(std::size_t i=0;i<desc.section_count;++i){const auto& section=desc.sections[i];const auto tag=section.tag;
             const unsigned kind=(tag==0x4e475349 || tag==0x31475349)?1U:
                 (tag==0x4e47534f || tag==0x3147534f || tag==0x3547534f)?2U:
                 (tag==0x47534350 || tag==0x31475350)?4U:0U;
-            if(kind&mask)sections.push_back(section);
+            if(kind&mask){
+                if(seen&kind)throw std::invalid_argument("DXBC 簽章重複");
+                sections.push_back(section);seen|=kind;
+            }
         }
-        if(sections.empty() || vkd3d_shader_serialize_dxbc(sections.size(),sections.data(),&output,nullptr)<0)throw std::invalid_argument("DXBC 缺少要求的 signature");
+        // ALL 可涵蓋沒有曲面細分常數的階段；指定的輸入／輸出則必須齊全。
+        if((mask!=7 && seen!=mask) || sections.empty() || vkd3d_shader_serialize_dxbc(sections.size(),sections.data(),&output,nullptr)<0)throw std::invalid_argument("DXBC 缺少要求的 signature");
         const auto* data=static_cast<const std::uint8_t*>(output.code);std::vector<std::uint8_t> result(data,data+output.size);
         vkd3d_shader_free_shader_code(&output);vkd3d_shader_free_dxbc(&desc);return result;
     }catch(...){vkd3d_shader_free_shader_code(&output);vkd3d_shader_free_dxbc(&desc);throw;}
@@ -201,16 +206,25 @@ std::vector<std::uint8_t> graphics_signature_blob(std::span<const std::uint8_t> 
 std::optional<std::vector<std::uint8_t>> graphics_dxbc_section(std::span<const std::uint8_t> bytes,std::uint32_t tag){
     const vkd3d_shader_code input{bytes.data(),bytes.size()};vkd3d_shader_dxbc_desc desc{};
     if(vkd3d_shader_parse_dxbc(&input,0,&desc,nullptr)<0)throw std::invalid_argument("DXBC 容器不合法");
-    std::optional<std::vector<std::uint8_t>> result;
-    for(std::size_t i=0;i<desc.section_count;++i)if(desc.sections[i].tag==tag){const auto* data=static_cast<const std::uint8_t*>(desc.sections[i].data.code);result.emplace(data,data+desc.sections[i].data.size);break;}
-    vkd3d_shader_free_dxbc(&desc);return result;
+    struct Release {vkd3d_shader_dxbc_desc& desc;~Release(){vkd3d_shader_free_dxbc(&desc);}} release{desc};
+    const vkd3d_shader_dxbc_section_desc* match=nullptr;
+    for(std::size_t i=0;i<desc.section_count;++i){
+        if(desc.sections[i].tag!=tag)continue;
+        if(match)return std::nullopt;
+        match=&desc.sections[i];
+    }
+    if(!match)return std::nullopt;
+    const auto* data=static_cast<const std::uint8_t*>(match->data.code);
+    return std::vector<std::uint8_t>(data,data+match->data.size);
 }
-std::vector<std::uint8_t> graphics_dxbc_filter(std::span<const std::uint8_t> bytes,const std::function<bool(std::uint32_t)>& keep){
+std::vector<std::uint8_t> graphics_dxbc_filter(std::span<const std::uint8_t> bytes,const std::function<bool(std::uint32_t)>& keep,
+    std::optional<std::uint32_t> append_tag,std::span<const std::uint8_t> append_data){
     const vkd3d_shader_code input{bytes.data(),bytes.size()};vkd3d_shader_dxbc_desc desc{};
     if(vkd3d_shader_parse_dxbc(&input,0,&desc,nullptr)<0)throw std::invalid_argument("DXBC 容器不合法");
     vkd3d_shader_code output{};
     try{
         std::vector<vkd3d_shader_dxbc_section_desc> sections;for(std::size_t i=0;i<desc.section_count;++i)if(keep(desc.sections[i].tag))sections.push_back(desc.sections[i]);
+        if(append_tag)sections.push_back({*append_tag,{append_data.data(),append_data.size()}});
         if(vkd3d_shader_serialize_dxbc(sections.size(),sections.data(),&output,nullptr)<0)throw std::invalid_argument("DXBC 無法重新序列化");
         const auto* data=static_cast<const std::uint8_t*>(output.code);std::vector<std::uint8_t> result(data,data+output.size);
         vkd3d_shader_free_shader_code(&output);vkd3d_shader_free_dxbc(&desc);return result;

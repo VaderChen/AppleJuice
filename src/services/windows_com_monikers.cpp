@@ -33,6 +33,7 @@ constexpr auto iid_unknown=ole_guid(0),iid_moniker=ole_guid(0xf),iid_persist=ole
     iid_item_container=ole_guid(0x11c),iid_parse_display_name=ole_guid(0x11a),iid_class_activator=ole_guid(0x140),iid_class_factory=ole_guid(1),
     iid_storage=ole_guid(0xb),iid_stream=ole_guid(0xc),iid_persist_file=ole_guid(0x10b);
 constexpr auto iid_rot_data=make_guid(0xf29f6bc0,0x5021,0x11ce,{0xaa,0x15,0,0,0x69,1,0x29,0x3f});
+constexpr auto clsid_query_cancel_autoplay=make_guid(0x331f1768,0x05a9,0x4ddd,{0xb8,0x6e,0xda,0xe3,0x4d,0xdc,0x99,0x8a});
 constexpr auto clsid_file=ole_guid(0x303),clsid_item=ole_guid(0x304),clsid_anti=ole_guid(0x305),clsid_pointer=ole_guid(0x306),clsid_composite=ole_guid(0x309),clsid_class=ole_guid(0x31a);
 constexpr std::uint32_t s_ok=0,s_false=1,e_notimpl=0x80004001U,e_nointerface=0x80004002U,e_pointer=0x80004003U,e_unexpected=0x8000ffffU,e_invalidarg=0x80070057U,
     e_outofmemory=0x8007000eU,mk_s_reduced_to_self=0x000401e2U,mk_s_me=0x000401e4U,mk_s_him=0x000401e5U,mk_s_us=0x000401e6U,
@@ -72,8 +73,9 @@ void append_item_string(std::vector<std::uint8_t>& out,std::u16string_view text)
 }
 std::span<const WindowsServiceDescriptor> com_moniker_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"shell32.dll","SHCreateQueryCancelAutoPlayMoniker",1},
         {"ole32.dll","CreateItemMoniker",3},{"ole32.dll","CreateClassMoniker",2},{"ole32.dll","CreatePointerMoniker",2},{"ole32.dll","CreateAntiMoniker",1},
-        {"ole32.dll","CreateGenericComposite",3},{"ole32.dll","MonikerCommonPrefixWith",3},{"ole32.dll","CreateFileMoniker",2},
+        {"ole32.dll","CreateGenericComposite",3},{"ole32.dll","MonikerCommonPrefixWith",3},{"ole32.dll","MonikerRelativePathTo",4,0,0,8},{"ole32.dll","CreateFileMoniker",2},
         {"ole32.dll","MkParseDisplayName",4},{"ole32.dll","CoGetObject",4},{"ole32.dll","DllGetClassObject",3},{"ole32.dll","Ole32DllGetClassObject",3},
         {"oleaut32.dll","RegisterActiveObject",4,0,0,0x4},{"oleaut32.dll","RevokeActiveObject",2,0,0,0x1},{"oleaut32.dll","GetActiveObject",3},
         {"internal-ole32-moniker","QueryInterface",3},{"internal-ole32-moniker","AddRef",1},{"internal-ole32-moniker","Release",1},
@@ -285,6 +287,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_monikers(GuestState& st
             m.write(GuestAddress{pointer},data);m.store(GuestAddress{output},bits,pointer);co_return s_ok;};
         try{
             // ---- 匯出函式 ----
+            if(family=="shell32.dll" && name=="SHCreateQueryCancelAutoPlayMoniker"){
+                const auto output=call(0);
+                if(!output)co_return finish(e_invalidarg);
+                co_return finish(co_await api("ole32.dll","CreateClassMoniker",{bytes(clsid_query_cancel_autoplay),output}));
+            }
             if(family=="ole32.dll" || family=="oleaut32.dll"){
                 if(name=="CreateItemMoniker" || name=="CreateClassMoniker" || name=="CreatePointerMoniker" || name=="CreateAntiMoniker"){
                     const auto output=call(name=="CreateAntiMoniker"?0:name=="CreateItemMoniker"?2:1);if(!output)co_return finish(e_invalidarg);
@@ -370,6 +377,43 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_monikers(GuestState& st
                 if(name=="CreateGenericComposite"){
                     if(!call(2))co_return finish(e_invalidarg);m.store(GuestAddress{call(2)},bits,0);
                     const auto [hr,result]=co_await generic(call(0),call(1));if(!failed(hr))m.store(GuestAddress{call(2)},bits,result);co_return finish(hr);
+                }
+                if(name=="MonikerRelativePathTo"){
+                    const auto src=call(0),dest=call(1),out=call(2);
+                    if(!out)co_return finish(e_invalidarg);
+                    m.store(GuestAddress{out},bits,0);
+                    if(!src || !dest || call(3)!=1)co_return finish(e_invalidarg);
+                    if(co_await kind_of(src)==mksys_composite)
+                        co_return finish(co_await com(src,19,{dest,out}));
+                    if(co_await kind_of(dest)==mksys_composite){
+                        auto parts=co_await parts_of(dest);
+                        if(parts.size()>=2){
+                            const auto first=parts.front();
+                            parts.erase(parts.begin());
+                            const auto tail=make_composite(std::move(parts));
+                            if(co_await equal_simple(src,first)){
+                                (void)co_await release(first);
+                                m.store(GuestAddress{out},bits,tail);
+                                co_return finish(s_ok);
+                            }
+                            const auto cell=out_cell();
+                            const auto status=static_cast<std::uint32_t>(co_await com(src,19,{first,cell}));
+                            const auto partial=m.load(GuestAddress{cell},bits);
+                            (void)co_await release(first);
+                            if(status==s_ok){
+                                const auto [hr,result]=co_await generic(partial,tail);
+                                (void)co_await release(partial);
+                                (void)co_await release(tail);
+                                m.store(GuestAddress{out},bits,result);
+                                co_return finish(hr);
+                            }
+                            (void)co_await release(partial);
+                            (void)co_await release(tail);
+                        }else (void)co_await release_all(parts);
+                    }
+                    (void)co_await addref(dest);
+                    m.store(GuestAddress{out},bits,dest);
+                    co_return finish(mk_s_him);
                 }
                 if(name=="MonikerCommonPrefixWith"){
                     // (pmkThis, pmkOther, ppmkCommon)：元件由左至右比較共同前綴。

@@ -5,15 +5,37 @@
 namespace x64arm {
 namespace {
 // 系統色彩（COLOR_*，COLORREF）：程序內共用；SetSysColors 改寫後，繪製、GetSysColor 與系統色筆刷一致取用。
-constexpr std::array<std::uint32_t,31> default_system_colors{0xc8c8c8,0,0xd1b499,0xdbcdbf,0xf0f0f0,0xffffff,0x646464,0,0,0xffffff,0xb4b4b4,0xfcf7f4,0xababab,0xd77800,0xffffff,0xf0f0f0,0xa0a0a0,0x6d6d6d,0,0,0xffffff,0x696969,0xe3e3e3,0,0xe1ffff,0,0xcc6600,0xead1b9,0xf2e4d7,0xff9933,0xf0f0f0};
-std::array<std::atomic<std::uint32_t>,31>& system_colors(){
-    static std::array<std::atomic<std::uint32_t>,31> colors;
+constexpr std::array<std::uint32_t,gui_system_color_count> default_system_colors{0xc8c8c8,0,0xd1b499,0xdbcdbf,0xf0f0f0,0xffffff,0x646464,0,0,0xffffff,0xb4b4b4,0xfcf7f4,0xababab,0xd77800,0xffffff,0xf0f0f0,0xa0a0a0,0x6d6d6d,0,0,0xffffff,0x696969,0xe3e3e3,0,0xe1ffff,0,0xcc6600,0xead1b9,0xf2e4d7,0xff9933,0xf0f0f0};
+std::array<std::atomic<std::uint32_t>,gui_system_color_count>& system_colors(){
+    static std::array<std::atomic<std::uint32_t>,gui_system_color_count> colors;
     static const bool initialized=[]{for(std::size_t i=0;i<colors.size();++i)colors[i].store(default_system_colors[i]);return true;}();
     (void)initialized;return colors;
 }
 }
 std::uint32_t gui_system_color(unsigned index){
     return index<default_system_colors.size()?system_colors()[index].load(std::memory_order_relaxed):0;
+}
+std::uint64_t gui_system_paint_object(GuiState& gui,unsigned index,bool pen){
+    if(!pen && index==0x100){
+        constexpr std::uint64_t checker=gui_system_brush_base+gui_system_color_count;
+        if(!gui.brush_patterns.contains(checker)){
+            GuiBitmap pattern;
+            pattern.width=pattern.height=8;pattern.bits_per_pixel=1;
+            for(unsigned y=0;y<8;++y)for(unsigned x=0;x<8;++x)
+                pattern.pixels.push_back((x^y)&1U?0xffffffU:0U);
+            gui.brush_patterns.emplace(checker,std::move(pattern));
+        }
+        gui.brushes[checker]=0;
+        return checker;
+    }
+    if(index>=gui_system_color_count)return 0;
+    for(auto it=gui.temporary_system_paint.rbegin();it!=gui.temporary_system_paint.rend();++it){
+        if(index<it->second.size())return pen?it->second[index].pen:it->second[index].brush;
+    }
+    const auto handle=(pen?gui_system_pen_base:gui_system_brush_base)+index;
+    (pen?gui.pens:gui.brushes)[handle]=gui_system_color(index);
+    if(pen)gui.pen_widths[handle]=1;
+    return handle;
 }
 bool gui_set_system_color(unsigned index,std::uint32_t color){
     if(index>=default_system_colors.size())return false;

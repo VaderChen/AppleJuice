@@ -1,3 +1,4 @@
+#include "../../services/adapter_multisampling.hpp"
 #include "metal_shared_frame.hpp"
 #include "metal_command_encoder.hpp"
 #include "metal_gpu_counter.hpp"
@@ -362,7 +363,7 @@ class MetalGl final:public NativeOpenGlContext {
     // 著色器依內容共用（D3D9 legacy、D3D10／11 HLSLcc、D3D12 DXIL 同一入口）：命中時回傳同一物件，轉譯與 Metal 編譯
     // 只做一次，render pipeline 快取（以 serial 為鍵）也能跨 PSO 重用。之後會修改物件的呼叫端改用 graphics_shader_private。
     std::mutex shader_cache_mutex_;std::unordered_map<std::uint64_t,std::vector<std::shared_ptr<MetalShader>>> shader_cache_;std::deque<std::uint64_t> shader_cache_order_;
-    std::shared_ptr<GraphicsShader> graphics_shader_create(std::uint32_t,std::span<const std::uint8_t>);
+    std::shared_ptr<GraphicsShader> graphics_shader_create(std::uint32_t,std::span<const std::uint8_t>,std::uint32_t shadow_samplers=0);
     std::array<Array,4> arrays_;
     State state_;
     GlProgrammable gl_;
@@ -1181,6 +1182,7 @@ public:
     bool graphics_samples_supported(std::uint32_t,std::uint32_t)override;
     bool graphics_vertex_format_supported(std::uint32_t)override;
     std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t,std::span<const std::uint8_t>)override;
+    std::shared_ptr<GraphicsShader> graphics_legacy_shader_variant(std::uint32_t,std::span<const std::uint8_t>,std::uint32_t)override;
     std::uint64_t graphics_shader_prefetch(std::uint32_t,std::span<const std::uint8_t>,const std::shared_ptr<SharedWake>&)override;
     bool graphics_shader_ticket_ready(std::uint64_t)override;
     std::shared_ptr<GraphicsShader> graphics_shader_private(std::uint32_t,std::span<const std::uint8_t>)override;
@@ -1188,6 +1190,7 @@ public:
     std::shared_ptr<GraphicsSampler> graphics_sampler(std::span<const std::uint8_t>)override;
     bool graphics_timestamp_supported()const override;
     GraphicsTimestamp graphics_timestamp()override;
+    std::optional<std::uint64_t> graphics_gpu_clock()override;
     std::shared_ptr<const GraphicsTimestampFuture> graphics_timestamp_future()override;
     void timestamp_into(const std::shared_ptr<GraphicsTimestampFuture>&);
     void graphics_write(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t)override;
@@ -1523,6 +1526,14 @@ std::optional<std::pair<std::string,std::string>> metal_opengl_identity(){
     if(count!=1 || !model)return std::nullopt;
     return std::pair<std::string,std::string>{*model+" (Metal)","MacWin"};
 }
+std::optional<std::uint32_t> adapter_multisample_mask(std::uint32_t format){@autoreleasepool{
+    const auto device=MTLCreateSystemDefaultDevice();
+    if(!device)return std::nullopt;
+    std::uint32_t mask=0;
+    for(unsigned samples=2;samples<=16;++samples)
+        if(metal_samples_supported(device,format,samples))mask|=1U<<samples;
+    return mask;
+}}
 std::shared_ptr<NativeOpenGlContext> make_metal_opengl(void* view,std::uint32_t w,std::uint32_t h){return std::make_shared<MetalGl>(view,w,h);}
 std::shared_ptr<NativeOpenGlContext> make_metal_command_thread(std::shared_ptr<NativeOpenGlContext> inner,std::function<void(const std::string&)> on_error){
     return std::make_shared<MetalCommandThread>(std::move(inner),std::move(on_error));}

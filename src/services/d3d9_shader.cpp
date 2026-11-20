@@ -22,7 +22,7 @@ std::vector<std::array<std::uint32_t,2>> graphics_legacy_semantics(std::span<con
     return result;
 }
 // SM1–3 的暫存器、宣告與控制流程由同一 bytecode 編譯器處理；不依範例改写 shader。
-GraphicsLegacyShader graphics_legacy_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes){
+GraphicsLegacyShader graphics_legacy_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes,std::uint32_t shadow_samplers){
     static std::mutex lock;const std::lock_guard guard(lock);
     if(stage>1 || bytes.size()<8 || bytes.size()%4)throw std::invalid_argument("D3D9 shader 位元碼長度／階段不合法");
     std::uint32_t version{};std::memcpy(&version,bytes.data(),4);
@@ -53,6 +53,10 @@ GraphicsLegacyShader graphics_legacy_shader(std::uint32_t stage,std::span<const 
     }
     vkd3d_shader_spirv_target_info target{};target.type=VKD3D_SHADER_STRUCTURE_TYPE_SPIRV_TARGET_INFO;target.environment=VKD3D_SHADER_SPIRV_ENVIRONMENT_VULKAN_1_0;
     vkd3d_shader_interface_info interface{};interface.type=VKD3D_SHADER_STRUCTURE_TYPE_INTERFACE_INFO;interface.next=&target;interface.bindings=bindings.data();interface.binding_count=static_cast<unsigned>(bindings.size());info.next=&interface;
+    // D3D9 由綁定紋理的格式決定陰影取樣（D24S8 等深度紋理）；SM1 的紋理維度維持預設 2D。
+    vkd3d_shader_d3dbc_source_info source_info{};source_info.type=VKD3D_SHADER_STRUCTURE_TYPE_D3DBC_SOURCE_INFO;source_info.next=&interface;
+    for(auto& dimension:source_info.texture_dimensions)dimension=VKD3D_SHADER_RESOURCE_TEXTURE_2D;
+    source_info.shadow_samplers=shadow_samplers;if(shadow_samplers)info.next=&source_info;
     if(vkd3d_shader_compile(&info,&scan.code,&scan.messages)<0){scan.code={};throw std::invalid_argument("D3D9 shader 轉譯失敗："+std::string(scan.messages?scan.messages:""));}
     std::vector<std::uint32_t> words(scan.code.size/4);std::memcpy(words.data(),scan.code.code,scan.code.size);spirv_cross::CompilerMSL compiler(std::move(words));
     const auto model=stage?spv::ExecutionModelFragment:spv::ExecutionModelVertex;

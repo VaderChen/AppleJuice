@@ -7,18 +7,19 @@ namespace x64arm {
 bool WindowsServices::draw_gui_icon(GuestMemory& memory,std::uint64_t hdc,std::uint64_t handle,std::int32_t x,std::int32_t y,std::uint32_t width,std::uint32_t height,std::uint32_t flags,std::uint64_t brush,std::uint32_t step){
     const auto fail=[&](std::uint32_t error){last_error_=error;return false;};
     const auto found=gui_.icons.find(handle);const auto context=gui_.contexts.find(hdc);
-    if(found==gui_.icons.end() || context==gui_.contexts.end())return fail(6);
-    if(flags&~0x1fU)return fail(87);
-    const auto& source_icon=found->second;
+    if(context==gui_.contexts.end())return fail(6);
+    const auto system=found==gui_.icons.end()?resolve_system_cursor(gui_,handle):std::nullopt;
+    if(found==gui_.icons.end() && !system)return fail(1402);
+    const auto& source_icon=system?*system:found->second;
     if(!source_icon.animation_sequence.empty() && step>=source_icon.animation_sequence.size())return fail(87);
     const auto& icon=source_icon.animation_sequence.empty()?source_icon:source_icon.animation_frames.at(source_icon.animation_sequence[step]);
     width=width?width:flags&8?32:icon.width;height=height?height:flags&8?32:icon.height;
     if(!width || !height || width>4096 || height>4096 || std::int64_t{x}+width>INT32_MAX || std::int64_t{y}+height>INT32_MAX)return fail(87);
     const auto count=static_cast<std::size_t>(icon.width)*icon.height;
     if(icon.mask_pixels.size()!=count*(icon.monochrome?2U:1U) || (!icon.monochrome && icon.color_pixels.size()!=count))return fail(50);
-    if(brush && !gui_.brushes.contains(brush) && !gui_.brush_patterns.contains(brush) && (brush<0xb000 || brush>0xb005) && brush!=0xb012)return fail(6);
+    if(brush && !gui_.brushes.contains(brush) && !gui_.brush_patterns.contains(brush) && (brush<0xb000 || brush>0xb005) && brush!=0xb012)brush=0;
     const std::array<std::int32_t,4> destination{x,y,x+static_cast<std::int32_t>(width),y+static_cast<std::int32_t>(height)},source{0,0,static_cast<std::int32_t>(icon.width),static_cast<std::int32_t>(icon.height)};
-    if((flags&3)==0)return true;
+    if(!(flags&3) && !brush)return true;
     auto target=raster_surface(memory,hdc);auto dc=context->second;
     if(!target){
         if(brush || (flags&3)!=3)return fail(50);
@@ -39,9 +40,10 @@ bool WindowsServices::draw_gui_icon(GuestMemory& memory,std::uint64_t hdc,std::u
                 output->draw(fill,pattern.get());
             }
         }
-        if((flags&3)==3 && icon.alpha){
+        const auto selected=gui_.bitmaps.find(dc.bitmap);
+        if((flags&2) && icon.alpha && (selected==gui_.bitmaps.end() || selected->second.bits_per_pixel>8)){
             auto image=make_hardware_raster(icon.width,icon.height);image->upload(icon.color_pixels,true);output->blit(*image,rectangle,source,draw_dc,0x01ff0000U);
-        }else {
+        }else if(flags&3){
             std::vector<std::uint32_t> pixels(count);RasterBlit operation;
             if(flags&1){for(std::size_t i=0;i<count;++i)pixels[i]=icon.mask_pixels[i]?0xffffffU:0U;auto mask=make_hardware_raster(icon.width,icon.height,pixels);operation.operation=(flags&2)?0x88U:0xccU;output->blit(*mask,rectangle,source,draw_dc,UINT32_MAX,operation);}
             if(flags&2){if(icon.monochrome)for(std::size_t i=0;i<count;++i)pixels[i]=icon.mask_pixels[count+i]?0xffffffU:0U;else pixels=icon.color_pixels;

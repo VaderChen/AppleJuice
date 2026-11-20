@@ -6,7 +6,8 @@
 // - HGLOBAL、HBITMAP、HPALETTE、HENHMETAFILE、HMETAFILE、HMETAFILEPICT：同程序傳 handle（x64 為 WDT_INPROC64_CALL＋__int64），
 //   跨程序傳 FLAGGED_BYTE_BLOB／userBITMAP／LOGPALETTE／BYTE_BLOB／remoteMETAFILEPICT 內容並在接收端重建；UserFree 只釋放跨程序重建的物件。
 // - SNB：RemSNB {ulCntStr, ulCntChar, OLECHAR[]}；接收端以 CoTaskMemAlloc 配置單一區塊（指標表＋字串），UserFree 以 CoTaskMemFree 釋放。
-// - BSTR：FLAGGED_WORD_BLOB，fFlags 為位元組長度（NULL BSTR 為 0xFFFFFFFF）；HSTRING 以同一 blob 傳字元。
+// - BSTR：FLAGGED_WORD_BLOB，fFlags 為位元組長度（NULL BSTR 為 0xFFFFFFFF）。
+// - HSTRING：8 位元組對齊；同程序封送持有一次引用，其餘內容封送保留完整 UTF-16。
 // 錯誤依 RPC 契約以不可繼續例外丟出（RPC_X_BAD_STUB_DATA、RPC_S_INVALID_TAG、E_OUTOFMEMORY）。
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
@@ -32,11 +33,11 @@ struct NdrReader {
         std::vector<std::uint8_t> data(static_cast<std::size_t>(size));if(!data.empty())memory.read(GuestAddress{at},data);at+=size;return data;
     }
 };
-enum class Wire {Handle,ClipFormat,Global,Bitmap,Palette,EnhMetafile,Metafile,MetafilePict,Snb,Bstr,Hstring};
+enum class Wire {Handle,ClipFormat,Global,Bitmap,Palette,EnhMetafile,Metafile,MetafilePict,Snb,Bstr};
 Wire wire_type(std::string_view type){
     if(type=="CLIPFORMAT")return Wire::ClipFormat;if(type=="HGLOBAL")return Wire::Global;if(type=="HBITMAP")return Wire::Bitmap;
     if(type=="HPALETTE")return Wire::Palette;if(type=="HENHMETAFILE")return Wire::EnhMetafile;if(type=="HMETAFILE")return Wire::Metafile;
-    if(type=="HMETAFILEPICT")return Wire::MetafilePict;if(type=="SNB")return Wire::Snb;if(type=="BSTR")return Wire::Bstr;if(type=="HSTRING")return Wire::Hstring;
+    if(type=="HMETAFILEPICT")return Wire::MetafilePict;if(type=="SNB")return Wire::Snb;if(type=="BSTR")return Wire::Bstr;
     return Wire::Handle;
 }
 }
@@ -47,6 +48,8 @@ std::span<const WindowsServiceDescriptor> ole_user_marshal_service_descriptors()
         X64ARM_WIRE("combase.dll",CLIPFORMAT),X64ARM_WIRE("combase.dll",HACCEL),X64ARM_WIRE("combase.dll",HBITMAP),X64ARM_WIRE("combase.dll",HBRUSH),
         X64ARM_WIRE("combase.dll",HDC),X64ARM_WIRE("combase.dll",HGLOBAL),X64ARM_WIRE("combase.dll",HICON),X64ARM_WIRE("combase.dll",HMENU),
         X64ARM_WIRE("combase.dll",HPALETTE),X64ARM_WIRE("combase.dll",HWND),X64ARM_WIRE("combase.dll",HSTRING),
+        {"combase.dll","HSTRING_UserSize64",3,0,0,2},{"combase.dll","HSTRING_UserMarshal64",3},
+        {"combase.dll","HSTRING_UserUnmarshal64",3},{"combase.dll","HSTRING_UserFree64",2},
         X64ARM_WIRE("ole32.dll",HENHMETAFILE),X64ARM_WIRE("ole32.dll",HMETAFILE),X64ARM_WIRE("ole32.dll",HMETAFILEPICT),X64ARM_WIRE("ole32.dll",SNB),
         X64ARM_WIRE("oleaut32.dll",BSTR)};
     return table;
@@ -54,7 +57,8 @@ std::span<const WindowsServiceDescriptor> ole_user_marshal_service_descriptors()
 #undef X64ARM_WIRE
 std::optional<std::uint32_t> WindowsServices::invoke_ole_user_marshal(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const auto split=name.find("_User");
-    const auto wire=wire_type(name.substr(0,split));const auto operation=name.substr(split+1);
+    const auto type=name.substr(0,split);auto operation=name.substr(split+1);
+    if(operation.ends_with("64"))operation.remove_suffix(2);
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     std::vector<std::uint64_t> blocks;
     struct Release {WindowsServices& self;GuestMemory& memory;GuestState& state;std::vector<std::uint64_t>& blocks;~Release(){for(const auto block:blocks)(void)self.free_heap(memory,block,state);}} release{*this,memory,state,blocks};
@@ -66,6 +70,47 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_user_marshal(GuestState
         const auto context=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)},32))&0xffffU;
         const bool inproc=context==3 || context==4;
         const auto pointer=arg(operation=="UserFree"?1:2);
+        if(type=="HSTRING"){
+            const auto finish=[&](std::uint64_t result){arg.return_to(state,result);return std::optional<std::uint32_t>{};};
+            const bool by_handle=context==3;
+            if(operation=="UserFree"){
+                (void)api("combase.dll","WindowsDeleteString",{memory.load(GuestAddress{pointer},bits)});
+                return finish(0);
+            }
+            const bool sizing=operation=="UserSize";
+            const auto start=sizing?static_cast<std::uint32_t>(arg(1)):arg(1);
+            const auto aligned=(start+7)&~std::uint64_t{7};
+            if(aligned<start)throw MarshalError{bad_stub_data};
+            const auto header=by_handle?2*unit:8U;
+            if(operation=="UserUnmarshal"){
+                memory.check(GuestAddress{aligned},header,Access::Read);
+                if(by_handle){
+                    memory.store(GuestAddress{pointer},bits,memory.load(GuestAddress{aligned+unit},bits));
+                    return finish(aligned+header);
+                }
+                const auto bytes=memory.load(GuestAddress{aligned+4},32);
+                if(bytes&1)throw MarshalError{bad_stub_data};
+                if(bytes)memory.check(GuestAddress{aligned+header},bytes,Access::Read);
+                if(api("combase.dll","WindowsCreateString",{aligned+header,bytes/2,pointer}))throw MarshalError{14};
+                return finish(aligned+header+bytes);
+            }
+            const auto value=memory.load(GuestAddress{pointer},bits);
+            const auto text=by_handle?WinrtString{}:winrt_string(memory,value);
+            const auto bytes=std::uint64_t{text.length}*2;
+            if(bytes>UINT32_MAX)throw MarshalError{bad_stub_data};
+            const auto end=aligned+header+bytes;
+            if(sizing)return finish(static_cast<std::uint32_t>(end));
+            memory.check(GuestAddress{aligned},header+bytes,Access::Write);
+            if(by_handle){
+                if(api("combase.dll","WindowsDuplicateString",{value,aligned+unit}))throw MarshalError{14};
+            }else{
+                if(bytes)memory.move(GuestAddress{aligned+header},GuestAddress{text.data},bytes);
+                memory.store(GuestAddress{aligned+4},32,bytes);
+            }
+            memory.store(GuestAddress{aligned},32,x86_?inproc_call:inproc64_call);
+            return finish(end);
+        }
+        const auto wire=wire_type(type);
         const auto read_guest=[&](std::uint64_t address,std::size_t size){std::vector<std::uint8_t> data(size);if(size)memory.read(GuestAddress{address},data);return data;};
         const auto global_bytes=[&](std::uint64_t handle){
             const auto size=api("kernel32.dll","GlobalSize",{handle});const auto locked=size?api("kernel32.dll","GlobalLock",{handle}):0;
@@ -143,14 +188,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_user_marshal(GuestState
                     const auto content=read_utf16(memory,GuestAddress{item},32768);for(const auto c:content){text.push_back(static_cast<std::uint8_t>(c));text.push_back(static_cast<std::uint8_t>(c>>8));}
                     text.push_back(0);text.push_back(0);}
                 w.put(text.size()/2,4);w.put(strings,4);w.put(text.size()/2,4);w.raw(text);break;}
-            case Wire::Bstr:case Wire::Hstring:{
-                std::vector<std::uint8_t> data;std::uint32_t flags=0;
-                if(wire==Wire::Bstr){
-                    if(!value)flags=UINT32_MAX;
-                    else {const auto length=static_cast<std::uint32_t>(api("oleaut32.dll","SysStringByteLen",{value}));flags=length;data=read_guest(value,length);if(length%2)data.push_back(0);}
-                }else if(value){
-                    const auto length_cell=scratch(4);const auto text=api("combase.dll","WindowsGetStringRawBuffer",{value,length_cell});
-                    const auto length=static_cast<std::uint32_t>(memory.load(GuestAddress{length_cell},32));flags=length;data=read_guest(text,std::size_t{length}*2);
+            case Wire::Bstr:{
+                std::vector<std::uint8_t> data;std::uint32_t flags=UINT32_MAX;
+                if(value){
+                    const auto length=static_cast<std::uint32_t>(api("oleaut32.dll","SysStringByteLen",{value}));
+                    flags=length;data=read_guest(value,length);if(length%2)data.push_back(0);
                 }
                 w.put(data.size()/2,4);w.put(flags,4);w.put(data.size()/2,4);w.raw(data);break;}
             }
@@ -206,18 +248,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_user_marshal(GuestState
                 memory.write(GuestAddress{block+table},text);std::uint64_t cursor=block+table;
                 for(std::uint32_t i=0;i<strings;++i){memory.store(GuestAddress{block+std::uint64_t{i}*unit},bits,cursor);while(memory.load(GuestAddress{cursor},16))cursor+=2;cursor+=2;}
                 memory.store(GuestAddress{block+std::uint64_t{strings}*unit},bits,0);store(block);break;}
-            case Wire::Bstr:case Wire::Hstring:{
+            case Wire::Bstr:{
                 const auto maximum=r.get(4),flags=r.get(4),size=r.get(4);if(size!=maximum)throw MarshalError{bad_stub_data};const auto data=r.raw(size*2);
-                if(wire==Wire::Bstr){
-                    if(flags!=UINT32_MAX && flags>data.size())throw MarshalError{bad_stub_data};
-                    if(existing)(void)api("oleaut32.dll","SysFreeString",{existing});
-                    if(flags==UINT32_MAX){store(0);break;}
-                    const auto text=api("oleaut32.dll","SysAllocStringByteLen",{data.empty()?0:in_guest(data),flags});if(!text)throw MarshalError{out_of_memory};store(text);
-                }else {
-                    if(flags!=size)throw MarshalError{bad_stub_data};
-                    if(!size){store(0);break;}
-                    const auto out=scratch(unit);if(api("combase.dll","WindowsCreateString",{in_guest(data),size,out}))throw MarshalError{out_of_memory};store(memory.load(GuestAddress{out},bits));
-                }
+                if(flags!=UINT32_MAX && flags>data.size())throw MarshalError{bad_stub_data};
+                if(existing)(void)api("oleaut32.dll","SysFreeString",{existing});
+                if(flags==UINT32_MAX){store(0);break;}
+                const auto text=api("oleaut32.dll","SysAllocStringByteLen",{data.empty()?0:in_guest(data),flags});if(!text)throw MarshalError{out_of_memory};store(text);
                 break;}
             }
         };
@@ -240,7 +276,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_user_marshal(GuestState
             break;
         case Wire::Snb:(void)api("ole32.dll","CoTaskMemFree",{value});break;
         case Wire::Bstr:(void)api("oleaut32.dll","SysFreeString",{value});break;
-        case Wire::Hstring:(void)api("combase.dll","WindowsDeleteString",{value});break;
         default:break;
         }
         arg.return_to(state,0);return std::nullopt;

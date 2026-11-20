@@ -98,7 +98,7 @@ bool registry_dependent_service(const WindowsServiceDescriptor& service) {
 
     if((family=="ole32.dll" || family=="combase.dll") && one_of(name,{"CoCreateInstance","CoCreateInstanceEx","CoGetClassObject",
         "ProgIDFromCLSID","CLSIDFromProgID","CLSIDFromString","RoGetActivationFactory","RoActivateInstance"}))return true;
-    if(family=="shlwapi.dll" && one_of(name,{"#236","#343","#344"}))return true;
+    if(family=="shlwapi.dll" && one_of(name,{"#236","#343","#344","WhichPlatform"}))return true;
     if(family=="internal-shell-guid" && (name=="GUIDFromStringA" || name=="GUIDFromStringW"))return true;
     if(family=="internal-com-rot" && name=="Register")return true;
     // 外部型別參照會惰性查詢 TypeLib 登錄，包含 COM metadata 與 Invoke。

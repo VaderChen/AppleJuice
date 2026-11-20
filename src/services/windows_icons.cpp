@@ -18,7 +18,8 @@ std::span<const WindowsServiceDescriptor> icon_service_descriptors(){
         {"shell32.dll","ExtractIconExA",5},{"shell32.dll","ExtractIconExW",5},
         {"shell32.dll","SHGetStockIconInfo",3},
         // 系統游標取代（SPI_SETCURSORS 還原）與動畫游標的逐步幀資訊。
-        {"user32.dll","SetSystemCursor",2,0,0,0x2},{"user32.dll","GetCursorFrameInfo",5,0,0,0x6}
+        {"user32.dll","SetSystemCursor",2,0,0,0x2},{"user32.dll","GetCursorFrameInfo",5,0,0,0x6},
+        {"win32u.dll","NtUserGetCursorFrameInfo",4,0,0,0x2}
     };return table;
 }
 std::uint64_t WindowsServices::store_gui_icon(GuiIcon icon,std::uint32_t flags){
@@ -72,7 +73,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_icon_api(GuestState& state,
             const auto output=arg(metric?3:4);if(!output)return finish(0x80070057U);
             memory.store(GuestAddress{output},static_cast<std::uint8_t>(unit*8),0);
             if(!arg(1) || (metric && d(2)>1))return finish(0x80070057U);
-            const auto width=metric?system_metric(d(2)?11:49):d(2),height=metric?system_metric(d(2)?12:50):d(3);
+            const auto width=metric?system_metric(memory,d(2)?11:49):d(2),height=metric?system_metric(memory,d(2)?12:50):d(3);
             if(width>4096 || height>4096)return finish(0x80070057U);
             const auto standard=[](std::uint32_t size){return size==16 || size==32 || size==48 || size==256;};
             const bool prefer_larger=metric || !(standard(width) && standard(height));
@@ -89,29 +90,35 @@ std::optional<std::uint32_t> WindowsServices::invoke_icon_api(GuestState& state,
         }else if(symbol=="SetSystemCursor"){
             // 以 hcur 的內容取代 OCR_* 系統游標，並依文件以 DestroyCursor 銷毀 hcur；目前正使用該系統游標時立即更新。
             const auto id=d(1);const auto found=gui_.icons.find(arg(0));
-            if(found==gui_.icons.end()){last_error_=1402;result=0;}
+            if(found==gui_.icons.end() || found->second.is_icon){last_error_=1402;result=0;}
             else if(!gui_system_cursor_id(id)){last_error_=87;result=0;}
             else {
                 auto copy=found->second;copy.shared=false;copy.system=0;copy.is_icon=false;gui_.system_cursors.insert_or_assign(id,std::move(copy));
+                release_cursor_frames(0xd000U+id);
                 (void)nested_service(state,memory,"user32.dll","DestroyCursor",{arg(0)});
                 if(gui_.cursor==0xd000U+id)present_gui_cursor();
                 result=1;
             }
-        }else if(symbol=="GetCursorFrameInfo"){
-            // (hCursor, reserved, istep, *rate_jiffies, *num_steps)：靜態游標回傳自身、0 jiffy、1 步；
-            // 動畫游標回傳第 istep 步的幀（共用控制代碼，原游標銷毀時回收）、該步的 jiffy 數與總步數，超出範圍回 NULL。
-            GuiIcon system;const auto known=gui_.icons.find(arg(0));
-            const GuiIcon* icon=known!=gui_.icons.end()?&known->second:resolve_gui_cursor(arg(0),system);
-            const auto step=d(2);
-            if(!icon){last_error_=1402;result=0;}
-            else if(icon->animation_sequence.empty()){
-                if(arg(3))memory.store(GuestAddress{arg(3)},32,0);if(arg(4))memory.store(GuestAddress{arg(4)},32,1);result=arg(0);
-            }else {
-                const auto steps=static_cast<std::uint32_t>(icon->animation_sequence.size());
-                if(arg(4))memory.store(GuestAddress{arg(4)},32,steps);
-                if(step>=steps){last_error_=87;result=0;}
-                else {
-                    if(arg(3))memory.store(GuestAddress{arg(3)},32,step<icon->animation_rates.size()?icon->animation_rates[step]:0U);
+        }else if(symbol=="GetCursorFrameInfo" || symbol=="NtUserGetCursorFrameInfo"){
+            const unsigned index=symbol=="GetCursorFrameInfo"?2:1;
+            const auto step=d(index);
+            const auto rate_out=arg(index+1),steps_out=arg(index+2);
+            if(!rate_out || !steps_out){arg.return_to(state,0);return std::nullopt;}
+            GuiIcon system;
+            const auto known=gui_.icons.find(arg(0));
+            const auto* icon=known!=gui_.icons.end()?&known->second:resolve_gui_cursor(arg(0),system);
+            if(!icon)last_error_=1402;
+            else if(icon->animation_sequence.empty() || step<icon->animation_sequence.size()){
+                memory.check(GuestAddress{rate_out},4,Access::Write);
+                memory.check(GuestAddress{steps_out},4,Access::Write);
+                if(icon->animation_frames.size()<=1){
+                    result=arg(0);
+                    memory.store(GuestAddress{rate_out},32,0);
+                    memory.store(GuestAddress{steps_out},32,1);
+                }else {
+                    const auto steps=static_cast<std::uint32_t>(icon->animation_sequence.size());
+                    memory.store(GuestAddress{rate_out},32,icon->animation_rates.at(step));
+                    memory.store(GuestAddress{steps_out},32,steps==1?UINT32_MAX:steps);
                     const auto frame=icon->animation_sequence[step];const auto key=std::pair{arg(0),frame};
                     if(const auto cached=gui_.cursor_frames.find(key);cached!=gui_.cursor_frames.end() && gui_.icons.contains(cached->second))result=cached->second;
                     else {
@@ -150,8 +157,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_icon_api(GuestState& state,
                 if(source==gui_.icons.end() && type==2)system=resolve_system_cursor(gui_,arg(0));
                 if(source==gui_.icons.end() && !system)return fail(type==1?1402:1401);
                 const auto original=source!=gui_.icons.end()?source->second:*system;if(original.is_icon!=(type==1))return fail(87);
-                const auto width=requested_width?requested_width:(flags&0x40U)?system_metric(type==1?11:13):original.width;
-                const auto height=requested_height?requested_height:(flags&0x40U)?system_metric(type==1?12:14):original.height;
+                const auto width=requested_width?requested_width:(flags&0x40U)?system_metric(memory,type==1?11:13):original.width;
+                const auto height=requested_height?requested_height:(flags&0x40U)?system_metric(memory,type==1?12:14):original.height;
                 if(width>4096 || height>4096)return fail(87);
                 if((flags&4) && width==original.width && height==original.height && (!monochrome || original.monochrome))return finish(arg(0));
                 if((flags&0x4000U) && original.resource_instance && (original.resource_name_id || !original.resource_name.empty())){

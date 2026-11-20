@@ -30,7 +30,49 @@ void WindowsServices::initialize_guest_com_agile(GuestMemory& memory){
         throw std::logic_error("COM agile 常式與既有常駐映像重疊");
     auto image=parsed.runtime;image.private_code=true;image.path=u"[guest-com-agile]";image.export_names.clear();image.export_ordinals.clear();
     for(const auto& [name,ordinal]:parsed.runtime.export_names)image.export_names.emplace(name,parsed.runtime.export_ordinals.at(ordinal));
-    for(auto& mapping:parsed.mappings)mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
+    // 只有程序參照資料槽所在的非執行頁可寫；服務入口表只保留函式。
+    const auto slot=image.export_names.at("ShellProcessReferenceSlot");
+    image.export_names.erase("ShellProcessReferenceSlot");
+    const auto table=image.export_names.at("GuestServiceFallbacks");
+    image.export_names.erase("GuestServiceFallbacks");
+    const unsigned unit=x86_?4:8;
+    bool patched=false;
+    for(auto& mapping:parsed.mappings){
+        if(table>=mapping.rva && table-mapping.rva<mapping.bytes.size()){
+            const auto at=table-mapping.rva;
+            static constexpr struct { const char *family, *symbol; } targets[]{
+                {"ole32.dll","CLSIDFromString"}, {"internal-shell-guid","GUIDFromStringA"},
+                {"internal-shell-guid","GUIDFromStringW"}, {"internal-mapi-property","FEqualNames"},
+                {"internal-mapi-buffer","MAPIFreeBuffer"}, {"internal-mapi-property","LPropCompareProp"},
+                {"kernel32.dll","IsDBCSLeadByteEx"},
+                {"user32.dll","CharLowerW"}, {"user32.dll","CharUpperW"},
+                {"user32.dll","CharLowerA"}, {"user32.dll","CharUpperA"},
+                {"user32.dll","CharLowerBuffW"}, {"user32.dll","CharUpperBuffW"},
+                {"user32.dll","CharLowerBuffA"}, {"user32.dll","CharUpperBuffA"},
+                {"user32.dll","CharToOemA"}, {"user32.dll","CharToOemW"},
+                {"user32.dll","OemToCharA"}, {"user32.dll","OemToCharW"},
+                {"user32.dll","CharToOemBuffA"}, {"user32.dll","CharToOemBuffW"},
+                {"user32.dll","OemToCharBuffA"}, {"user32.dll","OemToCharBuffW"}
+            };
+            if(mapping.bytes.size()-at<std::size(targets)*unit || (mapping.permissions&permission(Access::Execute)))
+                throw std::logic_error("常駐服務慢路徑表的區段不正確");
+            unsigned pos=at;
+            for(const auto& [family,name]:targets){
+                const auto address=host_service_stub(family,name);
+                if(!address.value)throw std::logic_error("常駐服務缺少宿主入口");
+                for(unsigned byte=0;byte<unit;++byte)mapping.bytes[pos++]=static_cast<std::uint8_t>(address.value>>(byte*8));
+            }
+            patched=true;
+        }
+        if(slot>=mapping.rva && slot-mapping.rva<mapping.bytes.size()){
+            if(!(mapping.permissions&permission(Access::Write)) || (mapping.permissions&permission(Access::Execute)))
+                throw std::logic_error("程序參照槽未位於可寫資料區段");
+            mapping.permissions=read_write;
+            shell_instance_explorer_=base+slot;
+        }else mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
+    }
+    if(!patched)throw std::logic_error("常駐服務慢路徑表未映射");
+    if(!shell_instance_explorer_)throw std::logic_error("程序參照槽未映射");
     map_pe_image(memory,parsed);runtime_.builtin_images.emplace(base,std::move(image));
 }
 

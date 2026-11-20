@@ -1,3 +1,4 @@
+#include "parallel_mapping_lock.hpp"
 #include <source_location>
 #include "x64arm/windows_services.hpp"
 #include "x64arm/media_surface.hpp"
@@ -127,6 +128,12 @@ struct Object {
     GraphicsView native_view;unsigned multisample{};bool lockable{};
     std::shared_ptr<GraphicsResource> cached_resource;
     std::vector<std::vector<std::uint8_t>> cached_pixels;
+    // CreateVertexBuffer／CreateIndexBuffer 的緩衝（shadow_buffer）：客體映射常駐，只在首次 Lock 寫入整份內容；Unlock 只回寫
+    // 鎖定的範圍並遞增 content_generation。下一次繪製依累積的上傳範圍更新 GPU 緩衝：全部是 NOOVERWRITE 時直接寫入原緩衝
+    // （客體保證不改寫 GPU 使用中的範圍），DISCARD 或一般鎖改建新緩衝，與驅動的緩衝更名一致。
+    std::uint64_t lock_shadow{},content_generation{},cached_generation{};
+    std::uint32_t dirty_begin{UINT32_MAX},dirty_end{},upload_begin{UINT32_MAX},upload_end{};
+    bool shadow_buffer{},upload_rename{};
     bool texture_pixels_dirty{true};
     std::array<std::uint64_t,8> helper_refs{};
     Kind kind{};std::uint64_t root{},parent{},back{},window{},focus{},mapped{},draws{},frames{},texture{},vertex_buffer{},index_buffer{},chain{},creator{};
@@ -167,15 +174,18 @@ struct Object {
     std::array<std::int32_t,4> scissor{};
     std::array<float,17> material{1,1,1,1,1,1,1,1};
     std::map<unsigned,D3DLight> lights;std::map<unsigned,bool> light_enabled;
-    std::map<std::uint32_t,std::uint32_t> sampler=[](){std::map<std::uint32_t,std::uint32_t> result;for(unsigned slot=0;slot<20;++slot)for(auto [key,value]:std::map<unsigned,unsigned>{{1,1},{2,1},{3,1},{5,1},{6,1},{7,0},{8,0},{9,0},{10,1},{11,0}})result[slot*32+key]=value;return result;}(),stage{{1,4},{2,2},{3,1},{4,2},{5,2},{6,1},{28,1},{33,1},{36,1},{65,1},{68,1},{97,1},{100,1},{129,1},{132,1},{161,1},{164,1},{193,1},{196,1},{225,1},{228,1}};
+    std::map<std::uint32_t,std::uint32_t> sampler=[](){std::map<std::uint32_t,std::uint32_t> result;for(unsigned slot=0;slot<20;++slot)for(auto [key,value]:std::map<unsigned,unsigned>{{1,1},{2,1},{3,1},{4,0},{5,1},{6,1},{7,0},{8,0},{9,0},{10,1},{11,0},{12,0},{13,256}})result[slot*32+key]=value;return result;}(),stage{{1,4},{2,2},{3,1},{4,2},{5,2},{6,1},{28,1},{33,1},{36,1},{65,1},{68,1},{97,1},{100,1},{129,1},{132,1},{161,1},{164,1},{193,1},{196,1},{225,1},{228,1}};
     std::map<std::uint32_t,Matrix> transforms{{2,identity()},{3,identity()},{256,identity()}};
-    std::map<std::uint32_t,std::uint32_t> render{{48,0},{60,0xffffffff},{128,0},{129,0},{130,0},{131,0},{132,0},{133,0},{134,0},{135,0},{136,1},{152,0},{176,0},{7,0},{8,3},{9,2},{14,1},{15,0},{24,0},{25,8},{26,0},{19,2},{20,1},{22,3},{23,4},{27,0},{28,0},{29,0},{52,0},{53,1},{54,1},{55,1},{56,8},{57,0},{58,0xffffffff},{59,0xffffffff},{185,0},{186,1},{187,1},{188,1},{189,8},{137,1},{139,0},{141,1},{142,1},{143,0},{145,1},{146,2},{147,0},{148,0},{151,0},{167,0},{168,15},{171,1},{174,0},{194,0},{206,0},{207,2},{208,1},{209,1}};
+    std::map<std::uint32_t,std::uint32_t> render{{48,0},{60,0xffffffff},{128,0},{129,0},{130,0},{131,0},{132,0},{133,0},{134,0},{135,0},{136,1},{152,0},{176,0},{7,0},{8,3},{9,2},{14,1},{15,0},{24,0},{25,8},{26,0},{19,2},{20,1},{22,3},{23,4},{27,0},{28,0},{29,0},{52,0},{53,1},{54,1},{55,1},{56,8},{57,0},{58,0xffffffff},{59,0xffffffff},{185,0},{186,1},{187,1},{188,1},{189,8},{137,1},{139,0},{141,1},{142,1},{143,0},{145,1},{146,2},{147,0},{148,0},{151,0},{167,0},{168,15},{171,1},{174,0},{194,0},{206,0},{207,2},{208,1},{209,1},{161,1},{162,0xffffffff}};
 };
 // 共用 D3D9 → D3D11 sampler 描述，固定與可程式化管線使用相同 LOD 契約。
-std::vector<std::uint8_t> sampler_desc(const Object& device,unsigned slot,unsigned lod,unsigned levels){
+// shadow：取樣陰影深度紋理（D16／D24X8／D24S8）時改為比較取樣器，比較函式 LESS_EQUAL（驅動硬體陰影貼圖的行為）。
+std::vector<std::uint8_t> sampler_desc(const Object& device,unsigned slot,unsigned lod,unsigned levels,bool shadow=false){
     const auto state=[&](unsigned key){return device.sampler.at(slot*32+key);};std::vector<std::uint8_t> data(52);
-    put(data,0,(state(6)>=2?0x10U:0U)|(state(5)>=2?4U:0U)|(state(7)==2?1U:0U)|((state(6)==3 || state(5)==3)?0x40U:0U));
-    put(data,4,state(1));put(data,8,state(2));put(data,12,state(3));put(data,16,state(8));put(data,20,state(10));put(data,24,1);
+    put(data,0,(state(6)>=2?0x10U:0U)|(state(5)>=2?4U:0U)|(state(7)==2?1U:0U)|((state(6)==3 || state(5)==3)?0x40U:0U)|(shadow?0x80U:0U));
+    put(data,4,state(1));put(data,8,state(2));put(data,12,state(3));put(data,16,state(8));put(data,20,state(10));put(data,24,shadow?4U:1U);
+    // D3DSAMP_BORDERCOLOR 是 D3DCOLOR（ARGB）；D3DTADDRESS_BORDER（4）與 MIRRORONCE（5）的編號與後端取樣器描述相同。
+    const auto border=state(4);for(unsigned c=0;c<4;++c)put(data,28+c*4,bits(static_cast<float>((border>>(c==3?24:16-8*c))&255U)/255.F));
     const auto first=std::min(levels-1,std::max(lod,state(9)))-lod;put(data,44,bits(static_cast<float>(first)));
     put(data,48,bits(static_cast<float>(state(7)?levels-lod-1:first)));return data;
 }
@@ -331,7 +341,19 @@ bool WindowsServices::d3d9_local_eligible(const GuestState& state,GuestMemory& m
     if(!d3d9_ || d3d9_->deferred_destroys.size()>=256)return false;
     const auto dot=service.symbol.find('.');if(dot==std::string_view::npos)return false;
     const auto prefix=service.symbol.substr(0,dot),method=service.symbol.substr(dot+1);
-    if(prefix!="Device" && prefix!="DeviceEx")return false;
+    // 資源方法：只改宿主端參考計數或常駐映射緩衝的內容，不配置也不立即銷毀（歸零的物件依同一契約延後銷毀）。
+    // 緩衝 Lock 只收已有常駐客體映射者（首次 Lock 要配置客體 heap，走完整路徑）。
+    if(prefix!="Device" && prefix!="DeviceEx"){
+        const bool texture=prefix=="Texture" || prefix=="CubeTexture",surface=prefix=="Surface",buffer=prefix=="VertexBuffer" || prefix=="IndexBuffer";
+        if(!(texture && (method=="GetSurfaceLevel" || method=="GetCubeMapSurface" || method=="AddRef")) && !(surface && (method=="AddRef" || method=="Release")) &&
+           !(buffer && (method=="Lock" || method=="Unlock")))return false;
+        const WindowsCall arg(state,memory,service);const auto found=d3d9_->objects.find(arg(0));
+        if(found==d3d9_->objects.end() || !found->second)return false;
+        const auto& object=*found->second;
+        if(texture)return texture_kind(object.kind);
+        if(surface)return object.kind==Kind::Surface;
+        return (object.kind==Kind::VertexBuffer || object.kind==Kind::IndexBuffer) && object.shadow_buffer && (method=="Unlock" || object.lock_shadow);
+    }
     static constexpr std::string_view methods[]{
         "SetRenderState","GetRenderState","SetSamplerState","GetSamplerState","SetTextureStageState","GetTextureStageState",
         "SetViewport","GetViewport","SetScissorRect","GetScissorRect","SetTransform","GetTransform","MultiplyTransform",
@@ -342,7 +364,9 @@ bool WindowsServices::d3d9_local_eligible(const GuestState& state,GuestMemory& m
         "GetVertexShaderConstantF","GetVertexShaderConstantI","GetVertexShaderConstantB",
         "GetPixelShaderConstantF","GetPixelShaderConstantI","GetPixelShaderConstantB",
         "SetStreamSource","SetIndices","SetTexture","SetVertexDeclaration","SetVertexShader","SetPixelShader",
-        "DrawPrimitive","DrawIndexedPrimitive","DrawPrimitiveUP","DrawIndexedPrimitiveUP","BeginScene","EndScene","Clear"};
+        "DrawPrimitive","DrawIndexedPrimitive","DrawPrimitiveUP","DrawIndexedPrimitiveUP","BeginScene","EndScene","Clear",
+        // 換綁定時失去最後綁定的舊目標依同一契約延後銷毀。
+        "SetRenderTarget","SetDepthStencilSurface"};
     if(std::find(std::begin(methods),std::end(methods),method)==std::end(methods))return false;
     const WindowsCall arg(state,memory,service);
     const auto found=d3d9_->objects.find(arg(0));
@@ -425,7 +449,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
         if(!value->subresources.empty()){for(auto address:value->subresources){auto surface=get(address,value->kind==Kind::VolumeTexture?Kind::Volume:Kind::Surface);require(!surface->references);if(surface->mapped)(void)free_heap(memory,surface->mapped,state);bridge.objects.erase(address);(void)free_heap(memory,address,state);}}
         else if(value->back){const auto back=get(value->back,Kind::Surface);require(!back->references);if(back->mapped)(void)free_heap(memory,back->mapped,state);bridge.objects.erase(back->root);(void)free_heap(memory,back->root,state);}
         if(value->depth_back){auto depth=get(value->depth_back,Kind::Surface);require(!depth->references);bridge.objects.erase(depth->root);(void)free_heap(memory,depth->root,state);}
-        if(value->mapped)(void)free_heap(memory,value->mapped,state);
+        if(value->mapped && value->mapped!=value->lock_shadow)(void)free_heap(memory,value->mapped,state);
+        if(value->lock_shadow)(void)free_heap(memory,value->lock_shadow,state);
         bridge.objects.erase(value->root);(void)free_heap(memory,value->root,state);
     };
     release=[&](std::uint64_t address)->std::uint32_t{
@@ -480,7 +505,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
         return slot;
     };
     const auto make_texture=[&](const std::shared_ptr<Object>& device,unsigned width,unsigned height,unsigned levels,unsigned usage,unsigned format,unsigned pool,bool cube=false,unsigned depth=1,bool volume=false){
-        require(!cube || (width==height && !volume));require(depth && (!volume || (depth<=2048 && width<=2048 && height<=2048)));require(width && height && width<=16384 && height<=16384 && pool<=3 && (!device->ex || pool!=1));const auto native=native_format(format);const auto maximum=static_cast<unsigned>(std::bit_width(std::max({width,height,depth})));const bool depth_texture=d9_raw_depth(format);if(!levels)levels=depth_texture?1:maximum;require(levels<=maximum);require(depth_texture?(usage==2 && pool==0 && levels==1 && !volume):(usage==0 || ((usage==0x200 || (usage==1 && render_color_format(format))) && pool==0)),unavailable);
+        require(!cube || (width==height && !volume));require(depth && (!volume || (depth<=2048 && width<=2048 && height<=2048)));require(width && height && width<=16384 && height<=16384 && pool<=3 && (!device->ex || pool!=1));const auto native=native_format(format);const auto maximum=static_cast<unsigned>(std::bit_width(std::max({width,height,depth})));const bool depth_texture=d9_raw_depth(format) || d9_shadow_depth(format);if(!levels)levels=depth_texture?1:maximum;require(levels<=maximum);require(depth_texture?(usage==2 && pool==0 && levels==1 && !volume):(usage==0 || ((usage==0x200 || (usage==1 && render_color_format(format))) && pool==0)),unavailable);
         require(!volume || usage!=1);auto texture=create(volume?Kind::VolumeTexture:cube?Kind::CubeTexture:Kind::Texture,device->root);texture->depth=depth;texture->width=width;texture->height=height;texture->levels=levels;texture->format=format;texture->pool=pool;texture->usage=usage;
         try{if(usage==1 || depth_texture){GraphicsResourceDesc desc;desc.dimension=3;desc.width=width;desc.height=height;desc.levels=levels;desc.layers=cube?6:1;desc.format=native;desc.bind=depth_texture?0x48:0x28;desc.misc=cube?4:0;texture->native_view={device->native->graphics_resource(desc),native,0,levels,0,desc.layers};texture->native_view.dimension=cube?9:4;}
             texture->subresources.reserve(levels*(cube?6U:1U));for(unsigned face=0;face<(cube?6U:1U);++face)for(unsigned level=0;level<levels;++level){auto surface=create(volume?Kind::Volume:Kind::Surface,texture->root,true);surface->depth=std::max(1U,depth>>level);texture->subresources.push_back(surface->root);if(!face && !level)texture->back=surface->root;surface->width=std::max(1U,width>>level);surface->height=std::max(1U,height>>level);surface->format=format;surface->pool=pool;surface->usage=usage;if(texture->native_view.resource)surface->native_view={texture->native_view.resource,native,level,1,face,1};const auto pitch=graphics_format_pitch(native,surface->width,surface->height);const auto size=std::size_t(pitch[0])*pitch[1]*surface->depth;surface->storage=reserve_gpu_memory(size);surface->pixels.resize(size);}}
@@ -729,7 +754,11 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                     if(arg(6))memory.store(GuestAddress{arg(6)},32,0);require(!u(1) && (u(2)==1 || u(2)==4) && (!u(5) || (u(5)>=2 && u(5)<=16)),unavailable);const auto format=depth_format(u(3))?depth_format(u(3)):render_color_format(u(3))?native_format(u(3)):0;require(format && object.native->graphics_samples_supported(format,u(5)?u(5):1),unavailable);if(arg(6))memory.store(GuestAddress{arg(6)},32,1);
                 }else if(symbol=="CheckDeviceFormatConversion")result=d9_check_conversion(u(1),u(2),u(3),u(4));
                 else if(symbol=="CreateDevice" || symbol=="CreateDeviceEx"){
-                    const auto out=symbol=="CreateDeviceEx"?7U:6U;output(out);const auto processing=u(4)&0xe0U;require(!u(1) && (u(2)==1 || u(2)==4) && (processing==0x20 || processing==0x40 || processing==0x80) && !(u(4)&~0x8e6U),unavailable);require(!arg(3) || gui_.windows.contains(arg(3)));
+                    const auto out=symbol=="CreateDeviceEx"?7U:6U;output(out);const auto processing=u(4)&0xe0U;
+                    // D3DCREATE_*：FPU_PRESERVE、MULTITHREADED、PUREDEVICE、三種頂點處理、DISABLE_DRIVER_MANAGEMENT(_EX)、ADAPTERGROUP_DEVICE、
+                    // NOWINDOWCHANGES 與 9Ex 的 DISABLE_PSGP_THREADING、ENABLE_PRESENTSTATS、DISABLE_PRINTSCREEN、SCREENSAVER。頂點處理恰取一種；
+                    // PUREDEVICE 只能搭配硬體頂點處理（否則 D3DERR_INVALIDCALL）。純裝置的 Get* 仍照常回傳狀態（較寬鬆、相容）。
+                    require(!u(1) && (u(2)==1 || u(2)==4) && (processing==0x20 || processing==0x40 || processing==0x80) && !(u(4)&~0x1000eff6U),unavailable);require(!(u(4)&0x10U) || processing==0x40);require(!arg(3) || gui_.windows.contains(arg(3)));
                     auto device=create(Kind::Device,object.root,false,object.ex);device->creator=threads_.current;device->focus=arg(3);device->flags=u(4);memory.store(GuestAddress{device->root+D9_CONSTANT_FLAGS},32,device->flags&4U);device->device_type=u(2);device->software_vertex=processing==0x20;
                     try{device->chain=create(Kind::SwapChain,device->root,true,object.ex)->root;device->back=create(Kind::Surface,device->root,true)->root;setup(*device,arg(5),false,out==7?arg(6):0,out==7);}
                     catch(...){release(device->root);throw;}
@@ -775,10 +804,19 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                     output(3);const auto offset=u(1),size=u(2)?u(2):static_cast<std::uint32_t>(object.pixels.size())-offset,flags=u(4);
                     require(offset<object.pixels.size() && size && std::uint64_t{offset}+size<=object.pixels.size() && !(flags&~0xb810U));
                     require(!(flags&0x3000) || (object.usage&0x200));require(!(flags&0x10) || !(object.usage&8));require(!(flags&0x10) || !(flags&0x3000));require(!(flags&0x2000) || !object.mapped);
-                    if(!object.mapped){object.mapped=allocate_heap(memory,object.pixels.size());require(object.mapped!=0,out_of_memory);memory.write(GuestAddress{object.mapped},object.pixels);object.lock_writable=false;}
+                    if(object.shadow_buffer){
+                        if(!object.lock_shadow){object.lock_shadow=allocate_heap(memory,object.pixels.size());require(object.lock_shadow!=0,out_of_memory);memory.write(GuestAddress{object.lock_shadow},object.pixels);}
+                        if(!object.mapped){object.mapped=object.lock_shadow;object.lock_writable=false;object.dirty_begin=UINT32_MAX;object.dirty_end=0;}
+                        if(!(flags&0x10)){object.dirty_begin=std::min(object.dirty_begin,offset);object.dirty_end=std::max(object.dirty_end,offset+size);if(!(flags&0x1000) || (flags&0x2000))object.upload_rename=true;}
+                    }else if(!object.mapped){object.mapped=allocate_heap(memory,object.pixels.size());require(object.mapped!=0,out_of_memory);memory.write(GuestAddress{object.mapped},object.pixels);object.lock_writable=false;}
                     require(object.lock_count<65536);++object.lock_count;object.lock_writable|=!(flags&0x10);store_pointer(arg(3),object.mapped+offset);
                 }else if(symbol=="Unlock"){
-                    require(object.lock_count!=0);if(!--object.lock_count){if(object.lock_writable)object.pixels=read(object.mapped,object.pixels.size());(void)free_heap(memory,object.mapped,state);object.mapped=0;}
+                    require(object.lock_count!=0);if(!--object.lock_count){
+                        if(object.shadow_buffer){
+                            if(object.lock_writable && object.dirty_begin<object.dirty_end){const auto bytes=read(object.lock_shadow+object.dirty_begin,object.dirty_end-object.dirty_begin);std::copy(bytes.begin(),bytes.end(),object.pixels.begin()+object.dirty_begin);
+                                ++object.content_generation;object.upload_begin=std::min(object.upload_begin,object.dirty_begin);object.upload_end=std::max(object.upload_end,object.dirty_end);}
+                            object.mapped=0;
+                        }else{if(object.lock_writable)object.pixels=read(object.mapped,object.pixels.size());(void)free_heap(memory,object.mapped,state);object.mapped=0;}}
                 }else if(symbol=="PreLoad"){
                     // 軟體 vertex processing 的 buffer 常駐於受額度限制的 backing；draw 時再提交 Metal。
                 }else throw HostCallFault("尚未實作 Direct3D 9 buffer 方法："+std::string(symbol));
@@ -866,7 +904,7 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                 else if(symbol=="CreateVertexBuffer" || symbol=="CreateIndexBuffer"){
                     output(5);const bool vertex=symbol=="CreateVertexBuffer";require(u(1) && u(1)<=64*1024*1024 && !(u(2)&~0x218U) && u(4)<=2 && (!object.ex || u(4)!=1) && !arg(6));
                     require(!(u(2)&0x200) || u(4)==0);if(!vertex)require((u(3)==101 && !(u(1)%2)) || (u(3)==102 && !(u(1)%4)));
-                    auto buffer=create(vertex?Kind::VertexBuffer:Kind::IndexBuffer,object.root);try{buffer->pool=u(4);buffer->usage=u(2);buffer->format=vertex?100:u(3);buffer->fvf=vertex?u(3):0;buffer->storage=reserve_gpu_memory(u(1));buffer->pixels.resize(u(1));}catch(...){release(buffer->root);throw;}store_pointer(arg(5),buffer->root);
+                    auto buffer=create(vertex?Kind::VertexBuffer:Kind::IndexBuffer,object.root);try{buffer->pool=u(4);buffer->usage=u(2);buffer->format=vertex?100:u(3);buffer->fvf=vertex?u(3):0;buffer->storage=reserve_gpu_memory(u(1));buffer->pixels.resize(u(1));buffer->shadow_buffer=true;}catch(...){release(buffer->root);throw;}store_pointer(arg(5),buffer->root);
                 }else if(symbol=="SetStreamSource" || symbol=="SetIndices"){
                     const bool vertex=symbol=="SetStreamSource";if(vertex)require(u(1)<16);const auto slot=vertex?u(1):0;const auto address=arg(vertex?2:1);std::shared_ptr<Object> buffer;
                     if(address){buffer=get(address,vertex?Kind::VertexBuffer:Kind::IndexBuffer);require(buffer->parent==object.root);if(vertex)require(u(3)<buffer->pixels.size() && u(4)<=256);}
@@ -899,7 +937,7 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                 }else if(symbol=="SetSamplerState" || symbol=="GetSamplerState" || symbol=="SetTextureStageState" || symbol=="GetTextureStageState"){
                     const bool sampler=symbol.find("Sampler")!=std::string_view::npos,write=symbol.starts_with("Set");const auto slot=sampler?texture_slot(u(1)):u(1);require(sampler || slot<8);auto& values=sampler?object.sampler:object.stage;const auto state_key=u(2)+slot*32;require(values.contains(state_key));
                     if(!write){require(arg(3)!=0);memory.store(GuestAddress{arg(3)},32,values.at(state_key));}
-                    else{const auto key=u(2),v=u(3);bool valid=false;if(sampler){if(key==1 || key==2 || key==3)valid=v>=1 && v<=3;else if(key==7)valid=v<=2;else if(key==8)valid=std::isfinite(real(v));else if(key==9)valid=true;else if(key==11)valid=v<=1;else if(key==10)valid=v>=1 && v<=16;else valid=v>=1 && v<=3;}
+                    else{const auto key=u(2),v=u(3);bool valid=false;if(sampler){if(key==1 || key==2 || key==3)valid=v>=1 && v<=5;else if(key==4 || key==12 || key==13)valid=true;else if(key==7)valid=v<=2;else if(key==8)valid=std::isfinite(real(v));else if(key==9)valid=true;else if(key==11)valid=v<=1;else if(key==10)valid=v>=1 && v<=16;else valid=v>=1 && v<=3;}
                         else if(u(1))valid=(key==1 || key==4) && v==1;else if(key==1)valid=v>=1 && v<=4;else if(key==4)valid=v>=1 && v<=4;else if(key==28)valid=v==1;else valid=(v&15)<=3 && !(v&~0x3fU);
                         require(valid,unavailable);values[state_key]=v;}
                 }else if(symbol=="CreateOffscreenPlainSurface"){
@@ -937,7 +975,10 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                 }else if(symbol=="SetRenderState" || symbol=="GetRenderState"){
                     // DITHERENABLE 影響 16-bit 表面；目前 32-bit target 保留可查詢／state block 還原的值，不改變色彩。
                     require(object.render.contains(u(1)));if(symbol=="GetRenderState"){require(arg(2)!=0);memory.store(GuestAddress{arg(2)},32,object.render.at(u(1)));}
-                    else{const auto key=u(1),v=u(2);bool valid=false;switch(key){case 7:valid=v<=1;break;case 8:valid=v==3;break;case 9:valid=v==1 || v==2;break;case 14:case 15:case 26:case 27:case 174:case 52:case 185:valid=v<=1;break;case 19:case 20:case 207:case 208:valid=v>=1 && v<=11;break;case 22:valid=v>=1 && v<=3;break;case 23:case 25:case 53:case 54:case 55:case 56:case 186:case 187:case 188:case 189:valid=v>=1 && v<=8;break;case 24:valid=v<=255;break;case 28:case 48:case 128:case 129:case 130:case 131:case 132:case 133:case 134:case 135:case 152:case 176:valid=v==0;break;case 151:valid=v<=3 || v==256;break;case 167:case 29:case 137:case 141:case 142:case 143:valid=v<=1;break;case 60:case 139:case 57:case 58:case 59:valid=true;break;case 145:case 146:case 147:case 148:valid=v<=2;break;case 168:valid=v<=15;break;case 171:case 209:valid=v>=1 && v<=5;break;case 194:case 206:valid=v<=1;break;case 136:valid=v==1;break;}require(valid,unavailable);object.render[key]=v;}
+                    else{const auto key=u(1),v=u(2);bool valid=false;switch(key){case 7:valid=v<=1;break;case 8:valid=v==3;break;case 9:valid=v==1 || v==2;break;case 14:case 15:case 26:case 27:case 174:case 52:case 185:valid=v<=1;break;case 19:case 20:case 207:case 208:valid=v>=1 && v<=11;break;case 22:valid=v>=1 && v<=3;break;case 23:case 25:case 53:case 54:case 55:case 56:case 186:case 187:case 188:case 189:valid=v>=1 && v<=8;break;case 24:valid=v<=255;break;case 28:case 48:case 128:case 129:case 130:case 131:case 132:case 133:case 134:case 135:case 152:case 176:valid=v==0;break;case 151:valid=v<=3 || v==256;break;case 167:case 29:case 137:case 141:case 142:case 143:valid=v<=1;break;case 60:case 139:case 57:case 58:case 59:valid=true;break;case 145:case 146:case 147:case 148:valid=v<=2;break;case 168:valid=v<=15;break;case 171:case 209:valid=v>=1 && v<=5;break;case 194:case 206:valid=v<=1;break;case 136:valid=v==1;break;
+                        // MULTISAMPLEANTIALIAS／MULTISAMPLEMASK：依文件只影響多重取樣目標，單取樣目標保存值即正確（可查詢、可由 state block 還原）。
+                        // 多重取樣目標上關閉反鋸齒或遮蔽樣本尚未接入 Metal 管線（已知限制）。
+                        case 161:valid=v<=1;break;case 162:valid=true;break;}require(valid,unavailable);object.render[key]=v;}
                 }else if(symbol=="SetFVF"){
                     if(u(1)){auto data=fvf_decl(u(1));auto decl=create(Kind::VertexDeclaration,object.root);decl->pixels=std::move(data);++decl->bound;drop_binding(object.vertex_declaration);object.vertex_declaration=decl->root;release(decl->root);object.fvf=u(1);}
                 }else if(symbol=="GetFVF"){require(arg(1)!=0);memory.store(GuestAddress{arg(1)},32,object.fvf);}
@@ -1073,6 +1114,8 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
         if(d3d9_local_call_)throw std::logic_error("D3D9 協調者本地服務不得啟動客體回呼");
         start_callbacks(state,memory,std::move(private_callbacks),Continuation::Return,result);return std::nullopt;
     }
+    // worker 繪製已放開映射共用鎖：不再讀客體堆疊，以持鎖時讀好的返回位址返回（x64，無堆疊參數）。
+    if(const auto& worker_release=detail::d3d9_worker_release();worker_release.released){state.rip=GuestAddress{worker_release.return_target};state.reg(Gpr::Rax)=result;state.reg(Gpr::Rsp)+=8;return std::nullopt;}
     arg.return_to(state,result);return std::nullopt;
 }
 }

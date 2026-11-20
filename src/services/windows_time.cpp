@@ -25,6 +25,7 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
         // 自其他群組遷入：處理函式在本檔。
         {"kernel32.dll", "QueryPerformanceCounter", 1},{"kernel32.dll", "QueryPerformanceFrequency", 1},{"kernel32.dll", "GetSystemTimeAsFileTime", 1},{"kernel32.dll", "GetTickCount", 0},
+        {"ntdll.dll","RtlCutoverTimeToSystemTime",4},
         {"vcomp140.dll","omp_get_wtime",0},{"vcomp140.dll","omp_get_wtick",0},
         {"crt","clock",0},
         {"crt","_ftime",1},{"crt","_ftime32",1},{"crt","_ftime64",1},
@@ -157,6 +158,26 @@ std::optional<std::int64_t> transition(SystemTime date,unsigned year){
     }
     return system_seconds(date);
 }
+// 固定日期直接換算；循環規則沿用時區轉換的「月份中第幾個星期幾」算法。
+std::optional<std::int64_t> cutover_time(const SystemTime& rule,std::int64_t current,bool this_year){
+    constexpr std::int64_t epoch=11644473600, ticks_per_second=10000000;
+    unsigned year=rule[0];
+    if(!year){
+        if(current<0)return {};
+        const auto stamp=static_cast<std::time_t>(current/ticks_per_second-epoch);
+        std::tm date{};
+        if(!::gmtime_r(&stamp,&date))return {};
+        year=static_cast<unsigned>(date.tm_year+1900);
+    }
+    const auto ticks=[&](unsigned candidate)->std::optional<std::int64_t>{
+        const auto seconds=transition(rule,candidate);
+        if(!seconds)return {};
+        return (*seconds+epoch)*ticks_per_second+rule[7]*INT64_C(10000);
+    };
+    const auto candidate=ticks(year);
+    if(!candidate || rule[0] || this_year || *candidate>=current)return candidate;
+    return ticks(year+1);
+}
 std::optional<std::int64_t> zone_local(std::int64_t utc,const Zone& zone){
     const auto standard=utc-(zone.bias+zone.standard_bias)*60;
     if(!zone.standard[1] && !zone.daylight[1])return utc-zone.bias*60;
@@ -174,6 +195,18 @@ void write_system_time(GuestMemory& memory,std::uint64_t address,const std::tm& 
 }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    if(service.symbol=="RtlCutoverTimeToSystemTime"){
+        const WindowsCall call(state,memory,service);
+        // TIME_FIELDS 的 Weekday 在最後一欄；SYSTEMTIME 的 Weekday 在 Day 前面。
+        const auto f=system_time(memory,call(0));
+        const SystemTime rule{f[0],f[1],f[7],f[2],f[3],f[4],f[5],f[6]};
+        const auto current=std::bit_cast<std::int64_t>(memory.load(GuestAddress{call(2)},64));
+        const auto candidate=cutover_time(rule,current,static_cast<std::uint8_t>(call(3))!=0);
+        if(candidate)memory.store(GuestAddress{call(1)},64,static_cast<std::uint64_t>(*candidate));
+        // 固定日期即使已經過去也寫入其絕對時間，並以 FALSE 回報。
+        call.return_to(state,candidate && (!rule[0] || *candidate>=current));
+        return std::nullopt;
+    }
     if(service.family=="vcomp140.dll"){
         const WindowsCall call(state,memory,service);
         const auto frequency=memory.load(GuestAddress{0x7ffe0300},64);

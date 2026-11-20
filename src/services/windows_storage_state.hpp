@@ -1,4 +1,5 @@
 #pragma once
+#include "property_set_stream.hpp"
 #include "x64arm/compound_file.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
@@ -67,6 +68,26 @@ struct StorageState {
         std::vector<Frame> frames{};std::vector<std::uint64_t> owned{};std::size_t index{};bool held{},move{},merge{};
         bool operator==(const Copy&)const=default;
     };
+    struct PropertyStat {
+        std::uint32_t id{};
+        std::uint16_t type{};
+        std::optional<std::u16string> name;
+        bool operator==(const PropertyStat&) const = default;
+    };
+    struct PropertyObject {
+        std::uint64_t backend{},container{};
+        std::uint32_t references{1}, flags{}, mode{};
+        bool collection{}, dirty{};
+        bool enumerator{};
+        size_t position{};
+        std::vector<PropertyStat> property_stats;
+        std::vector<std::array<std::uint8_t,64>> set_stats;
+        size_t section{};
+        property_set::Stream stream;
+        bool operator==(const PropertyObject&) const = default;
+    };
+    std::map<std::uint64_t,PropertyObject> properties;
+    std::array<std::uint64_t,4> property_tables{};
     std::map<std::uint64_t,Document> documents;std::map<std::uint64_t,View> views;std::map<std::uint64_t,Object> objects;
     std::map<std::uint64_t,Operation> operations;std::map<std::uint64_t,Copy> copies;
     std::array<std::uint64_t,3> tables{};std::uint64_t next_document{1},next_view{1},next_operation{1};

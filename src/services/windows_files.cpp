@@ -874,7 +874,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
             else if(std::any_of(files_.begin(),files_.end(),[&](const auto& entry){return !entry.second.native && entry.second.key==info.key && !(entry.second.sharing&4U);}))error=32;
             else if(moving) {
                 const bool progress=symbol.starts_with("MoveFileWithProgress");
-                const auto flags_value=progress?u32(4):symbol.starts_with("MoveFileEx")?u32(2):0;
+                // MoveFileA/W 預設允許跨磁碟複製，CRT rename 仍只允許同磁碟改名。
+                const bool basic_move=symbol=="MoveFileA" || symbol=="MoveFileW";
+                const auto flags_value=progress?u32(4):symbol.starts_with("MoveFileEx")?u32(2):basic_move?2U:0U;
                 if(flags_value&~11U)error=50;
                 else {
                     const auto destination=path(1);const auto target=filesystem_.information(destination);

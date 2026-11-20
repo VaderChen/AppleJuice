@@ -1,3 +1,5 @@
+#include "vidpn_ownership.hpp"
+#include "windows_display_identity.hpp"
 // D3DKMT 配置與資源共享家族（gdi32）：CreateAllocation(2)／DestroyAllocation(2)、QueryResourceInfo(FromNtHandle)、
 // OpenResource(2)／OpenResourceFromNtHandle、ShareObjects、OpenNtHandleFromName、OpenSyncObjectFromNtHandle(2)、
 // OpenSyncObjectNtHandleFromName、OpenKeyedMutexFromNtHandle 與 Escape。
@@ -47,6 +49,12 @@ std::vector<std::uint8_t> read_private(const GuestMemory& memory,std::uint64_t p
 }
 std::span<const WindowsServiceDescriptor> d3dkmt_resource_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"win32u.dll","NtGdiDdDDICreatePagingQueue",1},{"win32u.dll","NtGdiDdDDIDestroyPagingQueue",1},
+        {"win32u.dll","NtGdiDdDDIOfferAllocations",1},{"win32u.dll","NtGdiDdDDIReclaimAllocations",1},
+        {"win32u.dll","NtGdiDdDDIReclaimAllocations2",1},{"win32u.dll","NtGdiDdDDIQueryAllocationResidency",1},
+        {"win32u.dll","NtGdiDdDDIGetAllocationPriority",1},{"win32u.dll","NtGdiDdDDISetAllocationPriority",1},
+        {"gdi32.dll","D3DKMTGetSharedResourceAdapterLuid",1},
+        {"gdi32.dll","D3DKMTDestroyDevice",1},
         {"gdi32.dll","D3DKMTCreateAllocation",1},{"gdi32.dll","D3DKMTCreateAllocation2",1},{"gdi32.dll","D3DKMTDestroyAllocation",1},{"gdi32.dll","D3DKMTDestroyAllocation2",1},
         {"gdi32.dll","D3DKMTQueryResourceInfo",1},{"gdi32.dll","D3DKMTQueryResourceInfoFromNtHandle",1},
         {"gdi32.dll","D3DKMTOpenResource",1},{"gdi32.dll","D3DKMTOpenResource2",1},{"gdi32.dll","D3DKMTOpenResourceFromNtHandle",1},
@@ -70,20 +78,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3dkmt_resource(GuestState&
         const auto& resource=gui_.kmt_resources.at(object);
         const auto count=static_cast<std::uint32_t>(memory.load(GuestAddress{p+f.count},32));
         if(count!=resource.allocations.size() || (count && !memory.load(GuestAddress{p+f.info},bits)))return kmt_invalid;
-        const auto copy=[&](std::uint64_t pointer_at,std::uint64_t size_at,const std::vector<std::uint8_t>& data)->bool{
-            const auto pointer=memory.load(GuestAddress{p+pointer_at},bits),size=memory.load(GuestAddress{p+size_at},32);
-            if(data.empty())return true;if(!pointer || size<data.size())return false;memory.write(GuestAddress{pointer},data);return true;
+        const auto runtime=memory.load(GuestAddress{p+f.runtime},bits),driver=memory.load(GuestAddress{p+f.driver},bits);
+        const auto fits=[&](std::uint64_t buffer,std::uint64_t size_at,std::size_t required){
+            if(!required)return true;
+            if(!buffer || memory.load(GuestAddress{p+size_at},32)<required)return false;
+            memory.check(GuestAddress{buffer},required,Access::Write);return true;
         };
-        if(!copy(f.runtime,f.runtime_size,resource.runtime_data) || !copy(f.driver,f.driver_size,resource.driver_data))return kmt_too_small;
-        const auto total=std::accumulate(resource.allocations.begin(),resource.allocations.end(),std::uint64_t{},[](auto sum,const auto& item){return sum+item.size();});
+        const auto total=std::accumulate(resource.allocations.begin(),resource.allocations.end(),std::size_t{},[](auto sum,const auto& item){return sum+item.size();});
         const auto buffer=memory.load(GuestAddress{p+f.total},bits);
-        if(total && (!buffer || memory.load(GuestAddress{p+f.total_size},32)<total))return kmt_too_small;
+        if(!fits(runtime,f.runtime_size,resource.runtime_data.size()) || !fits(driver,f.driver_size,resource.driver_data.size()) ||
+            !fits(buffer,f.total_size,total))return kmt_too_small;
         const auto info=memory.load(GuestAddress{p+f.info},bits);const auto stride=f.second?(x86_?48U:80U):(x86_?12U:24U);
+        if(count)memory.check(GuestAddress{info},std::size_t{count}*stride,Access::Write);
+        memory.check(GuestAddress{p+f.resource},4,Access::Write);
+        if(!resource.runtime_data.empty())memory.write(GuestAddress{runtime},resource.runtime_data);
+        if(!resource.driver_data.empty())memory.write(GuestAddress{driver},resource.driver_data);
         const auto local=new_handle();gui_.kmt_resource_handles.emplace(local,std::pair{device,object});
         std::uint64_t cursor=buffer;
         for(std::uint32_t i=0;i<count;++i){
             const auto entry=info+i*stride;const auto handle=new_handle();const auto& data=resource.allocations[i];
-            gui_.kmt_allocations.emplace(handle,GuiState::KmtAllocation{device,object,data,resource.allocation_ids[i],false});
+            auto& allocation=gui_.kmt_allocations.emplace(handle,GuiState::KmtAllocation{device,object,data,resource.allocation_ids[i],false}).first->second;
+            if(auto it=resource.backings.find(allocation.entry);it!=resource.backings.end())allocation.backing=it->second;
             memory.store(GuestAddress{entry},32,handle);memory.store(GuestAddress{entry+unit},bits,data.empty()?0:cursor);memory.store(GuestAddress{entry+2*unit},32,data.size());
             if(f.second)memory.store(GuestAddress{entry+(x86_?16U:24U)},64,0); // 沒有 GPU 虛擬位址空間。
             if(!data.empty()){memory.write(GuestAddress{cursor},data);cursor+=data.size();}
@@ -140,7 +155,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3dkmt_resource(GuestState&
                         blob.runtime=item.runtime_data;blob.driver=item.driver_data;blob.allocations=item.allocations;
                     }else if(const auto mutex=gui_.kmt_mutex_handles.find(handle);mutex!=gui_.kmt_mutex_handles.end() && !(blob.flags&2U)){
                         blob.flags|=2U;blob.mutex=mutex->second;blob.mutex_data=gui_.kmt_mutexes.at(mutex->second).private_data;
-                    }else if(const auto sync=gui_.kmt_sync_handles.find(handle);sync!=gui_.kmt_sync_handles.end() && !(blob.flags&4U)){blob.flags|=4U;blob.sync=sync->second;}
+                    }else if(const auto sync=gui_.kmt_sync_handles.find(handle);sync!=gui_.kmt_sync_handles.end() && !(blob.flags&4U) && !gui_.kmt_sync_objects.at(sync->second).paging){blob.flags|=4U;blob.sync=sync->second;}
                     else co_return finish(kmt_invalid);
                 }
                 if((blob.flags&2U) && !(blob.flags&1U))co_return finish(kmt_invalid); // keyed mutex 只能與資源一起共用。
@@ -158,6 +173,182 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3dkmt_resource(GuestState&
     const WindowsCall call(state,memory,service);const auto finish=[&](std::uint32_t status){call.return_to(state,status);return std::optional<std::uint32_t>{};};
     const auto p=call(0);if(!p)return finish(kmt_invalid);
     try{
+        const auto backed=[&](const GuiState::KmtBacking& b){return b.section || (b.address && memory.mapped(GuestAddress{b.address}));};
+        const auto close_queue=[&](const GuiState::KmtPagingQueue& queue){
+            const auto object=gui_.kmt_sync_handles.at(queue.sync);
+            const auto address=gui_.kmt_sync_objects.at(object).cpu_address;
+            (void)nested_service(state,memory,"kernel32.dll","VirtualFree",{address,0,0x8000});
+            gui_.kmt_sync_handles.erase(queue.sync);
+            gui_.kmt_sync_objects.erase(object);
+            kmt_wake_waiters(state,memory);
+        };
+        if(name=="NtGdiDdDDICreatePagingQueue"){
+            const auto device=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));
+            const auto priority=static_cast<std::int32_t>(memory.load(GuestAddress{p+4},32));
+            if(!gui_.kmt_devices.contains(device) || priority< -1 || priority>1 || memory.load(GuestAddress{p+16+unit},32))return finish(kmt_invalid);
+            memory.check(GuestAddress{p+8},8+unit,Access::Write);
+            if(gui_.kmt_sync_handles.size()>=4096)return finish(kmt_no_memory);
+            const auto address=nested_service(state,memory,"kernel32.dll","VirtualAlloc",{0,4096,0x3000,2});
+            if(!address)return finish(kmt_no_memory);
+            const auto object=gui_.next_kmt_object++;
+            const auto fence=new_handle();
+            const auto handle=new_handle();
+            GuiState::KmtSync sync;sync.type=5;sync.device=device;sync.cpu_address=address;sync.paging=true;
+            gui_.kmt_sync_objects.emplace(object,sync);
+            gui_.kmt_sync_handles.emplace(fence,object);
+            gui_.kmt_paging_queues.emplace(handle,GuiState::KmtPagingQueue{device,fence,priority});
+            memory.store(GuestAddress{p+8},32,handle);memory.store(GuestAddress{p+12},32,fence);
+            memory.store(GuestAddress{p+16},bits,address);return finish(kmt_ok);
+        }
+        if(name=="NtGdiDdDDIDestroyPagingQueue"){
+            const auto q=gui_.kmt_paging_queues.find(static_cast<std::uint32_t>(memory.load(GuestAddress{p},32)));
+            if(q==gui_.kmt_paging_queues.end())return finish(kmt_invalid);
+            close_queue(q->second);gui_.kmt_paging_queues.erase(q);return finish(kmt_ok);
+        }
+        if(name=="NtGdiDdDDIOfferAllocations" || name.starts_with("NtGdiDdDDIReclaimAllocations")){
+            const bool offer=name=="NtGdiDdDDIOfferAllocations",second=name.ends_with('2');
+            auto device=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));
+            if(second){
+                const auto q=gui_.kmt_paging_queues.find(device);
+                if(q==gui_.kmt_paging_queues.end())return finish(kmt_invalid);
+                device=q->second.device;
+            }
+            const auto owner=gui_.kmt_devices.find(device);
+            if(owner==gui_.kmt_devices.end())return finish(kmt_invalid);
+            const auto base=p+(second?8:unit);
+            const auto resources=memory.load(GuestAddress{base},bits),allocations=memory.load(GuestAddress{base+unit},bits);
+            const auto count=memory.load(GuestAddress{second?p+4:base+(offer?2:3)*unit},32);
+            if(!count || bool(resources)==bool(allocations))return finish(kmt_invalid);
+            const auto list=resources?resources:allocations;
+            memory.check(GuestAddress{list},count*4,Access::Read);
+            std::uint32_t priority{},flags{};
+            if(offer){
+                priority=static_cast<std::uint32_t>(memory.load(GuestAddress{base+2*unit+4},32));
+                flags=static_cast<std::uint32_t>(memory.load(GuestAddress{base+2*unit+8},32));
+                if(!priority || priority>4 || (flags&~3U))return finish(kmt_invalid);
+            }
+            const auto output=offer?0:memory.load(GuestAddress{base+2*unit},bits);
+            if(output)memory.check(GuestAddress{output},count*4,Access::Write);
+            const auto fence=p+(x86_?24U:32U);
+            if(second)memory.check(GuestAddress{fence},8,Access::Write);
+            auto& offers=owner->second.offers;
+            std::map<std::uint64_t,GuiState::KmtOffer> batch;
+            std::vector<std::uint32_t> results;
+            for(std::uint64_t i=0;i<count;++i){
+                std::uint32_t result=0;
+                const auto add=[&](std::uint64_t id,bool resident){
+                    const auto old=offers.find(id);
+                    if(offer!=(old==offers.end()))return false;
+                    if(!offer && old->second.backed && !resident)
+                        result=std::max(result,second && (old->second.flags&2U)?2U:1U);
+                    batch.emplace(id,GuiState::KmtOffer{priority,flags,resident});
+                    return true;
+                };
+                const auto handle=static_cast<std::uint32_t>(memory.load(GuestAddress{list+4*i},32));
+                if(resources){
+                    const auto it=gui_.kmt_resource_handles.find(handle);
+                    if(it==gui_.kmt_resource_handles.end() || it->second.first!=device)return finish(kmt_invalid);
+                    const auto& resource=gui_.kmt_resources.at(it->second.second);
+                    if(resource.allocation_ids.empty())return finish(kmt_invalid);
+                    for(const auto id:resource.allocation_ids){
+                        const auto b=resource.backings.find(id);
+                        if(!add(id,b!=resource.backings.end() && backed(b->second)))return finish(kmt_invalid);
+                    }
+                }else{
+                    const auto it=gui_.kmt_allocations.find(handle);
+                    if(it==gui_.kmt_allocations.end() || it->second.device!=device || !add(it->second.entry,backed(it->second.backing)))return finish(kmt_invalid);
+                }
+                if(output)results.push_back(result);
+            }
+            if(offer)offers.merge(batch);
+            else{
+                for(const auto& item:batch)offers.erase(item.first);
+                for(std::size_t i=0;i<results.size();++i)memory.store(GuestAddress{output+4*i},32,results[i]);
+                // 本機取回同步完成，呼叫端無須等待後續分頁工作。
+                if(second)memory.store(GuestAddress{fence},64,0);
+            }
+            return finish(kmt_ok);
+        }
+        const bool residency=name=="NtGdiDdDDIQueryAllocationResidency";
+        if(residency || name=="NtGdiDdDDIGetAllocationPriority" || name=="NtGdiDdDDISetAllocationPriority"){
+            const auto device=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));
+            const auto resource=static_cast<std::uint32_t>(memory.load(GuestAddress{p+4},32));
+            const auto list=memory.load(GuestAddress{p+8},bits);
+            const auto count=memory.load(GuestAddress{p+8+unit},32);
+            const auto buffer=memory.load(GuestAddress{p+8+2*unit},bits);
+            if(!gui_.kmt_devices.contains(device) || !buffer)return finish(kmt_invalid);
+            // 同一程序再次開啟資源時會產生新的 handle，優先權隨配置識別碼共用。
+            struct Target { GuiState::KmtResource* resource; std::uint64_t entry; GuiState::KmtAllocation* standalone; };
+            std::vector<Target> targets;
+            if(resource){
+                const auto handle=gui_.kmt_resource_handles.find(resource);
+                if(list || count || handle==gui_.kmt_resource_handles.end() || handle->second.first!=device)return finish(kmt_invalid);
+                auto& object=gui_.kmt_resources.at(handle->second.second);
+                for(const auto entry:object.allocation_ids)targets.push_back({&object,entry,nullptr});
+                if(targets.empty())return finish(kmt_invalid);
+            }else{
+                if(!list || !count)return finish(kmt_invalid);
+                memory.check(GuestAddress{list},count*4,Access::Read);
+                for(std::uint64_t i=0;i<count;++i){
+                    const auto it=gui_.kmt_allocations.find(static_cast<std::uint32_t>(memory.load(GuestAddress{list+i*4},32)));
+                    if(it==gui_.kmt_allocations.end() || it->second.device!=device)return finish(kmt_invalid);
+                    auto& allocation=it->second;
+                    targets.push_back({allocation.resource?&gui_.kmt_resources.at(allocation.resource):nullptr,allocation.entry,&allocation});
+                }
+            }
+            const bool set=name=="NtGdiDdDDISetAllocationPriority";
+            const auto values=resource?1:count;
+            memory.check(GuestAddress{buffer},values*4,set?Access::Read:Access::Write);
+            if(residency){
+                std::uint32_t worst=0;
+                for(std::size_t i=0;i<targets.size();++i){
+                    const auto& target=targets[i];
+                    const GuiState::KmtBacking* backing=nullptr;
+                    if(target.standalone)backing=&target.standalone->backing;
+                    else if(auto it=target.resource->backings.find(target.entry);it!=target.resource->backings.end())backing=&it->second;
+                    // KMT 以既有區段或客體映射作共享記憶體；僅有驅動描述的配置沒有 GPU backing。
+                    const bool shared=backing && backed(*backing);
+                    const auto status=shared?2U:3U;
+                    if(resource)worst=std::max(worst,status);
+                    else memory.store(GuestAddress{buffer+i*4},32,status);
+                }
+                if(resource)memory.store(GuestAddress{buffer},32,worst);
+                return finish(kmt_ok);
+            }
+            for(std::size_t i=0;i<(set?targets.size():values);++i){
+                const auto& target=targets[i];
+                const GuestAddress address{buffer+(resource?0:i*4)};
+                if(set){
+                    const auto priority=static_cast<std::uint32_t>(memory.load(address,32));
+                    if(target.resource)target.resource->priorities[target.entry]=priority;
+                    else target.standalone->priority=priority;
+                }else if(target.resource){
+                    const auto it=target.resource->priorities.find(target.entry);
+                    memory.store(address,32,it==target.resource->priorities.end()?0x78000000U:it->second);
+                }else memory.store(address,32,target.standalone->priority);
+            }
+            return finish(kmt_ok);
+        }
+        if(name=="D3DKMTDestroyDevice"){
+            const auto device=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));
+            if(!gui_.kmt_devices.contains(device))return finish(kmt_invalid);
+            std::set<std::uint64_t> resources;
+            for(const auto& [handle,owner]:gui_.kmt_resource_handles)
+                if(owner.first==device)resources.insert(owner.second);
+            std::erase_if(gui_.kmt_resource_handles,[&](const auto& item){return item.second.first==device;});
+            std::erase_if(gui_.kmt_allocations,[&](const auto& item){return item.second.device==device;});
+            for(const auto object:resources)release_resource(object);
+            if(gui_.kmt_vidpn_owner==device){
+                std::uint32_t previous{};
+                vidpn_ownership(gui_,processes_ && runtime_.network.external_io?mapping_session():std::string{},process_id(),process_id(),device,0,previous);
+            }
+            std::erase_if(gui_.kmt_paging_queues,[&](const auto& item){
+                if(item.second.device!=device)return false;
+                close_queue(item.second);return true;
+            });
+            gui_.kmt_devices.erase(device);
+            return finish(kmt_ok);
+        }
         if(name=="D3DKMTOpenSyncObjectFromNtHandle" || name=="D3DKMTOpenSyncObjectFromNtHandle2"){
             // 1 版 {hNtHandle, hSyncObject}；2 版 {hNtHandle, hDevice, Flags, hSyncObject, MonitoredFence{CPU 位址, GPU 位址, EngineAffinity}}。
             const bool second=name.ends_with('2');const auto blob=read_share(state,memory,memory.load(GuestAddress{p},bits));
@@ -173,9 +364,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3dkmt_resource(GuestState&
             // {hNtHandle, hKeyedMutex（輸出）, pPrivateRuntimeData, PrivateRuntimeDataSize}。
             const auto blob=read_share(state,memory,memory.load(GuestAddress{p},bits));
             if(!blob || !(blob->flags&2U) || blob->pid!=process_id() || !gui_.kmt_mutexes.contains(blob->mutex))return finish(kmt_invalid);
-            const auto& data=gui_.kmt_mutexes.at(blob->mutex).private_data;const auto buffer=memory.load(GuestAddress{p+2*unit},bits);
-            if(!data.empty() && buffer){if(memory.load(GuestAddress{p+3*unit},32)<data.size())return finish(kmt_too_small);memory.write(GuestAddress{buffer},data);}
+            auto& initial=gui_.kmt_mutexes.at(blob->mutex).private_data;
+            const auto buffer=memory.load(GuestAddress{p+2*unit},bits),size=memory.load(GuestAddress{p+3*unit},32);
+            if(size>65536 || (size && !buffer))return finish(kmt_invalid);
+            if(gui_.kmt_sync_handles.size()+gui_.kmt_mutex_handles.size()>=4096)return finish(kmt_no_memory);
+            memory.check(GuestAddress{p+unit},4,Access::Write);
+            if(initial.empty() && size)initial=read_private(memory,buffer,size);
             const auto handle=new_handle();gui_.kmt_mutex_handles.emplace(handle,blob->mutex);memory.store(GuestAddress{p+unit},32,handle);return finish(kmt_ok);
+        }
+        if(name=="D3DKMTGetSharedResourceAdapterLuid"){
+            const auto global=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));
+            const auto nt=memory.load(GuestAddress{p+unit},bits);
+            if(bool(global)==bool(nt))return finish(kmt_invalid);
+            if(global){
+                if(!gui_.kmt_resource_shared.contains(global))return finish(kmt_invalid);
+            }else{
+                const auto blob=read_share(state,memory,nt);
+                if(!blob || !(blob->flags&1U) || !blob->resource)return finish(kmt_invalid);
+            }
+            memory.store(GuestAddress{p+2*unit},64,display_identity::adapter_luid);
+            return finish(kmt_ok);
         }
         if(name=="D3DKMTQueryResourceInfoFromNtHandle"){
             // {hDevice, hNtHandle, pPrivateRuntimeData, PrivateRuntimeDataSize, TotalPrivateDriverDataSize, ResourcePrivateDriverDataSize, NumAllocations}。
@@ -216,9 +424,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3dkmt_resource(GuestState&
             if(resource_handle){const auto found=gui_.kmt_resource_handles.find(resource_handle);if(found==gui_.kmt_resource_handles.end() || found->second.first!=device)return finish(kmt_invalid);object=found->second.second;}
             const auto stride=second?(x86_?56U:96U):(x86_?24U:40U);
             std::vector<std::vector<std::uint8_t>> data;data.reserve(count);
+            std::vector<std::uint32_t> priorities(count,0x78000000U);
+            std::vector<GuiState::KmtBacking> backings(count);
             for(std::uint32_t i=0;i<count;++i){const auto entry=info+i*stride;
-                if(system_memory && !memory.load(GuestAddress{entry+unit},bits))return finish(kmt_invalid);
+                const auto backing=memory.load(GuestAddress{entry+unit},bits);
+                if(flags&0x20000U){
+                    if(!second || !(backings[i].section=retain_mapping_object(backing)))return finish(kmt_invalid);
+                }else{
+                    if((system_memory && !backing) || (backing && !memory.mapped(GuestAddress{backing})))return finish(kmt_invalid);
+                    backings[i].address=backing;
+                }
+                if(second && (memory.load(GuestAddress{entry+(x86_?20U:32U)},32)&4U))
+                    priorities[i]=static_cast<std::uint32_t>(memory.load(GuestAddress{entry+(x86_?32U:48U)},32));
                 data.push_back(read_private(memory,memory.load(GuestAddress{entry+2*unit},bits),memory.load(GuestAddress{entry+3*unit},32)));}
+            memory.check(GuestAddress{p+4},8,Access::Write);
+            for(std::uint32_t i=0;i<count;++i){
+                const auto entry=info+i*stride;
+                memory.check(GuestAddress{entry},4,Access::Write);
+                if(second)memory.check(GuestAddress{entry+(x86_?24U:40U)},8,Access::Write);
+            }
             if(create_resource){
                 GuiState::KmtResource resource;resource.runtime_data=read_private(memory,memory.load(GuestAddress{at(12,16)},bits),memory.load(GuestAddress{at(16,24)},32));
                 if(!standard)resource.driver_data=read_private(memory,memory.load(GuestAddress{at(20,32)},bits),memory.load(GuestAddress{at(24,40)},32));
@@ -227,8 +451,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3dkmt_resource(GuestState&
             }
             std::uint32_t share=0;if(shared && !nt_sharing){share=new_handle();gui_.kmt_resource_shared.emplace(share,object);}
             for(std::uint32_t i=0;i<count;++i){
-                const auto handle=new_handle();const auto entry=gui_.next_kmt_object++;gui_.kmt_allocations.emplace(handle,GuiState::KmtAllocation{device,object,data[i],entry,true});
-                if(object){auto& resource=gui_.kmt_resources.at(object);resource.allocations.push_back(data[i]);resource.allocation_ids.push_back(entry);}
+                const auto handle=new_handle();const auto entry=gui_.next_kmt_object++;gui_.kmt_allocations.emplace(handle,GuiState::KmtAllocation{device,object,data[i],entry,true,priorities[i],backings[i]});
+                if(object){auto& resource=gui_.kmt_resources.at(object);resource.allocations.push_back(data[i]);resource.allocation_ids.push_back(entry);
+                    if(backings[i].address || backings[i].section)resource.backings.emplace(entry,backings[i]);
+                    if(priorities[i]!=0x78000000U)resource.priorities.emplace(entry,priorities[i]);}
                 memory.store(GuestAddress{info+i*stride},32,handle);
                 if(second)memory.store(GuestAddress{info+i*stride+(x86_?24U:40U)},64,0);
             }
@@ -239,17 +465,33 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3dkmt_resource(GuestState&
             const auto device=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32)),resource_handle=static_cast<std::uint32_t>(memory.load(GuestAddress{p+4},32));
             const std::uint64_t list=memory.load(GuestAddress{p+8},bits);const auto count=static_cast<std::uint32_t>(memory.load(GuestAddress{p+8+unit},32));
             if(!gui_.kmt_devices.contains(device) || (count && !list) || (!count && !resource_handle))return finish(kmt_invalid);
+            const auto resource_it=gui_.kmt_resource_handles.find(resource_handle);
+            if(resource_handle && (resource_it==gui_.kmt_resource_handles.end() || resource_it->second.first!=device))return finish(kmt_invalid);
             for(std::uint32_t i=0;i<count;++i){const auto found=gui_.kmt_allocations.find(static_cast<std::uint32_t>(memory.load(GuestAddress{list+i*4},32)));
                 if(found==gui_.kmt_allocations.end() || found->second.device!=device)return finish(kmt_invalid);}
             for(std::uint32_t i=0;i<count;++i){
                 const auto found=gui_.kmt_allocations.find(static_cast<std::uint32_t>(memory.load(GuestAddress{list+i*4},32)));if(found==gui_.kmt_allocations.end())continue;
                 if(found->second.owner && found->second.resource)if(const auto resource=gui_.kmt_resources.find(found->second.resource);resource!=gui_.kmt_resources.end()){
                     auto& ids=resource->second.allocation_ids;if(const auto at=std::find(ids.begin(),ids.end(),found->second.entry);at!=ids.end()){
+                        resource->second.backings.erase(*at);resource->second.priorities.erase(*at);
                         resource->second.allocations.erase(resource->second.allocations.begin()+(at-ids.begin()));ids.erase(at);}}
                 gui_.kmt_allocations.erase(found);
             }
-            if(resource_handle){const auto found=gui_.kmt_resource_handles.find(resource_handle);if(found==gui_.kmt_resource_handles.end() || found->second.first!=device)return finish(kmt_invalid);
-                const auto object=found->second.second;gui_.kmt_resource_handles.erase(found);release_resource(object);}
+            if(resource_handle){
+                const auto object=resource_it->second.second;gui_.kmt_resource_handles.erase(resource_it);release_resource(object);
+            }
+            auto& offers=gui_.kmt_devices.at(device).offers;
+            if(!offers.empty()){
+                std::set<std::uint64_t> live;
+                for(const auto& [handle,allocation]:gui_.kmt_allocations)
+                    if(allocation.device==device)live.insert(allocation.entry);
+                for(const auto& [handle,local]:gui_.kmt_resource_handles)
+                    if(local.first==device){
+                        const auto& ids=gui_.kmt_resources.at(local.second).allocation_ids;
+                        live.insert(ids.begin(),ids.end());
+                    }
+                std::erase_if(offers,[&](const auto& pair){return !live.contains(pair.first);});
+            }
             return finish(kmt_ok);
         }
         if(name=="D3DKMTQueryResourceInfo"){

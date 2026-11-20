@@ -60,11 +60,20 @@ struct ConsoleBuffer : ConsoleSnapshot {
     std::uint32_t input_codepage{65001},output_codepage{65001};
     std::string output_codepage_pending;
     bool eof{};std::u16string edited_line,echo_input;
+    std::size_t edit_tail{}; // 游標右側的 UTF-16 單位數
     std::u16string original_title{title};
     // 別名與命令歷程依執行檔名稱分組（名稱不分大小寫）；歷程只記錄行輸入模式送出的非空命令。
     struct Alias {std::u16string source,target;};
     struct AliasTable {std::u16string exe;std::vector<Alias> entries;};
-    struct History {std::u16string exe;std::deque<std::u16string> commands;};
+    struct History {
+        std::u16string exe;
+        std::deque<std::u16string> commands;
+        std::uint32_t capacity;
+        void resize(std::uint32_t size){
+            if(commands.size()>size)commands.resize(size);
+            capacity=size;
+        }
+    };
     std::vector<AliasTable> aliases;std::vector<History> histories;
     std::uint32_t history_size{50},history_buffers{4},history_flags{};
     void resize(std::uint16_t,std::uint16_t,bool preserve_viewport=false);

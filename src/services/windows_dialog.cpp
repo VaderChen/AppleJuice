@@ -98,7 +98,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_dialog(GuestState& stat
         }
         if(msg.message==0x100 && !(value&4U)){
             if(msg.wparam==9 && !(value&2U)){
-                start_callbacks(state,memory,{{resolve("user32.dll","GetNextDlgTabItem").value,{root,navigation_source(),(gui_.keyboard[16]&128U)!=0}}},Continuation::GuiDialogProc,4U|wide);return std::nullopt;
+                start_callbacks(state,memory,{{resolve("user32.dll","GetNextDlgTabItem").value,{root,navigation_source(),(threads_.input_queue(threads_.current).keys[16]&128U)!=0}}},Continuation::GuiDialogProc,4U|wide);return std::nullopt;
             }
             if(msg.wparam>=37 && msg.wparam<=40 && !(value&1U)){
                 start_callbacks(state,memory,{{resolve("user32.dll","GetNextDlgGroupItem").value,{root,navigation_source(),msg.wparam==37 || msg.wparam==38}}},Continuation::GuiDialogProc,4U|wide);return std::nullopt;
@@ -147,7 +147,8 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_dialog(GuestState& stat
 }
 
 std::optional<std::uint32_t> WindowsServices::invoke_gui_dialog(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');
+    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
+    const bool wide=symbol.ends_with("AorW") ? static_cast<std::uint32_t>(arg(5))==0 : symbol.ends_with('W');
     if(symbol.starts_with("IsDialogMessage")){
         if(!arg(1) || !gui_.windows.contains(arg(0))){arg.return_to(state,0);return std::nullopt;}
         const auto msg=gui_read_message(memory,arg(1));
@@ -181,7 +182,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_dialog(GuestState& stat
         DialogReader reader(memory,begin,size);const auto first=reader.number(2),second=reader.number(2);const bool extended=second==65535;
         GuiWindow window;window.dpi_context=effective_dpi_context();window.thread=threads_.current;window.dialog=true;window.modal=modal;window.instance=arg(0)?arg(0):runtime_.image.base;
         window.owner=arg(2);window.dialog_proc=arg(3);window.font=0xb011;
-        if(extended){if(first!=1)throw DialogFailure{13};(void)reader.number(4);window.ex_style=static_cast<std::uint32_t>(reader.number(4));window.style=static_cast<std::uint32_t>(reader.number(4));}
+        if(extended){if(first!=1)throw DialogFailure{13};window.context_help_id=static_cast<std::uint32_t>(reader.number(4));window.ex_style=static_cast<std::uint32_t>(reader.number(4));window.style=static_cast<std::uint32_t>(reader.number(4));}
         else {window.style=static_cast<std::uint32_t>(first|(second<<16));window.ex_style=static_cast<std::uint32_t>(reader.number(4));}
         const auto count=reader.number(2);if(count>=4096 || gui_.windows.size()>4095-count)throw DialogFailure{8};
         window.x=reader.coordinate();window.y=reader.coordinate();window.width=reader.dimension();window.height=reader.dimension();
@@ -216,7 +217,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_dialog(GuestState& stat
         plans.back().class_pointer=cls.ordinal?std::optional<std::uint64_t>{*cls.ordinal}:std::nullopt;
         for(std::uint64_t i=0;i<count;++i){
             reader.align();GuiWindow child;child.dpi_context=effective_dpi_context();child.thread=threads_.current;child.parent=handle;child.instance=plans.front().window.instance;child.font=plans.front().window.font;
-            if(extended){(void)reader.number(4);child.ex_style=static_cast<std::uint32_t>(reader.number(4));child.style=static_cast<std::uint32_t>(reader.number(4));}
+            if(extended){child.context_help_id=static_cast<std::uint32_t>(reader.number(4));child.ex_style=static_cast<std::uint32_t>(reader.number(4));child.style=static_cast<std::uint32_t>(reader.number(4));}
             else {child.style=static_cast<std::uint32_t>(reader.number(4));child.ex_style=static_cast<std::uint32_t>(reader.number(4));}
             child.style|=0x40000000;child.x=reader.coordinate();child.y=reader.coordinate();child.width=reader.dimension();child.height=reader.dimension();child.id=reader.number(extended?4:2);
             if((plans.front().window.ex_style&0x500000U)==0x400000U)child.ex_style|=0x400000U;

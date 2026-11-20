@@ -62,7 +62,7 @@ inline bool serial_definition(std::string text,std::array<std::uint8_t,28>& dcb,
             ++column;if(separator==std::string_view::npos)break;input=input.substr(separator+1);
         }
     }
-    if(baud110 && !stop_set)next[20]=2;
+    if(!stop_set)next[20]=baud110?2:0;
     const std::uint32_t length=28;std::memcpy(next.data(),&length,4);std::memcpy(next.data()+8,&flags,4);
     dcb=next;timeout=next_timeout;return true;
 }

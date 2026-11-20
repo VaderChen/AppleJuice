@@ -14,18 +14,19 @@ bool MetalGl::graphics_vertex_format_supported(std::uint32_t format){
 static bool graphics_format_integer_msaa(std::uint32_t format){
     switch(format){case 3:case 4:case 12:case 14:case 17:case 18:case 25:case 30:case 32:case 36:case 38:case 42:case 43:case 50:case 52:case 57:case 59:case 62:case 64:return true;default:return false;}
 }
-bool MetalGl::graphics_samples_supported(std::uint32_t format,std::uint32_t samples){@autoreleasepool{
+static bool metal_samples_supported(id<MTLDevice> device,std::uint32_t format,std::uint32_t samples){@autoreleasepool{
     try{(void)metal_format(format);}catch(const std::invalid_argument&){return false;}
-    if(graphics_format_bc_family(format))return samples==1 && device_.supportsBCTextureCompression;
+    if(graphics_format_bc_family(format))return samples==1 && device.supportsBCTextureCompression;
     if(samples==1)return true;
     // D3D11 的固定樣本模式包含標準與中心兩種；能力查詢必須涵蓋兩者。
-    if(!device_.areProgrammableSamplePositionsSupported)return false;
+    if(!device.areProgrammableSamplePositionsSupported)return false;
     if(format==67 || (format>=5 && format<=8))return false;
     if(samples!=2 && samples!=4 && samples!=8)return false;
     // 整數格式可以多重取樣繪製與取樣（D3D11 FL11 必備）；只是不能 resolve，由 graphics_resolve 拒絕。
-    if(format==1 || format==2 || format==3 || format==4 || format==15 || format==16 || format==17 || format==18 || format==39 || format==41 || format==42 || format==43){if(@available(macOS 11.0,*)){if(!device_.supports32BitMSAA)return false;}else return false;}
-    return [device_ supportsTextureSampleCount:samples];
+    if(format==1 || format==2 || format==3 || format==4 || format==15 || format==16 || format==17 || format==18 || format==39 || format==41 || format==42 || format==43){if(@available(macOS 11.0,*)){if(!device.supports32BitMSAA)return false;}else return false;}
+    return [device supportsTextureSampleCount:samples];
 }}
+bool MetalGl::graphics_samples_supported(std::uint32_t format,std::uint32_t samples){return metal_samples_supported(device_,format,samples);}
 std::shared_ptr<GraphicsResource> MetalGl::graphics_buffer_alias(std::shared_ptr<void> owner,std::span<std::uint8_t> bytes){@autoreleasepool{
     // newBufferWithBytesNoCopy 要求宿主分頁對齊的位址與分頁倍數長度；共享儲存模式下 CPU 寫入不需另外標記。
     // 記憶體屬於呼叫端（客體同時映射），不另計 GPU 額度；不清零（呼叫端的記憶體內容即緩衝內容）。
@@ -50,7 +51,8 @@ std::shared_ptr<GraphicsResource> MetalGl::graphics_resource(const GraphicsResou
     if(d.dimension==1){
         if(metal_create_pool_enabled()){r->buffer=discard_pool_->take(static_cast<std::size_t>(size));r->recycle=discard_pool_;}
         if(!r->buffer){r->buffer=[device_ newBufferWithLength:size options:MTLResourceStorageModeShared];if(!r->buffer)throw std::bad_alloc{};}
-        std::memset(r->buffer.contents,0,size);
+        // 呼叫端會立即寫入的前段（initialized）不先清零，只清其餘部分（含頁對齊補齊）。
+        const auto filled=std::min<std::uint64_t>(d.initialized,size);std::memset(static_cast<std::uint8_t*>(r->buffer.contents)+filled,0,static_cast<std::size_t>(size-filled));
         if(metal_backing_generation_enabled()){r->backing=std::make_shared<MetalBufferBacking>();r->backing->buffer=r->buffer;r->backing->lease=r->lease;}}
     else {
         auto t=[MTLTextureDescriptor new];t.pixelFormat=metal_format(d.format);if(d.format==22 || d.format==47)t.pixelFormat=MTLPixelFormatDepth32Float_Stencil8;if(d.bind&0x40){if(d.format==39)t.pixelFormat=MTLPixelFormatDepth32Float;if(d.format==53)t.pixelFormat=MTLPixelFormatDepth16Unorm;}t.width=d.width;t.height=d.height;t.depth=d.depth;t.mipmapLevelCount=d.levels;t.arrayLength=d.dimension==4?1:d.layers;t.sampleCount=d.samples;
@@ -176,7 +178,12 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_shader_private(std::uint32_t s
     }
     return shared;
 }
-std::shared_ptr<GraphicsShader> MetalGl::graphics_shader_create(std::uint32_t stage,std::span<const std::uint8_t> bytes){@autoreleasepool{
+// D3D9 陰影取樣器變體：繪製端已依 PS 物件快取，這裡只在編譯鎖內建立（不進內容快取，避免與無陰影版本同鍵）。
+std::shared_ptr<GraphicsShader> MetalGl::graphics_legacy_shader_variant(std::uint32_t stage,std::span<const std::uint8_t> bytes,std::uint32_t shadow_samplers){
+    if(!shadow_samplers)return graphics_shader(stage,bytes);
+    const std::lock_guard compile(shader_compile_mutex_);return graphics_shader_create(stage,bytes,shadow_samplers);
+}
+std::shared_ptr<GraphicsShader> MetalGl::graphics_shader_create(std::uint32_t stage,std::span<const std::uint8_t> bytes,std::uint32_t shadow_samplers){@autoreleasepool{
     const std::lock_guard compile(shader_compile_mutex_);
     // stage 6 是僅含輸出簽章的 SO 轉送物件；實際資料由目前綁定的 VS 產生。
     if(stage==6){
@@ -184,7 +191,7 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_shader_create(std::uint32_t st
         auto shader=std::make_shared<MetalShader>();shader->stage=0;shader->serial=++shader_serial_;shader->bytecode.assign(bytes.begin(),bytes.end());return shader;
     }
     if(bytes.size()>=8 && (metal_word(bytes,0)>>16)==(stage==0?0xfffeU:0xffffU)){
-        auto translated=graphics_legacy_shader(stage,bytes);auto shader=std::make_shared<MetalShader>();shader->stage=stage;shader->serial=++shader_serial_;shader->source=std::move(translated.source);shader->bindings=std::move(translated.bindings);shader->inputs=std::move(translated.inputs);shader->bytecode.assign(bytes.begin(),bytes.end());
+        auto translated=graphics_legacy_shader(stage,bytes,shadow_samplers);auto shader=std::make_shared<MetalShader>();shader->stage=stage;shader->serial=++shader_serial_;shader->source=std::move(translated.source);shader->bindings=std::move(translated.bindings);shader->inputs=std::move(translated.inputs);shader->bytecode.assign(bytes.begin(),bytes.end());
         if(std::getenv("X64ARM_D3D9_CAPTURE_SURFACES"))if(const auto* folder=std::getenv("X64ARM_D3D9_CAPTURE_DIR");folder && *folder){std::filesystem::create_directories(folder);std::ofstream out(std::filesystem::path(folder)/("legacy-"+std::to_string(shader->serial)+"-stage-"+std::to_string(stage)+".metal"));out<<shader->source;}
         shader->writes_depth=stage==1 && shader->source.find("[[depth(")!=std::string::npos;
         NSError* error=nil;auto options=[MTLCompileOptions new];options.fastMathEnabled=NO;auto library=metal_library_with_source(device_,shader->source,options,&error);

@@ -13,11 +13,14 @@ bool windows_locale_name_valid(std::u16string_view name);
 // 與語言群組列舉共用已安裝的 NLS 目錄；bit 0 對應 LGRPID 1。
 std::uint32_t windows_nls_language_group_mask();
 // Shell 與 NLS 使用相同的語系排序；回傳負值、零或正值。
+bool windows_nls_contains(std::u16string text,std::u16string pattern,std::uint32_t id,std::uint32_t flags,bool prefix);
+bool windows_regex_search(std::u16string_view text,std::u16string_view pattern);
 std::optional<int> windows_nls_compare(std::u16string_view left,std::u16string_view right,
                                      std::uint32_t locale,std::uint32_t flags);
 std::optional<std::array<std::uint32_t,3>> windows_locale_digit_substitution(std::uint32_t locale);
 // CRT locale 物件與 Win32 NLS 共用名稱、LCID、碼頁及 lead／trail 分類。
 std::optional<CrtLocaleCategory> windows_crt_locale(std::u16string_view name);
+std::optional<CrtLocaleCategory> windows_nls_codepage(std::uint32_t codepage);
 std::optional<CrtLocaleCategory> windows_crt_codepage(std::uint32_t codepage);
 // 依 LCID 建立 CRT locale 類別（VC8～VC10 的 STL 以 LCID 識別 locale）；0 即 C locale。
 std::optional<CrtLocaleCategory> windows_crt_locale_id(std::uint32_t lcid);

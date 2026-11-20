@@ -1,3 +1,6 @@
+#include "gui_timing_layout.h"
+#include "mouse_move_history.hpp"
+#include "gui_cursor_bounds.hpp"
 #include "windows_input_layout.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_pointer.hpp"
@@ -17,7 +20,7 @@ std::span<const WindowsServiceDescriptor> input_service_descriptors(){
         {"user32.dll","ToAscii",5},{"user32.dll","ToAsciiEx",6},
         {"user32.dll","VkKeyScanA",1},{"user32.dll","VkKeyScanW",1},
         {"user32.dll","VkKeyScanExA",2},{"user32.dll","VkKeyScanExW",2},
-        {"user32.dll","RegisterHotKey",4},{"user32.dll","UnregisterHotKey",2},
+        {"user32.dll","ShellRegisterHotKey",5},{"user32.dll","RegisterHotKey",4},{"user32.dll","UnregisterHotKey",2},
         // 左右鍵對調（與 GetSystemMetrics(SM_SWAPBUTTON)、SPI_SETMOUSEBUTTONSWAP 共用狀態）與最近 64 筆滑鼠移動歷程。
         {"user32.dll","SwapMouseButton",1,0,0,0x1},{"user32.dll","GetMouseMovePointsEx",5,0,0,0x19}};
     return table;
@@ -72,6 +75,8 @@ void WindowsServices::observe_gui_key(GuiMessage& message,bool injected){
     if(message.wparam>=256)return;
     const bool down=message.message==0x100 || message.message==0x104;
     const auto vk=physical_key(static_cast<unsigned>(message.wparam),message.lparam),generic=generic_key(vk);
+    // 左右 Alt 的按下事件都會解除前景視窗鎖定。
+    if(down && generic==0x12)gui_.foreground_locked=false;
     const auto update=[&](unsigned key,bool pressed,bool toggle){
         auto& input=gui_.input_keyboard[key];const bool before=input&0x80;
         input=static_cast<std::uint8_t>((input&1U)^(toggle && pressed && !before?1U:0U));if(pressed)input|=0x80;
@@ -110,17 +115,33 @@ void WindowsServices::consume_gui_input(const GuiMessage& message){
             }
         }else if(kind==18){move.quit=true;move.quit_code=static_cast<std::uint32_t>(message.wparam);move.nested_end=true;}
     }
-    if(message.keyboard_snapshot){gui_.keyboard=*message.keyboard_snapshot;return;}
+    auto& queue=threads_.input_queue(threads_.current);
+    auto& keyboard=queue.keys;
+    if(message.keyboard_snapshot){
+        // 只套用實體狀態的變化，保留 SetKeyboardState 對其他按鍵的佇列設定。
+        const auto& physical=*message.keyboard_snapshot;
+        for(unsigned i=0;i<physical.size();++i){
+            const auto changed=static_cast<unsigned>(physical[i]^queue.last_physical[i]);
+            if(changed&0x80U)keyboard[i]=(keyboard[i]&1U)|(physical[i]&0x80U);
+            keyboard[i]^=changed&1U;
+        }
+        if((message.message==0x100 || message.message==0x101 || message.message==0x104 || message.message==0x105) && message.wparam<256){
+            const auto vk=physical_key(static_cast<unsigned>(message.wparam),message.lparam);
+            for(auto key:{vk,generic_key(vk)})keyboard[key]=(keyboard[key]&1U)|(physical[key]&0x80U);
+        }
+        queue.last_physical=physical;
+        return;
+    }
     const bool mouse=message.message>=0x200 && message.message<=0x20e;
     if((message.message>=0x100 && message.message<=0x107) || mouse){
-        for(const auto [vk,flag]:std::array<std::pair<unsigned,unsigned>,3>{{{16,1},{17,2},{18,4}}})gui_.keyboard[vk]=static_cast<std::uint8_t>((gui_.keyboard[vk]&1U)|((message.modifiers&flag)?0x80U:0));
+        for(const auto [vk,flag]:std::array<std::pair<unsigned,unsigned>,3>{{{16,1},{17,2},{18,4}}})keyboard[vk]=static_cast<std::uint8_t>((keyboard[vk]&1U)|((message.modifiers&flag)?0x80U:0));
         if((message.message==0x100 || message.message==0x101 || message.message==0x104 || message.message==0x105) && message.wparam<256){
             const auto vk=physical_key(static_cast<unsigned>(message.wparam),message.lparam);const bool down=message.message==0x100 || message.message==0x104;
-            auto& value=gui_.keyboard[vk];if(down && !(value&0x80) && (vk==20 || vk==0x90 || vk==0x91))value^=1;
+            auto& value=keyboard[vk];if(down && !(value&0x80) && (vk==20 || vk==0x90 || vk==0x91))value^=1;
             value=static_cast<std::uint8_t>((value&1U)|(down?0x80U:0));
-            gui_.keyboard[generic_key(vk)]=static_cast<std::uint8_t>((gui_.keyboard[generic_key(vk)]&1U)|(down?0x80U:0));
+            keyboard[generic_key(vk)]=static_cast<std::uint8_t>((keyboard[generic_key(vk)]&1U)|(down?0x80U:0));
         }
-        if(mouse)for(const auto [vk,flag]:std::array<std::pair<unsigned,unsigned>,5>{{{1,1},{2,2},{4,16},{5,32},{6,64}}})gui_.keyboard[vk]=(message.wparam&flag)?0x80:0;
+        if(mouse)for(const auto [vk,flag]:std::array<std::pair<unsigned,unsigned>,5>{{{1,1},{2,2},{4,16},{5,32},{6,64}}})keyboard[vk]=(message.wparam&flag)?0x80:0;
     }
 }
 bool WindowsServices::match_gui_hotkey(const GuiMessage& message){
@@ -134,7 +155,8 @@ bool WindowsServices::match_gui_hotkey(const GuiMessage& message){
         if(!down){hotkey.pressed=false;continue;}
         if((hotkey.modifiers&15U)!=mods)continue;consumed=true;
         if((!hotkey.pressed || (!(hotkey.modifiers&0x4000U) && (message.lparam&0x40000000U))) && gui_.queue.size()<10000){
-            GuiMessage notify{hotkey.window,hotkey.id,mods|(std::uint64_t{key}<<16),0x312};notify.thread=hotkey.thread;
+            const auto recipient=hotkey.target_window?hotkey.target_window:hotkey.window;
+            GuiMessage notify{recipient,hotkey.id,mods|(std::uint64_t{key}<<16),0x312};notify.thread=hotkey.target_window?gui_.windows.at(recipient).thread:hotkey.thread;
             notify.keyboard_snapshot=message.keyboard_snapshot;notify.input_extra=message.input_extra;notify.injected=message.injected;notify.queued_time=message.queued_time;
             notify.queued_cursor=gui_.pointer_position;enqueue_gui_message(std::move(notify));
             // WM_HOTKEY 在訊息佇列頭部；普通 posted/input 仍保留原來的優先序。
@@ -151,7 +173,7 @@ bool WindowsServices::translate_gui_key(const GuiMessage& message){
         if(message.message==0x100 || message.message==0x104)text.push_back(static_cast<char16_t>(message.lparam>>16));
     }else {
         const auto scan=static_cast<std::uint32_t>((message.lparam>>16)&255U)|((message.lparam&0x1000000U)?0x100U:0)|((message.message==0x101 || message.message==0x105)?0x8000U:0);
-        text=windows_key_text(static_cast<std::uint32_t>(message.wparam),scan,gui_.keyboard,0,gui_.keyboard_translation[threads_.current]);
+        text=windows_key_text(static_cast<std::uint32_t>(message.wparam),scan,threads_.input_queue(threads_.current).keys,0,gui_.keyboard_translation[threads_.current]);
     }
     // 字元訊息沿用剛取出之按鍵訊息的輸入來源（GetCurrentInputMessageSource）。
     const auto& translating=threads_.items.at(threads_.current);
@@ -161,39 +183,49 @@ bool WindowsServices::translate_gui_key(const GuiMessage& message){
     // Win32 對四種 key message 回傳 TRUE，即使此鍵沒有產生字元。
     return true;
 }
-void WindowsServices::swap_gui_mouse_buttons(GuiMessage& message) const {
+void WindowsServices::swap_gui_mouse_buttons(const GuestMemory& memory,GuiMessage& message) const {
     // SwapMouseButton：左右鍵訊息（含非用戶區）互換，MK_LBUTTON／MK_RBUTTON 互換；非同步按鍵狀態與 Raw Input 仍是實體按鍵。
-    if(!gui_.mouse_buttons_swapped)return;
+    if(!gui_timing(memory,X64ARM_GUI_MOUSE_SWAP_OFFSET/4))return;
     const auto code=message.message;
     constexpr std::array<std::pair<std::uint32_t,std::uint32_t>,6> pairs{{{0x201,0x204},{0x202,0x205},{0x203,0x206},{0xa1,0xa4},{0xa2,0xa5},{0xa3,0xa6}}};
     for(const auto& [left,right]:pairs){if(code==left){message.message=right;break;}if(code==right){message.message=left;break;}}
     if((code>=0x200 && code<=0x20e) || code==0x10004)message.wparam=(message.wparam&~std::uint64_t{3})|((message.wparam&1U)<<1)|((message.wparam&2U)>>1);
 }
 void WindowsServices::record_mouse_move_point(std::int64_t x,std::int64_t y,std::uint32_t time,std::uint64_t extra){
-    auto& points=gui_.mouse_move_points;points.push_back({x,y,time,static_cast<std::int64_t>(extra)});
+    if(!interactive_station())return;
+    const MouseMoveSample sample{x,y,time,std::bit_cast<std::int64_t>(extra)};
+    initialize_shared_windows();
+    if(shared_windows_){append_shared_mouse_move(*shared_windows_,sample);return;}
+    auto& points=gui_.mouse_move_points;points.push_back(sample);
     if(points.size()>64)points.erase(points.begin(),points.begin()+static_cast<std::ptrdiff_t>(points.size()-64));
 }
 std::optional<std::uint32_t> WindowsServices::invoke_input_api(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
     std::uint64_t result{};const auto fail=[&](unsigned error){last_error_=error;result=0;};
     try {
-        if(name=="SwapMouseButton"){result=gui_.mouse_buttons_swapped?1:0;gui_.mouse_buttons_swapped=d(0)!=0;}
+        if(name=="SwapMouseButton"){result=exchange_mouse_buttons(memory,d(0)!=0);}
         else if(name=="GetMouseMovePointsEx"){
             // MOUSEMOVEPOINT {int x, y; DWORD time; ULONG_PTR dwExtraInfo}。輸入點以 16 位元螢幕座標比對（time 非零時一併比對），
             // 由該點往前取最多 nBufPoints 筆；顯示座標回傳 16 位元值，高解析度座標換算成虛擬螢幕的 0～65535。
             const unsigned size=x86_?16U:24U;const auto count=static_cast<std::int32_t>(d(3));const auto mode=d(4);
             const auto failed=[&](std::uint32_t error){last_error_=error;result=UINT32_MAX;};
-            if(d(0)!=size || !arg(1) || count<0 || count>64 || (mode!=1 && mode!=2) || (count && !arg(2)))failed(87);
+            if(d(0)!=size || count<0 || count>64)failed(87);
+            else if(!arg(1) || (count && !arg(2)))failed(998);
+            else if(mode!=1 && mode!=2)failed(1171);
+            else if(!interactive_station())failed(5);
             else {
                 const auto x=memory.load(GuestAddress{arg(1)},32)&0xffffU,y=memory.load(GuestAddress{arg(1)+4},32)&0xffffU;
                 const auto time=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)+8},32));
-                const auto& points=gui_.mouse_move_points;auto found=points.rend();
+                initialize_shared_windows();
+                const auto points=shared_windows_?shared_mouse_moves(*shared_windows_):gui_.mouse_move_points;auto found=points.rend();
                 for(auto it=points.rbegin();it!=points.rend();++it)
                     if((static_cast<std::uint64_t>((*it)[0])&0xffffU)==x && (static_cast<std::uint64_t>((*it)[1])&0xffffU)==y && (!time || static_cast<std::uint32_t>((*it)[2])==time)){found=it;break;}
                 if(found==points.rend())failed(1171); // ERROR_POINT_NOT_FOUND
                 else {
-                    const auto area=gui_screen_area();
-                    const auto normal=[&](std::int64_t value,unsigned axis){const auto span=std::max<std::int64_t>(1,area[axis+2]-area[axis]-1);
+                    const auto amount=std::min<std::size_t>(static_cast<unsigned>(count),static_cast<std::size_t>(points.rend()-found));
+                    if(amount)memory.check(GuestAddress{arg(2)},amount*size,Access::Write);
+                    const auto area=gui_virtual_screen_bounds(gui_monitors());
+                    const auto normal=[&](std::int64_t value,unsigned axis){const auto span=std::max<std::int64_t>(1,std::int64_t{area[axis+2]}-area[axis]-1);
                         return static_cast<std::uint32_t>(std::clamp<std::int64_t>((value-area[axis])*65535/span,0,65535));};
                     std::uint32_t copied=0;
                     for(auto it=found;it!=points.rend() && copied<static_cast<std::uint32_t>(count);++it,++copied){
@@ -241,20 +273,32 @@ std::optional<std::uint32_t> WindowsServices::invoke_input_api(GuestState& state
             const auto flags=d(unicode?5:4);const auto layout=extended?arg(unicode?6:5):0;
             const auto capacity=unicode?std::bit_cast<std::int32_t>(d(4)):2;
             if(!windows_input_layout_supported(layout))fail(87);
-            else if(flags&~5U || d(0)>255 || capacity<=0 || !arg(3))fail(87);
+            else if(flags&~7U || d(0)>255 || capacity<=0 || !arg(3))fail(87);
+            else if(unicode && !arg(2))result=0;
             else {
-                std::array<std::uint8_t,256> keys=gui_.keyboard;if(arg(2))memory.read(GuestAddress{arg(2)},keys);
+                std::array<std::uint8_t,256> keys=threads_.input_queue(threads_.current).keys;if(arg(2))memory.read(GuestAddress{arg(2)},keys);
                 auto translation=gui_.keyboard_translation[threads_.current];const auto text=windows_key_text(d(0),d(1),keys,flags,translation);
                 if(unicode){const auto count=std::min<std::size_t>(text.size(),static_cast<unsigned>(capacity));memory.check(GuestAddress{arg(3)},count*2,Access::Write);
                     for(std::size_t i=0;i<count;++i)memory.store(GuestAddress{arg(3)+i*2},16,text[i]);result=count;
-                }else {bool replacement{};const auto bytes=utf16_to_cp1252(text,'?',replacement);const auto count=std::min<std::size_t>(bytes.size(),2);
-                    if(count){memory.check(GuestAddress{arg(3)},2,Access::Write);memory.store(GuestAddress{arg(3)},16,static_cast<unsigned char>(bytes[0])|(count>1?static_cast<unsigned>(static_cast<unsigned char>(bytes[1]))<<8:0U));}result=count;
+                }else if(!text.empty()){
+                    // ToAscii 的目的地是一個 WORD；依客體 ACP 輸出完整字元，回傳翻譯的字元數。
+                    const auto translated=text.substr(0,2);
+                    const auto bytes=utf16_to_utf8_lossy(translated);
+                    if(bytes.size()>sizeof(std::uint16_t))fail(122);
+                    else{
+                        auto word=static_cast<std::uint16_t>(static_cast<unsigned char>(bytes[0]));
+                        if(bytes.size()==2)word|=static_cast<std::uint16_t>(static_cast<unsigned char>(bytes[1]))<<8;
+                        memory.store(GuestAddress{arg(3)},16,word);
+                        result=translated.size();
+                    }
                 }
                 gui_.keyboard_translation[threads_.current]=translation;
             }
-        }else if(name=="RegisterHotKey" || name=="UnregisterHotKey"){
+        }else if(name=="RegisterHotKey" || name=="ShellRegisterHotKey" || name=="UnregisterHotKey"){
             const auto window=gui_.windows.find(arg(0));const auto desktop=thread_desktop_object(threads_.current);
-            if(arg(0) && window==gui_.windows.end())fail(1400);
+            const auto target=name=="ShellRegisterHotKey"?arg(4):0;
+            if((arg(0) && window==gui_.windows.end()) || (target && !gui_.windows.contains(target)))fail(1400);
+            else if(target && thread_desktop_object(gui_.windows.at(target).thread)!=desktop)fail(5);
             else if(arg(0) && window->second.thread!=threads_.current)fail(1408);
             else if(d(1)>65535)fail(87);
             else if(name=="UnregisterHotKey"){
@@ -263,7 +307,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_input_api(GuestState& state
             }else if(d(2)&~0x400fU || !d(3) || d(3)>254)fail(87);
             else if(d(3)==0x7b || std::any_of(gui_.hotkeys.begin(),gui_.hotkeys.end(),[&](const auto& h){return h.desktop==desktop && h.key==d(3) && (h.modifiers&15U)==(d(2)&15U);}))fail(1409);
             else if(gui_.hotkeys.size()>=4096)fail(8);
-            else {prepare_input_backend();gui_.hotkeys.push_back({arg(0),threads_.current,desktop,d(1),d(2),d(3)});result=1;}
+            else {prepare_input_backend();gui_.hotkeys.push_back({arg(0),threads_.current,desktop,d(1),d(2),d(3),false,target});result=1;}
         }else {
             std::vector<Injected> inputs;const auto tick=static_cast<std::uint32_t>(runtime_.clock_ticks/10000);
             if(name=="SendInput"){
@@ -294,7 +338,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_input_api(GuestState& state
                 if(item.type==1){const bool up=item.flags&2U,packet=item.flags&4U;auto scan=item.scan,key=item.key;
                     if(!packet){if(item.flags&8U){scan=(scan&255U)|((item.flags&1U)?0xe000U:0);key=windows_map_virtual_key(scan,3);
                             if(!(scan&0xff00U) && (bool(gui_.input_keyboard[0x90]&1U)!=bool(gui_.input_keyboard[16]&0x80U))){constexpr std::array<unsigned,10> scans{0x52,0x4f,0x50,0x51,0x4b,0x4c,0x4d,0x47,0x48,0x49};const auto it=std::find(scans.begin(),scans.end(),scan);if(it!=scans.end())key=0x60+static_cast<unsigned>(it-scans.begin());if(scan==0x53)key=0x6e;}}
-                        else {if(!scan)scan=windows_map_virtual_key(key,4);else scan=(scan&255U)|((item.flags&1U)?0xe000U:0);}
+                        else {if(!scan)scan=windows_physical_scan(key);else scan=(scan&255U)|((item.flags&1U)?0xe000U:0);}
                         if(!key){fail(87);break;}
                     }else key=0xe7;
                     const auto target=gui_.focus?gui_.focus:gui_.active;const auto vk=physical_key(key,(std::uint64_t{scan&255U}<<16)|((scan&0xff00U)?0x1000000U:0));
@@ -309,9 +353,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_input_api(GuestState& state
                     if(raw_legacy_enabled(true) && !hotkey && target && enabled(target))enqueue_gui_message(std::move(message));
                 }else {
                     const auto before=gui_.pointer_position;if(item.flags&1U){
-                        if(item.flags&0x8000U){gui_.pointer_position={static_cast<std::int32_t>((std::int64_t{std::clamp(item.x,0,65535)}*1439+32767)/65535),static_cast<std::int32_t>((std::int64_t{std::clamp(item.y,0,65535)}*899+32767)/65535)};}
+                        if(item.flags&0x8000U){
+                            const auto area=(item.flags&0x4000U)?gui_virtual_screen_bounds(gui_monitors()):gui_screen_area();
+                            for(unsigned axis=0;axis<2;++axis){
+                                const auto value=std::clamp(axis?item.y:item.x,0,65535);
+                                const auto span=std::max<std::int64_t>(0,std::int64_t{area[axis+2]}-area[axis]-1);
+                                gui_.pointer_position[axis]=static_cast<std::int32_t>(area[axis]+(value*span+32767)/65535);
+                            }
+                        }
                         else for(unsigned axis=0;axis<2;++axis)gui_.pointer_position[axis]=static_cast<std::int32_t>(std::clamp<std::int64_t>(std::int64_t{before[axis]}+(axis?item.y:item.x),INT32_MIN,INT32_MAX));
-                        if(gui_.cursor_clip)for(unsigned axis=0;axis<2;++axis)gui_.pointer_position[axis]=std::clamp(gui_.pointer_position[axis],(*gui_.cursor_clip)[axis],(*gui_.cursor_clip)[axis+2]-1);
+                        if(gui_.cursor_clip)gui_.pointer_position=gui_clip_cursor_point(gui_.pointer_position,*gui_.cursor_clip);
                         if(native_gui_){if(!native_gui_->set_cursor_position(gui_.pointer_position[0],gui_.pointer_position[1])){gui_.pointer_position=before;last_error_=5;break;}dinput_cursor_warped();}
                         for(unsigned axis=0;axis<2;++axis)inject_dinput(false,axis,std::int64_t{gui_.pointer_position[axis]}-before[axis],time);
                     }
@@ -325,11 +376,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_input_api(GuestState& state
                         message.mouse_no_coalesce=(item.flags&0x2000U)!=0;message.source_device=2;message.source_origin=2;
                         message.queue_priority=1;queue_gui_mouse(std::move(message));
                     };
-                    if(item.flags&1U)send(0x200);
+                    if(item.flags&1U){record_mouse_move_point(point[0],point[1],time,item.extra);send(0x200);}
                     const auto button=[&](unsigned vk,unsigned object,bool down,unsigned message,unsigned high=0){
                         auto& value=gui_.async_keyboard[vk];if(down && !(value&0x80U))value|=1;value=static_cast<std::uint8_t>((value&1U)|(down?0x80U:0));
                         // SwapMouseButton：同步狀態與訊息改用對調後的邏輯按鍵；非同步狀態、DirectInput 與 Raw Input 仍是實體按鍵。
-                        const auto logical=gui_.mouse_buttons_swapped && (vk==1 || vk==2)?3U-vk:vk;if(logical!=vk)message=vk==1?message+3:message-3;
+                        const auto logical=system_metric(memory,23) && (vk==1 || vk==2)?3U-vk:vk;if(logical!=vk)message=vk==1?message+3:message-3;
                         gui_.input_keyboard[logical]=down?0x80:0;gui_.injected_keys[vk]=down?1:2;inject_dinput(false,object,down?1:0,time);send(message,high);
                     };
                     for(const auto [flag,vk,object,down,msg]:std::array<std::tuple<unsigned,unsigned,unsigned,bool,unsigned>,6>{{{2,1,3,true,0x201},{4,1,3,false,0x202},{8,2,4,true,0x204},{16,2,4,false,0x205},{32,4,5,true,0x207},{64,4,5,false,0x208}}})if(item.flags&flag)button(vk,object,down,msg);
@@ -346,7 +397,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_input_api(GuestState& state
             }
             poll_dinput();if(name!="SendInput")result=0;
         }
-    }catch(const MemoryFault&){last_error_=998;if(name!="SendInput")result=0;}catch(const std::bad_alloc&){last_error_=8;if(name!="SendInput")result=0;}
+    }catch(const MemoryFault&){last_error_=998;if(name!="SendInput")result=name=="GetMouseMovePointsEx"?UINT32_MAX:0;}catch(const std::bad_alloc&){last_error_=8;if(name!="SendInput")result=name=="GetMouseMovePointsEx"?UINT32_MAX:0;}
     arg.return_to(state,result);return std::nullopt;
 }
 }

@@ -10,7 +10,8 @@ std::span<const WindowsServiceDescriptor> user32_legacy_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"user32.dll","BroadcastSystemMessage",5,0,0,5},{"user32.dll","BroadcastSystemMessageA",5,0,0,5},{"user32.dll","BroadcastSystemMessageW",5,0,0,5},
         {"user32.dll","BroadcastSystemMessageExA",6,0,0,5},{"user32.dll","BroadcastSystemMessageExW",6,0,0,5},
-        {"user32.dll","SetSysColors",3,0,0,1},
+        {"user32.dll","SetSysColors",3,0,0,1},{"user32.dll","SetSysColorsTemp",3},
+        {"win32u.dll","NtUserCallNoParam",1},{"win32u.dll","NtUserCallOneParam",2},
         {"user32.dll","DlgDirListA",5,0,0,0x1c},{"user32.dll","DlgDirListW",5,0,0,0x1c},{"user32.dll","DlgDirListComboBoxA",5,0,0,0x1c},{"user32.dll","DlgDirListComboBoxW",5,0,0,0x1c},
         {"user32.dll","DlgDirSelectExA",4,0,0,0xc},{"user32.dll","DlgDirSelectExW",4,0,0,0xc},{"user32.dll","DlgDirSelectComboBoxExA",4,0,0,0xc},{"user32.dll","DlgDirSelectComboBoxExW",4,0,0,0xc},
     };
@@ -41,11 +42,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_legacy(GuestState& s
                 const auto control=handle(co_await service_callback::call_value(entry("user32.dll","GetDlgItem"),{call(0),call(3)}));if(!control)co_return finish(0);
                 const auto index=static_cast<std::int32_t>(static_cast<std::uint32_t>(co_await send(control,combo?0x147U:0x188U,0,0)));if(index<0)co_return finish(0);
                 const auto length=static_cast<std::int32_t>(static_cast<std::uint32_t>(co_await send(control,combo?0x149U:0x18aU,static_cast<std::uint64_t>(index),0)));if(length<0)co_return finish(0);
-                const auto buffer=scratch.allocate(static_cast<std::size_t>(length+1)*2);if(!buffer)co_return finish(0);
+                const auto buffer=scratch.allocate((static_cast<std::size_t>(length)+1)*2);if(!buffer)co_return finish(0);
                 (void)co_await send(control,combo?0x148U:0x189U,static_cast<std::uint64_t>(index),buffer);
                 auto text=read_utf16(m,GuestAddress{buffer},static_cast<std::size_t>(length)+1);bool directory=false;
                 if(text.size()==5 && text.starts_with(u"[-") && text.ends_with(u"-]")){text=std::u16string(1,text[2])+u":";directory=true;}
                 else if(text.size()>=2 && text.front()==u'[' && text.back()==u']'){text=text.substr(1,text.size()-2)+u"\\";directory=true;}
+                else if(text.find(u'.')==text.npos)text.push_back(u'.');
                 const auto capacity=static_cast<std::int32_t>(static_cast<std::uint32_t>(call(2)));
                 if(call(1) && capacity>0){
                     std::vector<std::uint8_t> bytes;
@@ -63,7 +65,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_legacy(GuestState& s
                 // 不含萬用字元且本身是目錄：切換進去並列出全部。
                 const auto candidate=scratch.text(directory+pattern);
                 const auto attributes=static_cast<std::uint32_t>(co_await service_callback::call(entry("kernel32.dll","GetFileAttributesW"),{candidate}));
-                if(attributes!=UINT32_MAX && (attributes&0x10U)){directory+=pattern;pattern=u"*.*";}
+                if(attributes==UINT32_MAX || !(attributes&0x10U)){
+                    last_error_=1417; // ERROR_NO_WILDCARD_CHARACTERS
+                    co_return finish(0);
+                }
+                directory+=pattern;pattern=u"*.*";
             }
             if(!directory.empty()){
                 if(directory.size()>1 && (directory.back()==u'\\' || directory.back()==u'/') && directory[directory.size()-2]!=u':')directory.pop_back();
@@ -76,8 +82,42 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_legacy(GuestState& s
             const auto list_id=static_cast<std::uint32_t>(call(2)),static_id=static_cast<std::uint32_t>(call(3)),types=static_cast<std::uint32_t>(call(4));
             if(list_id){
                 const auto control=handle(co_await service_callback::call_value(entry("user32.dll","GetDlgItem"),{call(0),list_id}));if(!control)co_return finish(0);
-                (void)co_await send(control,combo?0x14bU:0x184U,0,0);
-                (void)co_await send(control,combo?0x145U:0x18dU,types&~0x2000U,scratch.text(pattern));
+                const std::uint32_t reset=combo?0x14bU:0x184U,dir=combo?0x145U:0x18dU;
+                std::vector<std::pair<std::uint32_t,std::u16string>> searches;
+                auto attributes=types&~0x2000U;
+                if(attributes==0x4000U)attributes|=0x8000U;
+                if(attributes&0x10U){
+                    // 檔名樣式只篩選檔案；目錄與磁碟機使用獨立列舉。
+                    if(!(attributes&0x8000U))searches.emplace_back(attributes&~0x4010U,pattern);
+                    searches.emplace_back((attributes&0x4010U)|0x8000U,u"*.*");
+                }else searches.emplace_back(attributes,pattern);
+                if(types&0x2000U){
+                    if(gui_.queue.size()+1+searches.size()>10000){last_error_=1816;co_return finish(0);}
+                    auto window=gui_.windows.find(control);
+                    if(window==gui_.windows.end())co_return finish(0);
+                    std::vector<GuiMessage> messages{{control,0,0,reset}};
+                    for(const auto& [flags,mask]:searches){
+                        // MSG 可在移出佇列後才派送。由控制項保留樣式，同時提供兩種取訊息編碼。
+                        auto& buffer=window->second.posted_directory_patterns[mask];
+                        if(!buffer){
+                            if(gui_.control_notification_buffers.empty())buffer=runtime_allocate(m,{},gui_control_notification_bytes);
+                            else {buffer=gui_.control_notification_buffers.back();gui_.control_notification_buffers.pop_back();}
+                        }
+                        const auto ansi=utf16_to_utf8_lossy(mask);
+                        m.write(GuestAddress{buffer},utf16_bytes(mask));
+                        GuiMessage enumerate{control,flags,buffer,dir};
+                        enumerate.ansi_lparam=buffer+gui_control_notification_bytes/2;
+                        m.write(GuestAddress{enumerate.ansi_lparam},
+                                std::span(reinterpret_cast<const std::uint8_t*>(ansi.c_str()),ansi.size()+1));
+                        messages.push_back(std::move(enumerate));
+                    }
+                    gui_.queue.reserve(gui_.queue.size()+messages.size());
+                    for(auto& message:messages)enqueue_gui_message(std::move(message));
+                }else{
+                    (void)co_await send(control,reset,0,0);
+                    for(const auto& [flags,mask]:searches)
+                        (void)co_await send(control,dir,flags,scratch.text(mask));
+                }
             }
             if(static_id){
                 const auto buffer=scratch.allocate(1040);if(!buffer)co_return finish(0);
@@ -88,6 +128,84 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_legacy(GuestState& s
             co_return finish(1);
         });
     }
+    if(symbol=="NtUserCallNoParam"){
+        std::uint64_t value=0;
+        switch(d(0)){
+        case 0:value=nested_service(state,memory,"user32.dll","GetDesktopWindow",{});break;
+        case 1:value=nested_service(state,memory,"user32.dll","GetDialogBaseUnits",{});break;
+        case 2:{
+            GuestScratch scratch(*this,memory,state);
+            const auto info=scratch.allocate(8);memory.store(GuestAddress{info},32,8);
+            if(nested_service(state,memory,"user32.dll","GetLastInputInfo",{info}))value=memory.load(GuestAddress{info+4},32);
+            break;
+        }
+        case 3:value=desktop_manager_window(false,std::nullopt);break;
+        case 4:value=query_shell_window();break;
+        case 5:value=desktop_manager_window(true,std::nullopt);break;
+        case 6:{
+            gui_area_cached_={};
+            const auto rect=gui_monitors().front().rect;
+            const auto size=std::uint16_t(rect[2]-rect[0]) | (std::uint32_t(std::uint16_t(rect[3]-rect[1]))<<16);
+            const auto depth=gui_.display_mode?(*gui_.display_mode)[2]:32U;
+            start_callbacks(state,memory,{{resolve("user32.dll","SendMessageW").value,
+                {gui_.desktop,0x7e,depth,size}}},Continuation::Return,1);
+            return std::nullopt;
+        }
+        case 7:gui_.exiting_message_threads.insert(threads_.current);break;
+        case 8:cancel_gui_thread(threads_.current,memory,state);break;
+        default:last_error_=50;break;
+        }
+        arg.return_to(state,value);return std::nullopt;
+    }
+    if(symbol=="NtUserCallOneParam"){
+        std::uint64_t value=0;
+        switch(d(1)){
+        case 4:value=nested_service(state,memory,"user32.dll","GetMenuItemCount",{arg(0)});break;
+        case 5:{
+            const auto rect=gui_monitors().front().rect;
+            memory.check(GuestAddress{arg(0)},16,Access::Write);
+            for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(0)+4*i},32,static_cast<std::uint32_t>(rect[i]));
+            value=1;break;
+        }
+        case 9:value=system_metric(memory,d(0));break;
+        case 10:value=nested_service(state,memory,"win32u.dll","NtUserCallTwoParam",{arg(0),0,8});break;
+        case 13:value=nested_service(state,memory,"gdi32.dll","D3DKMTOpenAdapterFromGdiDisplayName",{arg(0)});break;
+        case 6:value=gui_system_color(d(0));break;
+        case 7:case 8:value=gui_system_paint_object(gui_,d(0),d(1)==8);break;
+        default:last_error_=50;break;
+        }
+        arg.return_to(state,value);return std::nullopt;
+    }
+    if(symbol=="SetSysColorsTemp"){
+        auto& layers=gui_.temporary_system_paint;
+        std::uint64_t result=0;
+        if(!arg(0) && !arg(1)){
+            if(const auto found=layers.find(arg(2));found!=layers.end()){
+                // 交給 GDI 檢查是否仍被目前或已儲存的 DC 選用。
+                for(const auto& item:found->second)
+                    (void)nested_service(state,memory,"gdi32.dll","DeleteObject",{item.pen});
+                layers.erase(found);result=1;
+            }
+        }else if(arg(0) && arg(1) && arg(2)<=gui_system_color_count){
+            const auto unit=x86_?4U:8U;
+            std::vector<GuiState::TemporarySystemPaint> items;
+            try{
+                items.reserve(arg(2));
+                for(unsigned i=0;i<arg(2);++i){
+                    const auto color=memory.load(GuestAddress{arg(0)+i*4U},32);
+                    const auto brush=memory.load(GuestAddress{arg(1)+i*unit},x86_?32:64);
+                    const auto pen=gui_.next_object++;
+                    items.push_back({pen,brush});
+                    gui_.pens[pen]=static_cast<std::uint32_t>(color)&0xffffffU;
+                    gui_.pen_widths[pen]=1;
+                }
+                const auto token=gui_.next_object++;
+                layers.emplace(token,std::move(items));result=token;
+            }catch(const MemoryFault&){last_error_=998;}catch(const std::bad_alloc&){last_error_=8;}
+            if(!result)for(const auto& item:items){gui_.pens.erase(item.pen);gui_.pen_widths.erase(item.pen);}
+        }
+        arg.return_to(state,result);return std::nullopt;
+    }
     if(symbol=="SetSysColors"){
         // 依序改寫系統色彩（索引超出 COLOR_* 範圍者略過），更新已發出的系統色筆刷，再通知頂層視窗並重繪。
         const auto count=static_cast<std::int32_t>(d(0));
@@ -97,7 +215,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_legacy(GuestState& s
             for(std::int32_t i=0;i<count;++i){
                 const auto index=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)+4ULL*static_cast<std::uint64_t>(i)},32));
                 const auto color=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)+4ULL*static_cast<std::uint64_t>(i)},32));
-                if(gui_set_system_color(index,color))if(const auto brush=gui_.brushes.find(0xa000+index);brush!=gui_.brushes.end())brush->second=gui_system_color(index);
+                if(gui_set_system_color(index,color)){
+                    if(const auto brush=gui_.brushes.find(gui_system_brush_base+index);brush!=gui_.brushes.end())brush->second=gui_system_color(index);
+                    if(const auto pen=gui_.pens.find(gui_system_pen_base+index);pen!=gui_.pens.end())pen->second=gui_system_color(index);
+                }
             }
         }catch(const MemoryFault&){last_error_=998;arg.return_to(state,0);return std::nullopt;}
         if(count){

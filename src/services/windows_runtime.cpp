@@ -4,6 +4,7 @@
 #include "service_callback_task.hpp"
 #include "guest_crt_state.h"
 #include "crt_format_contract.h"
+#include "message_insert.hpp"
 #include "crt_nonfinite_format.hpp"
 #include "guest_heap_layout.hpp"
 #include "guest_tls.hpp"
@@ -821,6 +822,24 @@ __attribute__((always_inline)) inline CrtBufferOutput format_buffer_output(const
     return output;
 }
 
+}
+std::u16string render_message_insert(GuestMemory& memory,std::u16string_view pattern,bool wide_strings,
+                                     std::span<const std::uint64_t> values){
+    // FormatMessage 的窄字串使用客體 ACP，不依賴呼叫端的 CRT locale。
+    static const CrtLocaleCategory locale=[]{
+        CrtLocaleCategory value;value.codepage=65001;value.maximum_character_bytes=4;return value;
+    }();
+    const unsigned unit=memory.execution_mode()==ExecutionMode::X86?4U:8U;
+    const auto next=[&](unsigned,unsigned,FormatArgumentKind){
+        if(values.empty())throw FormatError{22};
+        const auto value=values.front();values=values.subspan(1);return value;
+    };
+    try{
+        auto rendered=format(memory,u"%"+std::u16string(pattern),true,wide_strings,unit,false,false,
+                             false,false,0,locale,u".",next);
+        if(rendered.failed || rendered.encoding_error || !values.empty())throw FormatError{22};
+        return std::move(rendered.text);
+    }catch(const FormatError&){throw std::invalid_argument("訊息插入格式或參數無效");}
 }
 std::uint64_t WindowsServices::runtime_allocate(GuestMemory& memory, std::span<const std::uint8_t> bytes, std::size_t size, std::size_t alignment) {
     size = std::max({std::size_t{1}, size, bytes.size()});

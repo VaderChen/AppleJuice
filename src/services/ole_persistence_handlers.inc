@@ -24,7 +24,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_persistence(GuestState&
     if(kind==Save && !arg(0))return done(0x80040007U); // OLE_E_BLANK
     if(!arg(0) || !arg(1))return done(0x80070057U);
     if(kind==Load || kind==WriteClass)memory.check(GuestAddress{arg(1)},16,Access::Read);
-    if(kind==ReadClass)memory.check(GuestAddress{arg(1)},16,Access::Write);
+    if(kind==ReadClass)memory.write(GuestAddress{arg(1)},std::array<std::uint8_t,16>{});
     const auto scratch=allocate_heap(memory,scratch_size);
     if(!scratch)return done(0x8007000eU);
     try{
@@ -32,7 +32,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_persistence(GuestState&
         memory.store(GuestAddress{scratch+4},32,kind);
         memory.store(GuestAddress{scratch+16},64,kind==Save?arg(1):arg(0));
         memory.store(GuestAddress{scratch+24},64,kind==Save?arg(0):0);
-        memory.store(GuestAddress{scratch+32},64,kind==Load?arg(2):kind==ReadClass?arg(1):0);
+        memory.store(GuestAddress{scratch+32},64,kind==Load?arg(2):0);
         memory.write(GuestAddress{scratch+96},persist_iid);
         if(kind==Load){std::array<std::uint8_t,16> iid{};memory.read(GuestAddress{arg(1)},iid);memory.write(GuestAddress{scratch+80},iid);}
         if(kind==WriteClass){std::array<std::uint8_t,16> clsid{};memory.read(GuestAddress{arg(1)},clsid);memory.write(GuestAddress{scratch+64},clsid);}
@@ -42,7 +42,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_persistence(GuestState&
         if(!handles(GuestAddress{target}))memory.check(GuestAddress{target},1,Access::Execute);
         memory.store(GuestAddress{scratch},32,phase);
         const std::vector<std::uint64_t> args=kind==Save?std::vector<std::uint64_t>{object,scratch+64}:
-            std::vector<std::uint64_t>{object,scratch+64,16,scratch+56};
+            std::vector<std::uint64_t>{object,kind==ReadClass?arg(1):scratch+64,16,scratch+56};
         start_callbacks(state,memory,{{target,args}},Continuation::OlePersistence,scratch);
     }catch(const std::bad_alloc&){(void)free_heap(memory,scratch,state);return done(0x8007000eU);}
     catch(...){(void)free_heap(memory,scratch,state);throw;}
@@ -104,7 +104,7 @@ std::optional<std::uint32_t> WindowsServices::resume_ole_persistence(GuestState&
         if(phase==SaveObject)return finish(status);
         if(phase==ReadGuid){
             if(memory.load(GuestAddress{scratch+56},32)!=16)return cleanup(0x8003001eU);
-            if(kind==ReadClass){memory.move(GuestAddress{output},GuestAddress{scratch+64},16);return finish(0);}
+            if(kind==ReadClass)return finish(0);
             std::array<std::uint8_t,16> clsid{};memory.read(GuestAddress{scratch+64},clsid);
             if(std::all_of(clsid.begin(),clsid.end(),[](auto byte){return !byte;}))return finish(0);
             // 使用既有 CoCreateInstance 與客體 class factory，不在宿主實例化 COM 類別。

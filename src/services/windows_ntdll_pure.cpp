@@ -45,6 +45,7 @@ std::span<const WindowsServiceDescriptor> ntdll_pure_service_descriptors(){
         {"ntdll.dll","RtlCompareMemory",3},{"ntdll.dll","RtlCompareMemoryUlong",3,0,0,0x4},{"ntdll.dll","RtlFillMemory",3,0,0,0x4},
         {"ntdll.dll","RtlFillMemoryUlong",3,0,0,0x4},{"ntdll.dll","RtlZeroMemory",2},
         // 計數字串
+        {"ntdll.dll","RtlRunEncodeUnicodeString",2},{"ntdll.dll","RtlRunDecodeUnicodeString",2},
         {"ntdll.dll","RtlCopyUnicodeString",2},{"ntdll.dll","RtlCopyString",2},{"ntdll.dll","RtlAppendUnicodeStringToString",2},
         {"ntdll.dll","RtlAppendUnicodeToString",2},{"ntdll.dll","RtlAppendStringToString",2},{"ntdll.dll","RtlAppendAsciizToString",2},
         {"ntdll.dll","RtlDuplicateUnicodeString",3,0,0,0x1},{"ntdll.dll","RtlUpcaseUnicodeString",3},{"ntdll.dll","RtlDowncaseUnicodeString",3},
@@ -57,6 +58,7 @@ std::span<const WindowsServiceDescriptor> ntdll_pure_service_descriptors(){
         {"ntdll.dll","RtlxUnicodeStringToOemSize",1},{"ntdll.dll","RtlAnsiStringToUnicodeSize",1},{"ntdll.dll","RtlxAnsiStringToUnicodeSize",1},
         {"ntdll.dll","RtlOemStringToUnicodeSize",1},{"ntdll.dll","RtlxOemStringToUnicodeSize",1},
         {"ntdll.dll","RtlUpcaseUnicodeStringToAnsiString",3},{"ntdll.dll","RtlUpcaseUnicodeStringToOemString",3},
+        {"ntdll.dll","RtlUnicodeStringToCountedOemString",3},{"ntoskrnl.exe","RtlOemStringToCountedUnicodeString",3},
         {"ntdll.dll","RtlUpcaseUnicodeStringToCountedOemString",3},{"ntdll.dll","RtlUpcaseUnicodeToMultiByteN",5,0,0,0x12},
         {"ntdll.dll","RtlUpcaseUnicodeToOemN",5,0,0,0x12},{"ntdll.dll","RtlIsNameLegalDOS8Dot3",3},
         // 整數轉換
@@ -112,6 +114,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_ntdll_pure(GuestState& stat
     const auto bytes_of=[](std::u16string_view text){return utf16_payload(text);};
     const auto store_counted=[&](std::uint64_t address,std::vector<std::uint8_t> data,unsigned terminator,bool allocate)->std::uint32_t{
         return store_counted_string(memory,address,x86_,std::move(data),terminator,allocate,status_buffer_overflow,[&](std::size_t size){return allocate_heap(memory,size);});};
+    if(name=="RtlRunEncodeUnicodeString" || name=="RtlRunDecodeUnicodeString"){
+        const bool encode=name=="RtlRunEncodeUnicodeString";
+        const auto value=header(arg(1));
+        const auto seed_arg=arg(0);
+        auto seed=static_cast<std::uint8_t>(encode?memory.load(GuestAddress{seed_arg},8):seed_arg);
+        if(encode && !seed){
+            auto time=runtime_.system_filetime()>>8;
+            while(time && !seed){seed=static_cast<std::uint8_t>(time);time>>=8;}
+            if(!seed)seed=1;
+            memory.store(GuestAddress{seed_arg},8,seed);
+        }
+        // 解碼從末端往前，以保留尚未使用的編碼位元組；長度可為奇數。
+        std::uint8_t previous=0x43U;
+        for(unsigned i=0;i<value.length;++i){
+            const auto index=encode?i:value.length-1U-i;
+            const auto address=GuestAddress{value.buffer+index};
+            if(encode)seed=static_cast<std::uint8_t>(memory.load(GuestAddress{seed_arg},8));
+            else if(index)previous=static_cast<std::uint8_t>(memory.load(GuestAddress{address.value-1},8));
+            const auto mask=index?(seed^previous):(seed|0x43U);
+            previous=static_cast<std::uint8_t>(memory.load(address,8)^mask);
+            memory.store(address,8,previous);
+        }
+        return done(0);
+    }
     // 位元圖：RTL_BITMAP {ULONG SizeOfBitMap; PULONG Buffer}。
     struct Bitmap {std::uint32_t size;std::uint64_t buffer;};
     const auto bitmap=[&](std::uint64_t address)->Bitmap{return {static_cast<std::uint32_t>(memory.load(GuestAddress{address},32)),memory.load(GuestAddress{address+unit},bits)};};
@@ -274,10 +300,49 @@ std::optional<std::uint32_t> WindowsServices::invoke_ntdll_pure(GuestState& stat
         if(name.ends_with("StringToUnicodeSize")){
             return done((utf8_to_utf16_lossy(narrow_text(header(arg(0)))).size()+1)*2);
         }
-        if(name=="RtlUpcaseUnicodeStringToAnsiString" || name=="RtlUpcaseUnicodeStringToOemString" || name=="RtlUpcaseUnicodeStringToCountedOemString"){
+        if(name=="RtlOemStringToCountedUnicodeString" || name=="RtlUnicodeStringToCountedOemString" ||
+           name=="RtlUpcaseUnicodeStringToCountedOemString"){
+            const bool upcase=name=="RtlUpcaseUnicodeStringToCountedOemString";
+            const auto source=header(arg(1));
+            std::vector<std::uint8_t> data;
+            if(name=="RtlOemStringToCountedUnicodeString"){
+                data=bytes_of(utf8_to_utf16_lossy(narrow_text(source)));
+            }else{
+                auto text=wide_text(source);
+                if(upcase)for(auto& c:text)c=upper(c);
+                const auto encoded=utf16_to_utf8_lossy(text);
+                data.assign(encoded.begin(),encoded.end());
+            }
+            const auto destination=arg(0);
+            if(data.size()>UINT16_MAX)return done(0xc00000f0U); // STATUS_INVALID_PARAMETER_2
+            memory.check(GuestAddress{destination},2*unit,Access::Write);
+            if(data.empty() && !upcase){
+                memory.write(GuestAddress{destination},std::vector<std::uint8_t>(2*unit));
+                return done(0);
+            }
+            const bool allocate=byte(2)!=0;
+            set_length(destination,data.size());
+            if(allocate){
+                memory.store(GuestAddress{destination+2},16,data.size());
+                memory.store(GuestAddress{destination+unit},bits,0);
+            }else{
+                const auto target=header(destination);
+                if(data.size()>target.capacity){
+                    // 大寫版本會複製可容納的完整字元；一般版本只回報所需長度。
+                    if(upcase){
+                        std::size_t used=target.capacity;
+                        while(used && (data[used]&0xc0U)==0x80U)--used;
+                        if(used)memory.write(GuestAddress{target.buffer},std::span(data).first(used));
+                        set_length(destination,target.capacity);
+                    }
+                    return done(status_buffer_overflow);
+                }
+            }
+            return done(store_counted(destination,std::move(data),0,allocate));
+        }
+        if(name=="RtlUpcaseUnicodeStringToAnsiString" || name=="RtlUpcaseUnicodeStringToOemString"){
             auto text=wide_text(header(arg(1)));for(auto& c:text)c=upper(c);const auto converted=utf16_to_utf8_lossy(text);
-            const bool counted=name.ends_with("CountedOemString");
-            return done(store_counted(arg(0),std::vector<std::uint8_t>(converted.begin(),converted.end()),counted?0U:1U,(arg(2)&0xffU)!=0));
+            return done(store_counted(arg(0),std::vector<std::uint8_t>(converted.begin(),converted.end()),1,byte(2)!=0));
         }
         if(name=="RtlUpcaseUnicodeToMultiByteN" || name=="RtlUpcaseUnicodeToOemN"){
             // (Dest, DestBytes, BytesWritten*, Source, SourceBytes)：不附加 NUL，截斷在完整字元邊界。

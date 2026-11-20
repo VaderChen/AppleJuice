@@ -1,7 +1,14 @@
+#include "gui_window_menu.hpp"
+#include "gui_message_metadata.hpp"
+#include "gui_cursor_bounds.hpp"
+#include "gui_paint_region.hpp"
+#include "window_class_name.hpp"
+#include "shared_window_order.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_icon.hpp"
 #include "windows_slist.hpp"
 #include "resource_directory.hpp"
+#include "windows_locale_data.hpp"
 #include "x64arm/windows_userdraw.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/windows_window_state.hpp"
@@ -27,27 +34,33 @@ namespace x64arm {
 #include "windows_gui_timing.inc"
 // 目前執行緒的鍵盤配置名稱（KLID，8 位十六進位）；user32 GetKeyboardLayoutName 與主控台 GetConsoleKeyboardLayoutName 共用。
 std::u16string WindowsServices::keyboard_layout_name(){
-    std::uint32_t layout=0x409;if(native_gui_)for(const auto& method:native_input_methods())if(method.current){layout=method.layout;break;}
-    if(const auto selected=selected_keyboard_layout(threads_.current))layout=static_cast<std::uint32_t>(((selected>>16)&0xffffU)==(selected&0xffffU)?selected&0xffffU:selected);
+    auto selected=selected_keyboard_layout(threads_.current);
+    if(!selected){selected=0x04090409;if(native_gui_)for(const auto& method:native_input_methods())if(method.current){selected=method.layout;break;}}
+    std::uint32_t layout=static_cast<std::uint32_t>(((selected>>16)&0xffffU)==(selected&0xffffU)?selected&0xffffU:selected);
+    for(const auto& item:gui_.loaded_keyboard_layouts)if(item.first==selected){layout=item.second;break;}
     std::u16string name(8,u'0');for(unsigned i=0;i<8;++i)name[7-i]=u"0123456789ABCDEF"[(layout>>(i*4))&15];
     return name;
 }
-std::uint32_t WindowsServices::system_metric(std::uint32_t index,std::uint32_t dpi) {
+std::uint32_t WindowsServices::system_metric(const GuestMemory& memory,std::uint32_t index,std::uint32_t dpi) {
     switch(index){
     case 0:case 1:{const auto area=gui_screen_area();return static_cast<std::uint32_t>(index==0?area[2]-area[0]:area[3]-area[1]);}
     case 76:case 77:case 78:case 79:{
         // SM_*VIRTUALSCREEN 為全部顯示器的聯集；主螢幕左側或上方的螢幕使左上角為負值。
-        const auto& monitors=gui_monitors();auto bounds=monitors.front().rect;
-        for(const auto& monitor:monitors){
-            bounds[0]=std::min(bounds[0],monitor.rect[0]);bounds[1]=std::min(bounds[1],monitor.rect[1]);
-            bounds[2]=std::max(bounds[2],monitor.rect[2]);bounds[3]=std::max(bounds[3],monitor.rect[3]);
-        }
+        const auto bounds=gui_virtual_screen_bounds(gui_monitors());
         return static_cast<std::uint32_t>(index==76?bounds[0]:index==77?bounds[1]:index==78?bounds[2]-bounds[0]:bounds[3]-bounds[1]);
     }
-    case 23:return gui_.mouse_buttons_swapped?1U:0U; // SM_SWAPBUTTON
+    case 23:return gui_timing(memory,X64ARM_GUI_MOUSE_SWAP_OFFSET/4); // SM_SWAPBUTTON
     case 80:return static_cast<std::uint32_t>(gui_monitors().size());
     case 81:return 1;
     case 16:case 17:{const auto area=gui_work_area();return static_cast<std::uint32_t>(index==16?area[2]-area[0]:area[3]-area[1]);}
+    case 56:return gui_.minimized_metrics[3];
+    case 47:case 48:case 57:case 58:{
+        const bool horizontal=index==47 || index==57;
+        // MINIMIZEDMETRICS.iWidth 與 NONCLIENTMETRICS.iCaptionHeight 各加六個圖框像素。
+        const auto size=6ULL+(horizontal?gui_.minimized_metrics[0]:24U);
+        const auto gap=index==47?gui_.minimized_metrics[1]:index==48?gui_.minimized_metrics[2]:0U;
+        return gui_scale_metric(static_cast<std::uint32_t>(std::min<std::uint64_t>(size+gap,INT32_MAX)),dpi);
+    }
     case 68:return gui_scale_signed_metric(gui_.mouse_drag_width,dpi);
     case 69:return gui_scale_signed_metric(gui_.mouse_drag_height,dpi);
     case 36:case 37:return gui_scale_metric(4,dpi);
@@ -76,13 +89,14 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         
         
         
-        {"kernel32.dll","InterlockedFlushSList",1},{"kernel32.dll","InterlockedPushEntrySList",2},{"kernel32.dll","InterlockedPushListSListEx",4},{"ntdll.dll","RtlInterlockedPushListSListEx",4},{"kernel32.dll","InterlockedPopEntrySList",1},{"kernel32.dll","QueryDepthSList",1},{"kernel32.dll","InitializeSListHead",1}, {"kernel32.dll","FindResourceA",3},{"kernel32.dll","FindResourceExA",4},{"kernel32.dll","FindResourceExW",4},{"kernel32.dll","FindResourceW",3},
+        {"kernel32.dll","InterlockedFlushSList",1},{"kernel32.dll","InterlockedPushEntrySList",2},{"kernel32.dll","InterlockedPushListSListEx",4},{"kernel32.dll","InterlockedPushListSList",4},{"kernel32.dll","InterlockedPopEntrySList",1},{"kernel32.dll","QueryDepthSList",1},{"kernel32.dll","InitializeSListHead",1}, {"kernel32.dll","FindResourceA",3},{"kernel32.dll","FindResourceExA",4},{"kernel32.dll","FindResourceExW",4},{"kernel32.dll","FindResourceW",3},
         {"kernel32.dll","LoadResource",2},{"kernel32.dll","LockResource",1},{"kernel32.dll","SizeofResource",2},
         {"kernel32.dll","MulDiv",3},
         {"ole32.dll","CoInitialize",1},{"ole32.dll","CoInitializeEx",2},{"ole32.dll","CoUninitialize",0},{"ole32.dll","CoCreateInstance",5,0,0,4},{"ole32.dll","CoGetClassObject",5,0,0,2},
         {"comctl32.dll","PropertySheetA",1},{"comctl32.dll","PropertySheetW",1},
         {"comctl32.dll","InitCommonControls",0},{"comctl32.dll","InitCommonControlsEx",1},
         {"user32.dll","DialogBoxParamA",5},{"user32.dll","DialogBoxParamW",5},{"user32.dll","EndDialog",2},
+        {"user32.dll","DialogBoxIndirectParamAorW",6},{"user32.dll","CreateDialogIndirectParamAorW",6},
         {"user32.dll","DialogBoxIndirectParamA",5},{"user32.dll","DialogBoxIndirectParamW",5},{"user32.dll","CreateDialogIndirectParamA",5},{"user32.dll","CreateDialogIndirectParamW",5},
         {"user32.dll","MessageBoxA",4},{"user32.dll","MessageBoxW",4},
         {"user32.dll","MessageBoxIndirectA",1},{"user32.dll","MessageBoxIndirectW",1},{"user32.dll","MessageBeep",1},
@@ -98,24 +112,27 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"user32.dll","GetClipboardFormatNameA",3},{"user32.dll","GetClipboardFormatNameW",3},{"user32.dll","GetPriorityClipboardFormat",2},
         {"user32.dll","AddClipboardFormatListener",1},{"user32.dll","RemoveClipboardFormatListener",1},
         {"user32.dll","GetClipboardViewer",0},{"user32.dll","SetClipboardViewer",1},{"user32.dll","ChangeClipboardChain",2},
-        {"user32.dll","UserHandleGrantAccess",3},{"user32.dll","OpenClipboard",1},{"user32.dll","CloseClipboard",0},{"user32.dll","EmptyClipboard",0},
+        {"user32.dll","UserHandleGrantAccess",3},{"user32.dll","OpenClipboard",1},{"win32u.dll","NtUserOpenClipboard",2},{"user32.dll","CloseClipboard",0},{"user32.dll","EmptyClipboard",0},
         {"user32.dll","SetClipboardData",2},{"user32.dll","GetClipboardData",1},{"user32.dll","GetClipboardOwner",0},
         {"user32.dll","IsClipboardFormatAvailable",1},{"user32.dll","RegisterClipboardFormatA",1},{"user32.dll","RegisterClipboardFormatW",1},
         {"kernel32.dll","GlobalMemoryStatus",1},{"kernel32.dll","GlobalMemoryStatusEx",1},
-        {"kernel32.dll","GetThreadTimes",5},{"kernel32.dll","GetProcessTimes",5},{"kernel32.dll","QueryProcessCycleTime",2},{"user32.dll","GetCursorPos",1},{"user32.dll","GetPhysicalCursorPos",1},{"user32.dll","SetPhysicalCursorPos",2},{"user32.dll","SetCursorPos",2},{"user32.dll","GetCursorInfo",1},{"user32.dll","GetCursor",0},
+        {"kernel32.dll","GetThreadTimes",5},{"kernel32.dll","GetProcessTimes",5},{"kernel32.dll","QueryProcessCycleTime",2},{"user32.dll","GetCursorPos",1},{"user32.dll","GetPhysicalCursorPos",1},{"user32.dll","SetPhysicalCursorPos",2},{"user32.dll","SetCursorPos",2},{"user32.dll","GetCursorInfo",1},{"win32u.dll","NtUserGetCursorInfo",1},{"user32.dll","GetCursor",0},
         {"user32.dll","SetProcessDefaultLayout",1},{"user32.dll","GetProcessDefaultLayout",1},
         {"user32.dll","LoadImageA",6},{"user32.dll","LoadImageW",6},
         {"user32.dll","DisableProcessWindowsGhosting",0},
+        {"win32u.dll","NtUserShutdownBlockReasonCreate",3,0,0,0x4},
         {"user32.dll","ShutdownBlockReasonCreate",2},{"user32.dll","ShutdownBlockReasonQuery",3},{"user32.dll","ShutdownBlockReasonDestroy",1},
         {"user32.dll","InSendMessage",0},{"user32.dll","InSendMessageEx",1},{"user32.dll","ReplyMessage",1},
-        {"user32.dll","GetWindowDisplayAffinity",2},{"user32.dll","SetWindowDisplayAffinity",2},
+        {"user32.dll","GetWindowDisplayAffinity",2},{"user32.dll","SetWindowDisplayAffinity",2,0,0,0x2},
         {"user32.dll","GetClassLongA",2},{"user32.dll","GetClassLongW",2},{"user32.dll","SetClassLongA",3},{"user32.dll","SetClassLongW",3},
         {"user32.dll","GetClassLongPtrA",2},{"user32.dll","GetClassLongPtrW",2},{"user32.dll","SetClassLongPtrA",3},{"user32.dll","SetClassLongPtrW",3},
         {"user32.dll","GetClassWord",2},{"user32.dll","SetClassWord",3},
-        {"user32.dll","GetClassNameA",3},{"user32.dll","GetClassNameW",3},{"user32.dll","RealGetWindowClassA",3},{"user32.dll","RealGetWindowClassW",3},{"user32.dll","RealGetWindowClass",3},
-        {"user32.dll","SetTimer",4},{"user32.dll","SetCoalescableTimer",5},{"user32.dll","KillTimer",2},{"user32.dll","SetSystemTimer",4},{"user32.dll","KillSystemTimer",2},{"user32.dll","GetQueueStatus",1},{"user32.dll","MsgWaitForMultipleObjects",5},{"user32.dll","MsgWaitForMultipleObjectsEx",5},
+        {"user32.dll","GetClassNameA",3},{"user32.dll","GetClassNameW",3},{"user32.dll","RealGetWindowClassA",3},{"user32.dll","RealGetWindowClassW",3},{"user32.dll","RealGetWindowClass",3},{"win32u.dll","NtUserGetClassName",3},
+        {"user32.dll","SetTimer",4},{"user32.dll","SetCoalescableTimer",5},{"user32.dll","KillTimer",2},{"user32.dll","SetSystemTimer",4},{"win32u.dll","NtUserSetSystemTimer",3},{"user32.dll","KillSystemTimer",2},{"user32.dll","GetQueueStatus",1},{"user32.dll","MsgWaitForMultipleObjects",5},{"user32.dll","MsgWaitForMultipleObjectsEx",5},
         {"user32.dll","GetKeyboardLayout",1},{"user32.dll","GetKeyboardLayoutNameA",1},{"user32.dll","GetKeyboardLayoutNameW",1},{"user32.dll","GetKeyboardLayoutList",2},{"user32.dll","TrackMouseEvent",1},{"comctl32.dll","_TrackMouseEvent",1},{"user32.dll","GetAsyncKeyState",1},{"user32.dll","GetLastInputInfo",1},{"user32.dll","GetKeyboardState",1},{"user32.dll","SetKeyboardState",1},
         {"user32.dll","CreateCaret",4},{"user32.dll","DestroyCaret",0},{"user32.dll","ShowCaret",1},{"user32.dll","HideCaret",1},{"user32.dll","SetCaretPos",2},{"user32.dll","GetCaretPos",1},
+        {"internal-scroll","SetScrollInfo",4},{"internal-scroll","GetScrollInfo",3},
+        {"internal-scroll","GetScrollPos",2},{"internal-scroll","GetScrollBarInfo",3},
         {"user32.dll","SetScrollInfo",4},{"user32.dll","GetScrollInfo",3},{"user32.dll","GetScrollBarInfo",3},{"user32.dll","SetCursor",1},{"user32.dll","ShowCursor",1},
         {"user32.dll","GetCapture",0},{"user32.dll","SetCapture",1},{"user32.dll","ReleaseCapture",0},
         {"user32.dll","CreateDialogParamA",5},{"user32.dll","CreateDialogParamW",5},
@@ -131,17 +148,19 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"user32.dll","GetShellWindow",0},{"user32.dll","SetShellWindow",1},{"user32.dll","SetShellWindowEx",2},{"user32.dll","GetWindowInfo",2},
         {"user32.dll","LogicalToPhysicalPoint",2},{"user32.dll","PhysicalToLogicalPoint",2},{"user32.dll","LogicalToPhysicalPointForPerMonitorDPI",2},{"user32.dll","PhysicalToLogicalPointForPerMonitorDPI",2},{"user32.dll","MapDialogRect",2},
         {"user32.dll","MapWindowPoints",4},{"user32.dll","MoveWindow",6},{"user32.dll","SetWindowPos",7},{"user32.dll","OffsetRect",3},{"user32.dll","ScreenToClient",2},{"user32.dll","ClientToScreen",2},
+        {"win32u.dll","NtUserDeferWindowPosAndBand",10},{"win32u.dll","NtUserEndDeferWindowPosEx",2},
         {"user32.dll","BeginDeferWindowPos",1},{"user32.dll","DeferWindowPos",8},{"user32.dll","EndDeferWindowPos",1},
         {"user32.dll","EnableWindow",2},{"user32.dll","IsWindowEnabled",1},{"user32.dll","IsWindow",1},{"user32.dll","IsWindowVisible",1},{"user32.dll","IsIconic",1},{"user32.dll","IsZoomed",1},
-        {"user32.dll","GetAncestor",2},{"user32.dll","GetParent",1},{"user32.dll","SetParent",2},{"user32.dll","IsChild",2},{"user32.dll","SetFocus",1},{"user32.dll","GetFocus",0},
-        {"user32.dll","FindWindowExA",4},{"user32.dll","FindWindowExW",4},{"user32.dll","FindWindowA",2},{"user32.dll","FindWindowW",2},
+        {"user32.dll","GetAncestor",2,0,0,0x2},{"user32.dll","GetParent",1},{"user32.dll","SetParent",2},{"user32.dll","IsChild",2},{"user32.dll","SetFocus",1},{"user32.dll","GetFocus",0},
+        {"user32.dll","FindWindowExA",4},{"user32.dll","FindWindowExW",4},{"user32.dll","FindWindowA",2},{"user32.dll","FindWindowW",2},{"win32u.dll","NtUserFindWindowEx",5},
         {"user32.dll","GetForegroundWindow",0},{"user32.dll","GetActiveWindow",0},{"user32.dll","GetLastActivePopup",1},{"user32.dll","SetForegroundWindow",1},{"user32.dll","SetActiveWindow",1},
-        {"user32.dll","LoadIconA",2},{"user32.dll","LoadIconW",2},{"user32.dll","DestroyIcon",1},{"user32.dll","DestroyCursor",1},
+        {"user32.dll","LoadIconA",2},{"user32.dll","LoadIconW",2},{"user32.dll","DestroyIcon",1},{"user32.dll","DestroyCursor",1},{"win32u.dll","NtUserDestroyCursor",2},
         {"user32.dll","CreateIconIndirect",1},{"user32.dll","CopyIcon",1},{"user32.dll","GetIconInfo",2},
         {"user32.dll","BringWindowToTop",1},{"user32.dll","WindowFromDC",1},{"user32.dll","GetDC",1},{"user32.dll","GetDCEx",3},{"user32.dll","GetWindowDC",1},{"user32.dll","ReleaseDC",2},{"user32.dll","GetSysColor",1},{"user32.dll","GetSysColorBrush",1},
         {"user32.dll","GetDoubleClickTime",0},{"user32.dll","SetDoubleClickTime",1},{"user32.dll","GetCaretBlinkTime",0},{"user32.dll","SetCaretBlinkTime",1},{"user32.dll","GetMessageTime",0},{"user32.dll","GetMessagePos",0},{"user32.dll","GetMessageExtraInfo",0},{"user32.dll","SetMessageExtraInfo",1},
+        {"win32u.dll","NtUserGetWindowProcessHandle",2,0,0,0x2},
         {"user32.dll","GetWindowThreadProcessId",2},{"user32.dll","GetGuiResources",2},
-        {"user32.dll","RegisterWindowMessageA",1},{"user32.dll","RegisterWindowMessageW",1},
+        {"win32u.dll","NtUserGetAtomName",2},{"win32u.dll","NtUserGetClipboardFormatName",3},{"win32u.dll","NtUserRegisterWindowMessage",1},{"user32.dll","RegisterWindowMessageA",1},{"user32.dll","RegisterWindowMessageW",1},
         {"gdi32.dll","GetCharWidth32A",4},{"gdi32.dll","GetCharWidth32W",4},
         {"gdi32.dll","GetCharABCWidthsFloatA",4},{"gdi32.dll","GetCharABCWidthsFloatW",4},
         {"gdi32.dll","GetObjectA",3},{"gdi32.dll","GetObjectW",3},
@@ -154,7 +173,19 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
 }
 namespace {
 std::int32_t s32(std::uint64_t v){return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(v));}
-std::u16string lower(std::u16string s){for(auto& c:s)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);return s;}
+std::optional<std::uint64_t> resource_key(const GuestMemory& memory,std::uint64_t key,bool wide) {
+    if(key<=65535 || memory.load(GuestAddress{key},wide?16:8)!='#')return key;
+    const auto text=wide?read_utf16(memory,GuestAddress{key}):utf8_to_utf16_lossy(read_ansi(memory,key));
+    std::size_t at=1;
+    while(at<text.size() && text[at]<=u' ')++at;
+    const bool negative=at<text.size() && text[at]==u'-';
+    if(negative || (at<text.size() && text[at]==u'+'))++at;
+    std::uint32_t value=0;
+    while(at<text.size() && text[at]>=u'0' && text[at]<=u'9')value=value*10+(text[at++]-u'0');
+    if(negative)value=0U-value;
+    if(value>65535)return {};
+    return value;
+}
 }
 bool resource_name_matches(const GuestMemory& memory,std::uint64_t root,std::uint64_t extent,std::uint32_t entry,std::uint64_t requested,bool wide){
     if(!(entry&0x80000000U))return requested<=65535 && entry==requested;
@@ -162,7 +193,10 @@ bool resource_name_matches(const GuestMemory& memory,std::uint64_t root,std::uin
     const auto check=[&](std::uint64_t offset,std::uint64_t length){if(offset>extent || length>extent-offset)throw HostCallFault("資源目錄超出 PE 範圍");};
     const auto offset=entry&0x7fffffffU;check(offset,2);const auto length=memory.load(GuestAddress{root+offset},16);check(offset+2,length*2);std::u16string text;
     for(std::uint64_t i=0;i<length;++i)text.push_back(static_cast<char16_t>(memory.load(GuestAddress{root+offset+2+i*2},16)));
-    return lower(text)==lower(wide?read_utf16(memory,GuestAddress{requested}):utf8_to_utf16_lossy(read_ansi(memory,requested)));
+    const auto query=wide?read_utf16(memory,GuestAddress{requested}):utf8_to_utf16_lossy(read_ansi(memory,requested));
+    return std::equal(text.begin(),text.end(),query.begin(),query.end(),[](char16_t a,char16_t b){
+        return unicode_case_unit(a,true)==unicode_case_unit(b,true);
+    });
 }
 ResourceLookup find_resource_entry(const GuestMemory& memory,std::uint64_t base,std::uint64_t size,std::span<const std::uint64_t> keys,bool wide){
     ResourceLookup lookup;if(size<256)return lookup;
@@ -222,12 +256,26 @@ const GuiIcon* WindowsServices::resolve_gui_cursor(std::uint64_t handle,GuiIcon&
     system=GuiIcon{};system.is_icon=false;system.system=id;return &system;
 }
 void WindowsServices::release_cursor_frames(std::uint64_t cursor){
-    // 共用游標不會被 DestroyCursor 銷毀，其幀控制代碼保留。
-    if(const auto found=gui_.icons.find(cursor);found==gui_.icons.end() || found->second.shared)return;
-    for(auto it=gui_.cursor_frames.begin();it!=gui_.cursor_frames.end();)if(it->first.first==cursor){gui_.icons.erase(it->second);it=gui_.cursor_frames.erase(it);}else ++it;
+    bool redisplay=false;
+    for(auto it=gui_.cursor_frames.begin();it!=gui_.cursor_frames.end();){
+        if(it->first.first!=cursor){++it;continue;}
+        const auto frame=it->second;
+        for(auto& [id,thread]:threads_.items)if(thread.keyboard_queue.cursor==frame)thread.keyboard_queue.cursor=0;
+        redisplay|=gui_.cursor==frame;
+        gui_.icons.erase(frame);
+        it=gui_.cursor_frames.erase(it);
+    }
+    if(redisplay)present_gui_cursor();
 }
 // 依目前游標（含動畫幀）重新設定原生游標：系統游標被取代或還原、拖放結束還原游標時共用。
 void WindowsServices::present_gui_cursor(){
+    const auto active=gui_.windows.find(gui_.active);
+    const auto owner=active==gui_.windows.end()?1:active->second.thread;
+    if(threads_.items.contains(owner)){
+        const auto& queue=threads_.input_queue(owner);
+        if(gui_.cursor!=queue.cursor){gui_.cursor_animation_start=runtime_.clock_ticks;gui_.cursor_animation_step=0;}
+        gui_.cursor=queue.cursor;gui_.cursor_count=queue.cursor_count;
+    }
     if(!native_gui_ || !interactive_station())return;
     GuiIcon system;const GuiIcon* icon=gui_.cursor?resolve_gui_cursor(gui_.cursor,system):nullptr;
     if(icon && !icon->animation_sequence.empty()){
@@ -251,12 +299,18 @@ std::uint64_t WindowsServices::load_gui_icon(GuestMemory& memory,std::uint64_t i
             static constexpr std::array<std::uint32_t,7> stock{2,80,23,78,79,2,77};auto icon=native_stock_icon(stock[static_cast<std::size_t>(name-32512)],width?width:32);if(!icon)return fail(50);icon->system=static_cast<std::uint32_t>(name);resize_icon(*icon,width?width:32,height?height:32,(flags&1)!=0);return store_gui_icon(std::move(*icon),flags);
 #endif
         }
+        const auto store_resource=[&](GuiIcon icon,std::uint64_t entry){
+            icon.resource_instance=resource_image(entry,true)->base;
+            if(name<=65535)icon.resource_name_id=static_cast<std::uint32_t>(name);
+            else icon.resource_name=wide?read_utf16(memory,GuestAddress{name}):utf8_to_utf16_lossy(read_ansi(memory,name));
+            return store_gui_icon(std::move(icon),flags);
+        };
         const auto group=gui_resource(memory,instance,name,cursor?12:14,wide,first);
         if(!group){
             const auto animated=gui_resource(memory,instance,name,cursor?21:22,wide,first);if(!animated)return fail(1814);
             const auto length=memory.load(GuestAddress{animated+4},32);if(length>64*1024*1024)return fail(8);std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));
             memory.read(GuestAddress{resource_image(animated,true)->base+memory.load(GuestAddress{animated},32)},bytes);
-            return store_gui_icon(decode_icon_file(bytes,cursor,width,height,flags,prefer_larger),flags);
+            return store_resource(decode_icon_file(bytes,cursor,width,height,flags,prefer_larger),animated);
         }
         const auto size=memory.load(GuestAddress{group+4},32);if(size>65536)return fail(1814);std::vector<std::uint8_t> directory(static_cast<std::size_t>(size));
         memory.read(GuestAddress{resource_image(group,true)->base+memory.load(GuestAddress{group},32)},directory);
@@ -270,9 +324,7 @@ std::uint64_t WindowsServices::load_gui_icon(GuestMemory& memory,std::uint64_t i
         const auto length=memory.load(GuestAddress{entry+4},32);if(length>16*1024*1024)return fail(8);std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));
         memory.read(GuestAddress{resource_image(entry,true)->base+memory.load(GuestAddress{entry},32)},bytes);
         auto icon=decode_icon_resource(bytes,!cursor,width?width:intrinsic?choice.width:32,height?height:intrinsic?choice.height:32,flags);
-        if(flags&0x8000U){icon.resource_instance=resource_image(group,true)->base;if(name<=65535)icon.resource_name_id=static_cast<std::uint32_t>(name);
-            else icon.resource_name=wide?read_utf16(memory,GuestAddress{name}):utf8_to_utf16_lossy(read_ansi(memory,name));}
-        return store_gui_icon(std::move(icon),flags);
+        return store_resource(std::move(icon),group);
     }catch(const std::invalid_argument&){return fail(193);}catch(const std::bad_alloc&){return fail(8);}
 }
 std::pair<std::map<std::uint64_t,GuiSentMessage>::iterator,std::size_t> WindowsServices::active_gui_sent_message(std::uint64_t* text_token){
@@ -314,6 +366,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     if(service.symbol=="CreateCaret" || service.symbol=="DestroyCaret" || service.symbol=="ShowCaret" || service.symbol=="HideCaret" || service.symbol=="GetCaretPos" || service.symbol=="SetCaretPos")return invoke_gui_caret(state,memory,service);
 
     if(service.symbol=="UserHandleGrantAccess")return invoke_job(state,memory,service);
+    if(x86_ && service.symbol=="InterlockedPushListSList"){
+        // Win32 fastcall：ECX、EDX 分別指向標頭與首項，堆疊上只有末項與筆數。
+        const WindowsCall stack(state,memory,2);
+        const auto previous=slist::push_list(memory,static_cast<std::uint32_t>(state.reg(Gpr::Rcx)),true,
+            static_cast<std::uint32_t>(state.reg(Gpr::Rdx)),stack(0),static_cast<std::uint32_t>(stack(1)));
+        stack.return_to(state,previous);
+        return std::nullopt;
+    }
     if(invoke_remote_gui(state,memory,service))return std::nullopt;
     if(service.family=="imm32.dll")return invoke_imm(state,memory,service);
     if(service.symbol.starts_with("PropertySheet"))return invoke_property_sheet(state,memory,service);
@@ -386,77 +446,72 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         else if(symbol=="DwmEnableComposition")result=d(0)>1?0x80070057U:d(0)?0x80263001U:0U;
         else result=0x80263001U; // DWM_E_COMPOSITIONDISABLED；不回填不存在的合成資訊。
     }
-    else if(symbol.starts_with("FindWindow")){
-        const bool extended=symbol.starts_with("FindWindowEx");
-        const auto requested_parent=extended?arg(0):0,after=extended?arg(1):0;
-        const auto message_parent=x86_?UINT64_C(0xfffffffd):gui_message_parent;
-        const auto parent=requested_parent==gui_.desktop?0:requested_parent==message_parent?gui_message_parent:requested_parent;
-        const auto cls=arg(extended?2:0),caption=arg(extended?3:1);
-        const auto class_name=cls>65535?read(cls):std::u16string{};
-        const auto title=caption?read(caption):std::u16string{};
-        const auto equal=[](std::u16string_view a,std::u16string_view b){
-            return std::equal(a.begin(),a.end(),b.begin(),b.end(),[](char16_t x,char16_t y){
-                return x==y || unicode_case_unit(x,true)==unicode_case_unit(y,true);
-            });
-        };
-        const auto desktop=thread_desktop_object(threads_.current);
-        const auto find_child=[&](std::uint64_t target_parent)->std::uint64_t{
-            bool seen=!after;
-            for(const auto handle:gui_.z_order){
-                if(!seen){if(handle==after)seen=true;continue;}
-                const auto found=gui_.windows.find(handle);
-                if(found==gui_.windows.end() || handle==gui_.desktop)continue;
-                const auto& w=found->second;
-                if(w.desktop_object!=desktop || w.parent!=target_parent)continue;
-                if(cls && (cls<=65535?w.class_atom!=cls:!equal(w.class_name,class_name)))continue;
-                if(!caption || equal(w.title,title))return handle;
-            }
-            return 0;
-        };
-        if((parent && parent!=gui_message_parent && !gui_.windows.contains(parent)) ||
-           (after && (!gui_.windows.contains(after) || gui_.windows.at(after).parent!=parent)))fail(1400);
-        else if(cls<=65535 || !class_name.empty()){
-            result=find_child(parent);
-            if(!result && !requested_parent && !after)result=find_child(gui_message_parent);
-        }
+    else if(symbol.starts_with("FindWindow") || symbol=="NtUserFindWindowEx"){
+        result=find_gui_window(memory,arg,symbol);
+        if(!result && symbol=="FindWindowA")last_error_=1407;
     }
-    else if(symbol=="GetClassNameA" || symbol=="GetClassNameW" || symbol.starts_with("RealGetWindowClass")){
-        // RealGetWindowClass 回傳系統控制項的基底類別；未超類別化的視窗與 GetClassName 相同（無 W 尾碼的別名為 ANSI）。
+    else if(symbol.starts_with("GetClassName") || symbol.starts_with("RealGetWindowClass") || symbol=="NtUserGetClassName"){
         const auto found=gui_.windows.find(arg(0));
         if(found==gui_.windows.end())fail(1400);
-        else if(s32(arg(2))<=0)fail(87);
         else {
-            auto name=found->second.class_name;
-            if(!found->second.class_atom || gui_.system_classes.contains(found->second.class_name)){
-                for(const auto& [key,value]:std::array<std::pair<std::u16string_view,std::u16string_view>,7>{{
-                    {u"button",u"Button"},{u"static",u"Static"},{u"edit",u"Edit"},{u"listbox",u"ListBox"},
-                    {u"combobox",u"ComboBox"},{u"combolbox",u"ComboLBox"},{u"scrollbar",u"ScrollBar"}}})if(name==key){name=value;break;}
-            }
-            if(wide){result=std::min<std::uint64_t>(name.size(),d(2)-1U);memory.write(GuestAddress{arg(1)},utf16_bytes(name.substr(0,result)));}
-            else {const auto text=utf16_to_utf8(name);result=std::min<std::uint64_t>(text.size(),d(2)-1U);std::vector<std::uint8_t> bytes(text.begin(),text.begin()+static_cast<std::ptrdiff_t>(result));bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);}
+            const auto& w=found->second;
+            const bool real=symbol.starts_with("Real") || (symbol=="NtUserGetClassName" && arg(1));
+            const auto name=window_class_name(w,!w.class_atom || gui_.system_classes.contains(w.class_name),real);
+            result=write_window_class_name(memory,arg,symbol,x86_,name,last_error_);
         }
     }
     else if(symbol.starts_with("GetClassLong") || symbol.starts_with("SetClassLong") || symbol=="GetClassWord" || symbol=="SetClassWord" || symbol.starts_with("GetClassInfo") || symbol.starts_with("UnregisterClass")){
 #include "windows_class_properties.inc"
     }
-    else if(symbol=="InitializeSListHead" || symbol=="InterlockedFlushSList" || symbol=="InterlockedPushEntrySList" || symbol=="InterlockedPopEntrySList" || symbol=="QueryDepthSList" || symbol.ends_with("InterlockedPushListSListEx")) {
+    else if(symbol=="InitializeSListHead" || symbol=="InterlockedFlushSList" || symbol=="InterlockedPushEntrySList" || symbol=="InterlockedPopEntrySList" || symbol=="QueryDepthSList" ||
+            symbol=="InterlockedPushListSList" || symbol=="InterlockedPushListSListEx") {
         const auto header=arg(0);
         if(symbol=="InitializeSListHead") {slist::check(memory,header,x86_,Access::Write);memory.write(GuestAddress{header},std::vector<std::uint8_t>(slist::size(x86_)));}
         else if(symbol=="QueryDepthSList")result=slist::depth(memory,header,x86_);
         else if(symbol=="InterlockedFlushSList")result=slist::flush(memory,header,x86_);
         else if(symbol=="InterlockedPushEntrySList")result=slist::push(memory,header,x86_,arg(1));
-        else if(symbol.ends_with("InterlockedPushListSListEx"))result=slist::push_list(memory,header,x86_,arg(1),arg(2),static_cast<std::uint32_t>(arg(3)));
+        else if(symbol=="InterlockedPushListSList" || symbol=="InterlockedPushListSListEx")result=slist::push_list(memory,header,x86_,arg(1),arg(2),static_cast<std::uint32_t>(arg(3)));
         else result=slist::pop(memory,header,x86_);
     }
     else if(symbol=="MulDiv"){
         const auto a=static_cast<std::int64_t>(s32(arg(0))),b=static_cast<std::int64_t>(s32(arg(1))),c=static_cast<std::int64_t>(s32(arg(2)));result=UINT64_MAX;
         if(c){const auto product=a*b;const auto negative=(product<0)!=(c<0);const auto magnitude=(product<0?-product:product)+(c<0?-c:c)/2;const auto value=magnitude/(c<0?-c:c)*(negative?-1:1);if(value>=INT32_MIN && value<=INT32_MAX)result=static_cast<std::uint32_t>(value);}
-    } else if(symbol=="FindResourceExW" || symbol=="FindResourceExA"){
-        // FindResourceEx(hModule, type, name, language)：LANG_NEUTRAL 取第一個語系，其他語系須完全符合。
-        const auto language=static_cast<std::uint16_t>(arg(3));
-        result=gui_resource(memory,arg(0),arg(2),arg(1),wide,false,language?static_cast<int>(language):-1);
-        if(!result)last_error_=language && gui_resource(memory,arg(0),arg(2),arg(1),wide)?1815:1814;
-    } else if(symbol.starts_with("FindResource")){result=gui_resource(memory,arg(0),arg(1),arg(2),wide);if(!result)last_error_=1814;}
+    } else if(symbol.starts_with("FindResource")){
+        const bool extended=symbol.starts_with("FindResourceEx");
+        const auto type=resource_key(memory,arg(extended?1:2),wide);
+        const auto name=resource_key(memory,arg(extended?2:1),wide);
+        const auto* image=resource_image(arg(0)?arg(0):runtime_.image.base);
+        if(!type || !name)fail(87);
+        else if(!image)fail(1812);
+        else {
+            const std::array keys{*type,*name};
+            const auto directory=find_resource_entry(memory,image->base,image->size,keys,wide);
+            if(!directory.present)fail(1812);
+            else if(directory.depth<2)fail(directory.depth==0?1813:1814);
+            else {
+                const auto language=extended?static_cast<std::uint16_t>(arg(3)):0;
+                const auto probe=[&](int id){
+                    if(!result)result=gui_resource(memory,arg(0),*name,*type,wide,false,id);
+                };
+                const auto localized=[&](int id){probe(id);probe(id&0x3ff);};
+                if(language&0x3ff){localized(language);probe(0);}
+                else {
+                    probe(0);
+                    const auto preferred=[&](const auto& languages){
+                        for(const auto& tag:languages){
+                            if(result)break;
+                            if(const auto locale=windows_crt_locale(tag))localized(static_cast<std::uint16_t>(locale->lcid));
+                        }
+                    };
+                    if(const auto* thread=current_thread_ui_languages())preferred(*thread);
+                    preferred(runtime_.preferred_ui_languages);
+                    localized(0x409);
+                    probe(-1);
+                }
+                if(!result)fail(1815);
+            }
+        }
+    }
     else if(symbol=="LoadResource" || symbol=="SizeofResource"){
         const auto* image=resource_image(arg(0)?arg(0):runtime_.image.base);
         if(!image || arg(1)<image->base || arg(1)-image->base>image->size || image->size-(arg(1)-image->base)<16)fail(6);
@@ -489,13 +544,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         // 保留不可逆的程序政策，既有及後續 HWND 都繼續使用客體自己的視窗。
         gui_.ghosting_disabled=true;
     }
-    else if(symbol=="ShutdownBlockReasonCreate" || symbol=="ShutdownBlockReasonQuery" || symbol=="ShutdownBlockReasonDestroy"){
+    else if(symbol=="NtUserShutdownBlockReasonCreate" || symbol=="ShutdownBlockReasonCreate" || symbol=="ShutdownBlockReasonQuery" || symbol=="ShutdownBlockReasonDestroy"){
         const auto found=gui_.windows.find(arg(0));
         if(found==gui_.windows.end())fail(shared_gui_window(arg(0))?5:1400);
         else if(found->second.thread!=threads_.current)fail(5);
-        else if(symbol=="ShutdownBlockReasonCreate"){
+        else if(symbol.ends_with("ShutdownBlockReasonCreate")){
             if(!arg(1))fail(87);
-            else {found->second.shutdown_reason=read_utf16(memory,GuestAddress{arg(1)});result=1;}
+            else {
+                try {
+                    const GuestAddress reason{arg(1)};
+                    if(symbol=="NtUserShutdownBlockReasonCreate"){
+                        const auto count=d(2);
+                        if(count)memory.check(reason,static_cast<std::size_t>(count)*2,Access::Read);
+                        found->second.shutdown_reason=read_utf16_counted(memory,reason,count);
+                    }else found->second.shutdown_reason=read_utf16(memory,reason);
+                    result=1;
+                }catch(const MemoryFault&){fail(998);}
+            }
         }else if(symbol=="ShutdownBlockReasonDestroy"){
             found->second.shutdown_reason.reset();result=1;
         }else if(!arg(2))fail(87);
@@ -539,9 +604,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     }else if(symbol=="GetTouchInputInfo" || symbol=="CloseTouchInputHandle"){
         // 沒有實體觸控來源便不產生 WM_TOUCH 或 HTOUCHINPUT；任意值不是有效封包。
         fail(6);
-    }else if(symbol=="SetTimer" || symbol=="SetCoalescableTimer" || symbol=="SetSystemTimer"){
+    }else if(symbol=="SetTimer" || symbol=="SetCoalescableTimer" || symbol=="SetSystemTimer" || symbol=="NtUserSetSystemTimer"){
         // SetSystemTimer：與 SetTimer 相同的期限與 ID 規則，但送 WM_SYSTIMER，且與同 ID 的一般計時器互不影響。
-        const auto system=symbol=="SetSystemTimer"?gui_system_timer_bit:UINT64_C(0);
+        const bool system=symbol=="SetSystemTimer" || symbol=="NtUserSetSystemTimer";
         const auto elapsed=std::clamp(d(2),10U,0x7fffffffU);
         const auto tolerance=symbol=="SetCoalescableTimer"?d(4):0U;
         if(tolerance!=UINT32_MAX && tolerance>0x7ffffff5U)fail(87);
@@ -551,19 +616,29 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         else if(arg(0) && !gui_.windows.contains(arg(0)))fail(1400);
         else if(arg(0) && gui_.windows.at(arg(0)).thread!=threads_.current)fail(5);
         else {
-            auto id=arg(1)&~gui_system_timer_bit;const auto existing=gui_.timers.find({arg(0),id|system});
+            GuiTimerKey key{arg(0),arg(1),system?0x118U:0x113U};
+            const auto existing=gui_.timers.find(key);
             // 有 HWND 的 ID 屬於該視窗，包含 ID 0；只有無 HWND 的新 timer 才配置 ID。
-            if(!arg(0) && (!id || existing==gui_.timers.end() || existing->second.thread!=threads_.current))id=gui_.next_object++;
+            if(!arg(0) && (!key.id || existing==gui_.timers.end() || existing->second.thread!=threads_.current))key.id=gui_.next_object++;
             const auto interval=static_cast<std::uint64_t>(elapsed)*10000;
             const auto slack=tolerance==UINT32_MAX?0:static_cast<std::uint64_t>(tolerance)*10000;
             const auto owner=arg(0)?gui_.windows.at(arg(0)).thread:threads_.current;
-            const auto deadline=gui_.timer_deadline(runtime_.clock_ticks+interval,slack,{arg(0),id|system});
-            gui_.timers[{arg(0),id|system}]={deadline,interval,arg(3),owner,slack,system?0x118U:0x113U};
-            result=id?id:1;gui_.message_threads.insert(owner);
+            const auto deadline=gui_.timer_deadline(runtime_.clock_ticks+interval,slack,key);
+            gui_.timers[key]={deadline,interval,system?0:arg(3),owner,slack};
+            result=key.id?key.id:1;gui_.message_threads.insert(owner);
         }
     }else if(symbol=="KillTimer" || symbol=="KillSystemTimer"){
-        const auto timer=gui_.timers.find({arg(0),(arg(1)&~gui_system_timer_bit)|(symbol=="KillSystemTimer"?gui_system_timer_bit:UINT64_C(0))});
+        const auto timer=gui_.timers.find({arg(0),arg(1),symbol=="KillSystemTimer"?0x118U:0x113U});
         if(timer!=gui_.timers.end() && (arg(0) || timer->second.thread==threads_.current)){gui_.timers.erase(timer);result=1;}
+    }
+    else if(symbol=="NtUserGetWindowProcessHandle"){
+        auto pid=process_id();
+        if(!gui_.windows.contains(arg(0))){
+            const auto owner=shared_gui_window(arg(0));
+            if(!owner){fail(1400);arg.return_to(state,0);return std::nullopt;}
+            pid=owner->process;
+        }
+        result=nested_service(state,memory,"kernel32.dll","OpenProcess",{d(1),0,pid});
     }
     else if(symbol=="GetWindowThreadProcessId"){
         const auto window=gui_.windows.find(arg(0));if(window==gui_.windows.end())fail(1400);else {if(arg(1))memory.store(GuestAddress{arg(1)},32,process_id());result=thread_identifier(window->second.thread);}
@@ -617,25 +692,48 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         else {std::vector<std::uint32_t> layouts;for(const auto layout:keyboard_layouts())layouts.push_back(static_cast<std::uint32_t>(layout));
             if(!d(0))result=layouts.size();else {result=std::min<std::size_t>(layouts.size(),d(0));memory.check(GuestAddress{arg(1)},result*(x86_?4:8),Access::Write);for(unsigned i=0;i<result;++i)memory.store(GuestAddress{arg(1)+i*(x86_?4:8)},x86_?32:64,layouts[i]);}}
     }
-    else if(symbol=="GetKeyboardState"){memory.write(GuestAddress{arg(0)},gui_.keyboard);result=1;}
-    else if(symbol=="SetKeyboardState"){memory.read(GuestAddress{arg(0)},gui_.keyboard);for(unsigned i=0;i<256;++i)gui_.input_keyboard[i]=static_cast<std::uint8_t>((gui_.input_keyboard[i]&0x80U)|(gui_.keyboard[i]&1U));result=1;}
-    else if(symbol=="GetCursor")result=gui_.cursor;
+    else if(symbol=="GetKeyboardState" || symbol=="SetKeyboardState"){
+        auto& keyboard=threads_.input_queue(threads_.current).keys;
+        try{
+            if(symbol=="GetKeyboardState")memory.write(GuestAddress{arg(0)},keyboard);
+            else{
+                std::array<std::uint8_t,256> keys{};
+                memory.read(GuestAddress{arg(0)},keys);
+                for(auto& key:keys)key&=0x81U;
+                keyboard=keys;
+            }
+            result=1;
+        }catch(const MemoryFault&){fail(998);}
+    }
+    else if(symbol=="GetCursor")result=threads_.input_queue(threads_.current).cursor;
     else if(symbol=="ShowCursor" || symbol=="SetCursor"){
-        const bool set=symbol=="SetCursor";const auto handle=set?arg(0):gui_.cursor;GuiIcon icon;
+        auto& queue=threads_.input_queue(threads_.current);
+        const auto active=gui_.windows.find(gui_.active);
+        const auto foreground=active==gui_.windows.end()?1:active->second.thread;
+        const bool present=threads_.items.contains(foreground) && &queue==&threads_.input_queue(foreground);
+        const bool set=symbol=="SetCursor";const auto handle=set?arg(0):queue.cursor;GuiIcon icon;
         const GuiIcon* selected=handle?resolve_gui_cursor(handle,icon):nullptr;const bool valid=!handle || selected;
         const bool changed=set && handle!=gui_.cursor;const auto start=changed?runtime_.clock_ticks:gui_.cursor_animation_start;
         const auto step=selected?icon_animation_step(*selected,runtime_.clock_ticks>=start?runtime_.clock_ticks-start:0):0;
         if(selected && !selected->animation_sequence.empty())selected=&selected->animation_frames.at(selected->animation_sequence[step]);
-        const auto count=set?gui_.cursor_count:static_cast<std::int32_t>(std::clamp<std::int64_t>(static_cast<std::int64_t>(gui_.cursor_count)+(d(0)?1:-1),INT32_MIN,INT32_MAX));
+        const auto count=set?queue.cursor_count:static_cast<std::int32_t>(std::clamp<std::int64_t>(static_cast<std::int64_t>(queue.cursor_count)+(d(0)?1:-1),INT32_MIN,INT32_MAX));
         if(!valid)fail(1402);
-        else if(native_gui_ && interactive_station() && !native_gui_->set_cursor(selected,count>=0 && handle!=0))fail(50);
-        else {gui_.cursor_animation_start=start;gui_.cursor_animation_step=step;if(set){result=gui_.cursor;gui_.cursor=handle;}else{gui_.cursor_count=count;result=static_cast<std::uint64_t>(static_cast<std::int64_t>(count));}}
+        else if(present && native_gui_ && interactive_station() && !native_gui_->set_cursor(selected,count>=0 && handle!=0))fail(50);
+        else {
+            if(set){result=queue.cursor;queue.cursor=handle;}
+            else {
+                auto& delta=threads_.items.at(threads_.current).cursor_show_delta;
+                delta=static_cast<std::int32_t>(std::clamp<std::int64_t>(static_cast<std::int64_t>(delta)+(d(0)?1:-1),INT32_MIN,INT32_MAX));
+                queue.cursor_count=count;result=static_cast<std::uint64_t>(static_cast<std::int64_t>(count));
+            }
+            if(present){gui_.cursor_animation_start=start;gui_.cursor_animation_step=step;gui_.cursor=handle;gui_.cursor_count=count;}
+        }
     }
     else if(symbol=="GetScrollBarInfo"){
         const auto found=gui_.windows.find(arg(0));const auto object=static_cast<std::int32_t>(arg(1));const auto out=arg(2);
         if(found==gui_.windows.end())fail(1400);
         else if(!out || memory.load(GuestAddress{out},32)!=60 || (object!=-4 && object!=-5 && object!=-6))fail(87);
-        else if(object==-4 && gui_control_class(found->second)!=u"scrollbar"){
+        else if(object==-4 && service.family!="internal-scroll"){
             start_callbacks(state,memory,{{resolve("user32.dll","SendMessageW").value,{arg(0),0xeb,0,out}}},Continuation::ReturnCallback,0);return std::nullopt;
         }else {
             const auto& w=found->second;const bool control=object==-4,vertical=control?(w.style&1)!=0:object==-5;
@@ -655,7 +753,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             memory.fill(GuestAddress{out},0,60);memory.store(GuestAddress{out},32,60);
             const std::array<std::int64_t,4> rectangle{left,top,right,bottom};for(unsigned i=0;i<4;++i)memory.store(GuestAddress{out+4+i*4},32,static_cast<std::uint32_t>(rectangle[i]));
             memory.store(GuestAddress{out+20},32,arrow);memory.store(GuestAddress{out+24},32,start);memory.store(GuestAddress{out+28},32,start+thumb);
-            const auto visible=control || (w.style&(vertical?0x100000U:0x200000U));
+            const auto visible=control || (w.style&(vertical?0x200000U:0x100000U));
             memory.store(GuestAddress{out+36},32,(!visible?0x8000U:0U)|(!w.visible || !length?0x10000U:0U)|(!w.enabled?1U:0U));
             for(unsigned i=1;i<6;++i){std::uint32_t flags=!w.enabled || limit<=low?1:0;
                 const auto arrows=gui_.scroll_arrows.find({arg(0),control?2U:vertical?1U:0U});const auto disabled=arrows==gui_.scroll_arrows.end()?0:arrows->second;
@@ -667,39 +765,87 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     }
     else if(symbol=="SetScrollInfo" || symbol=="GetScrollInfo" || symbol=="GetScrollPos"){
         if(!gui_.windows.contains(arg(0)))fail(1400);else if(d(1)>2)fail(87);
+        else if(d(1)==2 && service.family!="internal-scroll"){
+            const auto message=symbol=="GetScrollPos"?0xe1U:symbol=="SetScrollInfo"?0xe9U:0xeaU;
+            start_callbacks(state,memory,{{resolve("user32.dll","SendMessageW").value,{arg(0),message,
+                symbol=="SetScrollInfo"?arg(3):0,symbol=="GetScrollPos"?0:arg(2)}}},Continuation::ReturnCallback);
+            return std::nullopt;
+        }
         else {auto& bytes=gui_.scroll_info[{arg(0),d(1)}];const auto load=[&](unsigned at){std::uint32_t value=0;for(unsigned i=0;i<4;++i)value|=std::uint32_t{bytes[at+i]}<<(8*i);return value;};
             const auto store=[&](unsigned at,std::uint32_t value){for(unsigned i=0;i<4;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(8*i));};
             if(!load(0)){store(0,28);store(12,100);}
             if(symbol=="GetScrollPos")result=load(20);
-            else {const auto p=arg(2);if(!p || memory.load(GuestAddress{p},32)!=28)fail(87);else {const auto mask=static_cast<std::uint32_t>(memory.load(GuestAddress{p+4},32));
-                if(mask&~0x1fU)fail(87);
+            else {
+                const auto p=arg(2);
+                const auto size=p?memory.load(GuestAddress{p},32):0;
+                if(size!=24 && size!=28){fail(87);arg.return_to(state,0);return std::nullopt;}
+                const auto mask=memory.load(GuestAddress{p+4},32);
+                if(mask&~0x101fU)fail(87);
                 else if(symbol=="SetScrollInfo"){
-                    if(mask&1){store(8,static_cast<std::uint32_t>(memory.load(GuestAddress{p+8},32)));store(12,static_cast<std::uint32_t>(memory.load(GuestAddress{p+12},32)));}
-                    if(mask&2)store(16,static_cast<std::uint32_t>(memory.load(GuestAddress{p+16},32)));if(mask&4)store(20,static_cast<std::uint32_t>(memory.load(GuestAddress{p+20},32)));
-                    const auto low=static_cast<std::int32_t>(load(8)),high=std::max(low,static_cast<std::int32_t>(load(12)));store(12,static_cast<std::uint32_t>(high));
-                    const auto page=std::min<std::uint64_t>(load(16),static_cast<std::uint64_t>(static_cast<std::int64_t>(high)-low+1));store(16,static_cast<std::uint32_t>(page));
-                    const auto upper=static_cast<std::int64_t>(high)-static_cast<std::int64_t>(page?page-1:0);store(20,static_cast<std::uint32_t>(std::clamp<std::int64_t>(static_cast<std::int32_t>(load(20)),low,upper)));result=load(20);
-                }else {memory.check(GuestAddress{p},28,Access::Write);for(const auto pair:std::array<std::pair<unsigned,unsigned>,5>{{{1,8},{1,12},{2,16},{4,20},{16,24}}})if(mask&pair.first)memory.store(GuestAddress{p+pair.second},32,load(pair.second));result=1;}
-            }}
+                    memory.check(GuestAddress{p},size,Access::Read);
+                    const auto previous=load(20);
+                    const auto old_min=load(8),old_max=load(12),old_page=load(16);
+                    auto low=static_cast<std::int32_t>(old_min),high=static_cast<std::int32_t>(old_max);
+                    if(mask&1){
+                        low=static_cast<std::int32_t>(memory.load(GuestAddress{p+8},32));
+                        high=static_cast<std::int32_t>(memory.load(GuestAddress{p+12},32));
+                        if(high<low || std::int64_t{high}-low>INT32_MAX)low=high=0;
+                    }
+                    const auto requested_page=static_cast<std::int32_t>((mask&2)?memory.load(GuestAddress{p+16},32):old_page);
+                    const auto page=std::clamp<std::int64_t>(requested_page,0,std::int64_t{high}-low+1);
+                    const auto upper=std::int64_t{high}-std::max<std::int64_t>(0,page-1);
+                    const auto requested_pos=static_cast<std::int32_t>((mask&4)?memory.load(GuestAddress{p+20},32):previous);
+                    const auto pos=static_cast<std::uint32_t>(std::clamp<std::int64_t>(requested_pos,low,upper));
+                    store(8,static_cast<std::uint32_t>(low));store(12,static_cast<std::uint32_t>(high));store(16,static_cast<std::uint32_t>(page));store(20,pos);
+                    result=(mask&0x1000U)?previous:pos;
+                    if((mask&0x17U) && (mask&0xbU)){
+                        auto& arrows=gui_.scroll_arrows[{arg(0),d(1)}];
+                        if(low>=upper && (mask&8U))arrows=3;
+                        if(low<upper && mask!=2)arrows=0;
+                        const bool changed=old_min!=load(8) || old_max!=load(12) || old_page!=page || previous!=pos;
+                        if(d(1)!=2 && changed && (low>=upper?!(mask&8U):mask!=2)){
+                            start_callbacks(state,memory,{{resolve("user32.dll","ShowScrollBar").value,{arg(0),d(1),low<upper?1U:0U}}},Continuation::Return,result);
+                            return std::nullopt;
+                        }
+                    }
+                }else {
+                    memory.check(GuestAddress{p},size,Access::Write);
+                    for(const auto& [flag,offset]:std::array<std::pair<unsigned,unsigned>,4>{{{1,8},{1,12},{2,16},{4,20}}})
+                        if(mask&flag)memory.store(GuestAddress{p+offset},32,load(offset));
+                    if((mask&16) && size==28)memory.store(GuestAddress{p+24},32,load(20));
+                    result=(mask&0x17U)!=0;
+                }
+            }
         }
     }
     else if(symbol=="GetCapture" || symbol=="SetCapture" || symbol=="ReleaseCapture"){
         detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,symbol=="SetCapture"?arg(0):0);
         const auto previous=gui_.capture;const auto owner=gui_.windows.find(previous);
-        const bool own=owner!=gui_.windows.end() && owner->second.thread==threads_.current;
+        const auto in_queue=[&](const auto& window){
+            return window!=gui_.windows.end() && threads_.items.contains(window->second.thread) &&
+                   &threads_.input_queue(window->second.thread)==&threads_.input_queue(threads_.current);
+        };
+        const bool own=in_queue(owner);
         if(symbol=="GetCapture")result=own?previous:0;
         else {
-            const auto next=symbol=="ReleaseCapture"?0:arg(0);const auto target=gui_.windows.find(next);
-            if(next && (target==gui_.windows.end() || target->second.thread!=threads_.current))fail(target==gui_.windows.end()?1400:5);
+            const auto next=symbol=="ReleaseCapture"?0:arg(0);
+            const auto target=gui_.windows.find(next);
+            if(next && !in_queue(target))fail(target==gui_.windows.end()?1400:5);
             else {
-                result=symbol=="ReleaseCapture"?1:previous;
-                // NULL 只釋放目前執行緒持有的 capture，不奪走其他執行緒的 capture。
-                if((next || own) && previous!=next){
-                    gui_.capture=next;++gui_.capture_generation;
+                result=symbol=="ReleaseCapture"?1:own?previous:0;
+                if(next || own){
+                    if(previous!=next){gui_.capture=next;++gui_.capture_generation;}
+                    std::vector<GuestCallback> callbacks;
+                    if(!gui_.event_hooks.empty()){
+                        const auto notify=resolve("user32.dll","NotifyWinEvent").value;
+                        if(previous)callbacks.push_back({notify,{9,previous,0,0}});
+                        if(next)callbacks.push_back({notify,{8,next,0,0}});
+                    }
                     if(owner!=gui_.windows.end()){
                         const auto notify=resolve("user32.dll",own?"SendMessageW":"SendNotifyMessageW").value;
-                        start_callbacks(state,memory,{{notify,{previous,0x215,0,next}}},Continuation::Return,result);return std::nullopt;
+                        callbacks.push_back({notify,{previous,0x215,0,next}});
                     }
+                    if(!callbacks.empty()){start_callbacks(state,memory,std::move(callbacks),Continuation::Return,result);return std::nullopt;}
                 }
             }
         }
@@ -731,7 +877,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     else if(symbol=="GetDlgCtrlID"){
         const auto found=gui_.windows.find(arg(0));
         if(found==gui_.windows.end())last_error_=1400;
-        else result=static_cast<std::uint32_t>(found->second.id);
+        else result=static_cast<std::uint32_t>(gui_menu_or_control_id(found->second));
     }
     else if(symbol=="EnumWindows" || symbol=="EnumChildWindows" || symbol=="EnumThreadWindows"){
         const bool children=symbol=="EnumChildWindows",thread_only=symbol=="EnumThreadWindows",offset=children || thread_only;const auto callback=arg(offset?1:0),parameter=arg(offset?2:1);
@@ -763,10 +909,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         }
     }
     else if(symbol=="GetDlgItem")result=gui_child(arg(0),d(1));
-    else if(symbol.starts_with("SendDlgItemMessage")){if(send({gui_child(arg(0),d(1)),arg(3),arg(4),d(2)}))return std::nullopt;}
+    else if(symbol.starts_with("SendDlgItemMessage")){
+        const auto child=gui_child(arg(0),d(1));
+        if(child && send({child,arg(3),arg(4),d(2)}))return std::nullopt;
+    }
     else if(symbol.starts_with("SetDlgItemText") || symbol.starts_with("GetDlgItemText") || symbol.starts_with("SetWindowText") || symbol.starts_with("GetWindowText")){
         const bool dlg=symbol.find("DlgItem")!=std::string_view::npos,set=symbol.starts_with("Set"),length=symbol.find("Length")!=std::string_view::npos;
-        const auto h=dlg?gui_child(arg(0),d(1)):arg(0);const auto f=gui_.windows.find(h);if(f==gui_.windows.end())fail(1400);
+        if(dlg && !set && arg(2) && static_cast<std::int32_t>(d(3))>0)
+            memory.store(GuestAddress{arg(2)},wide?16:8,0);
+        const auto h=dlg?gui_child(arg(0),d(1)):arg(0);
+        const auto f=gui_.windows.find(h);
+        if(f==gui_.windows.end()){if(!dlg)fail(1400);}
         else if(f->second.procedure){
             const GuiMessage message{h,set || length?0:d(dlg?3:2),length?0:arg(dlg?2:1),set?12U:length?14U:13U};
             if(send(message))return std::nullopt;
@@ -813,19 +966,32 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
                 }
             }
         }
-    } else if(symbol=="GetAncestor"){
-        const auto first=gui_.windows.find(arg(0));
-        if(d(1)<1 || d(1)>3)fail(87);
-        else if(arg(0)==gui_.desktop)result=0;
-        else if(first==gui_.windows.end())fail(1400);
-        else if(d(1)==1)result=first->second.parent?first->second.parent:gui_.desktop;
-        else {
-            result=arg(0);std::set<std::uint64_t> visited;
-            while(visited.insert(result).second){
-                const auto current=gui_.windows.find(result);if(current==gui_.windows.end())break;
-                const auto parent=current->second.parent?current->second.parent:(d(1)==3?current->second.owner:0);
-                if(!parent || parent==gui_.desktop || !gui_.windows.contains(parent))break;
-                result=parent;
+    } else if(symbol=="GetAncestor" || symbol=="GetParent"){
+        const bool immediate=symbol=="GetParent";
+        const auto mode=immediate?3U:d(1);
+        auto handle=arg(0);
+        if(mode<1 || mode>3)fail(87);
+        else if(handle!=gui_.desktop){
+            std::set<std::uint64_t> visited;
+            while(visited.insert(handle).second){
+                std::uint64_t parent,owner;
+                std::uint32_t style;
+                const auto local=gui_.windows.find(handle);
+                if(local!=gui_.windows.end()){
+                    parent=local->second.parent;owner=local->second.owner;style=local->second.style;
+                }else{
+                    const auto remote=shared_gui_window(handle,false);
+                    if(!remote){if(handle==arg(0))fail(1400);break;}
+                    if(!allowed_gui_window(*remote)){fail(5);break;}
+                    parent=remote->parent;owner=remote->owner;style=remote->style;
+                }
+                if(mode==1){result=parent?parent:gui_.desktop;break;}
+                // GA_ROOT 只循實際父視窗；GA_ROOTOWNER 每層套用 GetParent 的樣式規則。
+                const auto next=mode==2?parent:(style&0x80000000U)?owner:(style&0x40000000U)?parent:0;
+                if(immediate){result=next;break;}
+                result=handle;
+                if(!next || next==gui_.desktop || next==gui_message_parent)break;
+                handle=next;
             }
         }
     } else if(symbol=="GetDesktopWindow")result=gui_.desktop;
@@ -834,7 +1000,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     else if(symbol=="GetWindowInfo" || symbol=="LogicalToPhysicalPoint" || symbol=="PhysicalToLogicalPoint" || symbol=="LogicalToPhysicalPointForPerMonitorDPI" || symbol=="PhysicalToLogicalPointForPerMonitorDPI"){
         std::optional<SharedWindowInfo> info;
         if(gui_.windows.contains(arg(0)))info=describe_gui_window(arg(0));
-        else if(arg(0)==gui_.desktop){SharedWindowInfo desktop{};desktop.handle=gui_.desktop;desktop.width=desktop.outer_width=1440;desktop.height=desktop.outer_height=900;desktop.style=0x96000000;desktop.visible=desktop.enabled=1;desktop.class_atom=32769;info=desktop;}
+        else if(arg(0)==gui_.desktop){
+            SharedWindowInfo desktop{};
+            const auto screen=gui_screen_area();
+            desktop.handle=gui_.desktop;
+            desktop.x=desktop.client_x=screen[0];
+            desktop.y=desktop.client_y=screen[1];
+            desktop.width=desktop.outer_width=static_cast<std::uint32_t>(screen[2]-screen[0]);
+            desktop.height=desktop.outer_height=static_cast<std::uint32_t>(screen[3]-screen[1]);
+            desktop.style=0x96000000;desktop.visible=desktop.enabled=1;desktop.class_atom=32769;
+            info=desktop;
+        }
         else info=shared_gui_window(arg(0));
         if(!info)fail(1400);
         else if(!arg(1))fail(87);
@@ -849,7 +1025,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
                 memory.write(GuestAddress{arg(1)},bytes);result=1;
             }
         }else {const auto& w=*info;const auto x=s32(memory.load(GuestAddress{arg(1)},32)),y=s32(memory.load(GuestAddress{arg(1)+4},32));
-            if(!w.width || !w.height || x<w.client_x || y<w.client_y || std::int64_t{x}>std::int64_t{w.client_x}+w.width || std::int64_t{y}>std::int64_t{w.client_y}+w.height)fail(87);
+            const bool per_monitor=symbol.ends_with("ForPerMonitorDPI");
+            const auto left=per_monitor?w.x:w.client_x,top=per_monitor?w.y:w.client_y;
+            const auto width=per_monitor?w.outer_width:w.width,height=per_monitor?w.outer_height:w.height;
+            if((!per_monitor && (!width || !height)) || x<left || y<top || x>std::int64_t{left}+width || y>std::int64_t{top}+height)fail(87);
             else {memory.check(GuestAddress{arg(1)},8,Access::Write);result=1;} // 共用視窗模型目前為 96 DPI，兩個座標空間相同。
         }
     }
@@ -894,7 +1073,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             GuiWindowPositionBatch batch;batch.thread=threads_.current;batch.items.reserve(d(0));
             const auto handle=gui_.next_object++;gui_.deferred_positions.emplace(handle,std::move(batch));result=handle;
         }catch(const std::bad_alloc&){fail(8);}
-    } else if(symbol=="DeferWindowPos"){
+    } else if(symbol=="DeferWindowPos" || symbol=="NtUserDeferWindowPosAndBand"){
+        // 參考實作共用標準定位批次，尾端兩個 band 參數保留原生 ABI。
         const auto batch=gui_.deferred_positions.find(arg(0));const auto window=gui_.windows.find(arg(1));
         if(batch==gui_.deferred_positions.end())fail(1405);
         else if(batch->second.thread!=threads_.current)fail(5);
@@ -923,7 +1103,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
                 result=arg(0);
             }catch(const std::bad_alloc&){gui_.deferred_positions.erase(batch);fail(8);}
         }
-    } else if(symbol=="EndDeferWindowPos"){
+    } else if(symbol=="EndDeferWindowPos" || symbol=="NtUserEndDeferWindowPosEx"){
+        // 與 參考實作一致，async 也在本次呼叫中完成視窗定位。
         const auto batch=gui_.deferred_positions.find(arg(0));
         if(batch==gui_.deferred_positions.end())fail(1405);
         else if(batch->second.thread!=threads_.current)fail(5);
@@ -956,14 +1137,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             catch(...){discard_gui_control(token);throw;}
             return std::nullopt;
         }
-    } else if(symbol=="IsWindowEnabled" || symbol=="IsWindow" || symbol=="GetParent" || symbol=="IsIconic" || symbol=="IsZoomed"){
+    } else if(symbol=="IsWindowEnabled" || symbol=="IsWindow" || symbol=="IsIconic" || symbol=="IsZoomed"){
         const auto f=gui_.windows.find(arg(0));
         // CEF GPU 程序的 eglCreateWindowSurface 靠 IsWindow 判斷視窗有效，失敗就整個退出、Steam 介面消失。事後無法重現，每程序留少量紀錄。
         if(symbol=="IsWindow" && f==gui_.windows.end() && arg(0)>=0x10000 && arg(0)<0x0fffffff){
             static std::atomic<unsigned> reported{0};
             if(reported.fetch_add(1,std::memory_order_relaxed)<32)std::fprintf(stderr,"[iswindow_invalid] pid=%u thread=%llu hwnd=0x%llx\n",process_id(),static_cast<unsigned long long>(threads_.current),static_cast<unsigned long long>(arg(0)));
         }
-        if(f!=gui_.windows.end()){if(symbol=="GetParent")result=f->second.parent?f->second.parent:f->second.owner;else if(symbol=="IsWindow")result=1;else if(symbol=="IsWindowEnabled")result=f->second.enabled?1:0;else if(symbol=="IsIconic")result=f->second.show_command==2;else if(symbol=="IsZoomed")result=f->second.show_command==3;}
+        if(f!=gui_.windows.end()){if(symbol=="IsWindow")result=1;else if(symbol=="IsWindowEnabled")result=f->second.enabled?1:0;else if(symbol=="IsIconic")result=f->second.show_command==2;else if(symbol=="IsZoomed")result=f->second.show_command==3;}
     } else if(symbol=="SetFocus" || symbol=="GetFocus"){
         detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,symbol=="SetFocus"?arg(0):0);
         result=gui_.focus;if(result && !input_connected(gui_.windows.at(result).thread))result=0;
@@ -1053,9 +1234,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             }
         }
     }
-    else if(symbol=="DestroyIcon" || symbol=="DestroyCursor"){
-        release_cursor_frames(arg(0));
-        const auto icon=gui_.icons.find(arg(0));if(icon==gui_.icons.end())fail(1402);else if((symbol=="DestroyIcon")!=icon->second.is_icon)fail(87);else if(icon->second.shared)result=1;else{if(gui_.cursor==arg(0)){gui_.cursor=0;if(native_gui_ && interactive_station())(void)native_gui_->set_cursor(nullptr,false);}gui_.icons.erase(icon);result=1;}
+    else if(symbol=="DestroyIcon" || symbol=="DestroyCursor" || symbol=="NtUserDestroyCursor"){
+        const auto handle=arg(0);
+        const bool native=symbol=="NtUserDestroyCursor";
+        const auto icon=gui_.icons.find(handle);
+        GuiIcon stock;
+        if(icon==gui_.icons.end() && !resolve_gui_cursor(handle,stock))fail(1402);
+        else if(!native && ((symbol=="DestroyIcon")!=(icon!=gui_.icons.end() && icon->second.is_icon)))fail(87);
+        else {
+            result=!native || threads_.input_queue(threads_.current).cursor!=handle;
+            if(icon!=gui_.icons.end() && !icon->second.shared){
+                release_cursor_frames(handle);
+                for(auto& [id,thread]:threads_.items)if(thread.keyboard_queue.cursor==handle)thread.keyboard_queue.cursor=0;
+                gui_.icons.erase(icon);
+                if(gui_.cursor==handle)present_gui_cursor();
+            }
+        }
     }
     else if(symbol=="BringWindowToTop"){
         if(!gui_.windows.contains(arg(0)))fail(1400);
@@ -1064,47 +1258,73 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         if(arg(0)==0x10000000U)result=gui_.desktop;
         else if(arg(0)>=0x10000000U && gui_.windows.contains(arg(0)-0x10000000U))result=arg(0)-0x10000000U;
         else if(!gui_.contexts.contains(arg(0)))fail(6);
-    }else if(symbol=="GetWindowDC" || (symbol=="GetDCEx" && (d(2)&1U))){
-        const auto found=gui_.windows.find(arg(0));
-        if(arg(0) && arg(0)!=gui_.desktop && found==gui_.windows.end())fail(1400);
-        else{
-            result=0x10000000U+(arg(0)==gui_.desktop?0:arg(0));GuiDc context{};
-            // 非工作區由原生外框繪製：視窗 DC 的 (left,top) 對應工作區原點，量測文字與工作區繪製保持正確，
-            // 外框範圍的繪製落在表面之外而被裁掉。
-            if(found!=gui_.windows.end()){
-                const auto insets=gui_frame_insets(found->second);
-                if(insets.left || insets.top || insets.right || insets.bottom){context.viewport_origin={-static_cast<std::int32_t>(insets.left),-static_cast<std::int32_t>(insets.top)};context.window_frame=true;}
-            }
-            gui_.contexts[result]=std::move(context);gui_.dc_objects[result]=0xb011;gui_.saved_contexts.erase(result);
-        }
-    }
-    else if(symbol=="GetDC" || symbol=="GetDCEx"){
-        if(arg(0) && !gui_.windows.contains(arg(0)))fail(1400);
+    }else if(symbol=="GetWindowDC" || symbol=="GetDC" || symbol=="GetDCEx"){
+        const auto hwnd=arg(0);
+        const auto window=gui_.windows.find(hwnd);
+        const auto flags=symbol=="GetDCEx"?d(2):0U;
+        const auto region=flags&0xc0U?arg(1):0;
+        if(hwnd && hwnd!=gui_.desktop && window==gui_.windows.end())fail(1400);
+        else if(region>1 && !gui_.regions.contains(region))fail(6);
         else {
-            result=0x10000000+arg(0);gui_.dc_objects.try_emplace(result,0xb011);
-            if(const auto context=gui_.contexts.find(result);context!=gui_.contexts.end() && context->second.window_frame){context->second=GuiDc{};gui_.dc_objects[result]=0xb011;}
-            // DCX_INTERSECTRGN／DCX_EXCLUDERGN 以既有 GDI 剪裁區流程套用（hrgnClip==1 表示整個視窗）。
-            if(symbol=="GetDCEx" && (d(2)&0xc0U) && arg(1) && arg(1)!=1)
-                (void)nested_service(state,memory,"gdi32.dll","ExtSelectClipRgn",{result,arg(1),(d(2)&0x80U)?1U:4U});
+            result=0x10000000U+(hwnd==gui_.desktop?0:hwnd);
+            auto& dc=gui_.contexts[result];
+            const bool frame=symbol=="GetWindowDC" || (flags&1U);
+            if(dc.acquisition_region && dc.acquisition_region!=region)gui_.regions.erase(dc.acquisition_region);
+            dc.acquisition_region=0;dc.acquisition_clip.reset();gui_refresh_dc_clip(dc);
+            if(frame || dc.window_frame){
+                dc=GuiDc{};gui_.saved_contexts.erase(result);gui_.dc_objects[result]=0xb011;
+                if(frame && window!=gui_.windows.end()){
+                    const auto insets=gui_frame_insets(window->second);
+                    dc.viewport_origin={-static_cast<std::int32_t>(insets.left),-static_cast<std::int32_t>(insets.top)};
+                    dc.window_frame=true;
+                }
+            }
+            gui_.dc_objects.try_emplace(result,0xb011);
+            if(flags&0xc0U){
+                // GetDCEx 的可見範圍是系統裁剪，SelectClipRgn 不可將它擴張。
+                const auto surface=window!=gui_.windows.end()?gui_client_region(window->second):GuiRegion{gui_screen_area()};
+                auto input=region>1?gui_.regions.at(region):region==1?surface:GuiRegion{};
+                if(region>1 && window!=gui_.windows.end()){
+                    const auto origin=gui_client_origin(gui_,hwnd);
+                    for(auto& rect:input)for(unsigned i=0;i<4;++i)
+                        rect[i]=static_cast<std::int32_t>(std::clamp<std::int64_t>(rect[i]-origin[i%2],INT32_MIN,INT32_MAX));
+                }
+                dc.acquisition_region=region>1?region:0;
+                dc.acquisition_clip=gui_region_combine(surface,input,(flags&0x80U)?1:4);
+                gui_refresh_dc_clip(dc);
+            }
         }
     }
     else if(symbol=="ReleaseDC"){
-        auto found=gui_.contexts.find(arg(1));
+        const auto dc=arg(1);
+        const bool window_dc=dc==0x10000000U || (dc>=0x10000000U && gui_.windows.contains(dc-0x10000000U));
+        if(!window_dc || !gui_.dc_objects.contains(dc)){arg.return_to(state,0);return std::nullopt;}
+        auto found=gui_.contexts.find(dc);
         if(found!=gui_.contexts.end()){
+            if(found->second.acquisition_region)gui_.regions.erase(found->second.acquisition_region);
+            found->second.acquisition_region=0;found->second.acquisition_clip.reset();
             if(found->second.window_frame){found->second=GuiDc{};gui_.dc_objects[arg(1)]=0xb011;}
-            found->second.clipped=false;found->second.excluded.clear();
+            found->second.application_clip.reset();found->second.meta_clip.reset();
+            gui_refresh_dc_clip(found->second);
         }
         result=1;
     }
     else if(symbol=="GetSysColor")result=gui_system_color(d(0));
-    else if(symbol=="GetSysColorBrush"){result=0xa000+d(0);gui_.brushes[result]=gui_system_color(d(0));}
+    else if(symbol=="GetSysColorBrush")result=gui_system_paint_object(gui_,d(0),false);
     else if(symbol=="GetDoubleClickTime" || symbol=="GetCaretBlinkTime")result=gui_timing(memory,symbol=="GetCaretBlinkTime");
     else if(symbol=="SetDoubleClickTime" || symbol=="SetCaretBlinkTime"){set_gui_timing(memory,symbol=="SetCaretBlinkTime",d(0));result=1;}
-    else if(symbol=="GetMessageTime")result=threads_.items.at(threads_.current).message_time;
-    else if(symbol=="GetMessagePos")result=threads_.items.at(threads_.current).message_position;
-    else if(symbol=="GetMessageExtraInfo")result=threads_.items.at(threads_.current).message_extra;
-    else if(symbol=="SetMessageExtraInfo"){auto& extra=threads_.items.at(threads_.current).message_extra;result=extra;extra=arg(0);}
-    else if(symbol.starts_with("RegisterWindowMessage")){result=gui_registered_message(read(arg(0)));}
+    else if(symbol=="GetMessageTime" || symbol=="GetMessagePos" || symbol=="GetMessageExtraInfo" || symbol=="SetMessageExtraInfo"){
+        auto& thread=threads_.items.at(threads_.current);
+        const auto offset=symbol=="GetMessageTime"?X64ARM_MESSAGE_TIME:symbol=="GetMessagePos"?X64ARM_MESSAGE_POSITION:X64ARM_MESSAGE_EXTRA;
+        const auto width=static_cast<std::uint8_t>(offset==X64ARM_MESSAGE_EXTRA && !x86_?64:32);
+        const auto cell=gui_message_cell(thread,x86_,static_cast<unsigned>(offset));
+        if(thread.teb)result=memory.load(cell,width);
+        else result=offset==X64ARM_MESSAGE_EXTRA?thread.message_extra:offset==X64ARM_MESSAGE_POSITION?thread.message_position:thread.message_time;
+        if(symbol=="SetMessageExtraInfo"){
+            thread.message_extra=arg(0);
+            if(thread.teb)memory.store(cell,width,thread.message_extra);
+        }
+    }
     else if(symbol.starts_with("GetCharWidth32") || symbol.starts_with("GetCharABCWidthsFloat")){
         if(d(2)<d(1) || d(2)>65535 || (!wide && d(2)>255))fail(87);
         else {const bool abc=symbol.starts_with("GetCharABC");memory.check(GuestAddress{arg(3)},static_cast<std::size_t>(d(2)-d(1)+1)*(abc?12:4),Access::Write);const auto font=selected_font();

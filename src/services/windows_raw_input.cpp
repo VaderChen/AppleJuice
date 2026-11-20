@@ -1,3 +1,4 @@
+#include "gui_message_metadata.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_raw_input.hpp"
 #include "x64arm/windows_keyboard.hpp"
@@ -101,7 +102,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_raw_input(GuestState& state
                     else {
                         memory.write(GuestAddress{arg(0)},output);
                         for(const auto handle:packets){const auto message=std::find_if(gui_.queue.begin(),gui_.queue.end(),[&](const auto& item){return item.message==0xff && item.lparam==handle;});if(message!=gui_.queue.end()){
-                                auto& thread=threads_.items.at(threads_.current);thread.message_time=message->queued_time;thread.message_position=static_cast<std::uint16_t>(message->queued_cursor[0])|(std::uint32_t{static_cast<std::uint16_t>(message->queued_cursor[1])}<<16);if(message->input_extra)thread.message_extra=*message->input_extra;
+                                store_gui_message_metadata(memory,threads_.items.at(threads_.current),x86_,*message);
                                 gui_.queue.erase(message);}bridge.packets.erase(handle);}
                         result=packets.size();if(output.size()==capacity)fail(122);
                     }

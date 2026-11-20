@@ -239,7 +239,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     const bool good_boot=service.symbol=="SHGetValueGoodBootA" || service.symbol=="SHGetValueGoodBootW";
     if(good_boot || service.symbol=="SHGetValueA" || service.symbol=="SHGetValueW"){
         const bool wide=service.symbol.ends_with('W');const WindowsCall arg(state,memory,service);const auto bits=static_cast<std::uint8_t>(x86_?32:64);
-        if(good_boot && system_metric(67)){ // SM_CLEANBOOT：安全模式下不讀寫查詢參數。
+        if(good_boot && system_metric(memory,67)){ // SM_CLEANBOOT：安全模式下不讀寫查詢參數。
             arg.return_to(state,1); // ERROR_INVALID_FUNCTION
             return std::nullopt;
         }

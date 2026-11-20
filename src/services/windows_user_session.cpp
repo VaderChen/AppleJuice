@@ -20,12 +20,13 @@ std::vector<std::uint64_t> WindowsServices::keyboard_layouts() const {
     std::vector<std::uint64_t> layouts{0x04090409};
     const auto add=[&](std::uint64_t layout){if(std::find(layouts.begin(),layouts.end(),layout)==layouts.end())layouts.push_back(layout);};
     if(native_gui_)for(const auto& method:native_input_methods())add(method.layout);
-    for(const auto layout:gui_.loaded_keyboard_layouts)add(layout);
+    for(const auto& layout:gui_.loaded_keyboard_layouts)add(layout.first);
     return layouts;
 }
 std::span<const WindowsServiceDescriptor> user_session_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"user32.dll","LockWindowUpdate",1},{"user32.dll","ActivateKeyboardLayout",2},{"user32.dll","LoadKeyboardLayoutA",2},{"user32.dll","LoadKeyboardLayoutW",2},{"user32.dll","UnloadKeyboardLayout",1},
+        {"user32.dll","LoadKeyboardLayoutEx",3},{"win32u.dll","NtUserLoadKeyboardLayoutEx",8},
         {"user32.dll","InitializeTouchInjection",2},{"user32.dll","InjectTouchInput",2},
         {"user32.dll","CreateSyntheticPointerDevice",3,0,0,7},{"user32.dll","InjectSyntheticPointerInput",3,0,0,4},{"user32.dll","DestroySyntheticPointerDevice",1}
     };return table;
@@ -111,16 +112,41 @@ std::optional<std::uint32_t> WindowsServices::invoke_user_session(GuestState& st
                 else if(gui_.update_lock && gui_.update_lock!=arg(0))fail(5); // 同時只允許鎖定一個視窗。
                 else {gui_.update_lock=arg(0);result=1;}
             }
-        }else if(symbol=="LoadKeyboardLayoutA" || symbol=="LoadKeyboardLayoutW"){
-            // KLID 是 8 位十六進位文字；低 16 位元為語言，高 16 位元為配置變體。沒有變體時 HKL 高低字相同。
-            const auto text=!arg(0)?std::u16string{}:symbol.back()=='W'?read_utf16(memory,GuestAddress{arg(0)},16):utf8_to_utf16(read_ansi(memory,arg(0),16));
+        }else if(symbol.starts_with("LoadKeyboardLayout") || symbol=="NtUserLoadKeyboardLayoutEx"){
+            const bool native=symbol=="NtUserLoadKeyboardLayoutEx",extended=symbol=="LoadKeyboardLayoutEx";
+            const auto previous=native?arg(4):extended?arg(0):0;
+            const auto flags=u32(native?7:extended?2:1);
+            std::u16string text;
+            if(native){
+                // 原生入口接收計數字串，Buffer 不必以 NUL 結尾。
+                const auto descriptor=arg(5);
+                if(!descriptor || memory.load(GuestAddress{descriptor},16)!=16 ||
+                   memory.load(GuestAddress{descriptor+2},16)<16){fail(87);arg.return_to(state,0);return std::nullopt;}
+                const auto buffer=memory.load(GuestAddress{descriptor+(x86_?4U:8U)},x86_?32:64);
+                for(unsigned i=0;i<8;++i)text.push_back(static_cast<char16_t>(memory.load(GuestAddress{buffer+2*i},16)));
+                // 客製鍵盤檔及表格需由鍵盤轉譯後端解析。
+                if(arg(0) || u32(1) || u32(2) || arg(3)){fail(50);arg.return_to(state,0);return std::nullopt;}
+            }else{
+                if(extended && !previous){arg.return_to(state,0);return std::nullopt;}
+                const auto buffer=arg(extended?1:0);
+                if(buffer)text=symbol.ends_with('A')?utf8_to_utf16(read_ansi(memory,buffer,16)):read_utf16(memory,GuestAddress{buffer},16);
+            }
             std::uint32_t identifier=0;bool valid=text.size()==8;
             for(const auto c:text){const int digit=c>=u'0' && c<=u'9'?c-u'0':c>=u'a' && c<=u'f'?c-u'a'+10:c>=u'A' && c<=u'F'?c-u'A'+10:-1;if(digit<0)valid=false;identifier=identifier*16+static_cast<unsigned>(digit<0?0:digit);}
             if(!valid || !(identifier&0xffffU)){fail(87);arg.return_to(state,0);return std::nullopt;}
-            const std::uint64_t layout=(identifier>>16)?(UINT64_C(0xf000)+(identifier>>16))<<16|(identifier&0xffffU):(identifier&0xffffU)*UINT64_C(0x10001);
+            const std::uint32_t layout=native && u32(6)?u32(6):
+                ((identifier>>16)?(0xf000U|(identifier>>16))<<16|(identifier&0xffffU):(identifier&0xffffU)*0x10001U);
+            auto& loaded=gui_.loaded_keyboard_layouts;
             const auto known=keyboard_layouts();
-            if(std::find(known.begin(),known.end(),layout)==known.end())gui_.loaded_keyboard_layouts.push_back(layout);
-            const auto flags=u32(1);
+            if(previous && std::find(known.begin(),known.end(),previous)==known.end()){
+                fail(87);arg.return_to(state,0);return std::nullopt;
+            }
+            if(std::find(known.begin(),known.end(),layout)==known.end())loaded.emplace_back(layout,identifier);
+            if(previous && previous!=layout){
+                std::erase_if(loaded,[&](const auto& item){return item.first==previous;});
+                if(gui_.process_keyboard_layout==previous)gui_.process_keyboard_layout=layout;
+                for(auto& item:gui_.thread_keyboard_layouts)if(item.second==previous)item.second=layout;
+            }
             if(flags&1U)(void)nested_service(state,memory,"user32.dll","ActivateKeyboardLayout",{layout,flags&0x108U}); // KLF_ACTIVATE
             result=layout;
         }else if(symbol=="UnloadKeyboardLayout"){
@@ -129,7 +155,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_user_session(GuestState& st
             if(std::find(known.begin(),known.end(),layout)==known.end())fail(87);
             else{
                 // 系統與宿主輸入法的配置一直存在；只卸載本程序載入的配置，並還原已選用它的執行緒。
-                std::erase(gui_.loaded_keyboard_layouts,layout);
+                std::erase_if(gui_.loaded_keyboard_layouts,[&](const auto& item){return item.first==layout;});
                 if(gui_.process_keyboard_layout==layout)gui_.process_keyboard_layout=0;
                 std::erase_if(gui_.thread_keyboard_layouts,[&](const auto& item){return item.second==layout;});
                 result=1;

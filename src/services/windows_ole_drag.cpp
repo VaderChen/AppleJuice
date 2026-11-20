@@ -28,7 +28,7 @@ std::span<const WindowsServiceDescriptor> ole_drag_service_descriptors(){
 }
 ole_drag::Input WindowsServices::ole_drag_input(const OleDragOperation& op,bool physical) const {
     ole_drag::Input input;input.point=physical?gui_.pointer_position:op.input.point;
-    const auto& keys=physical?gui_.async_keyboard:gui_.keyboard;input.keys=ole_drag::key_state(keys);
+    const auto& keys=physical?gui_.async_keyboard:threads_.input_queue(op.thread).keys;input.keys=ole_drag::key_state(keys);
     input.escape=(keys[27]&0x80U) || gui_.escape_presses!=op.escape_presses;
     auto handle=gui_window_from_point(gui_,input.point[0],input.point[1],thread_desktop_object(op.thread));
     for(unsigned depth=0;handle && depth<64;++depth){
@@ -68,8 +68,8 @@ void WindowsServices::discard_ole_drag(GuestState& state,GuestMemory& memory,std
     if(op.data_proxy)release({op.proxy_thread,op.data_proxy});
     if(op.source_ref)release({op.thread,op.source});if(op.data_ref)release({op.thread,op.data});
     if(gui_.capture==op.capture && gui_.capture_generation==op.capture_generation){gui_.capture=0;++gui_.capture_generation;}
-    if(op.default_cursor && gui_.cursor==op.default_cursor){
-        gui_.cursor=op.original_cursor;
+    if(op.default_cursor && threads_.items.contains(op.thread) && threads_.input_queue(op.thread).cursor==op.default_cursor){
+        threads_.input_queue(op.thread).cursor=op.original_cursor;
         present_gui_cursor();
     }
     if(gui_.windows.contains(op.capture))erase_window(op.capture);
@@ -141,7 +141,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_drag(GuestState& state,
     if(!gui_.ole_initializations[threads_.current]){call.return_to(state,0x800401f0U);return std::nullopt;}
     if(gui_.ole_drags.size()>=4096 || runtime_.callbacks.size()>=120){call.return_to(state,no_memory);return std::nullopt;}
     for(const auto object:{call(0),call(1)})for(unsigned slot=1;slot<=2;++slot){const auto method=drag_method(memory,object,slot);if(!handles(GuestAddress{method}))memory.check(GuestAddress{method},1,Access::Execute);}
-    OleDragOperation op;op.thread=threads_.current;op.data=call(0);op.source=call(1);op.output=call(3);op.original_cursor=gui_.cursor;op.escape_presses=gui_.escape_presses;
+    OleDragOperation op;op.thread=threads_.current;op.data=call(0);op.source=call(1);op.output=call(3);op.original_cursor=threads_.input_queue(op.thread).cursor;op.escape_presses=gui_.escape_presses;
     op.buffer=allocate_heap(memory,80);if(!op.buffer){call.return_to(state,no_memory);return std::nullopt;}
     memory.write(GuestAddress{op.buffer},std::vector<std::uint8_t>(80));
     memory.write(GuestAddress{op.buffer+class_offset},std::array<std::uint8_t,14>{'S',0,'T',0,'A',0,'T',0,'I',0,'C',0,0,0});
@@ -182,9 +182,9 @@ std::optional<std::uint32_t> WindowsServices::resume_ole_drag(GuestState& state,
         }
         if(action==Action::DefaultFeedback){
             const auto expected=ole_drag_cursor(op.session.request().effect);
-            if(gui_.cursor==expected)op.default_cursor=expected;else op.session.cancel(0x80070032U);
+            if(threads_.input_queue(op.thread).cursor==expected)op.default_cursor=expected;else op.session.cancel(0x80070032U);
         }
-        (void)op.session.complete({action==Action::DefaultFeedback?(gui_.cursor==op.default_cursor?0U:0x80004005U):static_cast<std::uint32_t>(value),effect,transport});break;
+        (void)op.session.complete({action==Action::DefaultFeedback?(threads_.input_queue(op.thread).cursor==op.default_cursor?0U:0x80004005U):static_cast<std::uint32_t>(value),effect,transport});break;
     }
     case Stage::ProxyRelease:(void)op.session.complete({op.target_result,0,op.target_error});break;
     case Stage::Read:
@@ -221,7 +221,7 @@ std::optional<std::uint32_t> WindowsServices::advance_ole_drag(GuestState& state
             while(op.cleanup<7){switch(op.cleanup++){
             case 0:if(op.capture && gui_.capture==op.capture && gui_.capture_generation==op.capture_generation){callback(Stage::Cleanup,{resolve("user32.dll","ReleaseCapture").value,{}});return std::nullopt;}break;
             case 1:if(gui_.windows.contains(op.capture)){callback(Stage::Cleanup,{resolve("user32.dll","DestroyWindow").value,{op.capture}});return std::nullopt;}break;
-            case 2:if(op.default_cursor && gui_.cursor==op.default_cursor){callback(Stage::Cleanup,{resolve("user32.dll","SetCursor").value,{op.original_cursor}});return std::nullopt;}break;
+            case 2:if(op.default_cursor && threads_.input_queue(op.thread).cursor==op.default_cursor){callback(Stage::Cleanup,{resolve("user32.dll","SetCursor").value,{op.original_cursor}});return std::nullopt;}break;
             case 3:if(op.source_ref){const auto retirement=release_com_proxy_owned(state,memory,{op.thread,op.source});op.source_ref=false;if(retirement){callback(Stage::Cleanup,{resolve("internal-com-proxy","Retire").value,{retirement}});return std::nullopt;}}break;
             case 4:if(op.data_ref){const auto retirement=release_com_proxy_owned(state,memory,{op.thread,op.data});op.data_ref=false;if(retirement){callback(Stage::Cleanup,{resolve("internal-com-proxy","Retire").value,{retirement}});return std::nullopt;}}break;
             case 5:if(op.quit){callback(Stage::Cleanup,{resolve("user32.dll","PostQuitMessage").value,{op.quit_code}});return std::nullopt;}break;

@@ -135,5 +135,8 @@ private:
 // 放開後才失敗時拋 D3D11RelockMapping：完整路徑要讀客體記憶體，由 worker 入口依鎖序（映射 → 圖形）重新取鎖後再呼叫一次。
 ParallelMappingLock& parallel_mapping_mutex() noexcept;
 std::shared_lock<ParallelMappingLock>*& d3d11_worker_mapping_guard() noexcept;
+// D3D9 worker 呼叫：繪製前放開映射共用鎖（Metal 編碼與命令緩衝節流不碰客體記憶體），收尾以預先讀好的返回位址返回。
+struct D3D9WorkerRelease {std::shared_lock<ParallelMappingLock>* guard{};std::uint64_t return_target{};bool released{};};
+D3D9WorkerRelease& d3d9_worker_release() noexcept;
 struct D3D11RelockMapping {};
 }

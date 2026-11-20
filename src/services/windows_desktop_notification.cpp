@@ -7,7 +7,7 @@ std::span<const WindowsServiceDescriptor> desktop_notification_service_descripto
     static constexpr WindowsServiceDescriptor table[]{
         {"shell32.dll","Shell_NotifyIconA",2},{"shell32.dll","Shell_NotifyIconW",2},
         {"shell32.dll","SHQueryUserNotificationState",1},
-        {"user32.dll","FlashWindow",2},{"user32.dll","FlashWindowEx",1}
+        {"user32.dll","FlashWindow",2,0,0,0x2},{"user32.dll","FlashWindowEx",1}
     };return table;
 }
 void WindowsServices::poll_desktop_notifications(){
@@ -50,14 +50,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_desktop_notification(GuestS
         if(name=="FlashWindowEx" || name=="FlashWindow"){
             const bool extended=name=="FlashWindowEx";std::uint64_t window=arg(0);std::uint32_t flags=0,count=0,timeout=0;
             if(extended){
-                if(!window)return fail(87);const auto cb=memory.load(GuestAddress{window},32);if(cb!=(x86_?20:32))return fail(87);
+                if(!window)return fail(998);const auto cb=memory.load(GuestAddress{window},32);if(cb!=(x86_?20:32))return fail(87);
                 memory.check(GuestAddress{window},cb,Access::Read);const auto base=window;window=memory.load(GuestAddress{base+(x86_?4:8)},x86_?32:64);
                 flags=static_cast<std::uint32_t>(memory.load(GuestAddress{base+(x86_?8:16)},32));count=static_cast<std::uint32_t>(memory.load(GuestAddress{base+(x86_?12:20)},32));timeout=static_cast<std::uint32_t>(memory.load(GuestAddress{base+(x86_?16:24)},32));
             }
-            const auto found=gui_.windows.find(window);if(found==gui_.windows.end())return fail(1400);
+            const auto found=gui_.windows.find(window);if(found==gui_.windows.end())return fail(extended?87:1400);
             const bool prior=gui_.attention.caption(window,gui_.active==window);
             auto old=gui_.attention;
-            const auto result=extended?gui_.attention.set(window,flags,count,timeout,500,runtime_.clock_ticks):gui_.attention.toggle(window,arg(1)!=0,(found->second.style&0x20000000U)?2:1);
+            const auto result=extended?gui_.attention.set(window,flags,count,timeout,gui_timing(memory,1),runtime_.clock_ticks):gui_.attention.toggle(window,arg(1)!=0,(found->second.style&0x20000000U)?2:1);
             if(result!=desktop::Status::Ok)return fail(result==desktop::Status::Limit?8:87);
             const auto next=gui_.attention.values().find(window);
             try{if(native_gui_ && !native_gui_->attention(window,next!=gui_.attention.values().end() && (next->second.flags&1) && next->second.phase,next!=gui_.attention.values().end() && (next->second.flags&2) && next->second.phase)){

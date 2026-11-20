@@ -145,7 +145,7 @@ void WindowsServices::refresh_mdi(std::uint64_t client,GuestMemory* memory) {
                 }
             }
         }
-        if(mdi.active)if(const auto system=gui_.system_menus.find(mdi.active);system!=gui_.system_menus.end()) {
+        if(mdi.active)if(const auto system=gui_.system_menus.find(mdi.active);system!=gui_.system_menus.end() && gui_.menus.contains(system->second)) {
             const auto& active=gui_.windows.at(mdi.active);
             for(auto& item:gui_.menus.at(system->second)) {
                 if(item.id==0xf120)item.flags=(item.flags&~3U)|(active.show_command==1?1U:0U);
@@ -240,19 +240,19 @@ bool WindowsServices::dispatch_mdi_client(GuestState& state,GuestMemory& memory,
     case 0x225:
         if(mdi_member(gui_,client,message.wparam)){activate(message.wparam);call("ShowWindow",{message.wparam,3});}
         break;
-    case 0x226:case 0x227:case 0x228: {
-        const bool tile=message.message==0x226,icons=message.message==0x228;
-        if(!icons && (message.wparam&~static_cast<std::uint64_t>(tile?3U:6U))){last_error_=87;break;}
+    case 0x228:call("ArrangeIconicWindows",{client});break;
+    case 0x226:case 0x227: {
+        const bool tile=message.message==0x226;
+        if((message.wparam&~static_cast<std::uint64_t>(tile?3U:6U))){last_error_=87;break;}
         std::vector<std::uint64_t> children;
         const auto append=[&](std::uint64_t handle){if(!mdi_member(gui_,client,handle))return;const auto& w=gui_.windows.at(handle);
-            if(w.visible && ((w.show_command==2)==icons) && (icons || !(message.wparam&2) || w.enabled))children.push_back(handle);};
+            if(w.visible && w.show_command!=2 && (!(message.wparam&2) || w.enabled))children.push_back(handle);};
         if(message.message==0x227 && (message.wparam&4))for(auto it=gui_.z_order.rbegin();it!=gui_.z_order.rend();++it)append(*it);
         else for(const auto child:mdi.children)append(child);
-        if(!icons && mdi.maximized && mdi.active)call("ShowWindow",{mdi.active,9});
+        if(mdi.maximized && mdi.active)call("ShowWindow",{mdi.active,9});
         const auto count=static_cast<unsigned>(children.size());
         for(unsigned i=0;i<count;++i) {
-            if(icons){const auto columns=std::max(1U,window.width/160);position(children[i],static_cast<std::int32_t>((i%columns)*160),static_cast<std::int32_t>(window.height)-static_cast<std::int32_t>((i/columns+1)*32),160,32);}
-            else if(tile) {
+            if(tile) {
                 auto columns=std::max(1U,static_cast<unsigned>(std::ceil(std::sqrt(count)))),rows=(count+columns-1)/columns;
                 if(message.wparam&1)std::swap(columns,rows);
                 const auto column=i%columns,row=i/columns;
@@ -263,7 +263,7 @@ bool WindowsServices::dispatch_mdi_client(GuestState& state,GuestMemory& memory,
             } else {const auto step=std::min({26U,window.width/std::max(1U,count+1),window.height/std::max(1U,count+1)});
                 position(children[i],static_cast<std::int32_t>(i*step),static_cast<std::int32_t>(i*step),window.width-(count-1)*step,window.height-(count-1)*step);}
         }
-        result=icons?0:1;break;
+        result=1;break;
     }
     case 0x229:
         if(message.lparam)memory.store(GuestAddress{message.lparam},32,mdi.active && gui_.windows.at(mdi.active).show_command==3);
@@ -334,10 +334,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_mdi(GuestState& state,Guest
         const auto client=gui_.windows.find(arg(0));if(client==gui_.windows.end() || !client->second.mdi){fail(1400);return std::nullopt;}
         if(!arg(1)){fail(87);return std::nullopt;}
         const auto message=mdi_message(memory,arg(1),x86_);const auto child=client->second.mdi->active;
-        if(!child || !gui_.windows.at(child).enabled || message.message!=0x100 || !(gui_.keyboard[17]&128) || (gui_.keyboard[18]&128)) {arg.return_to(state,0);return std::nullopt;}
+        if(!child || !gui_.windows.at(child).enabled || message.message!=0x100 || !(threads_.input_queue(threads_.current).keys[17]&128) || (threads_.input_queue(threads_.current).keys[18]&128)) {arg.return_to(state,0);return std::nullopt;}
         std::uint64_t command=0;
         if(message.wparam==0x73)command=0xf060;
-        else if(message.wparam==0x75 || message.wparam==9)command=gui_.keyboard[16]&128?0xf050:0xf040;
+        else if(message.wparam==0x75 || message.wparam==9)command=threads_.input_queue(threads_.current).keys[16]&128?0xf050:0xf040;
         if(!command){arg.return_to(state,0);return std::nullopt;}
         api(gui_.windows.at(child).unicode?"SendMessageW":"SendMessageA",{child,0x112,command,0},Continuation::Return,1);return std::nullopt;
     }

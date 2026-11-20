@@ -13,6 +13,7 @@
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> common_dialog_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
+        {"shell32.dll","GetFileNameFromBrowse",7,0,0,4},
         {"comdlg32.dll","ChooseFontA",1},{"comdlg32.dll","ChooseFontW",1},
         {"comdlg32.dll","ChooseColorA",1},{"comdlg32.dll","ChooseColorW",1},
         {"comdlg32.dll","GetOpenFileNameA",1},{"comdlg32.dll","GetOpenFileNameW",1},
@@ -158,7 +159,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_busy(GuestState& state,
     if(value){complete_call(state,memory,value);return std::nullopt;}
     const auto end=[&](std::uint64_t result){window->second.ended=true;window->second.dialog_result=result;};
     const auto id=arg(2)&65535;
-    if(message==gui_registered_message(u"OLEUI_MSG_CLOSEBUSYDIALOG")){end(119);value=1;}
+    if(message>=0xc000 && message==gui_registered_message(u"OLEUI_MSG_CLOSEBUSYDIALOG")){end(119);value=1;}
     else if(message==0x10 || (message==0x111 && id==2)){if(!(data.flags&9U))end(2);value=1;}
     else if(message==0x111 && (id==600 || id==604) && (arg(2)>>16)==0){
         value=1;
@@ -185,6 +186,29 @@ void WindowsServices::common_dialog_refresh(std::uint64_t handle){
     present_gui(gui_child(handle,412));present_gui(gui_child(handle,499));
 }
 std::optional<std::uint32_t> WindowsServices::invoke_common_dialog(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol=="GetFileNameFromBrowse"){
+        return nested_continuation(state,memory,"Shell 開啟檔案",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);
+            const CommonDialogAbi abi(Kind::OpenFile,x86_);
+            GuestScratch scratch(*this,m,s);
+            const auto request=scratch.allocate(abi.size);
+            if(!request){gui_.common_dialog_error=9;call.return_to(s,0);co_return std::nullopt;}
+            m.fill(GuestAddress{request},0,abi.size);
+            const auto put=[&](unsigned offset,std::uint8_t bits,std::uint64_t value){m.store(GuestAddress{request+offset},bits,value);};
+            put(0,32,abi.size);
+            put(abi.owner,abi.bits,call(0));
+            put(abi.file,abi.bits,call(1));
+            put(abi.file_capacity,32,call(2));
+            put(abi.directory,abi.bits,call(3));
+            put(abi.extension,abi.bits,call(4));
+            put(abi.filter,abi.bits,call(5));
+            put(abi.title,abi.bits,call(6));
+            put(abi.flags,32,0x81004); // OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY
+            const auto ok=co_await service_callback::call(resolve("comdlg32.dll","GetOpenFileNameW").value,{request});
+            call.return_to(s,ok);
+            co_return std::nullopt;
+        });
+    }
     if(service.family=="oledlg.dll")return invoke_gui_busy(state,memory,service);
 #include "windows_find_replace.inc"
 #include "windows_file_dialog.inc"

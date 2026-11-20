@@ -1,3 +1,4 @@
+#include "shared_window_order.hpp"
 #include "x64arm/windows_services.hpp"
 #include "gui_lifecycle_trace.hpp"
 #include "x64arm/windows_geometry.hpp"
@@ -48,13 +49,15 @@ void WindowsServices::raise_gui_window(std::uint64_t handle){
     auto position=gui_.z_order.begin();
     if(!(found->second.ex_style&8U))while(position!=gui_.z_order.end()){
         const auto item=gui_.windows.find(*position);if(item!=gui_.windows.end() && !item->second.parent && !(item->second.ex_style&8U))break;++position;}
+    auto after=position==gui_.z_order.begin()?0:*(position-1);
     gui_.z_order.insert(position,group.begin(),group.end());
+    for(const auto item:group){publish_window_order(shared_windows_.get(),item,after);after=item;}
     if(native_gui_)for(auto it=group.rbegin();it!=group.rend();++it)native_gui_->reorder(*it,0);
 }
 std::vector<GuestCallback> WindowsServices::activate_gui_window(std::uint64_t handle,bool mouse,bool native){
     detail::trace_gui_lifecycle("activate",gui_,process_id(),threads_.current,handle,(mouse?1U:0U)|(native?2U:0U));
     std::vector<GuestCallback> callbacks;const auto previous=gui_.active;
-    gui_.active=handle;poll_desktop_notifications();
+    gui_.active=handle;present_gui_cursor();poll_desktop_notifications();
     for(auto owner=handle,depth=UINT64_C(0);owner && depth<64;++depth){const auto entry=gui_.windows.find(owner);if(entry==gui_.windows.end() || entry->second.parent)break;entry->second.last_active_popup=handle;owner=entry->second.owner;}
     const auto notify=[&](std::uint64_t target,unsigned message,std::uint64_t wp,std::uint64_t lp){
         const auto found=gui_.windows.find(target);if(found!=gui_.windows.end())callbacks.push_back({resolve("user32.dll",found->second.unicode?"SendMessageW":"SendMessageA").value,{target,message,wp,lp}});
@@ -87,7 +90,7 @@ void WindowsServices::queue_gui_mouse(GuiMessage message,bool native_activation)
         }
         message.has_point=true;message.screen_point=true;message.queued_cursor=message.point;gui_.pointer_position=message.point;
         // GetMouseMovePointsEx：原生、SendInput 與觸控／筆轉成的移動都在合併前記錄。
-        if(message.message==0x200 && message.queue_priority==1)record_mouse_move_point(message.point[0],message.point[1],message.queued_time,message.input_extra.value_or(0));
+        if(message.message==0x200 && message.queue_priority==1 && !(message.injected && message.source_device==2))record_mouse_move_point(message.point[0],message.point[1],message.queued_time,message.input_extra.value_or(0));
     }
     // 原生及 SendInput 共用尚未派送的移動槽。Windows 在取訊息時才為最新位置做
     // 命中測試；逐筆回放舊座標會讓拖曳、hover 與後續按鈕事件排在過時輸入後面。
@@ -230,7 +233,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_move_size(GuestState& s
         else if(message==0x100 || message==0x104){
             if(wp==27){end=true;operation.cancel=true;}
             else if(wp==13)end=true;
-            else if(wp>=37 && wp<=40){const auto step=(gui_.keyboard[17]&0x80U)?1:10;operation.point[wp==37 || wp==39?0:1]+=wp==37 || wp==38?-step:step;moved=true;}
+            else if(wp>=37 && wp<=40){const auto step=(threads_.input_queue(threads_.current).keys[17]&0x80U)?1:10;operation.point[wp==37 || wp==39?0:1]+=wp==37 || wp==38?-step:step;moved=true;}
         }else if(message==0x200 || message==0xa0){
             for(unsigned i=0;i<2;++i)operation.point[i]=integer(memory.load(GuestAddress{buffer+(x86_?20:36)+i*4},32));moved=true;
         }else {callback(Stage::Dispatch,{{resolve("user32.dll","TranslateMessage").value,{buffer}},{resolve("user32.dll","DispatchMessageW").value,{buffer}}});return std::nullopt;}

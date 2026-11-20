@@ -1,5 +1,5 @@
 // 此容器沒有 vtable；欄位為字串指標與一個空值字元。
-if(service.family=="msvcp140.dll" && symbol.find("_Yarn@")!=symbol.npos){
+if((service.family=="msvcp140.dll" || service.family=="msvcp120.dll") && symbol.find("_Yarn@")!=symbol.npos){
     const bool win32_member=symbol.find("@@QAE")!=symbol.npos || symbol.find("@@QBE")!=symbol.npos || symbol.find("@@AAE")!=symbol.npos;
     const auto object=x86_ && win32_member?state.reg(Gpr::Rcx)&UINT32_MAX:arg(0);
     const unsigned unit=x86_?4:8,element=symbol.find("_Yarn@D@")!=symbol.npos?1:2;

@@ -8,6 +8,9 @@
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> shell_notification_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
+        {"shell32.dll","SHChangeNotifyRegisterThread",1,0,0,1},
+        {"shell32.dll","SHChangeNotifySuspendResume",4,0,0,0xd},
+        {"shell32.dll","#640",6},{"shell32.dll","SHChangeNotifyReceive",4},
         {"shell32.dll","SHChangeNotifyRegister",6},{"shell32.dll","SHChangeNotifyDeregister",1},
         {"shell32.dll","SHChangeNotification_Lock",4},{"shell32.dll","SHChangeNotification_Unlock",1},
         {"shell32.dll","SHCreateDirectoryExA",3},{"shell32.dll","SHCreateDirectoryExW",3},{"shell32.dll","SHCreateDirectory",2}
@@ -85,6 +88,20 @@ void WindowsServices::finish_shell_callbacks(GuestMemory& memory,const CallbackF
     for(const auto token:frame.shell_deliveries){const auto found=gui_.shell_deliveries.find(token);if(found!=gui_.shell_deliveries.end() && found->second.active)--found->second.active;release_shell_delivery(memory,token);}
 }
 void WindowsServices::shell_notify(GuestMemory& memory,std::uint32_t event,const std::array<std::u16string,2>& paths,bool interrupt,std::vector<GuestCallback>* flush,std::uint32_t target,bool notify_children) {
+    // 顯式通知也必須看見在它之前提交的註冊；節點轉移不重新配置。
+    gui_.shell_registrations.merge(gui_.pending_shell_registrations);
+    if(interrupt && !gui_.shell_watch_suspensions.empty()){
+        for(const auto& path:paths){
+            if(path.empty())continue;
+            const auto item=fold(path);
+            for(const auto& suspension:gui_.shell_watch_suspensions){
+                const auto& [root,recursive]=suspension.first;
+                if(item==root || parent(item)==root)return;
+                if(recursive && item.size()>root.size() && item.starts_with(root) &&
+                   (root.back()==u'\\' || item[root.size()]==u'\\'))return;
+            }
+        }
+    }
     for(const auto& [id,registration]:gui_.shell_registrations){
         if(target && target!=id)continue;
         if(!(registration.sources&(interrupt?1U:2U)) || !(registration.events&(event&all_events)) || !matches(registration,paths,event,notify_children) || !gui_.windows.contains(registration.window))continue;
@@ -111,6 +128,7 @@ void WindowsServices::shell_notify(GuestMemory& memory,std::uint32_t event,const
     }
 }
 void WindowsServices::poll_shell_notifications(GuestMemory& memory) {
+    gui_.shell_registrations.merge(gui_.pending_shell_registrations);
     std::erase_if(gui_.shell_registrations,[&](const auto& item){return !gui_.windows.contains(item.second.window);});
     std::erase_if(shell_watches_,[&](const auto& item){return !gui_.shell_registrations.contains(item.first);});
     std::vector<std::uint64_t> stale;
@@ -158,13 +176,41 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_notification(GuestSta
     const auto fail=[&](std::uint32_t error){last_error_=error;return finish(symbol.starts_with("SHCreateDirectory")?error:0);};
     const std::uint8_t bits=x86_?32:64;const unsigned unit=x86_?4:8;
     try{
-        if(symbol=="SHChangeNotifyRegister"){
-            const auto source=u32(1),events=u32(2),message=u32(3);
+        if(symbol=="SHChangeNotifyRegisterThread"){
+            auto& enabled=threads_.items.at(threads_.current).async_shell_registration;
+            if(u32(0)==0)enabled=true;
+            else if(u32(0)==1){
+                if(enabled)poll_shell_notifications(memory);
+                enabled=false;
+            }else return fail(87);
+            return finish(0);
+        }
+        if(symbol=="SHChangeNotifySuspendResume"){
+            if(!arg(1) || u32(3))return fail(87);
+            const auto path=shell_pidl_path(memory,arg(1));
+            if(!path || path->empty())return fail(87);
+            const auto key=std::pair{fold(*path),u32(2)!=0};
+            // 切換前先處理監看器已累積的事件，使其沿用切換前的投遞狀態。
+            poll_shell_notifications(memory);
+            auto& suspensions=gui_.shell_watch_suspensions;
+            if(u32(0)){
+                auto& count=suspensions[key];
+                if(count==UINT32_MAX)return fail(534);
+                ++count;
+            }else{
+                const auto found=suspensions.find(key);
+                if(found==suspensions.end())return fail(1168);
+                if(!--found->second)suspensions.erase(found);
+            }
+            return finish(1);
+        }
+        if(symbol=="SHChangeNotifyRegister" || symbol=="#640"){
+            const auto source=u32(1)|(symbol=="#640"?0x8000U:0U),events=u32(2),message=u32(3);
             if(!gui_.windows.contains(arg(0)) || gui_.windows.at(arg(0)).ended)return fail(1400);
             if(!(source&3) || (source&~0x9003U) || !events || (events&interrupt_event) || !message || message>65535 || u32(4)!=1 || !arg(5))return fail(87);
             memory.check(GuestAddress{arg(5)},x86_?8:16,Access::Read);const bool recursive=memory.load(GuestAddress{arg(5)+unit},32)!=0;
             if((source&0x1000) && (!(source&1) || !recursive))return fail(87);
-            if(gui_.shell_registrations.size()>=64 || gui_.next_shell_registration==UINT32_MAX)return fail(8);
+            if(gui_.shell_registrations.size()+gui_.pending_shell_registrations.size()>=64 || gui_.next_shell_registration==UINT32_MAX)return fail(8);
             std::u16string root;const auto pidl=memory.load(GuestAddress{arg(5)},bits);
             if(pidl){const auto item=gui_.shell_pidls.find(pidl);if(item==gui_.shell_pidls.end() || !allocations_.contains(pidl))return fail(87);root=item->second;}
             std::vector<ShellWatch> watches;
@@ -178,10 +224,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_notification(GuestSta
                 if(watches.empty())return fail(3);
             }
             const auto id=gui_.next_shell_registration++;GuiState::ShellRegistration registration{arg(0),source,events,message,std::move(root),recursive};
-            shell_watches_.emplace(id,std::move(watches));try{gui_.shell_registrations.emplace(id,std::move(registration));}catch(...){shell_watches_.erase(id);throw;}return finish(id);
+            auto& registrations=threads_.items.at(threads_.current).async_shell_registration?gui_.pending_shell_registrations:gui_.shell_registrations;
+            shell_watches_.emplace(id,std::move(watches));try{registrations.emplace(id,std::move(registration));}catch(...){shell_watches_.erase(id);throw;}return finish(id);
         }
         if(symbol=="SHChangeNotifyDeregister"){
-            if(!gui_.shell_registrations.erase(u32(0)))return finish(0);shell_watches_.erase(u32(0));poll_shell_notifications(memory);return finish(1);
+            const auto id=u32(0);
+            if(!gui_.pending_shell_registrations.erase(id) && !gui_.shell_registrations.erase(id))return finish(0);
+            // 先撤銷 ID，非同步模式由下一次通知輪詢或停用時回收監看器與投遞。
+            if(!threads_.items.at(threads_.current).async_shell_registration)poll_shell_notifications(memory);
+            return finish(1);
         }
         if(symbol=="SHChangeNotification_Lock"){
             if(arg(2)){memory.check(GuestAddress{arg(2)},unit,Access::Write);memory.store(GuestAddress{arg(2)},bits,0);}
@@ -230,8 +281,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_notification(GuestSta
             }
             return finish(0);
         }
-        if(symbol=="SHChangeNotify"){
-            const auto event=u32(0),flags=u32(1),type=flags&0xffU;
+        if(symbol=="SHChangeNotify" || symbol=="SHChangeNotifyReceive"){
+            const auto event=u32(0),flags=u32(1),type=symbol=="SHChangeNotifyReceive"?0U:flags&0xffU;
             if(!event || (flags&~0x130ffU) || (flags&0x3000U)==0x2000)return fail(87);if(type!=0 && type!=1 && type!=5)return fail(50);
             std::array<std::u16string,2> paths;
             for(unsigned n=0;n<2;++n)if(arg(n+2)){

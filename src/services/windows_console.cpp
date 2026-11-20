@@ -1,3 +1,4 @@
+#include "shared_window_order.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/native_console.hpp"
 #include "windows_console_encoding.hpp"
@@ -69,7 +70,8 @@ std::span<const WindowsServiceDescriptor> console_service_descriptors(){
         {"kernel32.dll","FlushConsoleInputBuffer",1},{"kernel32.dll","GetNumberOfConsoleInputEvents",2},
         {"kernel32.dll","ReadConsoleInputA",4},{"kernel32.dll","ReadConsoleInputW",4},
         {"kernel32.dll","ReadConsoleInputExA",5,0,0,0x14},{"kernel32.dll","ReadConsoleInputExW",5,0,0,0x14},
-        {"kernel32.dll","WriteConsoleInputA",4},{"kernel32.dll","WriteConsoleInputW",4},
+        {"kernel32.dll","WriteConsoleInputA",4,0,0,4},{"kernel32.dll","WriteConsoleInputW",4,0,0,4},
+        {"kernel32.dll","WriteConsoleInputVDMA",4,0,0,4},{"kernel32.dll","WriteConsoleInputVDMW",4,0,0,4},
         {"kernel32.dll","PeekConsoleInputA",4},{"kernel32.dll","PeekConsoleInputW",4},
         {"kernel32.dll","ReadConsoleOutputCharacterA",5},{"kernel32.dll","ReadConsoleOutputCharacterW",5},{"kernel32.dll","ReadConsoleOutputAttribute",5}
     };return table;
@@ -145,39 +147,81 @@ bool WindowsServices::console_text_ready(bool line,int timeout){
     while(!buffer.records.empty()){
         auto record=buffer.records.front();buffer.records.pop_front();
         if(console_field(record,0,2)!=1 || !console_field(record,4))continue;
-        const auto c=static_cast<char16_t>(console_field(record,14,2));if(!c)continue;
+        const auto c=static_cast<char16_t>(console_field(record,14,2));
+        const auto key=console_field(record,10,2);
         auto repeats=console_field(record,8,2);if(!repeats)continue;
         while(repeats--){
+            auto& text=buffer.edited_line;
+            const auto cursor=text.size()-buffer.edit_tail;
+            const auto echo=[&](std::string_view bytes){
+                if(buffer.input_mode&4)(void)write_standard_output(1,{reinterpret_cast<const std::uint8_t*>(bytes.data()),bytes.size()},false,true);
+            };
+            const auto previous=[&](){
+                auto pos=cursor-1;
+                if(pos && text[pos]>=0xdc00 && text[pos]<=0xdfff && text[pos-1]>=0xd800 && text[pos-1]<=0xdbff)--pos;
+                return pos;
+            };
+            const auto next=[&](){
+                return cursor+1+(text[cursor]>=0xd800 && text[cursor]<=0xdbff && cursor+1<text.size() &&
+                                 text[cursor+1]>=0xdc00 && text[cursor+1]<=0xdfff);
+            };
+            if(!c){
+                if(editing && key==0x25 && cursor){buffer.edit_tail=text.size()-previous();echo("\b");}
+                if(editing && key==0x27 && buffer.edit_tail){
+                    const auto end=next();
+                    echo(utf16_to_utf8_lossy(std::u16string_view(text).substr(cursor,end-cursor)));
+                    buffer.edit_tail=text.size()-end;
+                }
+                continue;
+            }
             // 輪詢期間收到的 VEOF 尚未經宿主行編輯：有資料時提交該行，空行才回 EOF。
             if(terminal_eof>=0 && c==terminal_eof){
                 if(buffer.edited_line.empty())buffer.eof=true;
-                else {available=std::move(buffer.edited_line);buffer.edited_line.clear();}
+                else {available=std::move(buffer.edited_line);buffer.edited_line.clear();buffer.edit_tail=0;}
                 if(repeats){set_console_field(record,8,repeats,2);buffer.records.push_front(record);}break;
             }
             if(editing && (c==u'\b' || c==127)){
-                if(!buffer.edited_line.empty()){buffer.edited_line.pop_back();if(!buffer.edited_line.empty() && buffer.edited_line.back()>=0xd800 && buffer.edited_line.back()<=0xdbff)buffer.edited_line.pop_back();
-                    if(buffer.input_mode&4){if(!buffer.echo_input.empty())buffer.echo_input.clear();else (void)write_standard_output(1,std::array<std::uint8_t,3>{8,32,8});}}
+                if(cursor){
+                    const auto pos=previous();
+                    text.erase(pos,cursor-pos);
+                    if(!buffer.echo_input.empty())buffer.echo_input.clear();
+                    else if(buffer.input_mode&4){
+                        echo("\b");echo(utf16_to_utf8_lossy(std::u16string_view(text).substr(pos)));
+                        echo(" ");echo(std::string(buffer.edit_tail+1,'\b'));
+                    }
+                }
                 continue;
             }
             if(editing && (c==u'\r' || c==u'\n')){
                 console_remember_command(buffer,console_input_exe(),buffer.edited_line);
-                buffer.edited_line+=u"\r\n";available=std::move(buffer.edited_line);buffer.edited_line.clear();
+                buffer.edited_line+=u"\r\n";available=std::move(buffer.edited_line);buffer.edited_line.clear();buffer.edit_tail=0;
                 if(buffer.input_mode&4)(void)write_standard_output(1,std::array<std::uint8_t,2>{13,10});
                 if(repeats){set_console_field(record,8,repeats,2);buffer.records.push_front(record);}break;
             }
-            (editing?buffer.edited_line:available)+=c;
+            if(editing){
+                const bool completes_pair=c>=0xdc00 && c<=0xdfff && cursor && text[cursor-1]>=0xd800 && text[cursor-1]<=0xdbff;
+                if(buffer.edit_tail && !completes_pair && !(buffer.input_mode&0x20U)){
+                    const auto replaced=next()-cursor;
+                    text.erase(cursor,replaced);buffer.edit_tail-=replaced;
+                }
+                text.insert(cursor,1,c);
+            }else available+=c;
             if(buffer.input_mode&4){
                 buffer.echo_input+=c;
                 if(c>=0xd800 && c<=0xdbff)continue;
                 std::string bytes;try{bytes=utf16_to_utf8(buffer.echo_input);}catch(const std::invalid_argument&){
                     for(auto unit:buffer.echo_input)bytes+=unit>=0xd800 && unit<=0xdfff?"\xef\xbf\xbd":utf16_to_utf8(std::u16string(1,unit));
                 }
-                buffer.echo_input.clear();(void)write_standard_output(1,std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()),bytes.size()),false,true);
+                buffer.echo_input.clear();echo(bytes);
+                if(editing && buffer.edit_tail){
+                    echo(utf16_to_utf8_lossy(std::u16string_view(text).substr(text.size()-buffer.edit_tail)));
+                    echo(std::string(buffer.edit_tail,'\b'));
+                }
             }
         }
         if(editing && (!available.empty() || buffer.eof))break;
     }
-    if(buffer.eof && available.empty() && !buffer.edited_line.empty()){available=std::move(buffer.edited_line);buffer.edited_line.clear();}
+    if(buffer.eof && available.empty() && !buffer.edited_line.empty()){available=std::move(buffer.edited_line);buffer.edited_line.clear();buffer.edit_tail=0;}
     if(!available.empty()){
         std::string text;try{text=utf16_to_utf8(available);}catch(const std::invalid_argument&){
             // 客體可以注入單獨的 surrogate；文字串流以 U+FFFD 回填，不暴露宿主例外。
@@ -321,7 +365,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
                         model.procedure=resolve("user32.dll","DefWindowProcW").value;model.width=static_cast<std::uint32_t>(screen.view_columns)*screen.font_width;model.height=static_cast<std::uint32_t>(screen.view_rows)*screen.font_height;
                         model.x=model.y=120;model.visible=screen.window!=nullptr;model.style=model.visible?0x10cf0000U:0;
                         if(!screen.window)model.parent=gui_message_parent;
-                        const auto handle=allocate_gui_window();gui_.windows.emplace(handle,model);gui_.z_order.insert(gui_.z_order.begin(),handle);
+                        const auto handle=allocate_gui_window();gui_.windows.emplace(handle,model);gui_.z_order.insert(gui_.z_order.begin(),handle);publish_window_order(shared_windows_.get(),handle,0);
                         try{if(native_gui_)native_gui_->create(handle,model);publish_gui_window(handle);screen.window_handle=handle;if(model.visible && native_gui_)show_native_window(handle,true);}
                         catch(...){erase_window(handle);throw;}
                     }
@@ -409,7 +453,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
 #if !defined(_WIN32)
                     if(consoles_[0]->descriptor>=0 && ::tcflush(consoles_[0]->descriptor,TCIFLUSH)){fail(6);arg.return_to(state,result);return std::nullopt;}
 #endif
-                    if(buffer.window)(void)buffer.window->poll(0);buffer.records.clear();buffer.ansi_records.clear();buffer.ansi_input_records.clear();buffer.terminal_input.clear();buffer.edited_line.clear();buffer.echo_input.clear();
+                    if(buffer.window)(void)buffer.window->poll(0);buffer.records.clear();buffer.ansi_records.clear();buffer.ansi_input_records.clear();buffer.terminal_input.clear();buffer.edited_line.clear();buffer.edit_tail=0;buffer.echo_input.clear();
                     runtime_.console_input.clear();runtime_.standard_input.bytes.clear();runtime_.standard_input.position=0;result=1;
                 }
             }else if(name=="GetNumberOfConsoleInputEvents"){
@@ -422,12 +466,29 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
                 else {
                     memory.check(GuestAddress{arg(3)},4,Access::Write);
                     if(writing){
-                        if(count>65536-buffer.records.size()-buffer.ansi_records.size())fail(8);
-                        else {memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(count)*20,Access::Read);std::vector<ConsoleRecord> records(count);
-                            for(unsigned i=0;i<count;++i){memory.read(GuestAddress{arg(1)+20ULL*i},records[i]);const auto type=console_field(records[i],0,2);
-                                if(type!=1 && type!=2 && type!=4 && type!=8 && type!=16){fail(87);arg.return_to(state,result);return std::nullopt;}
+                        if(count)memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(count)*20,Access::Read);
+                        std::vector<ConsoleRecord> records(count);
+                        for(unsigned i=0;i<count;++i){
+                            memory.read(GuestAddress{arg(1)+20ULL*i},records[i]);
+                            const auto type=console_field(records[i],0,2);
+                            if(type!=1 && type!=2 && type!=4 && type!=8 && type!=16){
+                                fail(87);arg.return_to(state,result);return std::nullopt;
                             }
-                            if(wide)buffer.records.insert(buffer.records.end(),records.begin(),records.end());else console_decode_input(buffer,records);memory.store(GuestAddress{arg(3)},32,count);result=1;
+                        }
+                        std::deque<ConsoleRecord> pending;
+                        if(!wide){
+                            pending=buffer.ansi_input_records;
+                            pending.insert(pending.end(),records.begin(),records.end());
+                            records=console_decode_input(pending,buffer.input_codepage);
+                        }
+                        const auto used=buffer.records.size()+buffer.ansi_records.size();
+                        if(!records.empty() && used+records.size()>65536)fail(8);
+                        else{
+                            const bool prepend=name.starts_with("WriteConsoleInputVDM");
+                            buffer.records.insert(prepend?buffer.records.begin():buffer.records.end(),records.begin(),records.end());
+                            if(!wide)buffer.ansi_input_records.swap(pending);
+                            memory.store(GuestAddress{arg(3)},32,count);
+                            result=1;
                         }
                     }else {
                         (void)console_input_ready(arg(0));

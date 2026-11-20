@@ -2,7 +2,7 @@
 // - HashData：Pearson 雜湊，每個輸出位元組 i 以 T[(data[0]+i)&255] 起始、依序以 T[h^data[j]] 混入其餘輸入；T 為固定的 0～255 排列。
 // - UrlHashA／W：對 URL 的 ANSI 位元組（W 版先轉 ACP）做 HashData；輸出長度 1～256。
 // - PathIsValidCharA／W：回傳呼叫端遮罩與碼元類別的交集。
-// - SHTruncateString：截斷 ANSI 字串到緩衝區長度減一，不切開多位元組字元（ACP 為 UTF-8），回傳結果長度。
+// - SHTruncateString：依指定範圍檢查 DBCS 尾端，僅移除未配對的前導位元組。
 if(name=="HashData" || name.starts_with("UrlHash")){
     static const auto table=[]{
         std::array<std::uint8_t,256> value{};for(unsigned i=0;i<256;++i)value[i]=static_cast<std::uint8_t>(i);
@@ -34,10 +34,19 @@ if(name.starts_with("PathIsValidChar")){
     return done(u32(1)&path_character_class(ch));
 }
 if(name=="SHTruncateString"){
-    // (psz, cchBufferSize)：字串已經放得下時不變。
-    if(!arg(0) || !u32(1))return done(0);
-    auto text=read_ansi(memory,arg(0),0x40000);const auto limit=u32(1);
-    if(text.size()<limit)return done(text.size());
-    std::size_t cut=limit-1;while(cut>0 && (static_cast<unsigned char>(text[cut])&0xc0U)==0x80U)--cut;
-    memory.store(GuestAddress{arg(0)+cut},8,0);return done(cut);
+    const auto start=arg(0);
+    const auto size=u32(1);
+    if(!start || !size)return done(0);
+    memory.check(GuestAddress{start},size,Access::Read);
+    // UTF-8 ACP 的 IsDBCSLeadByte 一律為 FALSE，整個指定範圍皆可保留。
+    if(host("kernel32.dll","GetACP",{})==65001)return done(size);
+    for(std::uint64_t offset=0;offset<size;++offset){
+        const auto byte=memory.load(GuestAddress{start+offset},8);
+        if(!host("kernel32.dll","IsDBCSLeadByte",{byte}))continue;
+        if(++offset==size){
+            memory.store(GuestAddress{start+offset-1},8,0);
+            return done(size-1);
+        }
+    }
+    return done(size);
 }

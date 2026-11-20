@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "windows_locale_data.hpp"
 #include <locale.h>
 #include <algorithm>
 #include <bit>
@@ -17,7 +18,8 @@ std::span<const WindowsServiceDescriptor> userstring_service_descriptors() {
         {"user32.dll", "CharUpperBuffA", 2}, {"user32.dll", "CharUpperBuffW", 2},
         {"user32.dll", "CharLowerBuffA", 2}, {"user32.dll", "CharLowerBuffW", 2},
         {"user32.dll", "CharNextA", 1}, {"user32.dll", "CharNextW", 1}, {"user32.dll", "CharNextExA", 3},
-        {"user32.dll", "CharPrevA", 2}, {"user32.dll", "CharPrevW", 2}, {"user32.dll", "CharPrevExA", 4}
+        {"user32.dll", "CharPrevA", 2}, {"user32.dll", "CharPrevW", 2}, {"user32.dll", "CharPrevExA", 4},
+        {"user32.dll", "CharNextExW", 3}, {"user32.dll", "CharPrevExW", 4}
     };
     return table;
 }
@@ -71,11 +73,6 @@ std::basic_string<Character> user32_format(const GuestMemory& memory,std::basic_
 }
 }
 
-namespace {
-bool supported_codepage(std::uint16_t codepage) {
-    return codepage == 0 || codepage == 1 || codepage == 65001 || codepage == 1252;
-}
-}
 std::optional<std::uint32_t> WindowsServices::invoke_userstring(GuestState& state, GuestMemory& memory,
                                                               const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state, memory, service);
@@ -106,31 +103,47 @@ std::optional<std::uint32_t> WindowsServices::invoke_userstring(GuestState& stat
             result=text.size();output.assign(text.begin(),text.end());output.push_back(0);}
         memory.write(GuestAddress{arg(0)},output);if(!bounded && (truncated || result==limit))result=1024;
     } else if (symbol.starts_with("CharNext") || symbol.starts_with("CharPrev")) {
-        const bool extended = symbol.ends_with("ExA"), previous = symbol.starts_with("CharPrev");
-        const auto shift = extended ? 1U : 0U;
-        if (extended && (!supported_codepage(static_cast<std::uint16_t>(arg(0))) ||
-                         static_cast<std::uint32_t>(arg(previous ? 3 : 2)))) fail(87);
-        else if (previous) {
+        const bool previous = symbol.starts_with("CharPrev");
+        const bool extended = symbol.ends_with("ExA");
+        const unsigned shift = extended ? 1 : 0;
+        const auto lead_byte = [&](std::uint64_t byte) {
+            const auto page = extended ? static_cast<std::uint16_t>(arg(0)) : 0;
+            if (page == 0 || page == 1 || page == 3 || page == 65001 || page == 1252) return false;
+            const auto info = windows_nls_codepage(static_cast<std::uint16_t>(page));
+            if (!info) { last_error_ = 87; return false; }
+            return info->lead[static_cast<std::uint8_t>(byte)] != 0;
+        };
+        if (symbol.ends_with("ExW")) {
+            // 參考實作的兩個 Unicode 擴充入口回傳 NULL，並保留呼叫者的 last-error。
+            result = 0;
+        } else if (previous) {
             const auto start = arg(shift), current = arg(shift + 1);
-            const auto stride = wide ? 2U : 1U;
-            result = current <= start || current - start < stride ? start : current - stride;
+            result = current;
+            if (current > start) {
+                const bool pair = extended && current - start >= 2 &&
+                    lead_byte(memory.load(GuestAddress{current - 2}, 8));
+                result -= wide || pair ? 2 : 1;
+            }
         } else {
-            const auto pointer = arg(shift);
-            const auto stride = wide ? 2U : 1U;
-            result = memory.load(GuestAddress{pointer}, wide ? 16 : 8) ? pointer + stride : pointer;
+            const auto current = arg(shift);
+            const auto first = memory.load(GuestAddress{current}, wide ? 16 : 8);
+            result = current;
+            if (first) {
+                const bool pair = !wide && lead_byte(first) && memory.load(GuestAddress{current + 1}, 8);
+                result += wide || pair ? 2 : 1;
+            }
         }
-        // CharNextExA／CharPrevExA 採 DBCS lead-byte 規則。現有 ACP/OEM=UTF-8 與1252
-        // 都沒有 DBCS lead ranges，故 ANSI 每次一個 byte；不是 UTF-8 scalar iterator。
     } else if (symbol.starts_with("CharUpper") || symbol.starts_with("CharLower")) {
         const bool upper = symbol.starts_with("CharUpper"), buffer = symbol.find("Buff") != std::string_view::npos;
         if (!buffer && (arg(0) >> 16) == 0) {
-            const auto character = static_cast<char16_t>(arg(0));
+            const auto character = static_cast<char16_t>(wide ? arg(0) : arg(0) & 0xffU);
             // ANSI 單字元模式只有一個 ACP byte；UTF-8 高位元組本身不是完整字元。
             result = wide || character < 128 ? unicode_case_unit(character, upper) : character;
+            if (!wide && character >= 128) last_error_ = 122;
         } else {
             std::u16string text;
             const auto count = buffer ? static_cast<std::uint32_t>(arg(1)) : 0U;
-            if (buffer && !count) { arg.return_to(state, 0); return std::nullopt; }
+            if (buffer && (!count || !arg(0))) { arg.return_to(state, 0); return std::nullopt; }
             if (buffer && count > output_limit / (wide ? 2U : 1U)) {
                 fail(87); arg.return_to(state, result); return std::nullopt;
             }
@@ -150,8 +163,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_userstring(GuestState& stat
                         bytes.resize(count);
                         memory.read(GuestAddress{arg(0)}, std::span<std::uint8_t>{reinterpret_cast<std::uint8_t*>(bytes.data()), bytes.size()});
                     } else bytes = read_ansi(memory, arg(0), output_limit);
-                    capacity = bytes.size() + (buffer ? 0 : 1);
-                    text = utf8_to_utf16(bytes);
+                    capacity = bytes.size();
+                    text = utf8_to_utf16_lossy(bytes);
                 }
                 for (auto& character : text) character = unicode_case_unit(character, upper);
                 std::vector<std::uint8_t> output;
@@ -161,14 +174,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_userstring(GuestState& stat
                 } else {
                     const auto encoded = utf16_to_utf8(text);
                     output.assign(encoded.begin(), encoded.end());
-                    if (!buffer) output.push_back(0);
+                    // A 版以原字串長度呼叫 BuffA；原有的結尾 NUL 留在原位。
                 }
-                if (output.size() > capacity) fail(122);
+                if (output.size() > capacity) {
+                    fail(122);
+                    if (!buffer && !wide) result = arg(0);
+                }
                 else {
                     memory.check(GuestAddress{arg(0)}, output.size(), Access::Write);
                     memory.write(GuestAddress{arg(0)}, output);
                     result = buffer ? (wide ? text.size() : output.size()) : arg(0);
                 }
+            } catch (const MemoryFault&) {
+                if (wide || buffer) throw;
+                fail(87);
             } catch (const std::invalid_argument&) { fail(1113); }
         }
     } else throw HostCallFault("未知的 USER32 字元服務");

@@ -1,3 +1,9 @@
+#include "mapi_property_tag.h"
+#include "mapi_restriction.hpp"
+#include "x64arm/network_files.hpp"
+#include "mapi_scalar_compare.h"
+#include "mapi_hex.h"
+#include "ole_build_version.h"
 #include "windows_path_character.h"
 #include "windows_system_info_layout.hpp"
 #include "x64arm/windows_services.hpp"
@@ -190,7 +196,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"cfgmgr32.dll","CM_Get_Class_PropertyW",6,0,0,32},{"cfgmgr32.dll","CM_Get_Class_Property_ExW",7,0,0,32},{"cfgmgr32.dll","CM_Get_Class_Property_Keys",4,0,0,8},{"cfgmgr32.dll","CM_Get_Class_Property_Keys_Ex",5,0,0,8},
         {"setupapi.dll","SetupDiGetDeviceInterfacePropertyW",8,0,0,0xa0},
         {"setupapi.dll","SetupDiGetDeviceInterfacePropertyKeys",6,0,0,0x28},{"setupapi.dll","SetupDiSetDeviceInterfacePropertyW",7,0,0,0x68},
-        {"secur32.dll","GetUserNameExA",3},{"secur32.dll","GetUserNameExW",3},{"advapi32.dll","GetUserNameA",2},{"advapi32.dll","GetUserNameW",2},
+        {"secur32.dll","GetUserNameExA",3,0,0,1},{"secur32.dll","GetUserNameExW",3,0,0,1},{"advapi32.dll","GetUserNameA",2},{"advapi32.dll","GetUserNameW",2},
         {"shlwapi.dll","IsOS",1},{"shcore.dll","IsOS",1},
         {"shlwapi.dll","SHAutoComplete",2},
         {"user32.dll","ExitWindowsEx",2},
@@ -230,11 +236,31 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll", "SetFileApisToOEM", 0},{"kernel32.dll", "SetFileApisToANSI", 0},{"kernel32.dll", "AreFileApisANSI", 0},{"kernel32.dll", "GetLargePageMinimum", 0},
         {"crt", "wcslen", 1}, {"crt", "wcsnlen", 2}, {"crt", "strnlen", 2}, {"crt", "memchr", 3},
         {"crt", "wcscmp", 2},{"crt", "wcsncmp", 3},{"crt", "wcsstr", 2},{"crt", "wcschr", 2},{"crt", "wcsrchr", 2},
+        {"internal-mapi-hex","HexFromBin",3,0,0,2},{"internal-mapi-hex","FBinFromHex",2},
+        {"internal-mapi-hex","ScBinFromHexBounded",3,0,0,4},{"internal-mapi-hex","UlFromSzHex",1},{"internal-mapi-hex","UFromSz",1},
+        {"internal-mapi-buffer","MAPIAllocateBuffer",2,0,0,1},{"internal-mapi-buffer","MAPIAllocateMore",3,0,0,1},
+        {"internal-mapi-buffer","MAPIFreeBuffer",1},{"internal-mapi-buffer","FreeProws",1},{"internal-mapi-buffer","FreePadrlist",1},
+        {"internal-mapi-property","FBadRowSet",1},{"internal-mapi-property","FBadRow",1},
+        {"internal-mapi-path","ScUNCFromLocalPath",3,0,0,4},{"internal-mapi-path","ScLocalPathFromUNC",3,0,0,4},
+        {"internal-mapi-property","FBadRestriction",1},
+        {"internal-mapi-property","FPropContainsProp",3,0,0,4},
+        {"internal-mapi-property","FPropCompareProp",3,0,0,2},
+        {"internal-mapi-property","LPropCompareProp",2},
+        {"internal-mapi-property","FBadProp",1},{"internal-mapi-property","FBadEntryList",1},
+        {"internal-mapi-property","FBadColumnSet",1},{"internal-mapi-property","FBadSortOrderSet",1},
+        {"internal-mapi-index","ScCreateConversationIndex",4,0,0,1},{"internal-mapi-index","ScGenerateMuid",1},
+        {"internal-mapi-filetime","FtAddFt",2,3},{"internal-mapi-filetime","FtSubFt",2,3},
+        {"internal-mapi-filetime","FtMulDw",2,2,0,1},{"internal-mapi-filetime","FtMulDwDw",2,0,0,3},
+        {"internal-mapi-filetime","FtNegFt",1,1},
+        {"internal-mapi-property","FEqualNames",2},{"internal-mapi-property","FBadRglpNameID",2,0,0,2},
+        {"internal-mapi-property","PpropFindProp",3,0,0,6},{"internal-mapi-property","LpValFindProp",3,0,0,3},{"internal-mapi-property","FBadPropTag",1,0,0,1},
+        {"internal-mapi-swap","SwapPlong",2,0,0,2},{"internal-mapi-swap","SwapPword",2,0,0,2},
+        {"internal-mapi-nls","MapiCopyW",2},{"internal-mapi-nls","MapiCompareW",3},
         {"kernel32.dll","lstrlenA",1},{"kernel32.dll","lstrlenW",1},
         {"kernel32.dll","lstrcpyA",2},{"kernel32.dll","lstrcpyW",2},
         {"kernel32.dll","lstrcmpA",2},{"kernel32.dll","lstrcmpW",2},{"kernel32.dll","lstrcmpiA",2},{"kernel32.dll","lstrcmpiW",2},
-        {"kernel32.dll","GetLongPathNameA",3},{"kernel32.dll","GetLongPathNameW",3},
-        {"kernel32.dll","GetShortPathNameA",3},{"kernel32.dll","GetShortPathNameW",3},
+        {"kernel32.dll","GetLongPathNameA",3,0,0,4},{"kernel32.dll","GetLongPathNameW",3,0,0,4},
+        {"kernel32.dll","GetShortPathNameA",3,0,0,0x4},{"kernel32.dll","GetShortPathNameW",3,0,0,0x4},
         {"kernel32.dll","lstrcpynA",3},{"kernel32.dll","lstrcpynW",3},
         {"kernel32.dll","lstrcatA",2},{"kernel32.dll","lstrcatW",2},
         {"crt", "__std_exception_copy", 2}, {"crt", "__std_exception_destroy", 1}, {"crt", "_strdup", 1}, {"crt", "_strnicmp", 3}, {"crt", "_stricmp", 2}, {"crt", "_strcmpi", 2}, {"crt", "_wcsicmp", 2}, {"crt", "_wcsnicmp", 3}, {"crt", "strspn", 2}, {"crt", "strcspn", 2},
@@ -319,7 +345,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll", "GetSystemWow64Directory2A", 3, 0, 0, 0x6}, {"kernel32.dll", "GetSystemWow64Directory2W", 3, 0, 0, 0x6},
         {"kernel32.dll", "GetWindowsDirectoryA", 2}, {"kernel32.dll", "GetWindowsDirectoryW", 2},
         {"kernel32.dll", "GetSystemWindowsDirectoryA", 2}, {"kernel32.dll", "GetSystemWindowsDirectoryW", 2},
-        {"powrprof.dll", "PowerGetActiveScheme", 2}, {"powrprof.dll", "CallNtPowerInformation", 5}, {"rpcrt4.dll", "UuidToStringA", 2}, {"rpcrt4.dll", "UuidToStringW", 2}, {"rpcrt4.dll", "RpcStringFreeA", 1}, {"rpcrt4.dll", "RpcStringFreeW", 1}, {"rpcrt4.dll", "UuidCreate", 1}, {"rpcrt4.dll", "UuidCreateSequential", 1}, {"ole32.dll", "CoFileTimeNow", 1}, {"ole32.dll", "CoGetCurrentProcess", 0}, {"ole32.dll", "CoCreateGuid", 1}, {"kernel32.dll", "SetHandleCount", 1}, {"kernel32.dll", "GetThreadErrorMode", 0}, {"kernel32.dll", "SetThreadErrorMode", 2}, {"kernel32.dll", "DelayLoadFailureHook", 2}, {"kernel32.dll", "ResolveDelayLoadedAPI", 6}, {"kernel32.dll", "__chkstk", 0}, {"kernel32.dll", "GetErrorMode", 0}, {"kernel32.dll", "SetErrorMode", 1},
+        {"powrprof.dll", "PowerGetActiveScheme", 2}, {"powrprof.dll", "CallNtPowerInformation", 5}, {"rpcrt4.dll", "UuidToStringA", 2}, {"rpcrt4.dll", "UuidToStringW", 2}, {"rpcrt4.dll", "RpcStringFreeA", 1}, {"rpcrt4.dll", "RpcStringFreeW", 1}, {"rpcrt4.dll", "UuidCreate", 1}, {"rpcrt4.dll", "UuidCreateSequential", 1}, {"ole32.dll", "OleBuildVersion", 0}, {"ole32.dll", "CoBuildVersion", 0}, {"ole32.dll", "CoFileTimeNow", 1}, {"ole32.dll", "CoGetCurrentProcess", 0}, {"ole32.dll", "CoCreateGuid", 1}, {"kernel32.dll", "SetHandleCount", 1}, {"kernel32.dll", "GetThreadErrorMode", 0}, {"kernel32.dll", "SetThreadErrorMode", 2}, {"kernel32.dll", "DelayLoadFailureHook", 2}, {"kernel32.dll", "ResolveDelayLoadedAPI", 6}, {"kernel32.dll", "__chkstk", 0}, {"kernel32.dll", "GetErrorMode", 0}, {"kernel32.dll", "SetErrorMode", 1},
         {"kernel32.dll", "WerGetFlags", 2}, {"kernel32.dll", "WerSetFlags", 1},
         
         
@@ -331,11 +357,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         
         
         
-        {"shlwapi.dll", "PathIsRelativeA", 1}, {"shlwapi.dll", "PathIsRelativeW", 1},
-        {"shlwapi.dll", "PathFindExtensionA", 1}, {"shlwapi.dll", "PathFindExtensionW", 1},
-        {"shlwapi.dll", "PathFindFileNameA", 1}, {"shlwapi.dll", "PathFindFileNameW", 1},
         {"shlwapi.dll", "PathFindNextComponentA", 1}, {"shlwapi.dll", "PathFindNextComponentW", 1},
-        {"shlwapi.dll", "PathIsUNCA", 1}, {"shlwapi.dll", "PathIsUNCW", 1},
         {"shlwapi.dll", "PathGetCharTypeA", 1}, {"shlwapi.dll", "PathGetCharTypeW", 1}, {"shlwapi.dll", "StrTrimA", 2}, {"shlwapi.dll", "StrTrimW", 2},
         {"shlwapi.dll", "StrCmpLogicalW", 2}, {"shlwapi.dll", "StrCmpA", 2}, {"shlwapi.dll", "StrCmpW", 2},
         {"shlwapi.dll", "StrCmpIA", 2}, {"shlwapi.dll", "StrCmpIW", 2},
@@ -737,28 +759,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
                 memory.store(GuestAddress{arg(0)+(last-first)*unit},width,0);result=1;
             }
         }
-    }else if(symbol.starts_with("PathFindExtension") || symbol.starts_with("PathFindFileName") || symbol.starts_with("PathIsRelative") || symbol.starts_with("PathIsUNC")){
-        const bool wide=symbol.ends_with('W');
-        // ANSI 的索引仍是原始位元組位移；不可經 UTF-8 解碼改變返回指標。
-        std::u16string path;
-        if(arg(0)) {
-            if(wide)path=read_utf16(memory,GuestAddress{arg(0)},259);
-            else {const auto bytes=read_ansi(memory,arg(0),259);path.assign(bytes.begin(),bytes.end());}
-        }
-        if(symbol.starts_with("PathIsUNC"))result=path.starts_with(u"\\\\");
-        else if(symbol.starts_with("PathIsRelative"))result=path.empty() || (path.front()!=u'\\' && !(path.size()>1 && path[1]==u':'));
-        else if(arg(0)) {
-            std::size_t offset=0;
-            if(symbol.starts_with("PathFindExtension")) {
-                offset=windows_extension_offset(path);
-            } else {
-                for(std::size_t i=path.size();i>1;--i) {
-                    const auto previous=path[i-2],current=path[i-1];
-                    if((previous==u'\\' || previous==u'/' || previous==u':') && current!=u'\\' && current!=u'/') {offset=i-1;break;}
-                }
-            }
-            result=arg(0)+offset*(wide?2U:1U);
-        }
     }else if(symbol=="wcscmp" || symbol=="wcsncmp"){
         const auto count=symbol=="wcsncmp"?arg(2):output_limit/2;
         for(std::uint64_t i=0;i<count;++i){if(i>=output_limit/2)throw HostCallFault("寬字串比較超過上限");
@@ -798,12 +798,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         }
     }
     else if(symbol.starts_with("GetLocaleInfo"))return invoke_locale(state,memory,service);
-    else if(symbol=="IsValidCodePage") result=dword(0)>3 && windows_crt_codepage(dword(0)).has_value();
+    else if(symbol=="IsValidCodePage") result=dword(0)>3 && windows_nls_codepage(dword(0)).has_value();
     else if(symbol=="GetOEMCP") result=65001;
     else if(symbol=="GetCPInfo" || symbol=="GetCPInfoExA" || symbol=="GetCPInfoExW") {
         const bool extended=symbol!="GetCPInfo",wide=symbol.ends_with('W');
         const auto page=dword(0)==0 || dword(0)==1 || dword(0)==3?65001U:dword(0)==2?10000U:dword(0);
-        const auto info=windows_crt_codepage(page);const auto output=arg(extended?2:1);
+        const auto info=windows_nls_codepage(page);const auto output=arg(extended?2:1);
         if(!info || !output)fail(87);
         else if(extended && dword(1))fail(1004);
         else{
@@ -811,10 +811,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             unsigned at=6;bool valid=true;
             for(unsigned i=0;i<256;++i)if(info->lead[i]){const auto first=i;while(i+1<256 && info->lead[i+1])++i;if(at+2>18){valid=false;break;}bytes[at++]=static_cast<std::uint8_t>(first);bytes[at++]=static_cast<std::uint8_t>(i);}
             if(extended){
-                const auto unicode=page==65001?0xfffdU:0x3fU;bytes[18]=static_cast<std::uint8_t>(unicode&255);bytes[19]=static_cast<std::uint8_t>(unicode>>8);
+                const auto unicode=(page==65000 || page==65001)?0xfffdU:0x3fU;bytes[18]=static_cast<std::uint8_t>(unicode&255);bytes[19]=static_cast<std::uint8_t>(unicode>>8);
                 for(unsigned i=0;i<4;++i)bytes[20+i]=static_cast<std::uint8_t>(page>>(8*i));
                 std::string name="Code page "+std::to_string(page);
-                for(const auto& entry:std::array<std::pair<unsigned,const char*>,8>{{{65001,"Unicode (UTF-8)"},{1252,"Western European (Windows)"},{932,"Japanese (Shift-JIS)"},{936,"Chinese Simplified (GB2312)"},{949,"Korean"},{950,"Chinese Traditional (Big5)"},{437,"OEM United States"},{10000,"Western European (Mac)"}}})if(entry.first==page)name=std::to_string(page)+" ("+entry.second+")";
+                for(const auto& entry:std::array<std::pair<unsigned,const char*>,9>{{{65000,"UTF-7"},{65001,"Unicode (UTF-8)"},{1252,"Western European (Windows)"},{932,"Japanese (Shift-JIS)"},{936,"Chinese Simplified (GB2312)"},{949,"Korean"},{950,"Chinese Traditional (Big5)"},{437,"OEM United States"},{10000,"Western European (Mac)"}}})if(entry.first==page)name=std::to_string(page)+" ("+entry.second+")";
                 for(std::size_t i=0;i<name.size() && i<259;++i)bytes[24+i*(wide?2:1)]=static_cast<std::uint8_t>(name[i]);
             }
             if(!valid)fail(87);else{memory.write(GuestAddress{output},bytes);result=1;}
@@ -982,7 +982,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         // 內容與 worker 平行服務共用（windows_system_info_layout.hpp）。
         const auto info=system_info_bytes(x86_,symbol=="GetNativeSystemInfo",runtime_.processor_count,user_address_limit()-1);
         memory.write(GuestAddress{arg(0)},std::span<const std::uint8_t>(info.bytes.data(),info.size));
-    } else if (symbol.starts_with("GetSystemWow64Directory2") && dword(2)!=0x14cU) {
+    } else if (symbol.starts_with("GetSystemWow64Directory2") && static_cast<std::uint16_t>(arg(2))!=0x14cU) {
         // 64 位元客體 OS 只有 i386（IMAGE_FILE_MACHINE_I386）的 WOW64 目錄；其他機器類型沒有對應的 WOW64 子系統。
         fail(87);
     } else if (symbol.starts_with("GetSystemDirectory") || symbol.starts_with("GetSystemWow64Directory") || symbol.starts_with("GetWindowsDirectory") || symbol.starts_with("GetSystemWindowsDirectory")) {
@@ -1033,6 +1033,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         memory.store(GuestAddress{arg(0)+8},8,static_cast<std::uint8_t>((clock_sequence>>8)|0x80U));memory.store(GuestAddress{arg(0)+9},8,static_cast<std::uint8_t>(clock_sequence));
         for(unsigned i=0;i<6;++i)memory.store(GuestAddress{arg(0)+10+i},8,node[i]);
         result=1824;
+    } else if(symbol=="OleBuildVersion" || symbol=="CoBuildVersion") {
+        result=X64ARM_OLE_BUILD_VERSION;
     } else if(symbol=="CoFileTimeNow") {
         if(!arg(0))result=0x80070057U;else {memory.store(GuestAddress{arg(0)},64,runtime_.system_filetime());result=0;}
     } else if(symbol=="CoGetCurrentProcess") {
@@ -1429,20 +1431,437 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             static_cast<unsigned long long>(memory.load(GuestAddress{state.reg(Gpr::Rsp)}, x86_ ? 32 : 64)),
             runtime_.random_state, static_cast<unsigned long long>(result));
     }
-    else if (symbol.starts_with("lstrcmp")) {
+    else if(symbol=="ScGenerateMuid"){
+        result=arg(0)?nested_service(state,memory,"ole32.dll","CoCreateGuid",{arg(0)}):0x80070057U;
+    }
+    else if(symbol=="ScCreateConversationIndex"){
+        constexpr unsigned header=22,level=5;
+        const auto length=dword(0);
+        const auto parent=arg(1),size_out=arg(2),output=arg(3);
+        const std::uint8_t bits=x86_?32:64;
+        if(!size_out || !output || (length && (!parent || length<header || (length-header)%level || length>UINT32_MAX-level)))result=0x80070057U;
+        else{
+            memory.check(GuestAddress{size_out},4,Access::Write);
+            memory.check(GuestAddress{output},bits/8,Access::Write);
+            if(length)memory.check(GuestAddress{parent},length,Access::Read);
+            if(length && memory.load(GuestAddress{parent},8)!=1)result=0x80070057U;
+            else{
+                const auto size=length?length+level:header;
+                std::array<std::uint8_t,header> suffix{};
+                const auto now=runtime_.system_filetime();
+                if(length){
+                    // Outlook 的五個時間位元組為 FILETIME 的第 16～55 位。
+                    auto root=now&UINT64_C(0xff00000000000000);
+                    for(unsigned i=0;i<5;++i)root|=memory.load(GuestAddress{parent+1+i},8)<<(48-8*i);
+                    const auto delta=now>=root?now-root:0;
+                    const bool coarse=delta>=(UINT64_C(1)<<49);
+                    const auto code=static_cast<std::uint32_t>((delta>>(coarse?23:18))&0x7fffffffU)|(coarse?0x80000000U:0U);
+                    for(unsigned i=0;i<4;++i)suffix[i]=static_cast<std::uint8_t>(code>>(24-8*i));
+                    if(!random_bytes(std::span(suffix).subspan(4,1)))result=0x8007000eU;
+                }else{
+                    suffix[0]=1;
+                    for(unsigned i=0;i<5;++i)suffix[i+1]=static_cast<std::uint8_t>(now>>(48-8*i));
+                    if(!random_bytes(std::span(suffix).subspan(6)))result=0x8007000eU;
+                    suffix[12]=(suffix[12]&15U)|64U;
+                    suffix[14]=(suffix[14]&63U)|128U;
+                }
+                if(!result){
+                    result=nested_service(state,memory,"internal-mapi-buffer","MAPIAllocateBuffer",{size,output});
+                    if(!result){
+                        const auto data=memory.load(GuestAddress{output},bits);
+                        if(length)memory.move(GuestAddress{data},GuestAddress{parent},length);
+                        memory.write(GuestAddress{data+length},std::span(suffix).first(length?level:header));
+                        memory.store(GuestAddress{size_out},32,size);
+                    }
+                }
+            }
+        }
+    }
+    else if(service.family=="internal-mapi-buffer"){
+        const unsigned unit=x86_?4U:8U;
+        const std::uint8_t bits=x86_?32:64;
+        // 兩個鏈結槽放在對齊的客體標頭內，可從任一配置繼續掛接或釋放其後綴。
+        constexpr unsigned header=16;
+        const auto next=[&](std::uint64_t base){return memory.load(GuestAddress{base},bits);};
+        const auto free_chain=[&](std::uint64_t data){
+            if(!data)return;
+            auto base=data-header;
+            if(!allocations_.contains(base))return;
+            const auto prev=memory.load(GuestAddress{base+unit},bits);
+            if(prev)memory.store(GuestAddress{prev},bits,0);
+            while(base && allocations_.contains(base)){
+                const auto following=next(base);
+                (void)free_heap(memory,base,state);
+                base=following;
+            }
+        };
+        if(symbol=="MAPIAllocateBuffer" || symbol=="MAPIAllocateMore"){
+            const bool more=symbol=="MAPIAllocateMore";
+            const auto output=arg(more?2:1);
+            if(!output || (more && !allocations_.contains(arg(1)-header)))result=0x80070057U;
+            else{
+                memory.check(GuestAddress{output},unit,Access::Write);
+                auto tail=more?arg(1)-header:0;
+                while(tail){const auto child=next(tail);if(!child)break;tail=child;}
+                if(tail)memory.check(GuestAddress{tail},unit,Access::Write);
+                const auto base=allocate_heap(memory,std::uint64_t(dword(0))+header);
+                if(!base)result=0x8007000eU;
+                else{
+                    memory.store(GuestAddress{base},bits,0);
+                    memory.store(GuestAddress{base+unit},bits,tail);
+                    if(tail)memory.store(GuestAddress{tail},bits,base);
+                    memory.store(GuestAddress{output},bits,base+header);
+                }
+            }
+        }else{
+            const auto rows=arg(0);
+            if(rows && symbol!="MAPIFreeBuffer"){
+                const auto count=memory.load(GuestAddress{rows},32);
+                const auto stride=8+unit;
+                for(std::uint64_t i=0;i<count;++i)
+                    free_chain(memory.load(GuestAddress{rows+unit+i*stride+8},bits));
+            }
+            free_chain(rows);
+        }
+    }
+    else if(service.family=="internal-mapi-path"){
+        const auto convert=[&]() -> std::uint32_t {
+            constexpr std::uint32_t invalid=0x80070057U,missing=0x8004010fU,too_big=0x80040305U;
+            if(!arg(0) || !arg(1))return invalid;
+            const auto original=read_ansi(memory,arg(0),4*32767);
+            auto path=utf8_to_utf16_lossy(original);
+            std::replace(path.begin(),path.end(),u'/',u'\\');
+            const bool unc=path.starts_with(u"\\\\");
+            const bool to_unc=symbol=="ScUNCFromLocalPath";
+            const auto share=network_resources::parse_path(path);
+            if(unc){
+                if(!share || share->share.empty())return invalid;
+            }else{
+                const bool drive=path.size()>=2 && path[1]==u':' &&
+                    ((path[0]>=u'A' && path[0]<=u'Z') || (path[0]>=u'a' && path[0]<=u'z'));
+                if(!drive || (path.size()>2 && path[2]!=u'\\'))return invalid;
+            }
+            auto output=original;
+            if(unc!=to_unc){
+                refresh_file_security_context();
+                const auto& files=*filesystem_.network_files();
+                const auto& scope=filesystem_.network_scope();
+                if(to_unc){
+                    const auto location=files.locate(scope,path);
+                    if(!location.binding)return missing;
+                    output=utf16_to_utf8(location.binding->remote+path.substr(2));
+                }else{
+                    const auto key=network_resources::canonical(share->remote());
+                    const auto rows=files.connections(scope);
+                    const auto binding=std::find_if(rows.begin(),rows.end(),[&](const auto& row){
+                        return row->drive && network_resources::canonical(row->remote)==key;
+                    });
+                    if(binding==rows.end())return missing;
+                    std::u16string local(1,static_cast<char16_t>((*binding)->drive));
+                    local+=u':';
+                    local+=share->system.empty()?u"\\":share->system;
+                    output=utf16_to_utf8(local);
+                }
+            }
+            if(output.size()>=dword(2))return too_big;
+            const auto address=GuestAddress{arg(1)};
+            memory.check(address,output.size()+1,Access::Write);
+            memory.write(address,{reinterpret_cast<const std::uint8_t*>(output.c_str()),output.size()+1});
+            return unc==to_unc?1:0;
+        };
+        try{result=convert();}
+        catch(const MemoryFault&){result=0x80070057U;}
+        catch(const HostCallFault&){result=0x80070057U;}
+    }
+    else if(service.family=="internal-mapi-filetime"){
+        const auto left=arg(0);
+        if(symbol=="FtNegFt")result=0-left;
+        else if(symbol=="FtAddFt")result=left+arg(1);
+        else if(symbol=="FtSubFt")result=left-arg(1);
+        else result=left*arg(1);
+        arg.return_to(state,result,true);
+        return std::nullopt;
+    }
+    else if(service.family=="internal-mapi-hex"){
+        const auto read_byte=[](void *mem,std::uint64_t at){return static_cast<std::uint8_t>(
+            static_cast<GuestMemory*>(mem)->load(GuestAddress{at},8));};
+        if(symbol=="UFromSz")result=mapi_unsigned_decimal(arg(0),&memory,read_byte);
+        else{
+            const auto write_byte=[](void *mem,std::uint64_t at,std::uint8_t value){
+                static_cast<GuestMemory*>(mem)->store(GuestAddress{at},8,value);};
+            const auto op=symbol=="HexFromBin"?MapiHexEncode:symbol=="FBinFromHex"?MapiHexDecode:
+                          symbol=="ScBinFromHexBounded"?MapiHexBounded:MapiHexNumber;
+            const auto dst=op==MapiHexNumber?0:arg(op==MapiHexEncode?2:1);
+            const auto count=op==MapiHexEncode?dword(1):op==MapiHexBounded?dword(2):0;
+            result=mapi_hex_convert(op,arg(0),dst,count,&memory,read_byte,write_byte);
+        }
+    }
+    else if(service.family=="internal-mapi-property"){
+        const unsigned unit=x86_?4:8;
+        const auto load=[&](std::uint64_t address,std::uint8_t bits){return memory.load(GuestAddress{address},bits);};
+        const auto pointer=[&](std::uint64_t address){return load(address,x86_?32:64);};
+        if(symbol=="FPropCompareProp" || symbol=="LPropCompareProp" || symbol=="FPropContainsProp"){
+            const bool contains=symbol=="FPropContainsProp",relation=symbol=="FPropCompareProp";
+            const auto left=arg(0),right=arg(relation?2:1);
+            const auto compare=[&]() -> std::uint32_t {
+                if((contains || relation) && (nested_service(state,memory,"internal-mapi-property","FBadProp",{left}) ||
+                    nested_service(state,memory,"internal-mapi-property","FBadProp",{right})))return 0;
+                const auto type=static_cast<unsigned>(load(left,16)),other=static_cast<unsigned>(load(right,16));
+                if(type!=other)return contains || relation?0:static_cast<std::uint32_t>(type-other);
+                const auto a=left+8,b=right+8;
+                int order=0;
+                const auto flags=contains?dword(2):0;
+                const auto mode=flags&0xffffU;
+                if(contains && type!=30 && type!=258)return 0;
+                if(relation && dword(1)==6 && type!=30 && type!=31)return 0;
+                if(type==30 || type==31){
+                    const auto text=[&](std::uint64_t value){
+                        return type==31?read_utf16(memory,GuestAddress{pointer(value)},SIZE_MAX):
+                            windows_nls_decode(read_ansi(memory,pointer(value),SIZE_MAX),65001,false).value();
+                    };
+                    const auto hay=text(a),needle=text(b);
+                    if(relation && dword(1)==6)return windows_regex_search(hay,needle);
+                    const unsigned options=flags&0x40000?7:((flags>>16)&3);
+                    if(contains && (mode==1 || mode==2))
+                        return windows_nls_contains(hay,needle,0x409,options,mode==2);
+                    const auto compared=windows_nls_compare(hay,needle,0x409,options);
+                    if(!compared)return 0;
+                    order=*compared;
+                }else if(type==258 || type==72){
+                    const bool binary=type==258;
+                    const auto size=binary?load(a,32):16,count=binary?load(b,32):16;
+                    const auto x=pointer(a+(binary?unit:0)),y=pointer(b+(binary?unit:0));
+                    const auto bytes=[&](std::uint64_t start,std::uint64_t length){
+                        for(std::uint64_t i=0;i<length;++i){
+                            const int diff=int(load(x+start+i,8))-int(load(y+i,8));
+                            if(diff)return diff;
+                        }
+                        return 0;
+                    };
+                    if(contains && (mode==1 || mode==2)){
+                        if(count>size)return 0;
+                        const auto last=mode==2?0:size-count;
+                        for(std::uint64_t offset=0;offset<=last;++offset)if(!bytes(offset,count))return 1;
+                        return 0;
+                    }
+                    order=bytes(0,std::min(size,count));
+                    if(!order)order=(size>count)-(size<count);
+                }else order=mapi_scalar_order(type,load(a,64),load(b,64));
+                if(contains)return order==0;
+                if(!relation)return static_cast<std::uint32_t>(order);
+                switch(dword(1)){
+                case 0:return order<0; case 1:return order<=0; case 2:return order>0;
+                case 3:return order>=0; case 4:return order==0; case 5:return order!=0;
+                default:return 0;
+                }
+            };
+            result=compare();
+        }else if(symbol=="FBadRestriction" || symbol=="FBadRowSet" || symbol=="FBadRow" || symbol=="FBadProp" || symbol=="FBadEntryList"){
+            const auto check=[&](std::uint64_t address,std::uint64_t size){
+                if(size)memory.check(GuestAddress{address},size,Access::Read);
+            };
+            const auto binary=[&](std::uint64_t item){
+                check(pointer(item+unit),load(item,32));
+            };
+            const auto entries=[&](std::uint64_t list){
+                check(list,2*unit);
+                const auto count=load(list,32),items=pointer(list+unit);
+                check(items,count*2*unit);
+                for(std::uint64_t i=0;i<count;++i)binary(items+i*2*unit);
+            };
+            const auto stride=mapi_property_stride(unit);
+            const auto bad_property=[&](std::uint64_t prop){
+                check(prop,stride);
+                const auto tag=static_cast<std::uint32_t>(load(prop,32));
+                if(!mapi_valid_property_tag(tag))return true;
+                const auto value=prop+8;
+                unsigned width;
+                switch(tag&0xffffU){
+                case 30: case 31:
+                    return nested_service(state,memory,"kernel32.dll",(tag&1)?"IsBadStringPtrW":"IsBadStringPtrA",
+                                          {pointer(value),x86_?UINT32_MAX:UINT64_MAX})!=0;
+                case 258:binary(value);return false;
+                case 72:check(pointer(value),16);return false;
+                case 0x101e: case 0x101f:
+                    return nested_service(state,memory,"internal-mapi-string-probe",(tag&1)?"FBadRglpszW":"FBadRglpszA",
+                                          {pointer(value+unit),load(value,32)})!=0;
+                case 0x1102:entries(value);return false;
+                case 0x1002:width=2;break;
+                case 0x1003: case 0x1004:width=4;break;
+                case 0x1005: case 0x1006: case 0x1007: case 0x1014: case 0x1040:width=8;break;
+                case 0x1048:width=16;break;
+                default:return false;
+                }
+                check(pointer(value+unit),load(value,32)*width);
+                return false;
+            };
+            const auto bad_row=[&](std::uint64_t row){
+                check(row,8+unit);
+                const auto props=pointer(row+8),count=load(row+4,32);
+                if(!props)return true;
+                check(props,count*stride);
+                for(std::uint64_t i=0;i<count;++i)if(bad_property(props+i*stride))return true;
+                return false;
+            };
+            const auto base=arg(0);
+            try{
+                if(!base)result=1;
+                else if(symbol=="FBadRestriction")result=mapi_bad_restriction(memory,unit,base,bad_property);
+                else if(symbol=="FBadEntryList")entries(base);
+                else if(symbol=="FBadProp")result=bad_property(base);
+                else if(symbol=="FBadRow")result=bad_row(base);
+                else{
+                    const auto count=load(base,32);
+                    const auto row_size=8+unit;
+                    check(base,unit+count*row_size);
+                    for(std::uint64_t i=0;i<count && !result;++i)result=bad_row(base+unit+i*row_size);
+                }
+            }catch(const MemoryFault&){result=1;}
+        }else if(symbol=="FBadColumnSet" || symbol=="FBadSortOrderSet"){
+            const bool sort=symbol=="FBadSortOrderSet";
+            const auto base=arg(0);
+            const unsigned header=sort?12:4,stride=sort?8:4;
+            try{
+                const auto count=load(base,32);
+                memory.check(GuestAddress{base},header+count*stride,Access::Read);
+                const auto categories=sort?load(base+4,32):0;
+                if(sort)result=categories>count || load(base+8,32)>categories;
+                for(std::uint64_t i=0;i<count && !result;++i){
+                    const auto row=base+header+i*stride;
+                    auto tag=static_cast<std::uint32_t>(load(row,32));
+                    // 排序鍵的 MVI_PROP 代表多值屬性中的個別值。
+                    if(sort && (tag&0x3000U)==0x3000U)tag&=~0x2000U;
+                    result=(tag&0xffffU)==10 || !mapi_valid_property_tag(tag);
+                    if(sort && !result){
+                        const auto order=load(row+4,32);
+                        if(order==2)result=!i || i>=categories;
+                        else if(order==4 || order==8)result=!i || i>categories;
+                        else result=order>1;
+                    }
+                }
+            }catch(const MemoryFault&){result=1;}
+        }else if(symbol=="FBadRglpNameID"){
+            const auto count=dword(1);
+            try{
+                if(count)memory.check(GuestAddress{arg(0)},std::uint64_t(count)*unit,Access::Read);
+                for(std::uint32_t i=0;i<count && !result;++i){
+                    const auto entry=pointer(arg(0)+std::uint64_t(i)*unit);
+                    memory.check(GuestAddress{entry},3*unit,Access::Read);
+                    memory.check(GuestAddress{pointer(entry)},16,Access::Read);
+                    const auto kind=load(entry+unit,32);
+                    if(kind==1){
+                        auto name=pointer(entry+2*unit);
+                        while(load(name,16))name+=2;
+                    }else result=kind!=0;
+                }
+            }catch(const MemoryFault&){result=1;}
+        }else if(symbol=="FEqualNames"){
+            const auto a=arg(0),b=arg(1);
+            if(a && b){
+                const auto ga=pointer(a),gb=pointer(b);
+                if(load(ga,64)==load(gb,64) && load(ga+8,64)==load(gb+8,64)){
+                    const auto kind=load(a+unit,32);
+                    if(kind==load(b+unit,32)){
+                        if(kind!=1)result=load(a+2*unit,32)==load(b+2*unit,32);
+                        else{
+                            const auto left=pointer(a+2*unit),right=pointer(b+2*unit);
+                            if(!left || !right)result=left==right;
+                            else{
+                                const auto t=threads_.items.find(threads_.current);
+                                const auto locale=t!=threads_.items.end() && t->second.locale?t->second.locale:0x409U;
+                                result=windows_nls_compare(read_utf16(memory,GuestAddress{left},SIZE_MAX),
+                                    read_utf16(memory,GuestAddress{right},SIZE_MAX),locale,0)==0;
+                            }
+                        }
+                    }
+                }
+            }
+        }else if(symbol=="FBadPropTag")result=!mapi_valid_property_tag(dword(0));
+        else{
+            const bool id_only=symbol=="LpValFindProp";
+            auto item=arg(id_only?2:0);
+            const auto count=dword(1),tag=dword(id_only?0:2);
+            const auto stride=mapi_property_stride(x86_?4:8);
+            for(std::uint32_t i=0;item && i<count;++i,item+=stride){
+                const auto candidate=static_cast<std::uint32_t>(memory.load(GuestAddress{item},32));
+                if(mapi_property_matches(candidate,tag,id_only)){result=item;break;}
+            }
+        }
+    }
+    else if(service.family=="internal-mapi-swap"){
+        const bool wide=symbol=="SwapPlong";
+        const std::uint8_t bits=wide?32:16;
+        const auto count=static_cast<std::uint32_t>(arg(1));
+        auto address=arg(0);
+        for(std::uint32_t i=0;i<count;++i,address+=bits/8){
+            const auto value=memory.load(GuestAddress{address},bits);
+            memory.store(GuestAddress{address},bits,wide?__builtin_bswap32(static_cast<std::uint32_t>(value)):__builtin_bswap16(static_cast<std::uint16_t>(value)));
+        }
+    }
+    else if(symbol=="MapiCopyW"){
+        const auto bytes=utf16_bytes(read_utf16(memory,GuestAddress{arg(1)},1048575));
+        memory.write(GuestAddress{arg(0)},bytes);
+        result=static_cast<std::uint32_t>(bytes.size());
+    }
+    else if (symbol.starts_with("lstrcmp") || symbol=="MapiCompareW") {
         const bool wide=symbol.ends_with('W'),ignore_case=symbol.starts_with("lstrcmpi");
-        auto left=arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16_lossy(read_ansi(memory,arg(0)))):std::u16string{};
-        auto right=arg(1)?(wide?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16_lossy(read_ansi(memory,arg(1)))):std::u16string{};
+        const bool mapi=symbol=="MapiCompareW";
+        const auto a=arg(mapi?1:0),b=arg(mapi?2:1);
+        auto left=a?(wide?read_utf16(memory,GuestAddress{a}):utf8_to_utf16_lossy(read_ansi(memory,a))):std::u16string{};
+        auto right=b?(wide?read_utf16(memory,GuestAddress{b}):utf8_to_utf16_lossy(read_ansi(memory,b))):std::u16string{};
         if(ignore_case){for(auto& c:left)c=unicode_case_unit(c,true);for(auto& c:right)c=unicode_case_unit(c,true);}
-        result=left<right?UINT32_MAX:left>right?1:0;
+        const int order=left<right?-1:left>right?1:0;
+        result=static_cast<std::uint32_t>(mapi?order+2:order);
     } else if ((symbol.starts_with("GetShortPathName") || symbol.starts_with("GetLongPathName"))) {
-        const bool wide=symbol.ends_with('W');const auto path=wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16_lossy(read_ansi(memory,arg(0)));
-        const auto info=filesystem_.information(utf16_to_utf8(path));
-        if(info.error)fail(info.error);
+        const bool wide=symbol.ends_with('W'),short_path=symbol.starts_with("GetShortPathName");
+        auto path=!arg(0)?std::u16string{}:wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16_lossy(read_ansi(memory,arg(0)));
+        if(!arg(0))fail(87);
+        else if(path.empty())fail(short_path?161:3);
+        else if(path.find_first_of(u"*?",path.starts_with(u"\\\\?\\")?4:0)!=path.npos)fail(123);
         else {
-            // 映射的宿主檔案系統沒有 DOS 8.3 別名，保留原始名稱。
-            const auto ansi=utf16_to_utf8(path);result=(wide?path.size():ansi.size())+1;
-            if(dword(2)>=result){if(wide)memory.write(GuestAddress{arg(1)},utf16_bytes(path));else{std::vector<std::uint8_t> data(ansi.begin(),ansi.end());data.push_back(0);memory.write(GuestAddress{arg(1)},data);}--result;}
+            // 保留相對路徑、分隔符與磁碟前綴；一般路徑逐層取回映射目錄中的實際檔名。
+            const auto type=windows_dos_path_type(path);
+            const bool disk_path=type==WindowsDosPathType::DriveAbsolute || type==WindowsDosPathType::DriveRelative;
+            std::uint32_t error=0;
+            if(!short_path && (disk_path || type==WindowsDosPathType::Relative || type==WindowsDosPathType::Rooted)){
+                for(std::size_t at=disk_path?2:0;at<path.size();){
+                    if(windows_path_separator(path[at])){++at;continue;}
+                    const auto end=path.find_first_of(u"\\/",at);
+                    const auto leaf=path.substr(at,end-at);
+                    if(leaf==u"." || leaf==u".." || leaf.find(u':')!=leaf.npos){at+=leaf.size();continue;}
+                    const auto parent=at?utf16_to_utf8(path.substr(0,at)):".";
+                    const auto matches=filesystem_.list(parent,[&](std::string_view name){
+                        const auto text=utf8_to_utf16_lossy(name);
+                        return text.size()==leaf.size() && std::equal(text.begin(),text.end(),leaf.begin(),
+                            [](char16_t a,char16_t b){return unicode_case_unit(a,true)==unicode_case_unit(b,true);});
+                    });
+                    if(matches.error || matches.entries.empty()){error=matches.error?matches.error:2;break;}
+                    const auto exact=std::find_if(matches.entries.begin(),matches.entries.end(),[&](const auto& entry){
+                        return utf8_to_utf16_lossy(entry.name)==leaf;
+                    });
+                    const auto& entry=exact==matches.entries.end()?matches.entries.front():*exact;
+                    const auto spelling=utf8_to_utf16_lossy(entry.name);
+                    path.replace(at,leaf.size(),spelling);
+                    at+=spelling.size();
+                }
+            }
+            const auto ansi=utf16_to_utf8(path);
+            if(!error)error=filesystem_.information(ansi).error;
+            if(error)fail(error);
+            else {
+                // 映射磁碟未配置 DOS 別名，使用客體可重新開啟的原名。
+                const auto length=wide?path.size():ansi.size();
+                result=length+1;
+                if(arg(1) && dword(2)>length){
+                    if(wide)memory.write(GuestAddress{arg(1)},utf16_bytes(path));
+                    else {
+                        std::vector<std::uint8_t> bytes(ansi.begin(),ansi.end());
+                        bytes.push_back(0);
+                        memory.write(GuestAddress{arg(1)},bytes);
+                    }
+                    result=length;
+                }
+            }
         }
     }
     else if (symbol.starts_with("lstrcpyn")) {
@@ -1540,9 +1959,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             if(wide && to_oem){
                 auto text=counted?read_utf16_counted(memory,GuestAddress{arg(0)},count):read_utf16(memory,GuestAddress{arg(0)});
                 if(!counted)text.push_back(0);
-                capacity=text.size();
-                try {const auto bytes=utf16_to_utf8(text);output.assign(bytes.begin(),bytes.end());}
-                catch(const std::invalid_argument&){last_error_=1113;arg.return_to(state,1);return std::nullopt;}
+                capacity=text.size()*sizeof(char16_t);
+                const auto bytes=utf16_to_utf8_lossy(text);
+                output.assign(bytes.begin(),bytes.end());
             }else{
                 std::string bytes;
                 if(counted){bytes.resize(count);memory.read(GuestAddress{arg(0)},{reinterpret_cast<std::uint8_t*>(bytes.data()),bytes.size()});}
@@ -1554,7 +1973,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
                     output.assign(converted.begin(),converted.end());
                 }
             }
-            // 此舊 API 的 OEM 目的長度與輸入字元數相同；UTF-8 展開不得越界。
+            // W 轉 OEM 的目的容量以 UTF-16 輸入所佔位元組數計算；UTF-8 展開不得越界。
             // BOOL 依契約表示有效參數，底層轉碼失敗仍透過 LastError 保留。
             if((to_oem || !wide) && output.size()>capacity)last_error_=122;
             else memory.write(GuestAddress{arg(1)},output);
@@ -1564,7 +1983,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         const bool wide = symbol == "WideCharToMultiByte";
         const auto count = sint(3), capacity = sint(5); const auto codepage = dword(0),flags=dword(1);
         const auto page=codepage==0 || codepage==1 || codepage==3?65001U:codepage;
-        const auto page_info=windows_crt_codepage(page);
+        const auto page_info=windows_nls_codepage(page);
         const bool legacy_composition=codepage==0 || codepage==3 || codepage==1252;
         const bool multibyte=page!=65001 && page!=1252;
         // CP_ACP／CP_OEMCP／CP_THREAD_ACP 別名解析到 UTF-8 時，舊碼頁的組合／預設字元／最佳對應旗標（WC_COMPOSITECHECK、WC_DISCARDNS、WC_SEPCHARS、
@@ -1576,6 +1995,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         const bool ansi_alias=codepage==0 || codepage==1 || codepage==3 || (wide && codepage==65001);
         const auto allowed_flags=wide?(codepage==1252?0x480U:multibyte && page!=54936?0x400U:ansi_alias?0x6f0U:0x80U):(legacy_composition?0xfU:multibyte && page!=54936?0xbU:8U);
         if (!page_info) fail(87);
+        else if(page==65000 && wide && (arg(6) || arg(7)))fail(87);
+        else if(page==65000 && flags)fail(1004);
         else if((flags&~allowed_flags) || (!wide && (flags&3)==3))fail(1004);
         else if (count == 0 || count < -1 || capacity < 0 || !arg(2) || (!arg(4) && capacity) || arg(2)==arg(4)) fail(87);
         else {
@@ -1633,7 +2054,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         }
     } else if (symbol == "AreFileApisANSI") result = 1;
     else if(symbol=="IsDBCSLeadByteEx"){
-        const auto page=dword(0)==0 || dword(0)==1 || dword(0)==3?65001U:dword(0);const auto info=windows_crt_codepage(page);
+        const auto page=dword(0)==0 || dword(0)==1 || dword(0)==3?65001U:dword(0);const auto info=windows_nls_codepage(page);
         if(!info)fail(87);else result=info->lead[static_cast<std::uint8_t>(arg(1))];
     }
     else if (symbol == "IsWow64Process" || symbol == "IsWow64Process2") {

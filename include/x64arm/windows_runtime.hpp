@@ -235,6 +235,7 @@ struct WaitObject {
     std::uint32_t timer_tolerance{};
     std::u16string timer_reason;
     bool active{};
+    bool display_event{};
     std::uint32_t memory_notification_type{};
     std::uint64_t mutex{}; // Mutex handle 指向獨立物件；同名建立的多 handle 共用 ownership。
     std::shared_ptr<SharedEvent> shared_event{};
@@ -283,7 +284,7 @@ public:
     bool empty() const noexcept {return items_.empty();}
     template<class... Args> std::pair<iterator,bool> emplace(Args&&... args){
         auto result=items_.emplace(std::forward<Args>(args)...);
-        if(result.second && result.first->second.kind==WaitObject::Kind::Timer){
+        if(result.second && (result.first->second.kind==WaitObject::Kind::Timer || result.first->second.display_event)){
             try{timers_.insert(result.first->first);}catch(...){items_.erase(result.first);throw;}
         }
         return result;
@@ -344,7 +345,15 @@ struct WmiValue {
     bool operator==(const WmiValue&) const = default;
 };
 using WmiRow=std::map<std::u16string,WmiValue>;
+struct ComAuthenticationService {
+    std::uint32_t authentication{},authorization{};
+    std::optional<std::u16string> principal;
+    bool operator==(const ComAuthenticationService&) const = default;
+    static constexpr std::uint32_t local_default=10;
+    static bool supports(std::uint32_t auth){return auth==local_default || auth==16;}
+};
 struct WmiObject {
+    std::uint64_t original_proxy{}; // 私有代理持有原代理的一個引用，共用其物件與列舉位置。
     unsigned kind{},references{1};std::size_t cursor{};std::vector<WmiRow> rows;
     std::u16string name_space;
     std::vector<std::u16string> property_names;bool enumerating{};
@@ -841,6 +850,13 @@ struct RuntimeState {
     std::map<std::uint64_t,WmiObject> wmi_objects;
     std::map<unsigned,std::uint64_t> wmi_vtables;
     std::optional<std::array<std::uint32_t,3>> com_security;
+    std::vector<ComAuthenticationService> com_auth_services;
+    void initialize_implicit_com_security(){
+        if(!com_security){
+            com_auth_services={{ComAuthenticationService::local_default,0,std::nullopt}};
+            com_security=std::array<std::uint32_t,3>{3,3,0};
+        }
+    }
     std::map<std::uint64_t,WinrtString> winrt_strings;
     std::map<std::uint64_t,WinrtModule> winrt_modules;
     std::uint64_t winrt_empty_string{};

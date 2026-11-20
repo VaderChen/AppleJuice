@@ -150,11 +150,14 @@ void trace_fault_memory(const GuestState& state,const GuestMemory& memory,std::u
             // 位址恰在映射開頭時，不因前方 16 bytes 不可讀而遺失有效資料。
             const auto begin=std::max(aligned>=16?aligned-16:0,mapping?mapping->base.value:0);
             out<<"[fault_memory] "<<names[n]<<"=0x"<<value<<" begin=0x"<<begin;
-            // 每個暫存器最多讀取 64 bytes；逐字核對，以保留映射尾端的有效前綴。
-            for(unsigned i=0;i<8;++i){
+            // 每個暫存器預設讀取 64 bytes（X64ARM_TRACE_FAULT_SPAN=<位元組> 可放寬到 1024，用來看出錯物件的完整欄位）；
+            // 逐字核對，以保留映射尾端的有效前綴。
+            static const unsigned words=[] {const auto* value=std::getenv("X64ARM_TRACE_FAULT_SPAN");
+                const auto bytes=value?std::strtoul(value,nullptr,10):64UL;return static_cast<unsigned>(std::clamp(bytes,8UL,1024UL)/8);}();
+            for(unsigned i=0;i<words;++i){
                 if(begin>UINT64_MAX-i*8U-7U){out<<" unreadable";break;}
                 try{const auto word=memory.load(GuestAddress{begin+i*8},64);out<<" 0x"<<word;
-                    if(pointers)roots[root_count++]={begin+i*8,word};}
+                    if(pointers && root_count<roots.size())roots[root_count++]={begin+i*8,word};}
                 catch(const MemoryFault&){out<<" unreadable";break;}
             }
             out<<'\n';

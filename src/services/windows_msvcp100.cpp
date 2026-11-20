@@ -30,6 +30,12 @@
 namespace x64arm {
 namespace {
 using Layout=msvcp_detail::StreamAbi;
+// VC12 的 mbstate_t 是 int：修飾名與 RTTI 型別名稱以 H 取代 VC14 的 _Mbstatet（與 msvcp120 描述表的產生規則相同）。
+std::string msvcp120_symbol(std::string symbol){
+    for(const auto& [from,to]:std::array<std::pair<std::string_view,std::string_view>,5>{{{"U_Mbstatet@@@","H@"},{"AEAU_Mbstatet@@","AEAH"},{"AAU_Mbstatet@@","AAH"},{"AEBU_Mbstatet@@","AEBH"},{"ABU_Mbstatet@@","ABH"}}})
+        for(auto at=symbol.find(from);at!=symbol.npos;at=symbol.find(from,at+to.size()))symbol.replace(at,from.size(),to);
+    return symbol;
+}
 struct Operation {
     WindowsServiceDescriptor service;
     std::string kind;
@@ -108,18 +114,23 @@ unsigned character_mask(char16_t c){
 struct Msvcp100State {
     std::uint64_t file_table9{},ifstream_table9{},ifstream_vb9{};
     std::map<std::string,std::uint64_t,std::less<>> data;
-    std::map<std::string,std::uint64_t,std::less<>> data14;
     std::map<std::uint64_t,Operation> operations;
     std::map<std::uint64_t,std::pair<std::uint64_t,std::uint64_t>> ios_objects;
     std::uint64_t global{},codecvt_table{},ctype_table{},buffer_table{},ios_table{},istream_vb{},iostream_vb{},next{1},next_id{2};
     bool sync_with_stdio{true}; // ios_base::sync_with_stdio 的目前設定（MSVC 只保存值，不改變串流行為）。
-    std::uint64_t codecvt_base14{}; // codecvt_base 的虛擬表（do_always_noconv／do_max_length／do_encoding）。
-    std::uint64_t ctype_base14{},std_new_handler{},winit_count14{}; // ctype_base 虛擬表、std::set_new_handler 的處理常式、_Winit 計數格。
+    std::uint64_t std_new_handler{},ostream_vb{}; // std::set_new_handler 的處理常式、VC10 ostream 的虛擬基底表。
     struct Tables {std::uint64_t buffer{},ios{},istream{},ostream{},iostream{},codecvt{},codecvt16{},codecvt32{},codecvt_ushort{},ctype{},num_put{},num_put16{},num_get{},num_get16{},numpunct{},numpunct_byname{},time_put{},time_put16{},time_get{};};
-    std::array<Tables,2> tables14;
-    std::uint64_t global14{},classic14{},facet_table14{},locimp_table14{},ios_base_table14{},ostream_vb{},ostream_vb14{},istream_vb14{},iostream_vb14{},id_count14{},next_id14{8};
-    std::uint64_t ctype_masks14{},classic_locale14{},init_count14{},ios_index14{},empty_wide14{};
-    std::int32_t init_locks14{-1}; // std::_Init_locks::_Init_cnt（初值 -1）
+    // VC14 與 VC12 各自的常駐物件：虛擬表指向各自的內部家族，locale 物件與標準串流依各自版面建立（索引見 StreamAbi::variant）。
+    struct ModernRuntime {
+        std::map<std::string,std::uint64_t,std::less<>> data14;
+        std::uint64_t codecvt_base14{}; // codecvt_base 的虛擬表（do_always_noconv／do_max_length／do_encoding）。
+        std::uint64_t ctype_base14{},winit_count14{}; // ctype_base 虛擬表、_Winit 計數格。
+        std::array<Tables,2> tables14;
+        std::uint64_t global14{},classic14{},facet_table14{},locimp_table14{},ios_base_table14{},ostream_vb14{},istream_vb14{},iostream_vb14{},id_count14{},next_id14{8};
+        std::uint64_t ctype_masks14{},classic_locale14{},init_count14{},ios_index14{},empty_wide14{};
+        std::int32_t init_locks14{-1}; // std::_Init_locks::_Init_cnt（初值 -1）
+    };
+    std::array<ModernRuntime,2> runtimes;
     bool shared_ptr_locked{};
     std::map<std::uint64_t,unsigned> standard_buffers;
     std::set<std::uint64_t> owned_locale_imps;
@@ -178,71 +189,76 @@ void WindowsServices::initialize_msvcp100(GuestMemory& memory){
     input_file_shape.bases={{msvcp_detail::stream_type("ifstream",false),4},{msvcp_detail::stream_type("istream",false),3},
         {msvcp_detail::stream_type("ios",false),2,0,0,4,80},{".?AVios_base@std@@",1,0,0,4},{".?AV?$_Iosb@H@std@@",0,static_cast<std::int32_t>(l.p),0,4}};
     rtti_tables.emplace_back(s.ifstream_table9-l.p,rtti.add(input_file_shape));
-    const auto modern_table=[&](char element,std::initializer_list<const char*> names,msvc_rtti::Shape shape=msvc_rtti::Shape{}){
+    const auto modern_table=[&](unsigned variant,char element,std::initializer_list<const char*> names,msvc_rtti::Shape shape=msvc_rtti::Shape{}){
         const auto storage=runtime_allocate(memory,{},(names.size()+1)*l.p),address=storage+l.p;unsigned i=0;
-        for(const auto name:names)put(address+i++*l.p,resolve("internal-msvcp140",std::string(1,element)+name+(x86_?"32":"64")).value);
-        if(!shape.bases.empty()){rtti_tables.emplace_back(storage,rtti.add(shape));s.data14.emplace("??_7"+shape.bases.front().name.substr(4)+"6B@",address);}return address;
+        for(const auto name:names)put(address+i++*l.p,resolve(msvcp_detail::modern_internal(variant),std::string(1,element)+name+(x86_?"32":"64")).value);
+        if(!shape.bases.empty()){
+            if(variant)for(auto& base:shape.bases)base.name=msvcp120_symbol(base.name);
+            rtti_tables.emplace_back(storage,rtti.add(shape));s.runtimes[variant].data14.emplace("??_7"+shape.bases.front().name.substr(4)+"6B@",address);
+        }
+        return address;
     };
-    for(unsigned element=0;element<2;++element){auto& t=s.tables14[element];const auto prefix=element?'W':'D';
+    const auto initialize_modern=[&](unsigned variant){auto& m=s.runtimes[variant];
+    for(unsigned element=0;element<2;++element){auto& t=m.tables14[element];const auto prefix=element?'W':'D';
         const auto stream_shape=[&](std::string_view kind){return msvcp_detail::stream_shape(kind,element!=0,l.p);};const std::string character=element?"_W":"D";
-        t.buffer=modern_table(prefix,{"StreamDelete","StreamLock","StreamUnlock","StreamOverflow","StreamPbackfail","StreamShowmany","StreamUnderflow","StreamUflow","StreamXsgetn","StreamXsputn","StreamSeekoff","StreamSeekpos","StreamSetbuf","StreamSync","StreamImbue"},stream_shape("streambuf"));
-        t.ios=modern_table(prefix,{"IosDelete"},stream_shape("ios"));t.istream=modern_table(prefix,{"IosDelete"},stream_shape("istream"));
-        t.ostream=modern_table(prefix,{"IosDelete"},stream_shape("ostream"));t.iostream=modern_table(prefix,{"IosDelete"},stream_shape("iostream"));
-        t.codecvt=modern_table(prefix,{"FacetDelete","FacetIncref","FacetDecref","CodecvtNoconv","CodecvtMaxLength","CodecvtEncoding","CodecvtIn","CodecvtOut","CodecvtUnshift","CodecvtLength"},
+        t.buffer=modern_table(variant,prefix,{"StreamDelete","StreamLock","StreamUnlock","StreamOverflow","StreamPbackfail","StreamShowmany","StreamUnderflow","StreamUflow","StreamXsgetn","StreamXsputn","StreamSeekoff","StreamSeekpos","StreamSetbuf","StreamSync","StreamImbue"},stream_shape("streambuf"));
+        t.ios=modern_table(variant,prefix,{"IosDelete"},stream_shape("ios"));t.istream=modern_table(variant,prefix,{"IosDelete"},stream_shape("istream"));
+        t.ostream=modern_table(variant,prefix,{"IosDelete"},stream_shape("ostream"));t.iostream=modern_table(variant,prefix,{"IosDelete"},stream_shape("iostream"));
+        t.codecvt=modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","CodecvtNoconv","CodecvtMaxLength","CodecvtEncoding","CodecvtIn","CodecvtOut","CodecvtUnshift","CodecvtLength"},
             msvcp_detail::facet_shape(element?".?AV?$codecvt@_WDU_Mbstatet@@@std@@":".?AV?$codecvt@DDU_Mbstatet@@@std@@",l.p,".?AVcodecvt_base@std@@"));
         if(element){
             // unsigned short 版與 wchar_t 共用碼頁轉換（自己的 RTTI）；char16_t／char32_t 為 UTF-8 轉換。
-            t.codecvt_ushort=modern_table(prefix,{"FacetDelete","FacetIncref","FacetDecref","CodecvtNoconv","CodecvtMaxLength","CodecvtEncoding","CodecvtIn","CodecvtOut","CodecvtUnshift","CodecvtLength"},
+            t.codecvt_ushort=modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","CodecvtNoconv","CodecvtMaxLength","CodecvtEncoding","CodecvtIn","CodecvtOut","CodecvtUnshift","CodecvtLength"},
                 msvcp_detail::facet_shape(".?AV?$codecvt@GDU_Mbstatet@@@std@@",l.p,".?AVcodecvt_base@std@@"));
-            t.codecvt16=modern_table(prefix,{"FacetDelete","FacetIncref","FacetDecref","Codecvt16Noconv","Codecvt16MaxLength","Codecvt16Encoding","Codecvt16In","Codecvt16Out","Codecvt16Unshift","Codecvt16Length"},
+            t.codecvt16=modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","Codecvt16Noconv","Codecvt16MaxLength","Codecvt16Encoding","Codecvt16In","Codecvt16Out","Codecvt16Unshift","Codecvt16Length"},
                 msvcp_detail::facet_shape(".?AV?$codecvt@_SDU_Mbstatet@@@std@@",l.p,".?AVcodecvt_base@std@@"));
-            t.codecvt32=modern_table(prefix,{"FacetDelete","FacetIncref","FacetDecref","Codecvt32Noconv","Codecvt32MaxLength","Codecvt32Encoding","Codecvt32In","Codecvt32Out","Codecvt32Unshift","Codecvt32Length"},
+            t.codecvt32=modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","Codecvt32Noconv","Codecvt32MaxLength","Codecvt32Encoding","Codecvt32In","Codecvt32Out","Codecvt32Unshift","Codecvt32Length"},
                 msvcp_detail::facet_shape(".?AV?$codecvt@_UDU_Mbstatet@@@std@@",l.p,".?AVcodecvt_base@std@@"));
         }
         const auto ctype_shape=msvcp_detail::facet_shape(".?AV?$ctype@"+character+"@std@@",l.p,".?AUctype_base@std@@");
-        if(element)t.ctype=modern_table(prefix,{"FacetDelete","FacetIncref","FacetDecref","CtypeIsRange","CtypeIs","CtypeScanIs","CtypeScanNot","CtypeLowerRange","CtypeLower","CtypeUpperRange","CtypeUpper","CtypeWidenRange","CtypeWiden","CtypeNarrowRange","CtypeNarrow"},ctype_shape);
-        else t.ctype=modern_table(prefix,{"FacetDelete","FacetIncref","FacetDecref","CtypeLowerRange","CtypeLower","CtypeUpperRange","CtypeUpper","CtypeWidenRange","CtypeWiden","CtypeNarrowRange","CtypeNarrow"},ctype_shape);
-        const auto num_put_table=[&](const std::string& c){return modern_table(prefix,{"FacetDelete","FacetIncref","FacetDecref","NumPutPointer","NumPutLongDouble","NumPutDouble","NumPutUnsigned64","NumPutSigned64","NumPutUnsigned32","NumPutSigned32","NumPutBoolean"},
+        if(element)t.ctype=modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","CtypeIsRange","CtypeIs","CtypeScanIs","CtypeScanNot","CtypeLowerRange","CtypeLower","CtypeUpperRange","CtypeUpper","CtypeWidenRange","CtypeWiden","CtypeNarrowRange","CtypeNarrow"},ctype_shape);
+        else t.ctype=modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","CtypeLowerRange","CtypeLower","CtypeUpperRange","CtypeUpper","CtypeWidenRange","CtypeWiden","CtypeNarrowRange","CtypeNarrow"},ctype_shape);
+        const auto num_put_table=[&](const std::string& c){return modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","NumPutPointer","NumPutLongDouble","NumPutDouble","NumPutUnsigned64","NumPutSigned64","NumPutUnsigned32","NumPutSigned32","NumPutBoolean"},
             msvcp_detail::facet_shape(".?AV?$num_put@"+c+"V?$ostreambuf_iterator@"+c+"U?$char_traits@"+c+"@std@@@std@@@std@@",l.p));};
         // unsigned short 字元版與 wchar_t 共用實作，另有自己的 vtable 與 RTTI。
         t.num_put=num_put_table(character);if(element)t.num_put16=num_put_table("G");
         // num_get 的 do_get 依 MSVC 多載反向宣告順序：3 void*&、4 long double、5 double、6 float、7 unsigned long long、8 long long、
         // 9 unsigned long、10 long、11 unsigned int、12 unsigned short、13 bool；unsigned short 字元版另有自己的 RTTI。
         const auto num_get_shape=[&](const std::string& c){return msvcp_detail::facet_shape(".?AV?$num_get@"+c+"V?$istreambuf_iterator@"+c+"U?$char_traits@"+c+"@std@@@std@@@std@@",l.p);};
-        const auto num_get_table=[&](const std::string& c){return modern_table(prefix,{"FacetDelete","FacetIncref","FacetDecref","NumGetPointer","NumGetLongDouble","NumGetDouble","NumGetFloat",
+        const auto num_get_table=[&](const std::string& c){return modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","NumGetPointer","NumGetLongDouble","NumGetDouble","NumGetFloat",
             "NumGetUnsigned64","NumGetSigned64","NumGetUnsignedLong","NumGetLong","NumGetUnsigned32","NumGetUnsigned16","NumGetBoolean"},num_get_shape(c));};
         t.num_get=num_get_table(character);if(element)t.num_get16=num_get_table("G");
-        const auto time_put_table=[&](const std::string& c){return modern_table(prefix,{"FacetDelete","FacetIncref","FacetDecref","TimePutDoPut"},
+        const auto time_put_table=[&](const std::string& c){return modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","TimePutDoPut"},
             msvcp_detail::facet_shape(".?AV?$time_put@"+c+"V?$ostreambuf_iterator@"+c+"U?$char_traits@"+c+"@std@@@std@@@std@@",l.p));};
         t.time_put=time_put_table(character);if(element)t.time_put16=time_put_table("G"); // unsigned short 版另有 RTTI，實作與 wchar_t 相同。
         // time_get 虛擬函式：do_date_order、do_get_time／date／weekday／monthname／year、do_get(規格)，與 get(格式範圍) 共用解析器。
-        t.time_get=modern_table(prefix,{"FacetDelete","FacetIncref","FacetDecref","TimeGetDateOrder","TimeGetTime","TimeGetDate","TimeGetWeekday","TimeGetMonth","TimeGetYear","TimeGetDoGet"},
+        t.time_get=modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","TimeGetDateOrder","TimeGetTime","TimeGetDate","TimeGetWeekday","TimeGetMonth","TimeGetYear","TimeGetDoGet"},
             msvcp_detail::facet_shape(".?AV?$time_get@"+character+"V?$istreambuf_iterator@"+character+"U?$char_traits@"+character+"@std@@@std@@@std@@",l.p,".?AVtime_base@std@@"));
-        t.numpunct=modern_table(prefix,{"FacetDelete","FacetIncref","FacetDecref","NumPunctDecimal","NumPunctThousands","NumPunctGrouping","NumPunctFalseName","NumPunctTrueName"},msvcp_detail::facet_shape(".?AV?$numpunct@"+character+"@std@@",l.p));
-        t.numpunct_byname=modern_table(prefix,{"FacetDelete","FacetIncref","FacetDecref","NumPunctDecimal","NumPunctThousands","NumPunctGrouping","NumPunctFalseName","NumPunctTrueName"},msvcp_detail::facet_shape(".?AV?$numpunct_byname@"+character+"@std@@",l.p,".?AV?$numpunct@"+character+"@std@@"));
+        t.numpunct=modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","NumPunctDecimal","NumPunctThousands","NumPunctGrouping","NumPunctFalseName","NumPunctTrueName"},msvcp_detail::facet_shape(".?AV?$numpunct@"+character+"@std@@",l.p));
+        t.numpunct_byname=modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","NumPunctDecimal","NumPunctThousands","NumPunctGrouping","NumPunctFalseName","NumPunctTrueName"},msvcp_detail::facet_shape(".?AV?$numpunct_byname@"+character+"@std@@",l.p,".?AV?$numpunct@"+character+"@std@@"));
     }
-    s.facet_table14=modern_table('W',{"FacetDelete","FacetIncref","FacetDecref"},msvcp_detail::facet_shape(".?AVfacet@locale@std@@",l.p));
-    s.codecvt_base14=modern_table('D',{"FacetDelete","FacetIncref","FacetDecref","CodecvtBaseNoconv","CodecvtBaseMaxLength","CodecvtBaseEncoding"},msvcp_detail::facet_shape(".?AVcodecvt_base@std@@",l.p));
-    s.ctype_base14=modern_table('W',{"FacetDelete","FacetIncref","FacetDecref"},msvcp_detail::facet_shape(".?AUctype_base@std@@",l.p));
-    s.winit_count14=runtime_allocate(memory,{},4);s.data14.emplace("?_Init_cnt@_Winit@std@@0HA",s.winit_count14);
-    s.locimp_table14=modern_table('W',{"FacetDelete","FacetIncref","FacetDecref"},msvcp_detail::facet_shape(".?AV_Locimp@locale@std@@",l.p));
+    m.facet_table14=modern_table(variant,'W',{"FacetDelete","FacetIncref","FacetDecref"},msvcp_detail::facet_shape(".?AVfacet@locale@std@@",l.p));
+    m.codecvt_base14=modern_table(variant,'D',{"FacetDelete","FacetIncref","FacetDecref","CodecvtBaseNoconv","CodecvtBaseMaxLength","CodecvtBaseEncoding"},msvcp_detail::facet_shape(".?AVcodecvt_base@std@@",l.p));
+    m.ctype_base14=modern_table(variant,'W',{"FacetDelete","FacetIncref","FacetDecref"},msvcp_detail::facet_shape(".?AUctype_base@std@@",l.p));
+    m.winit_count14=runtime_allocate(memory,{},4);m.data14.emplace("?_Init_cnt@_Winit@std@@0HA",m.winit_count14);
+    m.locimp_table14=modern_table(variant,'W',{"FacetDelete","FacetIncref","FacetDecref"},msvcp_detail::facet_shape(".?AV_Locimp@locale@std@@",l.p));
     // _Facet_base 內聯建構／解構會寫入此 vtable；_Incref／_Decref 在這一層是純虛擬。
     msvc_rtti::Shape facet_base_shape;facet_base_shape.bases.push_back({".?AV_Facet_base@std@@",0});
-    const auto facet_base_table=modern_table('W',{"FacetDelete","FacetIncref","FacetDecref"},std::move(facet_base_shape));
+    const auto facet_base_table=modern_table(variant,'W',{"FacetDelete","FacetIncref","FacetDecref"},std::move(facet_base_shape));
     for(unsigned slot=1;slot<3;++slot)put(facet_base_table+slot*l.p,resolve("crt","_purecall").value);
-    s.ios_base_table14=modern_table('D',{"IosDelete"},msvcp_detail::stream_shape("ios_base",false,l.p));
-    s.ctype_masks14=runtime_allocate(memory,{},512);for(unsigned c=0;c<256;++c)memory.store(GuestAddress{s.ctype_masks14+c*2},16,crt_c_locale::character_mask(c));
-    const Layout modern(x86_,true,1);s.global14=runtime_allocate(memory,{},96);s.classic14=s.global14;put(s.global14,s.locimp_table14);memory.store(GuestAddress{s.global14+l.p},32,1);
-    const auto modern_facets=runtime_allocate(memory,{},9*l.p);put(s.global14+2*l.p,modern_facets);put(s.global14+3*l.p,9);memory.store(GuestAddress{s.global14+4*l.p},32,0x3f);put(s.global14+4*l.p+8,name);
+    m.ios_base_table14=modern_table(variant,'D',{"IosDelete"},msvcp_detail::stream_shape("ios_base",false,l.p));
+    m.ctype_masks14=runtime_allocate(memory,{},512);for(unsigned c=0;c<256;++c)memory.store(GuestAddress{m.ctype_masks14+c*2},16,crt_c_locale::character_mask(c));
+    const Layout modern(x86_,true,1,false,variant!=0);m.global14=runtime_allocate(memory,{},96);m.classic14=m.global14;put(m.global14,m.locimp_table14);memory.store(GuestAddress{m.global14+l.p},32,1);
+    const auto modern_facets=runtime_allocate(memory,{},9*l.p);put(m.global14+2*l.p,modern_facets);put(m.global14+3*l.p,9);memory.store(GuestAddress{m.global14+4*l.p},32,0x3f);put(m.global14+4*l.p+8,name);
     // locale::classic 的常駐物件與 MSVC 相同共用 classic _Locimp 的基礎參考，不另外累加。
-    s.classic_locale14=runtime_allocate(memory,{},modern.locale_size());put(s.classic_locale14+modern.locale_pointer(),s.classic14);
-    s.empty_wide14=runtime_allocate(memory,{},2);
-    s.init_count14=runtime_allocate(memory,{},4);memory.store(GuestAddress{s.init_count14},32,UINT32_MAX);s.data14.emplace("?_Init_cnt@Init@ios_base@std@@0HA",s.init_count14);
-    s.ios_index14=runtime_allocate(memory,{},4);memory.store(GuestAddress{s.ios_index14},32,0);s.data14.emplace("?_Index@ios_base@std@@0HA",s.ios_index14);
+    m.classic_locale14=runtime_allocate(memory,{},modern.locale_size());put(m.classic_locale14+modern.locale_pointer(),m.classic14);
+    m.empty_wide14=runtime_allocate(memory,{},2);
+    m.init_count14=runtime_allocate(memory,{},4);memory.store(GuestAddress{m.init_count14},32,UINT32_MAX);m.data14.emplace("?_Init_cnt@Init@ios_base@std@@0HA",m.init_count14);
+    m.ios_index14=runtime_allocate(memory,{},4);memory.store(GuestAddress{m.ios_index14},32,0);m.data14.emplace("?_Index@ios_base@std@@0HA",m.ios_index14);
     const auto classic_group=runtime_allocate(memory,std::array<std::uint8_t,1>{0});
-    for(unsigned element=0;element<2;++element){const auto characters=element?2U:1U;const auto& tables=s.tables14[element];
+    for(unsigned element=0;element<2;++element){const auto characters=element?2U:1U;const auto& tables=m.tables14[element];
         const auto type=runtime_allocate(memory,{},96);put(type,tables.ctype);memory.store(GuestAddress{type+l.p},32,1);
-        put(type+2*l.p+(x86_?4U:8U),s.ctype_masks14);s.facet_locales.emplace(type,Msvcp100State::FacetLocale{});
+        put(type+2*l.p+(x86_?4U:8U),m.ctype_masks14);s.facet_locales.emplace(type,Msvcp100State::FacetLocale{});
         const auto num=runtime_allocate(memory,{},2*l.p);put(num,tables.num_put);memory.store(GuestAddress{num+l.p},32,1);
         const auto punct=runtime_allocate(memory,{},6*l.p);put(punct,tables.numpunct);memory.store(GuestAddress{punct+l.p},32,1);put(punct+2*l.p,classic_group);
         memory.store(GuestAddress{punct+3*l.p},static_cast<std::uint8_t>(characters*8),'.');memory.store(GuestAddress{punct+3*l.p+characters},static_cast<std::uint8_t>(characters*8),',');
@@ -257,7 +273,7 @@ void WindowsServices::initialize_msvcp100(GuestMemory& memory){
         {"?id@?$ctype@_W@std@@2V0locale@2@A",6},
         {"?id@?$num_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A",7},
         {"?id@?$numpunct@_W@std@@2V0locale@2@A",8}}}){
-        const auto address=runtime_allocate(memory,{},l.p);put(address,id);s.data14.emplace(symbol,address);
+        const auto address=runtime_allocate(memory,{},l.p);put(address,id);m.data14.emplace(symbol,address);
     }
     // 不在 classic locale 預建清單的 facet：id 為 0，第一次 use_facet 時由 locale::id 配發，再經 _Getcat 建立。
     for(const auto* symbol:{"?id@?$codecvt@DDU_Mbstatet@@@std@@2V0locale@2@A","?id@?$collate@_W@std@@2V0locale@2@A",
@@ -271,39 +287,42 @@ void WindowsServices::initialize_msvcp100(GuestMemory& memory){
         "?id@?$codecvt@_SDU_Mbstatet@@@std@@2V0locale@2@A","?id@?$codecvt@_UDU_Mbstatet@@@std@@2V0locale@2@A","?id@?$codecvt@GDU_Mbstatet@@@std@@2V0locale@2@A",
         "?id@?$time_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A",
         "?id@?$time_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A"}){
-        const auto address=runtime_allocate(memory,{},l.p);put(address,0);s.data14.emplace(symbol,address);
+        const auto address=runtime_allocate(memory,{},l.p);put(address,0);m.data14.emplace(symbol,address);
     }
-    for(unsigned element=0;element<2;++element){const auto character=element?"_W":"D";const auto& tables=s.tables14[element];
-        s.data14.emplace(std::string("??_7?$numpunct@")+character+"@std@@6B@",tables.numpunct);
-        s.data14.emplace(std::string("??_7?$num_put@")+character+"V?$ostreambuf_iterator@"+character+"U?$char_traits@"+character+"@std@@@std@@@std@@6B@",tables.num_put);
+    for(unsigned element=0;element<2;++element){const auto character=element?"_W":"D";const auto& tables=m.tables14[element];
+        m.data14.emplace(std::string("??_7?$numpunct@")+character+"@std@@6B@",tables.numpunct);
+        m.data14.emplace(std::string("??_7?$num_put@")+character+"V?$ostreambuf_iterator@"+character+"U?$char_traits@"+character+"@std@@@std@@@std@@6B@",tables.num_put);
     }
     // locale::id::_Id_cnt 是匯出的 static int；inline locale::id 轉換與 ??Bid 共用同一個客體計數，已預建 8 個標準 facet id。
-    s.id_count14=runtime_allocate(memory,{},4);memory.store(GuestAddress{s.id_count14},32,8);s.data14.emplace("?_Id_cnt@id@locale@std@@0HA",s.id_count14);
-    s.ostream_vb=runtime_allocate(memory,{},8);memory.store(GuestAddress{s.ostream_vb+4},32,8);
-    s.ostream_vb14=runtime_allocate(memory,{},8);memory.store(GuestAddress{s.ostream_vb14+4},32,modern.ostream_base());
-    s.istream_vb14=runtime_allocate(memory,{},8);memory.store(GuestAddress{s.istream_vb14+4},32,modern.istream_base());
-    s.iostream_vb14=runtime_allocate(memory,{},16);memory.store(GuestAddress{s.iostream_vb14+4},32,modern.iostream_base());
-    memory.store(GuestAddress{s.iostream_vb14+8},32,static_cast<std::uint32_t>(-16));memory.store(GuestAddress{s.iostream_vb14+12},32,modern.iostream_base()-16);
+    m.id_count14=runtime_allocate(memory,{},4);memory.store(GuestAddress{m.id_count14},32,8);m.data14.emplace("?_Id_cnt@id@locale@std@@0HA",m.id_count14);
+    if(!variant){s.ostream_vb=runtime_allocate(memory,{},8);memory.store(GuestAddress{s.ostream_vb+4},32,8);}
+    m.ostream_vb14=runtime_allocate(memory,{},8);memory.store(GuestAddress{m.ostream_vb14+4},32,modern.ostream_base());
+    m.istream_vb14=runtime_allocate(memory,{},8);memory.store(GuestAddress{m.istream_vb14+4},32,modern.istream_base());
+    m.iostream_vb14=runtime_allocate(memory,{},16);memory.store(GuestAddress{m.iostream_vb14+4},32,modern.iostream_base());
+    memory.store(GuestAddress{m.iostream_vb14+8},32,static_cast<std::uint32_t>(-16));memory.store(GuestAddress{m.iostream_vb14+12},32,modern.iostream_base()-16);
     // 標準串流使用相同客體 ABI 與 streambuf 虛擬派送，輸出交給既有 Windows 標準 handle。
     // cout／cerr／clog 各有自己的 streambuf 與 locale 參考；cerr 預設 unitbuf 並 tie 到 cout，與 MSVC 初始化相同。
     const auto standard_ostream=[&](unsigned handle,std::uint64_t index,std::uint32_t flags,std::uint64_t tie){
-        const auto console_buffer=runtime_allocate(memory,{},modern.buffer_size);put(console_buffer,s.tables14[0].buffer);
+        const auto console_buffer=runtime_allocate(memory,{},modern.buffer_size);put(console_buffer,m.tables14[0].buffer);
         for(unsigned side=0;side<2;++side){put(console_buffer+modern.first_indirect(side),console_buffer+modern.first(side));put(console_buffer+modern.next_indirect(side),console_buffer+modern.next(side));put(console_buffer+modern.count_indirect(side),console_buffer+modern.count(side));}
-        const auto buffer_locale=runtime_allocate(memory,{},modern.locale_size());put(buffer_locale+modern.locale_pointer(),s.global14);put(console_buffer+modern.buffer_locale(),buffer_locale);s.standard_buffers.emplace(console_buffer,handle);
-        const auto stream=runtime_allocate(memory,{},modern.ostream_base()+modern.ios_size+3*l.p);put(stream,s.ostream_vb14);const auto stream_ios=stream+modern.ostream_base();put(stream_ios,s.tables14[0].ostream);memory.store(GuestAddress{stream_ios-4},32,0);
+        const auto buffer_locale=runtime_allocate(memory,{},modern.locale_size());put(buffer_locale+modern.locale_pointer(),m.global14);put(console_buffer+modern.buffer_locale(),buffer_locale);s.standard_buffers.emplace(console_buffer,handle);
+        const auto stream=runtime_allocate(memory,{},modern.ostream_base()+modern.ios_size+3*l.p);put(stream,m.ostream_vb14);const auto stream_ios=stream+modern.ostream_base();put(stream_ios,m.tables14[0].ostream);memory.store(GuestAddress{stream_ios-4},32,0);
         put(stream_ios+l.p,index);memory.store(GuestAddress{stream_ios+modern.flags},32,flags);memory.store(GuestAddress{stream_ios+modern.precision},64,6);
-        const auto stream_locale=runtime_allocate(memory,{},modern.locale_size());put(stream_locale+modern.locale_pointer(),s.global14);put(stream_ios+modern.locale,stream_locale);put(stream_ios+modern.ios_size,console_buffer);
+        const auto stream_locale=runtime_allocate(memory,{},modern.locale_size());put(stream_locale+modern.locale_pointer(),m.global14);put(stream_ios+modern.locale,stream_locale);put(stream_ios+modern.ios_size,console_buffer);
         put(stream_ios+modern.ios_size+l.p,tie);memory.store(GuestAddress{stream_ios+modern.ios_size+2*l.p},8,' ');
-        memory.store(GuestAddress{s.global14+l.p},32,memory.load(GuestAddress{s.global14+l.p},32)+2);s.ios_objects.emplace(stream_ios,std::pair{stream,modern.ostream_base()+modern.ios_size+3*l.p});return stream;
+        memory.store(GuestAddress{m.global14+l.p},32,memory.load(GuestAddress{m.global14+l.p},32)+2);s.ios_objects.emplace(stream_ios,std::pair{stream,modern.ostream_base()+modern.ios_size+3*l.p});return stream;
     };
     const auto cout=standard_ostream(1,1,0x201,0);
-    s.data14.emplace("?cout@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A",cout);
-    s.data14.emplace("?cerr@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A",standard_ostream(2,2,0x203,cout));
-    s.data14.emplace("?clog@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A",standard_ostream(2,3,0x201,0));
-    s.exception_control_table=modern_table('D',{"ExceptionControlDestroy","ExceptionControlDelete","ExceptionControlDestructor","ExceptionControlDeleter"});
+    m.data14.emplace("?cout@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A",cout);
+    m.data14.emplace("?cerr@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A",standard_ostream(2,2,0x203,cout));
+    m.data14.emplace("?clog@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A",standard_ostream(2,3,0x201,0));
+    if(variant){std::map<std::string,std::uint64_t,std::less<>> renamed;for(auto& [symbol,address]:m.data14)renamed.emplace(msvcp120_symbol(symbol),address);m.data14=std::move(renamed);}
+    };
+    initialize_modern(0);initialize_modern(1);
+    s.exception_control_table=modern_table(0,'D',{"ExceptionControlDestroy","ExceptionControlDelete","ExceptionControlDestructor","ExceptionControlDeleter"});
     for(unsigned i=0;i<3;++i){const std::array<std::string_view,3> names{"generic","system","iostream"};const std::array<std::string,3> types{".?AV_Generic_error_category@std@@",".?AV_System_error_category@std@@",".?AV_Iostream_error_category2@std@@"};
         msvc_rtti::Shape shape;shape.bases={{types[i],1},{".?AVerror_category@std@@",0}};
-        const auto category_table=modern_table('D',{"ErrorCategoryDelete","ErrorCategoryName","ErrorCategoryMessage","ErrorCategoryCondition","ErrorCategoryEquivalentB","ErrorCategoryEquivalentA"},std::move(shape));
+        const auto category_table=modern_table(0,'D',{"ErrorCategoryDelete","ErrorCategoryName","ErrorCategoryMessage","ErrorCategoryCondition","ErrorCategoryEquivalentB","ErrorCategoryEquivalentA"},std::move(shape));
         const auto category=runtime_allocate(memory,{},2*l.p);put(category,category_table);put(category+l.p,i==0?3:i==1?7:5);s.error_categories[i]=category;
         std::vector<std::uint8_t> text(names[i].begin(),names[i].end());text.push_back(0);s.error_category_names[i]=runtime_allocate(memory,text);}
     // noexcept current_exception 的配置失敗分支使用預先配置的實際型別／例外紀錄。
@@ -318,11 +337,11 @@ void WindowsServices::initialize_msvcp100(GuestMemory& memory){
     }
     const auto rtti_image=runtime_allocate(memory,{},rtti.bytes.size(),l.p);rtti.relocate(rtti_image);memory.write(GuestAddress{rtti_image},rtti.bytes);
     for(const auto& [cell,locator]:rtti_tables)put(cell,rtti_image+locator);
-    for(const auto& [type_name,offset]:rtti.types)s.data14.emplace("??_R0"+type_name.substr(1)+"@8",rtti_image+offset);
+    for(auto& runtime:s.runtimes)for(const auto& [type_name,offset]:rtti.types)runtime.data14.emplace("??_R0"+type_name.substr(1)+"@8",rtti_image+offset);
 }
-void WindowsServices::initialize_msvcp_numeric_facet(GuestState& state,GuestMemory& memory,std::uint64_t object,bool punct,bool wide,const CrtLocaleCategory& category,std::uint32_t references,bool defaults){
+void WindowsServices::initialize_msvcp_numeric_facet(GuestState& state,GuestMemory& memory,std::uint64_t object,bool punct,bool wide,const CrtLocaleCategory& category,std::uint32_t references,bool defaults,unsigned variant){
     auto& s=*msvcp100_;const unsigned unit=x86_?4:8,characters=wide?2:1;const auto bits=static_cast<std::uint8_t>(unit*8);
-    const auto& tables=s.tables14[wide?1:0];Msvcp100State::FacetLocale metadata;metadata.category=category;metadata.resources.reserve(3);
+    const auto& tables=s.runtimes[variant].tables14[wide?1:0];Msvcp100State::FacetLocale metadata;metadata.category=category;metadata.resources.reserve(3);
     const auto put=[&](std::uint64_t at,std::uint64_t value){memory.store(GuestAddress{at},bits,value);};
     const auto save=[&](std::vector<std::uint8_t> bytes){const auto at=allocate_heap(memory,bytes.size());if(!at)throw std::bad_alloc();metadata.resources.push_back(at);memory.write(GuestAddress{at},bytes);return at;};
     try{
@@ -346,8 +365,8 @@ void WindowsServices::queue_msvcp_facet_retirement(std::uint64_t facet){
     request.rpc=GuestCallback{resolve("internal-msvcp140",x86_?"DFacetRetire32":"DFacetRetire64").value,{facet}};
     gui_.sent_messages.emplace(gui_.next_object++,std::move(request));
 }
-GuestAddress WindowsServices::msvcp100_data(std::string_view name,bool modern)const{
-    if(!msvcp100_)return GuestAddress{};const auto& data=modern?msvcp100_->data14:msvcp100_->data;const auto it=data.find(name);return it==data.end()?GuestAddress{}:GuestAddress{it->second};
+GuestAddress WindowsServices::msvcp100_data(std::string_view name,bool modern,bool vc12)const{
+    if(!msvcp100_)return GuestAddress{};const auto& data=modern?msvcp100_->runtimes[vc12?1:0].data14:msvcp100_->data;const auto it=data.find(name);return it==data.end()?GuestAddress{}:GuestAddress{it->second};
 }
 void WindowsServices::prepare_msvcp_exception_capture(GuestState& state,GuestMemory& memory,std::uint64_t token){
     auto& s=*msvcp100_;auto& op=s.operations.at(token);const Layout l(x86_,true,1);const auto bits=static_cast<std::uint8_t>(l.p*8);
@@ -376,7 +395,7 @@ std::optional<std::uint32_t> WindowsServices::finish_msvcp_callback_exception(Gu
     exceptions_.stack.at(captured_depth).protected_callback_depth=SIZE_MAX;(void)msvc_exception_cells(state,memory,false,true);
     if(op.kind=="exception_capture"){op.exception_record=std::move(record);++op.copy_failures;prepare_msvcp_exception_capture(state,memory,frame.value);return resume_msvcp100(state,memory,frame.value,0);}
     if(op.ios){
-        const Layout l(x86_,op.modern,op.element,op.service.family=="msvcp90.dll" || op.service.family=="internal-msvcp90");const auto at=op.ios+l.state;
+        const Layout l(x86_,op.modern,op.element,op.service.family=="msvcp90.dll" || op.service.family=="internal-msvcp90",msvcp_detail::vc12(op.service));const auto at=op.ios+l.state;
         const bool suffix=op.callback==52;
         const bool body=op.callback!=10 && op.callback!=11 && !suffix;const auto flags=memory.load(GuestAddress{at},32)|(body?4U:0U);if(body)memory.store(GuestAddress{at},32,flags);
         op.rethrow_exception=!suffix && (!body || (memory.load(GuestAddress{at+4},32)&4U));op.throw_failure=false;op.exception_record=std::move(record);op.callback=0;
@@ -412,10 +431,11 @@ void WindowsServices::discard_msvcp100(std::uint64_t token,GuestState& state,Gue
 
 std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall call(state,memory,service);auto& s=*msvcp100_;const auto l=msvcp_detail::abi(x86_,service);const auto bits=static_cast<std::uint8_t>(l.p*8);
-    const auto name=service.symbol;const bool internal=service.family=="internal-msvcp100" || service.family=="internal-msvcp140" || service.family=="internal-msvcp90";
-    if(l.modern && !s.global14)s.global14=s.classic14;
-    const auto global=l.modern?s.global14:s.global;
-    const auto& tables=s.tables14[l.element==1?0:1];const auto buffer_table=l.modern?tables.buffer:l.legacy?s.buffer_table9[l.element==1?0:1]:l.element==1?s.buffer_table_narrow:s.buffer_table,ios_table=l.modern?tables.ios:s.ios_table;
+    auto& m=s.runtimes[l.variant()];const auto* const modern_internal=msvcp_detail::modern_internal(l.variant());
+    const auto name=service.symbol;const bool internal=service.family=="internal-msvcp100" || service.family=="internal-msvcp140" || service.family=="internal-msvcp120" || service.family=="internal-msvcp90";
+    if(l.modern && !m.global14)m.global14=m.classic14;
+    const auto global=l.modern?m.global14:s.global;
+    const auto& tables=m.tables14[l.element==1?0:1];const auto buffer_table=l.modern?tables.buffer:l.legacy?s.buffer_table9[l.element==1?0:1]:l.element==1?s.buffer_table_narrow:s.buffer_table,ios_table=l.modern?tables.ios:s.ios_table;
     const bool stat=service.caller_cleanup || name.starts_with("?_Getcat@") || name.starts_with("?_Getgloballocale@") || name.starts_with("?_Ios_base_dtor@");
     const auto object=stat?0:x86_?state.reg(Gpr::Rcx)&UINT32_MAX:call(0);
     const auto a=[&](unsigned i){return call(i+(!x86_ && !stat?1:0));};
@@ -439,7 +459,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
     const auto new_locale=[&]{const auto loc=allocate_heap(memory,l.locale_size());if(!loc)throw std::bad_alloc{};memory.fill(GuestAddress{loc},0,l.locale_size());put(loc+l.locale_pointer(),global);put_refs(global,refs(global)+1);return loc;};
     // _Cvtvec／_Ctypevec 與 VC11／VC12 的 C 匯出共用 windows_msvcp_runtime.cpp；表配置失敗時退回常駐 classic 表。
     const auto write_cvtvec=[&](std::uint64_t output){msvcp_cvt_vector(state,memory,output);};
-    const auto write_ctypevec=[&](std::uint64_t output){if(!msvcp_ctype_vector(state,memory,output))put(output+(x86_?4U:8U),s.ctype_masks14);};
+    const auto write_ctypevec=[&](std::uint64_t output){if(!msvcp_ctype_vector(state,memory,output))put(output+(x86_?4U:8U),m.ctype_masks14);};
     if(!internal && name.starts_with('_')){
         // C 匯出：x64 浮點引數在與參數序相同的 XMM，Win32 cdecl 在堆疊；回傳值分別走 XMM0 與 x87 ST(0)。
         if(name=="_Getctype"){write_ctypevec(a(0));return done(a(0));}
@@ -463,7 +483,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         callback.x86_register_arguments=x86_?1:0;callback.exception_policy=GuestExceptionPolicy::NoexceptCpp;
         start_callbacks(state,memory,{std::move(callback)},Continuation::ReturnZeroFreeHeap,a(0));return {};
     }
-    if(l.modern && method=="_Setgloballocale"){s.global14=a(0);return done(0);}
+    if(l.modern && method=="_Setgloballocale"){m.global14=a(0);return done(0);}
     if(l.modern && method=="global" && name.find("@locale@")!=name.npos){
         memory.check(GuestAddress{a(0)},l.locale_size(),Access::Write);const auto replacement=ptr(a(1)+l.locale_pointer());
         if(!replacement)throw HostCallFault("STL 全域 locale 來源為空");memory.check(GuestAddress{replacement},x86_?32:56,Access::Read);
@@ -481,13 +501,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         if(byname){const auto named=windows_crt_locale(utf8_to_utf16(read_ansi(memory,a(0),4095)));if(!named){throw_msvc_exception(state,memory,service,MsvcExceptionKind::RuntimeError);return {};}category=*named;}
         // refs 位於 byname 名稱或 _Locinfo 之後；預設建構閉包為 refs 0、無回傳值。
         const auto references=closure?0U:static_cast<std::uint32_t>(a(byname || name.find("_Locinfo@")!=name.npos?1:0));
-        initialize_msvcp_numeric_facet(state,memory,object,numeric_punct,l.element==2,category,references);if(byname)put(object,tables.numpunct_byname);if(numeric_put16)put(object,tables.num_put16);
+        initialize_msvcp_numeric_facet(state,memory,object,numeric_punct,l.element==2,category,references,false,l.variant());if(byname)put(object,tables.numpunct_byname);if(numeric_put16)put(object,tables.num_put16);
         return done(closure?0:object);
     }
     if(l.modern && numeric_put && method=="_Init")return done(0); // num_put::_Init 不從 _Locinfo 載入任何資料。
     if(l.modern && (numeric_punct || numeric_put) && name.starts_with("??1")){
         if(const auto found=s.facet_locales.find(object);found!=s.facet_locales.end()){for(const auto resource:found->second.resources)(void)free_heap(memory,resource,state);s.facet_locales.erase(found);}
-        put(object,s.facet_table14);return done(0);
+        put(object,m.facet_table14);return done(0);
     }
     if(l.modern && (numeric_punct || numeric_put) && method=="_Getcat"){
         if(a(0) && !ptr(a(0))){const auto imp=a(1)?ptr(a(1)+l.locale_pointer()):global;const auto label=ptr(imp+4*l.p+8);
@@ -495,7 +515,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
             const auto category=text==u"*"?std::optional<CrtLocaleCategory>{current_crt_locale(state,memory).categories[4]}:windows_crt_locale(text);
             if(!category){throw_msvc_exception(state,memory,service,MsvcExceptionKind::RuntimeError);return {};}
             const auto facet=allocate_heap(memory,(numeric_punct?6U:2U)*l.p);if(!facet){throw_msvc_exception(state,memory,service,MsvcExceptionKind::BadAlloc);return {};}
-            try{initialize_msvcp_numeric_facet(state,memory,facet,numeric_punct,l.element==2,*category,0,numeric_punct);if(numeric_put16)put(facet,tables.num_put16);put(a(0),facet);}
+            try{initialize_msvcp_numeric_facet(state,memory,facet,numeric_punct,l.element==2,*category,0,numeric_punct,l.variant());if(numeric_put16)put(facet,tables.num_put16);put(a(0),facet);}
             catch(...){if(const auto record=s.facet_locales.find(facet);record!=s.facet_locales.end()){for(const auto address:record->second.resources)(void)free_heap(memory,address,state);s.facet_locales.erase(record);}(void)free_heap(memory,facet,state);throw;}
         }return done(8);
     }
@@ -546,7 +566,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
             const bool closure=name.starts_with("??_F");const auto references=closure?0U:static_cast<std::uint32_t>(a(name.find("_Locinfo@")!=name.npos?1U:0U));
             memory.fill(GuestAddress{object},0,2*l.p);put(object,table);memory.store(GuestAddress{object+l.p},32,references);return done(closure?0:object);
         }
-        if(name.starts_with("??1")){put(object,s.facet_table14);return done(0);}
+        if(name.starts_with("??1")){put(object,m.facet_table14);return done(0);}
         if(method=="_Init")return done(0); // num_get::_Init 不從 _Locinfo 載入任何資料。
         if(method=="_Getcat"){
             if(a(0) && !ptr(a(0))){
@@ -646,12 +666,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         if(method=="_Getfalse" || method=="_Gettrue" || method=="_Getdays" || method=="_Getmonths" || method=="_W_Getdays" || method=="_W_Getmonths"){
             // MSVC 在名稱不可用時回傳的 C locale 預設字串；同一程序共用一份常駐資料。
             const bool wide=method.starts_with("_W_");const auto key="#"+std::string(method);
-            if(const auto found=s.data14.find(key);found!=s.data14.end())return done(found->second);
+            if(const auto found=m.data14.find(key);found!=m.data14.end())return done(found->second);
             const std::string text=method=="_Getfalse"?"false":method=="_Gettrue"?"true":method.ends_with("days")?
                 ":Sun:Sunday:Mon:Monday:Tue:Tuesday:Wed:Wednesday:Thu:Thursday:Fri:Friday:Sat:Saturday":
                 ":Jan:January:Feb:February:Mar:March:Apr:April:May:May:Jun:June:Jul:July:Aug:August:Sep:September:Oct:October:Nov:November:Dec:December";
             std::vector<std::uint8_t> bytes;for(const auto c:text){bytes.push_back(static_cast<std::uint8_t>(c));if(wide)bytes.push_back(0);}bytes.push_back(0);if(wide)bytes.push_back(0);
-            const auto address=runtime_allocate(memory,bytes);s.data14.emplace(key,address);return done(address);
+            const auto address=runtime_allocate(memory,bytes);m.data14.emplace(key,address);return done(address);
         }
         if(method=="_Getcoll"){
             const auto output=a(0);memory.check(GuestAddress{output},2*l.p,Access::Write);const auto& category=current_crt_locale(state,memory).categories[1];std::uint64_t locale_name=0;
@@ -733,25 +753,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         }catch(...){if(operation_token)s.operations.erase(operation_token);s.exception_pointers.erase(allocation);(void)free_heap(memory,allocation,state);throw;}
     }
     if(method=="_Getgloballocale")return done(global);
-    if(l.modern && method=="classic")return done(s.classic_locale14);
+    if(l.modern && method=="classic")return done(m.classic_locale14);
     // ios_base::Init 的建構／解構（含靜態 _Init_ctor／_Init_dtor）；operator= 與 _Init_cnt_func 另行處理。
     if(l.modern && name.find("Init@ios_base@std@@")!=name.npos && !name.starts_with("??4") && !name.starts_with("?_Init_cnt_func@")){
         // 計數由 -1 起算；最後一個 Init 解構時依 cerr、clog、cout 的順序 flush，串流本身維持常駐。
-        const auto count=static_cast<std::int32_t>(memory.load(GuestAddress{s.init_count14},32));
-        if(name.starts_with("??0") || method=="_Init_ctor"){memory.store(GuestAddress{s.init_count14},32,static_cast<std::uint32_t>(count>=0?count+1:1));return done(object);}
-        memory.store(GuestAddress{s.init_count14},32,static_cast<std::uint32_t>(count-1));if(count!=1)return done(0);
+        const auto count=static_cast<std::int32_t>(memory.load(GuestAddress{m.init_count14},32));
+        if(name.starts_with("??0") || method=="_Init_ctor"){memory.store(GuestAddress{m.init_count14},32,static_cast<std::uint32_t>(count>=0?count+1:1));return done(object);}
+        memory.store(GuestAddress{m.init_count14},32,static_cast<std::uint32_t>(count-1));if(count!=1)return done(0);
         Operation op;op.service=service;op.modern=true;op.element=1;op.kind="ios_init_flush";
-        for(const auto* stream:{"?cerr@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A","?clog@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A","?cout@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A"})op.objects.push_back(s.data14.at(stream));
+        for(const auto* stream:{"?cerr@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A","?clog@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A","?cout@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A"})op.objects.push_back(m.data14.at(stream));
         const auto token=s.next++;s.operations.emplace(token,std::move(op));return resume_msvcp100(state,memory,token,0);
     }
     if(l.modern && name.find("_Init_locks@std@@")!=name.npos){
         // std::_Init_locks：_Init_cnt 由 -1 起算，首個建構初始化 STL 鎖、計數回到 -1 時銷毀。這裡的 _Lockit 鎖由 InitOnce
         // 延遲初始化並常駐（其他模組仍可能持有），所以只維持相同的配對計數；成員建構回傳 this，靜態版本無回傳值。
         const bool constructor=name.starts_with("??0") || method=="_Init_locks_ctor";
-        s.init_locks14+=constructor?1:-1;
+        m.init_locks14+=constructor?1:-1;
         return done(name.starts_with("??0")?object:0);
     }
-    if(l.modern && method=="xalloc"){const auto index=memory.load(GuestAddress{s.ios_index14},32);memory.store(GuestAddress{s.ios_index14},32,index+1);return done(index);}
+    if(l.modern && method=="xalloc"){const auto index=memory.load(GuestAddress{m.ios_index14},32);memory.store(GuestAddress{m.ios_index14},32,index+1);return done(index);}
     if(l.modern && method=="_Init" && name.find("@locale@")!=name.npos){if(static_cast<std::uint8_t>(a(0)))put_refs(global,refs(global)+1);return done(global);}
     if(l.modern && method=="_New_Locimp"){
         const auto source=a(0);memory.check(GuestAddress{source},x86_?32:56,Access::Read);
@@ -806,8 +826,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
     if(name.starts_with("??0id@locale@") || name.starts_with("??_Fid@locale@")){const bool closure=name.starts_with("??_F");put(object,closure?0:a(0));return done(closure?0:object);}
     if(name.starts_with("?_Getcat@facet@locale@"))return done(x86_?UINT32_MAX:UINT64_MAX); // locale::facet 本身沒有類別：(size_t)-1。
     if(l.modern && (name.starts_with("??0ctype_base@") || name.starts_with("??_Fctype_base@") || name.starts_with("??1ctype_base@"))){
-        if(name.starts_with("??1")){put(object,s.facet_table14);return done(0);}
-        const bool closure=name.starts_with("??_F");memory.write(GuestAddress{object},std::vector<std::uint8_t>(2*l.p));put(object,s.ctype_base14);put_refs(object,closure?0:a(0));return done(closure?0:object);
+        if(name.starts_with("??1")){put(object,m.facet_table14);return done(0);}
+        const bool closure=name.starts_with("??_F");memory.write(GuestAddress{object},std::vector<std::uint8_t>(2*l.p));put(object,m.ctype_base14);put_refs(object,closure?0:a(0));return done(closure?0:object);
     }
     if(name.find("_Timevec@std@@")!=name.npos && !name.starts_with("?_Gettnames@")){
         // _Timevec 擁有 CRT 配置的時間名稱表：複製建構與指派轉移擁有權（來源變為空），解構以 free 釋放。
@@ -823,10 +843,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
     if(name.find("_Winit@std@@")!=name.npos){
         // 寬字元標準串流的初始化計數；本實作沒有常駐的寬字元標準串流物件，最後一個解構沒有需要 flush 的對象。
         if(name.starts_with("??4"))return done(object);
-        const auto count=static_cast<std::int32_t>(memory.load(GuestAddress{s.winit_count14},32));
-        memory.store(GuestAddress{s.winit_count14},32,static_cast<std::uint32_t>(name.starts_with("??0")?count+1:count-1));return done(name.starts_with("??0")?object:0);
+        const auto count=static_cast<std::int32_t>(memory.load(GuestAddress{m.winit_count14},32));
+        memory.store(GuestAddress{m.winit_count14},32,static_cast<std::uint32_t>(name.starts_with("??0")?count+1:count-1));return done(name.starts_with("??0")?object:0);
     }
-    if(name.starts_with("?_Init_cnt_func@Init@ios_base@"))return done(s.init_count14);
+    if(name.starts_with("?_Init_cnt_func@Init@ios_base@"))return done(m.init_count14);
     if(method=="SetWidth" || method=="SetPrecision"){
         memory.store(GuestAddress{a(0)+(method=="SetWidth"?l.width:l.precision)},64,a(1));return done(0);
     }
@@ -837,7 +857,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         memory.store(GuestAddress{output+8},64,a(1));return done(output);
     }
     if(name.starts_with("??Bid@")){auto value=ptr(object);if(!value){
-        if(l.modern){value=memory.load(GuestAddress{s.id_count14},32)+1;memory.store(GuestAddress{s.id_count14},32,value);}else value=++s.next_id;put(object,value);}return done(value);}
+        if(l.modern){value=memory.load(GuestAddress{m.id_count14},32)+1;memory.store(GuestAddress{m.id_count14},32,value);}else value=++s.next_id;put(object,value);}return done(value);}
     if(method=="_Incref" || method=="_Decref" || method=="FacetIncref" || method=="FacetDecref"){
         auto n=refs(object);if(method=="_Incref" || method=="FacetIncref"){put_refs(object,n+1);return done(0);}
         if(n)put_refs(object,--n);return done(n?0:object);
@@ -851,7 +871,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
             memory.write(GuestAddress{object},std::vector<std::uint8_t>(4*l.p));put(object,table);put_refs(object,closure?0:a(second?1U:0U));
             s.facet_locales.insert_or_assign(object,Msvcp100State::FacetLocale{});return done(closure?0:object);
         }
-        if(name.starts_with("??1")){s.facet_locales.erase(object);put(object,s.facet_table14);return done(0);}
+        if(name.starts_with("??1")){s.facet_locales.erase(object);put(object,m.facet_table14);return done(0);}
         if(method=="_Init" || method=="_Tidy")return done(0); // 沒有從 _Locinfo 載入的名稱表，也沒有要釋放的資料。
         // 公開 get_*／date_order／get(規格) 轉給虛擬函式（衍生 facet 的覆寫也生效）。
         const unsigned slot=method=="date_order"?3U:method=="get_time"?4U:method=="get_date"?5U:method=="get_weekday"?6U:method=="get_monthname"?7U:method=="get_year"?8U:
@@ -1073,7 +1093,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
     if(codecvt_method!=method){
         // wchar_t／unsigned short 的 do_* 匯出：以內部方法名稱重新進入同一處理（引數順序相同）。
         const auto internal_name=std::string(1,'W')+codecvt_method+(x86_?"32":"64");
-        for(const auto& entry:runtime_service_descriptors())if(entry.family=="internal-msvcp140" && entry.symbol==internal_name)return invoke_msvcp100(state,memory,entry);
+        for(const auto& entry:runtime_service_descriptors())if(entry.family==modern_internal && entry.symbol==internal_name)return invoke_msvcp100(state,memory,entry);
         throw HostCallFault("codecvt 虛擬函式缺少內部入口");
     }
     if(method=="CodecvtNoconv")return done(0);
@@ -1178,7 +1198,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         const bool extended=name.find("W4_Codecvt_mode@")!=name.npos,locinfo=name.find("_Locinfo@")!=name.npos;
         const unsigned size=codecvt?(cvt16 || cvt32?2*l.p+8:cvt_char?2*l.p:64U):2*l.p;
         memory.write(GuestAddress{object},std::vector<std::uint8_t>(size));
-        put(object,base?s.codecvt_base14:!codecvt?s.facet_table14:cvt16?tables.codecvt16:cvt32?tables.codecvt32:cvt_ushort?tables.codecvt_ushort:tables.codecvt);
+        put(object,base?m.codecvt_base14:!codecvt?m.facet_table14:cvt16?tables.codecvt16:cvt32?tables.codecvt32:cvt_ushort?tables.codecvt_ushort:tables.codecvt);
         put_refs(object,closure?0:a(extended?3:locinfo?1:0));
         if(cvt16 || cvt32){memory.store(GuestAddress{object+2*l.p},32,extended?static_cast<std::uint32_t>(a(1)):0x10ffffU);memory.store(GuestAddress{object+2*l.p+4},32,extended?static_cast<std::uint32_t>(a(2)):0U);}
         if(codecvt && !cvt16 && !cvt32 && !cvt_char){const auto category=current_crt_locale(state,memory).categories[2];const auto vector=object+2*l.p;
@@ -1187,21 +1207,35 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
             Msvcp100State::FacetLocale metadata;metadata.category=category;s.facet_locales.insert_or_assign(object,std::move(metadata));
         }return done(closure?0:object);
     }
-    if(l.modern && (name.starts_with("??1facet@") || name.starts_with("??1?$codecvt@"))){s.facet_locales.erase(object);put(object,s.facet_table14);return done(0);}
+    if(l.modern && (name.starts_with("??1facet@") || name.starts_with("??1?$codecvt@"))){s.facet_locales.erase(object);put(object,m.facet_table14);return done(0);}
     // 區間多載的簽章含指標；x64 與 x86 裝飾名都只在此處出現 P。
     const bool ctype_range=name.find("@?$ctype@")!=name.npos && name.substr(name.rfind("@@")+2).find('P')!=name.npos;
+    // 公開包裝轉呼叫的虛擬函式仍是本引擎的基底實作（facet 沒有覆寫）時直接計算，不經客體回呼；引數與虛擬函式相同。
+    std::string devirtualized;
+    const auto base_virtual=[&](unsigned slot,std::string_view operation){
+        const auto entry=std::string(1,l.element==1?'D':'W')+std::string(operation)+(x86_?"32":"64");
+        return ptr(ptr(object)+slot*l.p)==resolve(msvcp_detail::modern_internal(l.variant()),entry).value;
+    };
     if(l.modern && (method=="tolower" || method=="toupper")){
-        return virtual_call(object,(l.element==1?3U:7U)+(method=="toupper"?2U:0U)+(ctype_range?0U:1U),ctype_range?std::vector<std::uint64_t>{a(0),a(1)}:std::vector<std::uint64_t>{a(0)});}
+        const auto slot=(l.element==1?3U:7U)+(method=="toupper"?2U:0U)+(ctype_range?0U:1U);
+        const std::string operation=std::string(method=="toupper"?"CtypeUpper":"CtypeLower")+(ctype_range?"Range":"");
+        if(!base_virtual(slot,operation))return virtual_call(object,slot,ctype_range?std::vector<std::uint64_t>{a(0),a(1)}:std::vector<std::uint64_t>{a(0)});
+        devirtualized=operation;
+    }
     // ctype::widen／narrow 單字元公開包裝：與標頭內聯版本相同轉呼叫 do_widen／do_narrow（衍生 facet 的覆寫一併生效）。
     if(l.modern && (method=="widen" || method=="narrow") && name.find("@?$ctype@")!=name.npos){
-        const bool widen=method=="widen";const auto slot=(l.element==1?8U:12U)+(widen?0U:2U);
-        if(ctype_range)return virtual_call(object,slot-1,widen?std::vector<std::uint64_t>{a(0),a(1),a(2)}:std::vector<std::uint64_t>{a(0),a(1),a(2)&255U,a(3)});
-        return virtual_call(object,slot,widen?std::vector<std::uint64_t>{a(0)&255U}:std::vector<std::uint64_t>{a(0)&(l.element==1?255U:65535U),a(1)&255U});
+        const bool widen=method=="widen";const auto slot=(l.element==1?8U:12U)+(widen?0U:2U)-(ctype_range?1U:0U);
+        const std::string operation=std::string(widen?"CtypeWiden":"CtypeNarrow")+(ctype_range?"Range":"");
+        if(!base_virtual(slot,operation)){
+            if(ctype_range)return virtual_call(object,slot,widen?std::vector<std::uint64_t>{a(0),a(1),a(2)}:std::vector<std::uint64_t>{a(0),a(1),a(2)&255U,a(3)});
+            return virtual_call(object,slot,widen?std::vector<std::uint64_t>{a(0)&255U}:std::vector<std::uint64_t>{a(0)&(l.element==1?255U:65535U),a(1)&255U});
+        }
+        devirtualized=operation;
     }
     // ctype 虛擬函式的基底實作：衍生 facet 直接呼叫時與內部 vtable 入口走同一流程。
     const bool ctype_virtual=method.starts_with("do_") && name.find("@?$ctype@")!=name.npos;
-    if(method.starts_with("Ctype") || ctype_virtual){
-        const std::string_view operation=!ctype_virtual?method:method=="do_is"?(ctype_range?"CtypeIsRange":"CtypeIs"):method=="do_scan_is"?"CtypeScanIs":method=="do_scan_not"?"CtypeScanNot":
+    if(method.starts_with("Ctype") || ctype_virtual || !devirtualized.empty()){
+        const std::string_view operation=!devirtualized.empty()?std::string_view(devirtualized):!ctype_virtual?method:method=="do_is"?(ctype_range?"CtypeIsRange":"CtypeIs"):method=="do_scan_is"?"CtypeScanIs":method=="do_scan_not"?"CtypeScanNot":
             method=="do_tolower"?(ctype_range?"CtypeLowerRange":"CtypeLower"):method=="do_toupper"?(ctype_range?"CtypeUpperRange":"CtypeUpper"):method=="do_widen"?(ctype_range?"CtypeWidenRange":"CtypeWiden"):(ctype_range?"CtypeNarrowRange":"CtypeNarrow");
         if(operation=="CtypeIs")return done((character_mask(static_cast<char16_t>(a(1)))&a(0))!=0);
         if(operation=="CtypeIsRange"){
@@ -1479,7 +1513,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         return done(object);
     }
     if((input_stream || io_stream || output_stream) && name.starts_with("??0")){
-        const auto iostream_vb=l.modern?s.iostream_vb14:s.iostream_vb,istream_vb=l.modern?s.istream_vb14:s.istream_vb,ostream_vb=l.modern?s.ostream_vb14:s.ostream_vb;
+        const auto iostream_vb=l.modern?m.iostream_vb14:s.iostream_vb,istream_vb=l.modern?m.istream_vb14:s.istream_vb,ostream_vb=l.modern?m.ostream_vb14:s.ostream_vb;
         if(static_cast<std::uint32_t>(a(io_stream?1:2))){put(object,io_stream?iostream_vb:output_stream?ostream_vb:istream_vb);if(io_stream)put(object+16,iostream_vb+8);}
         const auto vb=ptr(object);const auto base=object+static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(memory.load(GuestAddress{vb+4},32))));
         s.ios_objects[base]={object,base-object+((l.ios_size+3*l.p+7U)&~7U)};
@@ -1498,7 +1532,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         }return done(0);
     }
     const auto destroy_ios_object=[&](std::uint64_t self)->std::optional<std::uint32_t>{
-        if(l.modern)put(self,s.ios_base_table14);
+        if(l.modern)put(self,m.ios_base_table14);
         if(l.modern?memory.load(GuestAddress{self+l.p},32):ptr(self+l.p))return done(0);
         Operation op;op.service=service;op.modern=l.modern;op.element=l.element;op.kind="destroy_ios";op.object=self;op.objects.push_back(self);
         const auto token=s.next++;s.operations.emplace(token,std::move(op));return resume_msvcp100(state,memory,token,0);
@@ -1635,7 +1669,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
 }
 
 std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,GuestMemory& memory,std::uint64_t token,std::uint64_t value){
-    auto& s=*msvcp100_;auto& op=s.operations.at(token);const Layout l(x86_,op.modern,op.element,op.service.family=="msvcp90.dll" || op.service.family=="internal-msvcp90");const auto bits=static_cast<std::uint8_t>(l.p*8);
+    auto& s=*msvcp100_;auto& op=s.operations.at(token);const Layout l(x86_,op.modern,op.element,op.service.family=="msvcp90.dll" || op.service.family=="internal-msvcp90",msvcp_detail::vc12(op.service));const auto bits=static_cast<std::uint8_t>(l.p*8);
+    auto& m=s.runtimes[l.variant()];const auto* const modern_dll=msvcp_detail::modern_dll(l.variant());
     const WindowsCall call(state,memory,op.service);
     const auto ptr=[&](std::uint64_t at){return memory.load(GuestAddress{at},bits);};
     const auto put=[&](std::uint64_t at,std::uint64_t v){memory.store(GuestAddress{at},bits,v);};
@@ -1743,7 +1778,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
     }
     if(op.kind=="ios_init_flush"){
         if(op.count<op.objects.size()){const auto stream=op.objects[static_cast<std::size_t>(op.count++)];
-            return callback(resolve("msvcp140.dll",x86_?"?flush@?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV12@XZ":"?flush@?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@XZ").value,{stream},1);}
+            return callback(resolve(modern_dll,x86_?"?flush@?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV12@XZ":"?flush@?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@XZ").value,{stream},1);}
         return finish(0);
     }
     const auto retire_facet=[&](std::uint64_t facet,unsigned next){return callback(resolve("internal-msvcp140",x86_?"DFacetRetire32":"DFacetRetire64").value,{facet},next,false);};
@@ -1826,12 +1861,12 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
     }
     if(op.kind=="global_locale"){
         if(!op.phase){op.phase=1;return callback(resolve("msvcp140.dll",x86_?"??0_Lockit@std@@QAE@H@Z":"??0_Lockit@std@@QEAA@H@Z").value,{op.locale_lock_storage,0},40);}
-        if(returned==40){op.locale_lock_owned=true;op.locale_source=s.global14;op.phase=2;return callback(ptr(ptr(op.locale_source)+l.p),{op.locale_source},41);}
+        if(returned==40){op.locale_lock_owned=true;op.locale_source=m.global14;op.phase=2;return callback(ptr(ptr(op.locale_source)+l.p),{op.locale_source},41);}
         if(returned==41){op.locale_source_owned=true;
             if(op.object==op.locale_source)op.phase=5;
             else{op.phase=3;return callback(ptr(ptr(op.object)+l.p),{op.object},42);}
         }
-        if(returned==42){op.locale_facet_owned=true;op.locale_pending=op.object;s.global14=op.object;op.locale_facet_owned=false;op.locale_pending=0;
+        if(returned==42){op.locale_facet_owned=true;op.locale_pending=op.object;m.global14=op.object;op.locale_facet_owned=false;op.locale_pending=0;
             op.phase=4;return callback(resolve("internal-msvcp140",x86_?"DFacetRetire32":"DFacetRetire64").value,{op.locale_source},43,false);
         }
         if(op.phase==4){const auto label=ptr(op.object+4*l.p+8);const auto mask=memory.load(GuestAddress{op.object+4*l.p},32)&0x3fU;
@@ -1918,7 +1953,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
                 if(op.ios_node)return ios_event(base,0,4);
                 free_ios_lists(base);op.started=false;
             }
-            ++op.count;const auto loc=ptr(base+l.locale);if(l.modern)put(base,s.ios_base_table14);put(base+l.locale,0);s.ios_objects.erase(base);
+            ++op.count;const auto loc=ptr(base+l.locale);if(l.modern)put(base,m.ios_base_table14);put(base+l.locale,0);s.ios_objects.erase(base);
             if(!loc)continue;const auto imp=ptr(loc+l.locale_pointer());if(!free_heap(memory,loc,state))throw HostCallFault("STL locale 配置無效");
             if(l.modern)return callback(ptr(ptr(imp)+2*l.p),{imp},1);
             const auto n=memory.load(GuestAddress{imp+l.p},l.reference_bits());if(n)memory.store(GuestAddress{imp+l.p},l.reference_bits(),n-1);
@@ -1939,7 +1974,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
             else{const auto star=allocate_heap(memory,2);if(star){memory.store(GuestAddress{star},16,'*');replace_name(new_name,star);}}
             return finish(op.object);
         }
-        if(!op.phase){op.phase=1;return callback(resolve("crt","_wsetlocale").value,{0,ptr(old)?ptr(old):s.empty_wide14},1,false);}
+        if(!op.phase){op.phase=1;return callback(resolve("crt","_wsetlocale").value,{0,ptr(old)?ptr(old):m.empty_wide14},1,false);}
         if(op.skip)return finish(0);
         if(op.phase==1){for(unsigned i=0;i<6;++i){const auto at=yarns+i*yarn_size,text=ptr(at);if(text)(void)free_heap(memory,text,state);put(at,0);}op.phase=2;
             return callback(resolve(family,x86_?"??1_Lockit@std@@QAE@XZ":"??1_Lockit@std@@QEAA@XZ").value,{op.object},2);}
@@ -1981,7 +2016,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
                 copy=allocate_heap(memory,x86_?32:56);if(!copy)throw std::bad_alloc{};memory.move(GuestAddress{copy},GuestAddress{source},x86_?32:56);
                 if(count){array=allocate_heap(memory,count*l.p);if(!array)throw std::bad_alloc{};memory.move(GuestAddress{array},GuestAddress{facets},static_cast<std::size_t>(count*l.p));}
                 if(const auto name=ptr(source+4*l.p+8)){label=crt_duplicate_string(memory,name);if(!label)throw std::bad_alloc{};}
-                put(copy,s.locimp_table14);memory.store(GuestAddress{copy+l.p},l.reference_bits(),1);put(copy+2*l.p,array);put(copy+4*l.p+8,label);
+                put(copy,m.locimp_table14);memory.store(GuestAddress{copy+l.p},l.reference_bits(),1);put(copy+2*l.p,array);put(copy+4*l.p+8,label);
                 s.owned_locale_imps.insert(copy);op.object=copy;op.output=array;op.limit=count;op.phase=2;
             }catch(const std::bad_alloc&){
                 s.owned_locale_imps.erase(copy);if(label)(void)free_heap(memory,label,state);if(array)(void)free_heap(memory,array,state);if(copy)(void)free_heap(memory,copy,state);
@@ -2089,13 +2124,13 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
     const auto stream_facet=[&](unsigned id){
         // locale 自身沒有此 facet 時依序退回全域與 classic，與 _Getfacet 相同。
         const auto locale=ptr(op.ios+l.locale);
-        for(const auto imp:{locale?ptr(locale+l.locale_pointer()):0,s.global14,s.classic14})if(imp && ptr(imp+3*l.p)>id)if(const auto facet=ptr(ptr(imp+2*l.p)+id*l.p))return facet;
+        for(const auto imp:{locale?ptr(locale+l.locale_pointer()):0,m.global14,m.classic14})if(imp && ptr(imp+3*l.p)>id)if(const auto facet=ptr(ptr(imp+2*l.p)+id*l.p))return facet;
         return std::uint64_t{};
     };
     const auto is_space=[&](std::uint64_t c){
         // ctype<char>::is 查 facet 的遮罩表，客體自訂表（例如把逗號視為空白）也生效；寬字元依分類語義。
         if(l.modern && l.element==1){
-            if(!op.space_table){const auto facet=stream_facet(1);op.space_table=facet?ptr(facet+2*l.p+(x86_?4U:8U)):0;if(!op.space_table)op.space_table=s.ctype_masks14;}
+            if(!op.space_table){const auto facet=stream_facet(1);op.space_table=facet?ptr(facet+2*l.p+(x86_?4U:8U)):0;if(!op.space_table)op.space_table=m.ctype_masks14;}
             return (memory.load(GuestAddress{op.space_table+(c&255U)*2},16)&8U)!=0;
         }
         return (character_mask(static_cast<char16_t>(c))&8U)!=0;
@@ -2128,7 +2163,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
             if(l.modern){
                 const std::string character=l.element==1?"D":"_W";
                 const auto name="?flush@?$basic_ostream@"+character+"U?$char_traits@"+character+"@std@@@std@@"+(x86_?"QAEAAV":"QEAAAEAV")+"12@XZ";
-                return callback(resolve("msvcp140.dll",name).value,{tied},11);
+                return callback(resolve(modern_dll,name).value,{tied},11);
             }
             if(tied_buffer && !memory.load(GuestAddress{op.tie_ios+l.state},32))return callback(ptr(ptr(tied_buffer)+l.slot(13)*l.p),{tied_buffer},11);
         }
@@ -2347,7 +2382,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
     // 兩參數 getline 以 widen('\n') 為分隔字元：內建 ctype 即原字元，只有客體衍生 facet 需要虛擬回呼。
     if(returned==65)op.delimiter=value&((1U<<(l.element*8))-1U);
     else if(line && l.modern && !op.phase && op.service.symbol.ends_with("_J@Z")){
-        op.phase=1;const auto facet=stream_facet(l.element==1?1U:6U);const auto table=facet?ptr(facet):0;const auto& facet_tables=s.tables14[l.element==1?0:1];
+        op.phase=1;const auto facet=stream_facet(l.element==1?1U:6U);const auto table=facet?ptr(facet):0;const auto& facet_tables=m.tables14[l.element==1?0:1];
         if(facet && table!=facet_tables.ctype)return callback(ptr(table+(l.element==1?8U:12U)*l.p),{facet,'\n'},65);
     }
     if(number && !op.number_ready){
@@ -2363,7 +2398,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
         else if(returned==64)punctuation.true_name=read_string(l.element);
         else if(l.modern){
             // 內建 numpunct 直接讀欄位；只有客體衍生的 facet 才需要虛擬回呼。
-            const auto facet=stream_facet(l.element==1?5U:8U);const auto& facet_tables=s.tables14[l.element==1?0:1];const auto table=facet?ptr(facet):0;
+            const auto facet=stream_facet(l.element==1?5U:8U);const auto& facet_tables=m.tables14[l.element==1?0:1];const auto table=facet?ptr(facet):0;
             if(facet && table!=facet_tables.numpunct && table!=facet_tables.numpunct_byname){
                 op.numeric_punct=facet;op.scratch=allocate_heap(memory,64);if(!op.scratch){setstate(4);return finish(op.object);}
                 memory.fill(GuestAddress{op.scratch},0,64);return punct(3,60);

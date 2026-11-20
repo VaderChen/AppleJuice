@@ -688,7 +688,7 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
                 if(!routine.slot)continue;
                 const auto d3d12_list=routine.symbol.starts_with("D3D12List");
                 const auto d3d12_device=routine.symbol.starts_with("D3D12Device");
-                const auto family=(d3d12_list || d3d12_device)?"internal-d3d12":routine.symbol.starts_with("Gdi")?"gdi32.dll":"kernel32.dll";
+                const auto family=(d3d12_list || d3d12_device)?"internal-d3d12":routine.symbol.starts_with("Gdi")?"gdi32.dll":routine.symbol.starts_with("RtlRun")?"ntdll.dll":"kernel32.dll";
                 const auto found=std::find_if(table.begin(),table.end(),[&](const auto& d){
                     if(d.family!=family)return false;
                     if(d3d12_list)return d.symbol.starts_with("List.") && d.symbol.substr(5)==routine.symbol.substr(9);
@@ -929,6 +929,11 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     if(native_library_module(lower) && !native_libraries_.enabled(lower)){if(!required)return GuestAddress{};throw std::invalid_argument("原生函式庫代理未啟用："+lower+"!"+std::string(symbol));}
     if(const auto host=windows_api_set_host(lower);host!=lower)lower=host;
     if(const auto family=detail::builtin_provider_export_family(lower,symbol);family!=lower)lower=family;
+    if(x86_ && lower=="combase.dll" && symbol.ends_with("64") &&
+       (symbol.starts_with("WdtpInterfacePointer_User") || symbol.starts_with("HSTRING_User"))){
+        if(!required)return GuestAddress{};
+        throw std::invalid_argument("此 COM 封送入口僅供 Win64 使用");
+    }
     if(lower=="ntdll.dll" && symbol.starts_with("Zw")){const auto native=std::string("Nt")+std::string(symbol.substr(2));if(const auto target=resolve_service(lower,native,false);target.value)return target; }
     static const auto aliases=[] {
         std::map<std::pair<std::string_view,std::string_view>,const detail::ServiceExportAlias*> index;
@@ -941,11 +946,20 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         const auto& alias=*found->second;lower=alias.target_family;symbol=alias.target_symbol;
     }
     if (lower == "wsock32.dll") lower = "ws2_32.dll";
+    if(lower=="ntdll.dll" && (symbol=="RtlRunEncodeUnicodeString" || symbol=="RtlRunDecodeUnicodeString")){
+        const auto target=guest_thread_routine(symbol);
+        if(target.value)return target;
+    }
     if(lower=="ws2_32.dll" && (symbol=="htons" || symbol=="ntohs" || symbol=="htonl" || symbol=="ntohl")){
         static const bool enabled=[] {const auto* value=std::getenv("X64ARM_GUEST_WINSOCK_BYTEORDER");return !value || std::string_view(value)!="0";}();
         if(enabled){const auto target=guest_thread_routine(symbol.ends_with('s')?"WinsockSwap16":"WinsockSwap32");if(target.value)return target;}
     }
-    if(lower=="user32.dll" && (symbol=="GetDoubleClickTime" || symbol=="SetDoubleClickTime" || symbol=="GetCaretBlinkTime" || symbol=="SetCaretBlinkTime")){
+    const bool message_metadata=symbol=="GetMessageTime" || symbol=="GetMessagePos" || symbol=="GetMessageExtraInfo" || symbol=="SetMessageExtraInfo";
+    if(lower=="user32.dll" && message_metadata){
+        static const bool enabled=[] {const auto* v=std::getenv("X64ARM_GUEST_MESSAGE_METADATA");return !v || std::string_view(v)!="0";}();
+        if(enabled){const auto target=guest_thread_routine(symbol);if(target.value)return target;}
+    }
+    if(lower=="user32.dll" && (symbol=="SwapMouseButton" || symbol=="GetDoubleClickTime" || symbol=="SetDoubleClickTime" || symbol=="GetCaretBlinkTime" || symbol=="SetCaretBlinkTime")){
         static const bool timing_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_GUI_TIMING");return !value || std::string_view(value)!="0";}();
         if(timing_routines){const auto target=guest_thread_routine(symbol);if(target.value)return target;}
     }
@@ -992,7 +1006,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
                (srw_routines || symbol.find("SRWLock")==symbol.npos) && (critical_routines || symbol.find("CriticalSection")==symbol.npos) &&
                (fls_mirror_ || !symbol.starts_with("FlsGetValue")) &&
                (once_routines || !symbol.starts_with("InitOnce")) &&
-               symbol!="SHAnsiToAnsi" && symbol!="SHUnicodeToUnicode" && !symbol.starts_with("SHGlobalCounter") && symbol!="CreateAllAccessSecurityAttributes" && symbol!="GetDoubleClickTime" && symbol!="SetDoubleClickTime" && symbol!="GetCaretBlinkTime" && symbol!="SetCaretBlinkTime" && !symbol.starts_with("Gdi") &&
+               !message_metadata && symbol!="SwapMouseButton" && symbol!="GetKeyboardType" && symbol!="OleBuildVersion" && !symbol.starts_with("RtlRun") && symbol!="SHAnsiToAnsi" && symbol!="SHUnicodeToUnicode" && !symbol.starts_with("SHGlobalCounter") && symbol!="CreateAllAccessSecurityAttributes" && symbol!="GetDoubleClickTime" && symbol!="SetDoubleClickTime" && symbol!="GetCaretBlinkTime" && symbol!="SetCaretBlinkTime" && !symbol.starts_with("Gdi") &&
                (language_routines || symbol!="IsValidLanguageGroup"))
                 return GuestAddress{guest_thread_routines_.value+guest_thread_offset(found->second)};
         }
@@ -1014,7 +1028,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         if(entry.family=="d3dx9_43.dll" && entry.symbol==symbol){lower="d3dx9_43.dll";break;}
     const auto family = crt_library(lower) ? "crt" : lower;
     if(const auto data=builtin_constant_address(lower,symbol);data.value)return data;
-    if(lower=="msvcp100.dll" || lower=="msvcp140.dll")if(const auto data=msvcp100_data(symbol,lower=="msvcp140.dll");data.value)return data;
+    if(lower=="msvcp100.dll" || lower=="msvcp140.dll" || lower=="msvcp120.dll")if(const auto data=msvcp100_data(symbol,lower!="msvcp100.dll",lower=="msvcp120.dll");data.value)return data;
     if(lower=="gdi32.dll" && (symbol=="pfnRealizePalette" || symbol=="pfnSelectPalette") && gdi_palette_hooks_[0])return GuestAddress{gdi_palette_hooks_[symbol=="pfnSelectPalette"?1:0]};
     if(lower=="msvcrt.dll"){
         if(symbol=="__pioinfo")return GuestAddress{runtime_.lowio_table};
@@ -1096,6 +1110,14 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
                 return GuestAddress{image->first+entry->second};
         }
+        if(descriptor.family=="user32.dll" && descriptor.symbol=="GetKeyboardType"){
+            const auto entry=guest_thread_routine(descriptor.symbol);
+            if(entry.value)return entry;
+        }
+        if(descriptor.family=="ole32.dll" && (descriptor.symbol=="OleBuildVersion" || descriptor.symbol=="CoBuildVersion")){
+            const auto entry=guest_thread_routine("OleBuildVersion");
+            if(entry.value)return entry;
+        }
         if(descriptor.family=="vcomp140.dll"){
             const auto image=runtime_.builtin_images.find(callback_return_.value+vcomp_image_offset);
             if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
@@ -1119,14 +1141,27 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_GUEST_SHELL_COUNTER");return !setting || std::string_view(setting)!="0";}();
             if(enabled){const auto entry=guest_thread_routine(descriptor.symbol);if(entry.value)return entry;}
         }
-        if((descriptor.family=="internal-com-agile" || descriptor.family=="internal-shell-persist" || descriptor.family=="internal-shell-owner" || descriptor.family=="internal-shell-identity" || descriptor.family=="internal-shell-slashes" ||
-            descriptor.family=="internal-shell-dispatch" || descriptor.family=="internal-shell-fdsa" || descriptor.family=="internal-shell-map" || descriptor.family=="internal-shell-guid" ||
-            (descriptor.family=="shlwapi.dll" && (descriptor.symbol.starts_with("StrCmp") ||
+        if((descriptor.family=="internal-mapi-table" || descriptor.family=="internal-mapi-one" || descriptor.family=="internal-mapi-filetime" || descriptor.family=="internal-mapi-hex" || descriptor.family=="internal-mapi-property" || descriptor.family=="internal-mapi-reference" || descriptor.family=="internal-mapi-swap" || descriptor.family=="internal-mapi-nls" || descriptor.family=="internal-com-agile" || (descriptor.family=="internal-shell-persist" && descriptor.symbol=="IUnknown_GetClassID") || descriptor.family=="internal-shell-owner" || descriptor.family=="internal-shell-identity" || descriptor.family=="internal-shell-slashes" ||
+            descriptor.family=="internal-shell-dispatch" || descriptor.family=="internal-shell-fdsa" || descriptor.family=="internal-shell-map" || descriptor.family=="internal-shell-guid" || (descriptor.family=="ole32.dll" && descriptor.symbol=="CLSIDFromString") || descriptor.family=="internal-shell-extension" || descriptor.family=="internal-shell-field" || descriptor.family=="internal-shell-factory" || descriptor.family=="internal-shell-ole-string" ||
+            (descriptor.family=="user32.dll" && (descriptor.symbol.starts_with("CharNext") || descriptor.symbol.starts_with("CharPrev") ||
+                descriptor.symbol.starts_with("CharLower") || descriptor.symbol.starts_with("CharUpper") ||
+                descriptor.symbol.starts_with("CharToOem") || descriptor.symbol.starts_with("OemToChar"))) ||
+            (descriptor.family=="pathcch.dll" && (descriptor.symbol=="PathIsUNCEx" || descriptor.symbol.starts_with("PathCchAddBackslash") || descriptor.symbol.starts_with("PathCchRemoveBackslash") || descriptor.symbol=="PathCchRemoveFileSpec" || descriptor.symbol=="PathCchIsRoot" || descriptor.symbol=="PathCchSkipRoot" || descriptor.symbol=="PathCchStripToRoot")) ||
+            (descriptor.family=="shlwapi.dll" && descriptor.symbol=="_SHGetInstanceExplorer") ||
+            (descriptor.family=="shell32.dll" && (descriptor.symbol=="SHSetInstanceExplorer" || descriptor.symbol=="SHGetInstanceExplorer" || descriptor.symbol.starts_with("SheRemoveQuotes") || descriptor.symbol=="PathIsExe" ||
+                descriptor.symbol=="ILGetNext" || descriptor.symbol=="ILGetSize" || descriptor.symbol=="ILFindLastID")) ||
+            (descriptor.family=="shlwapi.dll" && (descriptor.symbol.ends_with("ExtensionA") || descriptor.symbol.ends_with("ExtensionW") || descriptor.symbol.starts_with("PathIsUNC") || descriptor.symbol.starts_with("PathIsRelative") ||
+                descriptor.symbol.starts_with("PathParseIconLocation") || descriptor.symbol.starts_with("PathRemoveBlanks") ||
+                descriptor.symbol.starts_with("PathCombine") || descriptor.symbol.starts_with("PathAppend") || descriptor.symbol.starts_with("PathRemoveFileSpec") || descriptor.symbol.starts_with("PathAddBackslash") || descriptor.symbol.starts_with("PathRemoveBackslash") || descriptor.symbol.starts_with("PathIsRoot") || descriptor.symbol.starts_with("PathStripToRoot") || descriptor.symbol.starts_with("PathSkipRoot") ||
+                descriptor.symbol.starts_with("PathBuildRoot") || descriptor.symbol.starts_with("PathGetDriveNumber") ||
+                descriptor.symbol.starts_with("PathFindFileName") || descriptor.symbol.starts_with("PathStripPath") ||
+                descriptor.symbol.starts_with("PathGetArgs") || descriptor.symbol.starts_with("PathRemoveArgs") ||
+                descriptor.symbol.starts_with("PathQuoteSpaces") || descriptor.symbol.starts_with("PathUnquoteSpaces") || descriptor.symbol.starts_with("StrCmp") ||
                 descriptor.symbol=="ConnectToConnectionPoint" || descriptor.symbol=="IUnknown_GetWindow" || descriptor.symbol=="IUnknown_Set" || descriptor.symbol=="IUnknown_AtomicRelease" ||
                 descriptor.symbol.starts_with("SHStripMneumonic") ||
                 descriptor.symbol.starts_with("PathIsValidChar") || descriptor.symbol.starts_with("PathGetCharType")))) && trace_services_.empty()){
             const auto image=runtime_.builtin_images.find(callback_return_.value+com_agile::image_offset);
-            if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
+            if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol=="_SHGetInstanceExplorer"?"SHGetInstanceExplorer":descriptor.symbol));entry!=image->second.export_names.end())
                 return GuestAddress{image->first+entry->second};
         }
         if(guest_crt_algorithms_.base && trace_services_.empty() && (descriptor.family=="crt" ||
@@ -1339,6 +1374,7 @@ std::string_view WindowsServices::name(GuestAddress address) const noexcept {
     const auto index = (address.value - stub_base_.value) / 16;
     return index < services.size() ? services[index].name : runtime_service_descriptors()[index - services.size()].symbol;
 }
+bool same_readonly_module_store(const std::shared_ptr<FileMappingState>&, const std::shared_ptr<FileMappingState>&) noexcept;
 bool WindowsServices::same_state(const WindowsServices& other) const {
     // 開啟中的更新／備份交易包含宿主檔案生命期，不視為可任意複製的 deterministic 狀態。
     if(!resource_updates_.empty() || !other.resource_updates_.empty() || !file_backups_.empty() || !other.file_backups_.empty() || !recent_document_calls_.empty() || !other.recent_document_calls_.empty())return false;
@@ -1395,7 +1431,7 @@ bool WindowsServices::same_state(const WindowsServices& other) const {
     if(power_monitor_ || other.power_monitor_)return false; // 原生電源來源不能宣告 deterministic 分支等價。
     if (!address_notifications_.empty() || !other.address_notifications_.empty())return false;
     if (!canceled_http_io_.empty() || !other.canceled_http_io_.empty())return false;
-    if (mappings_ || other.mappings_ || processes_ || other.processes_ || !opengl_.contexts.empty() || !other.opengl_.contexts.empty() || !rasters_.empty() || !other.rasters_.empty() || dmusic_ || other.dmusic_ || dsound_ || other.dsound_ || dinput_ || other.dinput_ || d3d9_ || other.d3d9_ || d3d11_ || other.d3d11_ || dwrite_ || other.dwrite_ || runtime_.host_clock || other.runtime_.host_clock) return false;
+    if (!same_readonly_module_store(mappings_, other.mappings_) || processes_ || other.processes_ || !opengl_.contexts.empty() || !other.opengl_.contexts.empty() || !rasters_.empty() || !other.rasters_.empty() || dmusic_ || other.dmusic_ || dsound_ || other.dsound_ || dinput_ || other.dinput_ || d3d9_ || other.d3d9_ || d3d11_ || other.d3d11_ || dwrite_ || other.dwrite_ || runtime_.host_clock || other.runtime_.host_clock) return false;
     if(opengl_.pixel_formats!=other.opengl_.pixel_formats || opengl_.swap_intervals!=other.opengl_.swap_intervals || opengl_.current!=other.opengl_.current || opengl_.next_context!=other.opengl_.next_context || opengl_.completed!=other.opengl_.completed)return false;
     if (unresolved_imports_ != other.unresolved_imports_) return false;
     if (threads_ != other.threads_) return false;
@@ -1477,8 +1513,9 @@ unsigned WindowsServices::runtime_compute_boundary(GuestAddress address) const n
         static const bool region_boundary=[] {const auto* value=std::getenv("X64ARM_GUI_REGION_BOUNDARY");return !value || std::string_view(value)!="0";}();
         constexpr std::array region_operations{"ValidateRect","ValidateRgn","ExcludeUpdateRgn"};
         constexpr std::array shell_text_operations{"PathFindNextComponentA","PathFindNextComponentW",
+            "PathMatchSpecA","PathMatchSpecW","PathMatchSpecExA","PathMatchSpecExW",
             "StrCmpA","StrCmpW","StrCmpIA","StrCmpIW","StrCmpNA","StrCmpNW","StrCmpNIA","StrCmpNIW",
-            "StrStrA","StrStrW","StrStrIA","StrStrIW","StrStrNW","StrStrNIW"};
+            "StrStrA","StrStrW","StrStrIA","StrStrIW","StrStrNW","StrStrNIW","StrRStrA","StrRStrW","StrRStrIA","StrRStrIW"};
         constexpr std::array image_codec_queries{"GdipGetImageEncodersSize","GdipGetImageEncoders","GdipGetImageDecodersSize","GdipGetImageDecoders",
             "GdipGetEncoderParameterListSize","GdipGetEncoderParameterList"};
         constexpr std::array automation_date_operations{"VarUdateFromDate","VarDateFromUdate","VarDateFromUdateEx",
@@ -1502,7 +1539,7 @@ unsigned WindowsServices::runtime_compute_boundary(GuestAddress address) const n
             else if(resident_compute && std::find(pointer_operations.begin(),pointer_operations.end(),descriptor.symbol)!=pointer_operations.end())result[index]=14;
             // HID parser 僅處理客體預解析資料與報告緩衝區；裝置 IO 的 HidD_* 保留宿主服務。i8042 轉換會呼叫客體插入回呼，走完整入口。
             else if(resident_compute && ((descriptor.family=="msvcp90.dll" && !msvcp90_stream::family(descriptor.symbol) && !descriptor.symbol.starts_with("?_Fiopen@")) || (descriptor.family=="hid.dll" && descriptor.symbol.starts_with("HidP_") && descriptor.symbol!="HidP_TranslateUsagesToI8042ScanCodes") ||
-                    (descriptor.family=="shlwapi.dll" && std::find(shell_text_operations.begin(),shell_text_operations.end(),descriptor.symbol)!=shell_text_operations.end()) ||
+                    ((descriptor.family=="shlwapi.dll" || descriptor.family=="shell32.dll") && std::find(shell_text_operations.begin(),shell_text_operations.end(),descriptor.symbol)!=shell_text_operations.end()) ||
                     (descriptor.family=="gdiplus.dll" && std::find(image_codec_queries.begin(),image_codec_queries.end(),descriptor.symbol)!=image_codec_queries.end())))result[index]=15;
             else if(scalar_math_operation(descriptor))result[index]=3;
             else if(descriptor.family=="kernel32.dll" &&
@@ -3103,8 +3140,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
     }
     if(state.rip.value==callback_return_.value+0xe0)return finish_system_call(state,memory);
     if(!stock_gui_class(state.rip.value).empty())return invoke_stock_gui(state,memory);
-    if (state.rip.value >= unresolved_base_.value && state.rip.value - unresolved_base_.value < unresolved_imports_.size() * 16)
+    if (state.rip.value >= unresolved_base_.value && state.rip.value - unresolved_base_.value < unresolved_imports_.size() * 16){
+        // 診斷：X64ARM_TRAP_DUMP_DIR=<目錄>：停在未實作匯入時，把主映像目前的記憶體（含執行期才解開的程式碼）逐頁寫成
+        // image-<基底>.bin，讀不到的頁補零；用來離線反組譯加殼程式內嵌的標準函式庫存取，核對物件版面。只讀取。
+        if(const auto* directory=std::getenv("X64ARM_TRAP_DUMP_DIR");directory && *directory && runtime_.image.base && runtime_.image.size){
+            char file[64];std::snprintf(file,sizeof file,"image-%llx.bin",static_cast<unsigned long long>(runtime_.image.base));
+            if(auto* out=std::fopen((std::string(directory)+"/"+file).c_str(),"wb")){
+                std::vector<std::uint8_t> page(GuestMemory::guest_page_size);
+                for(std::uint64_t at=0;at<runtime_.image.size;at+=page.size()){
+                    const auto bytes=std::min<std::uint64_t>(page.size(),runtime_.image.size-at);
+                    try{memory.read(GuestAddress{runtime_.image.base+at},std::span(page.data(),static_cast<std::size_t>(bytes)));}
+                    catch(...){std::fill(page.begin(),page.end(),0);}
+                    std::fwrite(page.data(),1,static_cast<std::size_t>(bytes),out);
+                }
+                std::fclose(out);
+            }
+        }
         throw HostCallFault("呼叫尚未實作的 PE import：" + std::string(name(state.rip)));
+    }
     if(state.rip.value==callback_return_.value+0x60 || state.rip.value==callback_return_.value+0x70){
         const bool dispatch=state.rip.value==callback_return_.value+0x70;
         const auto raw_target=state.reg(dispatch?Gpr::Rax:Gpr::Rcx);const auto target=x86_?static_cast<std::uint32_t>(raw_target):raw_target;

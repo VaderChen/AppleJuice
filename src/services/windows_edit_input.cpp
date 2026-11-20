@@ -115,7 +115,7 @@ std::optional<std::uint64_t> WindowsServices::gui_edit_input(GuestMemory& memory
     if(code==0x303){replace({},true);return 0;}
     if(code==0xc){start=end=0;window.edit_undo.reset();window.edit_modified=false;return std::nullopt;}
     if(code==0x100){
-        const auto key=static_cast<unsigned>(message.wparam);const bool shift=gui_.keyboard[16]&0x80U;
+        const auto key=static_cast<unsigned>(message.wparam);const bool shift=threads_.input_queue(threads_.current).keys[16]&0x80U;
         if(key==0x2e){if(start==end)end=following(end);replace({},true);return 0;}
         if(key==0x25 || key==0x27 || key==0x24 || key==0x23){unsigned at=end;
             if(key==0x24)at=0;else if(key==0x23)at=length;else if(start!=end && !shift)at=key==0x25?std::min(start,end):std::max(start,end);else at=key==0x25?previous(end):following(end);

@@ -160,6 +160,7 @@ std::span<const WindowsServiceDescriptor> environment_service_descriptors() {
         {"advapi32.dll","UnregisterTraceGuids",1,1},
         {"advapi32.dll","GetTraceEnableFlags",1,1},{"advapi32.dll","GetTraceEnableLevel",1,1},
         {"advapi32.dll","GetTraceLoggerHandle",1},{"advapi32.dll","TraceEvent",2,1},{"advapi32.dll","TraceMessage",4,1,0,0,true},{"advapi32.dll","TraceMessageVa",5,1},
+        {"shell32.dll","DoEnvironmentSubstA",2,0,0,0x2},{"shell32.dll","DoEnvironmentSubstW",2,0,0,0x2},
         {"kernel32.dll","ExpandEnvironmentStringsA",3},{"kernel32.dll","ExpandEnvironmentStringsW",3}
     };return table;
 }
@@ -988,8 +989,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
         else {memory.write(GuestAddress{result},bytes);runtime_.environment_blocks.emplace(result,wide);}
     } else if (symbol.starts_with("FreeEnvironmentStrings")) {
         const auto found=runtime_.environment_blocks.find(arg(0));
-        if (found==runtime_.environment_blocks.end() || found->second!=wide) last_error_=87;
-        else {free_heap(memory,arg(0),state);runtime_.environment_blocks.erase(found);result=1;}
+        // A／W 的環境快照由同一個程序堆積配置，釋放只需驗證區塊所屬。
+        if (found==runtime_.environment_blocks.end() || !free_heap(memory,arg(0),state)) last_error_=87;
+        else {runtime_.environment_blocks.erase(found);result=1;}
+    } else if (symbol.starts_with("DoEnvironmentSubst")) {
+        const auto capacity=static_cast<std::uint32_t>(arg(1));
+        result=capacity&0xffffU;
+        if(arg(0) && capacity && (!wide || capacity<0x7fffffffU)){
+            try{
+                const auto bytes=encode(expand_guest_environment(text(0),runtime_.environment));
+                const auto used=bytes.size()/(wide?2U:1U);
+                // 低位字包括 NUL。參考實作的 W 版允許剛好填滿，A 版要求再有一個位元組空間。
+                if(wide?used<=capacity:used<capacity){
+                    memory.write(GuestAddress{arg(0)},bytes);
+                    result=0x10000U|(used&0xffffU);
+                }
+            }catch(const std::bad_alloc&){last_error_=8;}
+             catch(const std::length_error&){last_error_=206;}
+             catch(const std::invalid_argument&){last_error_=87;}
+             catch(const MemoryFault&){last_error_=998;}
+        }
     } else if (symbol.starts_with("ExpandEnvironmentStrings")) {
         std::u16string expanded;
         try{expanded=expand_guest_environment(text(0),runtime_.environment);}

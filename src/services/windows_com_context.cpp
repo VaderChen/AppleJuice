@@ -14,6 +14,7 @@
 
 namespace x64arm {
 namespace {
+constexpr std::uint64_t neutral_context_owner=UINT64_MAX-1; // 程序內 NA 的 context key，與 MTA 的 0 及 STA 執行緒識別分開。
 constexpr std::uint32_t context_invalid=0x80070057U,context_pointer_error=0x80004003U,context_no_memory=0x8007000eU;
 constexpr std::uint32_t context_no_interface=0x80004002U,context_failed=0x80004005U,context_unexpected=0x8000ffffU;
 WindowsGuid context_iid(std::uint32_t value){
@@ -37,7 +38,7 @@ std::uint32_t context_status(com_context::Status status){
     }
 }
 }
-// CoImpersonateClient／CoRevertToSelf：向目前呼叫內容查詢 IServerSecurity，呼叫 ImpersonateClient（4）或 RevertToSelf（5）後釋放。
+// 透過目前呼叫內容的 IServerSecurity 查詢驗證資訊、模擬客戶端或還原身分。
 std::optional<std::uint32_t> WindowsServices::invoke_com_call_security(GuestState& entry_state,GuestMemory& entry_memory,const WindowsServiceDescriptor& service){
     return service_callback::invoke<std::optional<std::uint32_t>>(
         this,threads_.current,entry_state,entry_memory,"CoCallSecurity",
@@ -48,6 +49,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_call_security(GuestStat
             const WindowsCall call(state,memory,service);const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
             const auto done=[&](std::uint32_t value){call.return_to(state,value);return std::optional<std::uint32_t>{};};
             const auto context=threads_.items.at(threads_.current).com_call_context;
+            if(!context)co_return done(0x80010117U); // RPC_E_CALL_COMPLETE
+            std::vector<std::uint64_t> args{0};
+            for(unsigned i=0;i<service.arguments;++i)args.push_back(call(i));
             const auto scratch=allocate_heap(memory,unit+16);if(!scratch)co_return done(context_no_memory);
             struct ReleaseScratch {WindowsServices& self;GuestState& state;GuestMemory& memory;std::uint64_t address;
                 ~ReleaseScratch(){(void)self.free_heap(memory,address,state);}} release_scratch{*this,state,memory,scratch};
@@ -55,17 +59,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_call_security(GuestStat
             const auto queried=static_cast<std::uint32_t>(co_await service_callback::call(context_method(memory,context,0),{context,scratch+unit,scratch}));
             const auto security=memory.load(GuestAddress{scratch},bits);
             if((queried&0x80000000U) || !security)co_return done(queried&0x80000000U?queried:context_no_interface);
-            const auto result=static_cast<std::uint32_t>(co_await service_callback::call(context_method(memory,security,service.symbol=="CoImpersonateClient"?4:5),{security}));
+            args[0]=security;
+            const unsigned slot=service.symbol=="CoQueryClientBlanket"?3:service.symbol=="CoImpersonateClient"?4:5;
+            const auto result=static_cast<std::uint32_t>(co_await service_callback::call(context_method(memory,security,slot),std::move(args)));
             (void)co_await service_callback::call(context_method(memory,security,2),{security});
             co_return done(result);
         });
 }
 std::span<const WindowsServiceDescriptor> com_context_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"ole32.dll","CoGetDefaultContext",3,0,0,1},{"combase.dll","CoGetDefaultContext",3,0,0,1},
         {"ole32.dll","CoGetContextToken",1},{"combase.dll","CoGetContextToken",1},{"ole32.dll","CoGetObjectContext",2},{"combase.dll","CoGetObjectContext",2},
         {"ole32.dll","CoGetApartmentType",2},{"combase.dll","CoGetApartmentType",2},
         {"ole32.dll","CoGetCallContext",2},{"combase.dll","CoGetCallContext",2},{"ole32.dll","CoSwitchCallContext",2},{"combase.dll","CoSwitchCallContext",2},
+        {"combase.dll","CoGetSystemSecurityPermissions",2,0,0,1},
+        {"ole32.dll","CoQueryClientBlanket",7},{"combase.dll","CoQueryClientBlanket",7},
         {"ole32.dll","CoImpersonateClient",0},{"combase.dll","CoImpersonateClient",0},{"ole32.dll","CoRevertToSelf",0},{"combase.dll","CoRevertToSelf",0},
+        {"ole32.dll","CoSetCancelObject",1},{"combase.dll","CoSetCancelObject",1},
+        {"ole32.dll","CoGetCancelObject",3},{"combase.dll","CoGetCancelObject",3},
+        {"ole32.dll","CoTestCancel",0},{"combase.dll","CoTestCancel",0},
         {"ole32.dll","CoCancelCall",2},{"combase.dll","CoCancelCall",2},
         {"ole32.dll","CoEnableCallCancellation",1},{"combase.dll","CoEnableCallCancellation",1},{"ole32.dll","CoDisableCallCancellation",1},{"combase.dll","CoDisableCallCancellation",1},
         {"ole32.dll","CoIncrementMTAUsage",1},{"combase.dll","CoIncrementMTAUsage",1},{"ole32.dll","CoDecrementMTAUsage",1},{"combase.dll","CoDecrementMTAUsage",1},
@@ -107,20 +119,41 @@ std::vector<GuestCallback> WindowsServices::release_com_context(GuestState& stat
     return callbacks?release_context_properties(memory,result.disposal->properties):std::vector<GuestCallback>{};
 }
 std::vector<GuestCallback> WindowsServices::retire_com_context(GuestState& state,GuestMemory& memory,std::uint64_t thread,bool callbacks){
-    const auto initialized=gui_.com_initializations.find(thread);if(initialized==gui_.com_initializations.end())return {};
-    const auto owner=(initialized->second&2U)?thread:0;
-    if(!owner && mta_alive(thread))return {};
+    // UINT64_MAX 表示最後一個 MTA usage cookie 被歸還，沒有離開的執行緒。
+    const bool cookie=thread==UINT64_MAX;
     std::vector<GuestCallback> pending;
-    const auto token=runtime_.com_contexts.contexts.current(owner);
-    // 延遲封送的原始引用不能帶出已結束的公寓；agile 來源本身不受此限制。
-    if(token)for(auto& [address,reference]:runtime_.com_agile.objects){
-        (void)address;if(reference.context!=*token || reference.agile || !reference.source)continue;
-        if(callbacks)pending.push_back({context_method(memory,reference.source,2),{reference.source}});
-        reference.source=0;
+    if(!cookie){
+        auto stack=runtime_.com_contexts.cancel_stacks.extract(thread);
+        if(callbacks && stack)for(auto it=stack.mapped().rbegin();it!=stack.mapped().rend();++it){
+            const com_context::Property held{{},0,*it};
+            auto releases=release_context_properties(memory,std::span{&held,1});
+            pending.insert(pending.end(),releases.begin(),releases.end());
+        }
+        if(auto found=threads_.items.find(thread);found!=threads_.items.end())found->second.com_cancel_enabled=0;
     }
-    auto result=runtime_.com_contexts.contexts.retire(owner);if(!result.disposal)return pending;
-    (void)free_heap(memory,result.disposal->token,state);
-    if(callbacks){auto properties=release_context_properties(memory,result.disposal->properties);pending.insert(pending.end(),properties.begin(),properties.end());}
+    const auto initialized=gui_.com_initializations.find(thread);
+    if(!cookie && initialized==gui_.com_initializations.end())return pending;
+    const auto owner=(!cookie && (initialized->second&2U))?thread:0;
+    if(!owner && mta_alive(thread))return pending;
+    const auto retire=[&](std::uint64_t key){
+        const auto token=runtime_.com_contexts.contexts.current(key);
+        if(token)for(auto& [address,reference]:runtime_.com_agile.objects){
+            (void)address;if(reference.context!=*token || reference.agile || !reference.source)continue;
+            if(callbacks)pending.push_back({context_method(memory,reference.source,2),{reference.source}});
+            reference.source=0;
+        }
+        auto result=runtime_.com_contexts.contexts.retire(key);
+        if(result.disposal){
+            (void)free_heap(memory,result.disposal->token,state);
+            if(callbacks){auto releases=release_context_properties(memory,result.disposal->properties);pending.insert(pending.end(),releases.begin(),releases.end());}
+        }
+    };
+    retire(owner);
+    if(runtime_.com_mta_usage_cookies.empty() && std::none_of(gui_.com_initializations.begin(),gui_.com_initializations.end(),
+        [&](const auto& row){return row.first!=thread && row.second>=16;})){
+        if(owner)retire(0);
+        retire(neutral_context_owner);
+    }
     return pending;
 }
 std::vector<GuestCallback> WindowsServices::release_context_enumerator(GuestState& state,GuestMemory& memory,std::uint64_t object){
@@ -236,12 +269,35 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_context(GuestState& sta
         const auto id=begin_context_operation(std::move(operation));return resume_com_context(state,memory,id);
     };
     constexpr std::uint32_t call_complete=0x80010117U,cancel_disabled=0x80010140U,not_initialized=0x800401f0U;
-    if(name=="CoImpersonateClient" || name=="CoRevertToSelf"){
-        // 只有在呼叫內容中才有客戶端可模擬；伺服器端呼叫內容由 CoSwitchCallContext 設定。
-        if(!threads_.items.at(threads_.current).com_call_context)return done(call_complete);
+    if(name=="CoQueryClientBlanket" || name=="CoImpersonateClient" || name=="CoRevertToSelf")
         return invoke_com_call_security(state,memory,service);
-    }
+#include "windows_com_cancel.inc"
     try{
+        if(name=="CoGetSystemSecurityPermissions"){
+            const auto selector=static_cast<std::uint32_t>(arg(0));
+            const auto out=arg(1);
+            if(!out)return done(context_invalid);
+            memory.store(GuestAddress{out},bits,0);
+            // COMSD 依序為預設啟動、存取、啟動限制、存取限制。EXECUTE=1，
+            // 本機／遠端執行為 2／4，本機／遠端啟用為 8／16。
+            static const std::array defaults{
+                sddl_descriptor("O:BAG:BAD:(A;;0x1f;;;BA)(A;;0xb;;;SY)(A;;0xb;;;IU)"),
+                sddl_descriptor("O:BAG:BAD:(A;;0x7;;;PS)(A;;0x3;;;SY)(A;;0x7;;;BA)"),
+                sddl_descriptor("O:BAG:BAD:(A;;0x1f;;;BA)(A;;0xb;;;WD)"),
+                sddl_descriptor("O:BAG:BAD:(A;;0x7;;;WD)(A;;0x3;;;AN)")
+            };
+            if(selector>=defaults.size())return done(context_invalid);
+            const auto& bytes=defaults[selector];
+            const auto block=nested_service(state,memory,"kernel32.dll","LocalAlloc",{0,bytes.size()});
+            if(!block)return done(context_no_memory);
+            try{
+                memory.write(GuestAddress{block},bytes);
+                memory.store(GuestAddress{out},bits,block);
+            }catch(...){
+                (void)nested_service(state,memory,"kernel32.dll","LocalFree",{block});throw;
+            }
+            return done(0);
+        }
         if(name=="CoGetCallContext" || name=="CoSwitchCallContext"){
             auto& thread=threads_.items.at(threads_.current);
             if(name=="CoSwitchCallContext"){
@@ -260,15 +316,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_context(GuestState& sta
             if(name=="CoEnableCallCancellation"){if(count==UINT32_MAX)return done(context_no_memory);++count;return done(0);}
             if(!count)return done(cancel_disabled);--count;return done(0);
         }
-        if(name=="CoCancelCall"){
-            // 目標執行緒（0＝目前執行緒）必須先啟用取消。程序內 COM 呼叫都在呼叫者執行緒上同步完成，
-            // 啟用取消的執行緒沒有可中止的待命呼叫時回 RPC_E_CALL_COMPLETE。
-            const auto wanted=static_cast<std::uint32_t>(arg(0));std::optional<std::uint64_t> target;
-            if(!wanted)target=threads_.current;
-            else for(const auto& [index,item]:threads_.items)if(item.status!=ThreadStatus::Exited && thread_identifier(index)==wanted){target=index;break;}
-            if(!target)return done(context_invalid);
-            return done(threads_.items.at(*target).com_cancel_enabled?call_complete:cancel_disabled);
-        }
         if(name=="CoIncrementMTAUsage"){
             if(!arg(0))return done(context_invalid);pointer(arg(0),unit);memory.store(GuestAddress{arg(0)},bits,0);
             if(runtime_.com_mta_usage_cookies.size()>=65536)return done(context_no_memory);
@@ -279,7 +326,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_context(GuestState& sta
             if(!runtime_.com_mta_usage_cookies.erase(arg(0)))return done(context_invalid);
             // 最後一份使用計數離開且沒有 MTA 執行緒時，MTA 結束：與最後一個 MTA 執行緒 CoUninitialize 相同地通知 apartment 關閉。
             if(mta_alive())return done(0);
-            return with_callbacks(retire_apartment_shutdowns(memory,UINT64_MAX,std::uint64_t{0}),0);
+            auto callbacks=retire_apartment_shutdowns(memory,UINT64_MAX,std::uint64_t{0});
+            auto context=retire_com_context(state,memory,UINT64_MAX);
+            callbacks.insert(callbacks.end(),context.begin(),context.end());
+            return with_callbacks(std::move(callbacks),0);
         }
         if(name=="CoGetApartmentType"){
             if(!arg(0) || !arg(1))return done(context_invalid);
@@ -296,10 +346,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_context(GuestState& sta
         }
         // CoGetContextToken 與 CoGetObjectContext 共用：取得（必要時建立）目前 apartment 的預設 context 物件。
         std::uint32_t failure=0;
-        const auto current_context=[&]()->std::optional<std::uint64_t>{
+        const auto default_context=[&](std::uint32_t type)->std::optional<std::uint64_t>{
             auto apartment=com_apartment(threads_.current);
             if(!apartment && mta_alive())apartment=0;
             if(!apartment){failure=0x800401f0U;return std::nullopt;}
+            switch(type){
+            case UINT32_MAX:break; // APTTYPE_CURRENT
+            case 1:apartment=0;break;
+            case 2:apartment=neutral_context_owner;break;
+            case 3:
+                if(!gui_.com_main_sta){failure=not_initialized;return std::nullopt;}
+                apartment=gui_.com_main_sta;break;
+            default:failure=context_invalid;return std::nullopt;
+            }
             auto token=bridge.contexts.current(*apartment);
             if(!token){
                 if(!bridge.table){
@@ -316,17 +375,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_context(GuestState& sta
             return token;
         };
         if(name=="CoGetContextToken"){
-            pointer(arg(0),unit);const auto token=current_context();if(!token)return done(failure);
+            pointer(arg(0),unit);const auto token=default_context(UINT32_MAX);if(!token)return done(failure);
             memory.store(GuestAddress{arg(0)},bits,*token);return done(0); // 借用，沒有 AddRef。
         }
-        if(name=="CoGetObjectContext"){
-            // 依 QueryInterface 規則回傳新增參照：IUnknown、IContext、IObjContext。
-            pointer(arg(1),unit);memory.store(GuestAddress{arg(1)},bits,0);if(!arg(0))return done(context_invalid);
-            WindowsGuid iid{};memory.read(GuestAddress{arg(0)},iid);
-            const auto token=current_context();if(!token)return done(failure);
+        if(name=="CoGetObjectContext" || name=="CoGetDefaultContext"){
+            const bool selected=name=="CoGetDefaultContext";
+            const auto iid_at=arg(selected?1:0),out=arg(selected?2:1);
+            if(selected && !out)return done(context_invalid);
+            pointer(out,unit);
+            WindowsGuid iid{};
+            if(iid_at)memory.read(GuestAddress{iid_at},iid);
+            memory.store(GuestAddress{out},bits,0);
+            if(!iid_at)return done(context_invalid);
+            const auto token=default_context(selected?static_cast<std::uint32_t>(arg(0)):UINT32_MAX);
+            if(!token)return done(failure);
             if(iid!=context_iid(0) && iid!=context_iid(0x1c0) && iid!=context_iid(0x1c6))return done(context_no_interface);
             if(bridge.contexts.add_ref(*token).status!=com_context::Status::Ok)return done(context_no_memory);
-            memory.store(GuestAddress{arg(1)},bits,*token);return done(0);
+            memory.store(GuestAddress{out},bits,*token);return done(0);
         }
         const auto object=arg(0);const bool enumerator=service.family=="internal-com-context-enum";
         if(enumerator?!bridge.enumerators.contains(object):!bridge.contexts.find(object))return done(context_invalid);

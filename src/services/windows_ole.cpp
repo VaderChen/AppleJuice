@@ -34,7 +34,7 @@ std::span<const WindowsServiceDescriptor> ole_service_descriptors(){
         {"oleaut32.dll","VarAdd",3},{"oleaut32.dll","VarSub",3},{"oleaut32.dll","VarMul",3},{"oleaut32.dll","VarDiv",3},
         {"oleaut32.dll","VarIdiv",3},{"oleaut32.dll","VarMod",3},{"oleaut32.dll","VarNeg",2},{"oleaut32.dll","VarNot",2},
         {"oleaut32.dll","VarAnd",3},{"oleaut32.dll","VarOr",3},{"oleaut32.dll","VarXor",3},
-        {"ole32.dll","CoInitializeSecurity",9},{"ole32.dll","OleInitialize",1},{"ole32.dll","OleUninitialize",0},{"ole32.dll","ReleaseStgMedium",1},
+        {"ole32.dll","CoQueryAuthenticationServices",2},{"ole32.dll","CoInitializeSecurity",9},{"ole32.dll","OleInitialize",1},{"ole32.dll","OleUninitialize",0},{"ole32.dll","ReleaseStgMedium",1},
         {"ole32.dll","OleRun",1},{"ole32.dll","OleIsRunning",1},{"ole32.dll","OleLockRunning",3},{"ole32.dll","OleSetContainedObject",2},
         {"ole32.dll","OleSetClipboard",1},{"ole32.dll","OleGetClipboard",1},{"ole32.dll","OleFlushClipboard",0},{"ole32.dll","OleIsCurrentClipboard",1},
         {"internal-ole-clipboard","Render",1},{"internal-ole-clipboard","Empty",0},{"internal-ole-clipboard","WindowProc",4},
@@ -246,15 +246,65 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole(GuestState& state,Guest
         return done(name=="UuidCompare"?static_cast<std::uint32_t>(comparison):comparison==0);
     }
     // OLE 與 CoInitialize 共用執行緒 apartment 與成功呼叫的 reference count。
-    if(name=="CoInitializeSecurity"){
-        // 只提供程序本地 COM policy；遠端 activation 仍未開放，不宣稱具備 DCOM provider。
-        const auto count=static_cast<std::uint32_t>(arg(1)),authentication=static_cast<std::uint32_t>(arg(4)),impersonation=static_cast<std::uint32_t>(arg(5)),capabilities=static_cast<std::uint32_t>(arg(7));
-        std::uint32_t status=0;
-        if(runtime_.com_security)status=0x80010119U; // RPC_E_TOO_LATE
-        else if(arg(3) || arg(8) || authentication>6 || impersonation>4)status=0x80070057U;
-        else if(arg(0) || arg(2) || arg(6) || (count!=0 && count!=UINT32_MAX) || (capabilities&~0x3000U))status=0x80004001U;
-        else runtime_.com_security=std::array{authentication,impersonation,capabilities};
-        arg.return_to(state,status);return std::nullopt;
+    if(name=="CoInitializeSecurity" || name=="CoQueryAuthenticationServices"){
+        const unsigned stride=x86_?16:24;
+        try{
+            if(name=="CoQueryAuthenticationServices"){
+                if(!arg(0) || !arg(1))return done(e_invalidarg);
+                memory.check(GuestAddress{arg(0)},4,Access::Write);
+                memory.store(GuestAddress{arg(1)},bits,0);
+                memory.store(GuestAddress{arg(0)},32,0);
+                const auto& entries=runtime_.com_auth_services;
+                if(entries.empty())return done(0);
+                std::vector<std::uint8_t> packed(entries.size()*stride,0);
+                std::vector<std::size_t> offsets;
+                for(const auto& e:entries){
+                    offsets.push_back(e.principal?packed.size():0);
+                    if(e.principal){const auto text=utf16_bytes(*e.principal);packed.insert(packed.end(),text.begin(),text.end());}
+                }
+                const auto output=nested_service(state,memory,"ole32.dll","CoTaskMemAlloc",{packed.size()});
+                if(!output)return done(0x8007000eU);
+                memory.write(GuestAddress{output},packed);
+                for(std::size_t i=0;i<entries.size();++i){
+                    const auto at=output+i*stride;
+                    memory.store(GuestAddress{at},32,entries[i].authentication);
+                    memory.store(GuestAddress{at+4},32,entries[i].authorization);
+                    if(offsets[i])memory.store(GuestAddress{at+8},bits,output+offsets[i]);
+                }
+                memory.store(GuestAddress{arg(1)},bits,output);
+                memory.store(GuestAddress{arg(0)},32,entries.size());
+                return done(0);
+            }
+            if(runtime_.com_security)return done(0x80010119U);
+            const auto count=static_cast<std::int32_t>(arg(1));
+            const auto auth=static_cast<std::uint32_t>(arg(4)),imp=static_cast<std::uint32_t>(arg(5)),caps=static_cast<std::uint32_t>(arg(7));
+            if(arg(3) || arg(8) || auth>6 || imp>4 || count < -1 || ((count>0)!=bool(arg(2))))return done(e_invalidarg);
+            if(arg(0) || arg(6) || (caps&~0x3000U))return done(0x80004001U);
+            std::vector<ComAuthenticationService> entries;
+            if(count==-1)entries.push_back({ComAuthenticationService::local_default,0,std::nullopt});
+            if(count>0){
+                memory.check(GuestAddress{arg(2)},std::uint64_t(count)*stride,Access::Read);
+                for(std::int32_t i=0;i<count;++i){
+                    const auto at=arg(2)+std::uint64_t(i)*stride;
+                    ComAuthenticationService entry;
+                    entry.authentication=static_cast<std::uint32_t>(memory.load(GuestAddress{at},32));
+                    entry.authorization=static_cast<std::uint32_t>(memory.load(GuestAddress{at+4},32));
+                    const auto principal=memory.load(GuestAddress{at+8},bits);
+                    std::uint32_t hr=0;
+                    if(!ComAuthenticationService::supports(entry.authentication))hr=0x800706d3U;
+                    else if(entry.authorization)hr=0x800706d6U;
+                    else{
+                        if(principal)entry.principal=read_utf16(memory,GuestAddress{principal});
+                        entries.push_back(std::move(entry));
+                    }
+                    memory.store(GuestAddress{at+8+width},32,hr);
+                }
+                if(entries.empty())return done(0x8001011aU);
+            }
+            runtime_.com_auth_services=std::move(entries);
+            runtime_.com_security=std::array{auth,imp,caps};
+            return done(0);
+        }catch(const MemoryFault&){return done(e_invalidarg);}catch(const std::bad_alloc&){return done(0x8007000eU);}
     }
     if(name=="OleInitialize"){
         const auto result=invoke_gui_support(state,memory,{"ole32.dll","CoInitialize",1});

@@ -167,14 +167,16 @@ std::shared_ptr<RasterSurface> WindowsServices::raster_surface(GuestMemory& memo
     import_dib_bitmap(memory,dc->second.bitmap);
     const auto window=hdc>=0x10000000?gui_.windows.find(hdc-0x10000000):gui_.windows.end();
     // 離屏點陣圖不依賴視窗系統，使用相同的 DIB 上傳、繪製及批次發布流程。
-    if(!native_gui_ && (window!=gui_.windows.end() || !gui_.bitmaps.contains(dc->second.bitmap))){
+    if(!native_gui_ && window==gui_.windows.end() && !gui_.bitmaps.contains(dc->second.bitmap)){
         const auto key=dc->second.bitmap?dc->second.bitmap:hdc;
         const auto found=rasters_.find(key);
         if(found!=rasters_.end() && writing)mark_gdi_surface(memory,key);
         return found==rasters_.end()?std::shared_ptr<RasterSurface>{}:found->second;
     }
     std::uint64_t key=hdc,resource=0;std::uint32_t width=0,height=0;std::span<const std::uint32_t> pixels;void* view=nullptr;
-    if(window!=gui_.windows.end()){width=window->second.width;height=window->second.height;view=native_gui_->graphics_view(window->first);}
+    if(window!=gui_.windows.end()){width=window->second.width;height=window->second.height;
+        if(native_gui_)view=native_gui_->graphics_view(window->first);
+        else if(window->second.layered_stride==width && window->second.layered_pixels.size()==std::uint64_t{width}*height)pixels=window->second.layered_pixels;}
     else {const auto bitmap=gui_.bitmaps.find(dc->second.bitmap);if(bitmap==gui_.bitmaps.end())return {};key=dc->second.bitmap;width=bitmap->second.width;height=bitmap->second.height;pixels=bitmap->second.pixels;resource=bitmap->second.resource_id;}
     if(!width || !height)return {};
     const auto found=rasters_.find(key);
@@ -192,7 +194,10 @@ std::shared_ptr<RasterSurface> WindowsServices::raster_surface(GuestMemory& memo
         surface=cached->second;shared=true;
     }
     const bool created=!surface || surface->width()!=width || surface->height()!=height;
-    if(created){surface=make_hardware_raster(width,height,pixels,view);if(!surface)return {};if(window!=gui_.windows.end())native_gui_->graphics_surface(window->first,surface);}
+    if(created){surface=make_hardware_raster(width,height,pixels,view);if(!surface)return {};if(window!=gui_.windows.end()){
+            if(native_gui_)native_gui_->graphics_surface(window->first,surface);
+            else if(pixels.empty())for(const auto& draw:window->second.drawing)surface->draw(draw);
+        }}
     if(writing && shared){
         auto independent=make_hardware_raster(width,height);GuiDc copy_dc;const std::array<std::int32_t,4> rect{0,0,static_cast<std::int32_t>(width),static_cast<std::int32_t>(height)};independent->blit(*surface,rect,rect,copy_dc,UINT32_MAX);surface=std::move(independent);shared=false;
     }
@@ -529,10 +534,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
                 }else {
                     GuiDraw style;style.kind=GuiDraw::Kind::Fill;
                     if(symbol=="FillRect" || symbol=="FrameRect"){
-                        const auto brush=arg(2);const bool system=symbol=="FillRect" && brush>=1 && brush<=31;
+                        auto brush=arg(2);
+                        if(symbol=="FillRect" && brush>=1 && brush<=gui_system_color_count)
+                            brush=gui_system_paint_object(gui_,static_cast<unsigned>(brush-1),false);
                         if(brush==0xb005){result=1;arg.return_to(state,result);return std::nullopt;}
-                        if(!system && !gui_.brushes.contains(brush) && !(brush>=0xb000 && brush<=0xb004) && brush!=0xb012)error=6;
-                        else {constexpr std::array<unsigned,5> stocks{0xffffff,0xc0c0c0,0x808080,0x404040,0};style.color=system?gui_system_color(static_cast<unsigned>(brush-1)):brush==0xb012?dc.dc_brush_color:gui_.brushes.contains(brush)?gui_.brushes.at(brush):stocks[brush-0xb000];style.hatch=gui_.brush_hatches.contains(brush)?gui_.brush_hatches.at(brush):-1;style.pattern_background=dc.background;style.pattern_opaque=dc.mode==2;style.brush_origin=dc.brush_origin;style.pattern_color=dc.color;if(gui_.brush_patterns.contains(brush)){style.pattern_brush=brush;style.pattern_monochrome=gui_.brush_patterns.at(brush).bits_per_pixel==1;}}
+                        if(!gui_.brushes.contains(brush) && !(brush>=0xb000 && brush<=0xb004) && brush!=0xb012)error=6;
+                        else {constexpr std::array<unsigned,5> stocks{0xffffff,0xc0c0c0,0x808080,0x404040,0};style.color=brush==0xb012?dc.dc_brush_color:gui_.brushes.contains(brush)?gui_.brushes.at(brush):stocks[brush-0xb000];style.hatch=gui_.brush_hatches.contains(brush)?gui_.brush_hatches.at(brush):-1;style.pattern_background=dc.background;style.pattern_opaque=dc.mode==2;style.brush_origin=dc.brush_origin;style.pattern_color=dc.color;if(gui_.brush_patterns.contains(brush)){style.pattern_brush=brush;style.pattern_monochrome=gui_.brush_patterns.at(brush).bits_per_pixel==1;}}
                     }else {style.rop2=symbol=="InvertRect"?6:7;style.color=0xffffff;}
                     if(!error){
                         if(symbol=="FrameRect"){box(rect[0],rect[1],rect[2],rect[1]+1,style);if(height>1)box(rect[0],rect[3]-1,rect[2],rect[3],style);box(rect[0],rect[1]+1,rect[0]+1,rect[3]-1,style);if(width>1)box(rect[2]-1,rect[1]+1,rect[2],rect[3]-1,style);}
@@ -619,7 +626,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
             else {result=gui_.next_object++;gui_.bitmaps[result]={d(1),d(2),std::vector<std::uint32_t>(static_cast<std::size_t>(d(1))*d(2))};}
         }else last_error_=87;
     }else if(symbol=="DeleteDC"){delete_printer_dc(arg(0));gui_.emf_recorders.erase(arg(0));result=gui_.contexts.erase(arg(0))?1:0;gui_.dc_objects.erase(arg(0));gui_.saved_contexts.erase(arg(0));}
-    else if(symbol=="DeleteObject"){
+    else if(symbol=="DeleteObject" &&
+            (arg(0)-gui_system_brush_base<=gui_system_color_count || arg(0)-gui_system_pen_base<gui_system_color_count)){
+        result=gui_.brushes.contains(arg(0)) || gui_.pens.contains(arg(0));
+    }else if(symbol=="DeleteObject"){
         const auto bitmap=gui_.bitmaps.find(arg(0));
         const auto selected=[&](const GuiDc& context){return context.bitmap==arg(0) || context.font==arg(0) || context.pen==arg(0) || context.brush==arg(0) || context.palette==arg(0);};
         const bool in_use=std::any_of(gui_.contexts.begin(),gui_.contexts.end(),[&](const auto& entry){return selected(entry.second);}) || std::any_of(gui_.saved_contexts.begin(),gui_.saved_contexts.end(),[&](const auto& entry){return std::any_of(entry.second.begin(),entry.second.end(),selected);});
@@ -656,7 +666,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
                 static const bool readback=[] {const auto v=std::getenv("X64ARM_GDI_PIXEL_READBACK");return v && std::string_view(v)=="1";}();
                 result=readback?surface->pixel(static_cast<unsigned>(px),static_cast<unsigned>(py)):pixel_color;
             }else result=surface->pixel(static_cast<unsigned>(px),static_cast<unsigned>(py));
-        }else if(window!=gui_.windows.end() && !window->second.layered_pixels.empty() && px>=0 && py>=0 && static_cast<unsigned>(px)<window->second.width && static_cast<unsigned>(py)<window->second.height){auto& pixel=window->second.layered_pixels[static_cast<std::size_t>(py)*window->second.width+static_cast<unsigned>(px)];if(symbol=="SetPixel")pixel=0xff000000U|pixel_color;result=pixel&0xffffffU;
+        }else if(window!=gui_.windows.end() && !window->second.layered_pixels.empty() && px>=0 && py>=0 && static_cast<unsigned>(px)<window->second.width && static_cast<unsigned>(py)<window->second.height && static_cast<unsigned>(px)<window->second.layered_stride && static_cast<unsigned>(py)<window->second.layered_pixels.size()/window->second.layered_stride){auto& pixel=window->second.layered_pixels[static_cast<std::size_t>(py)*window->second.layered_stride+static_cast<unsigned>(px)];if(symbol=="SetPixel")pixel=0xff000000U|pixel_color;result=pixel&0xffffffU;
         }else if(bitmap!=gui_.bitmaps.end() && px>=0 && py>=0 && static_cast<unsigned>(px)<bitmap->second.width && static_cast<unsigned>(py)<bitmap->second.height){auto& pixel=bitmap->second.pixels[static_cast<std::size_t>(py)*bitmap->second.width+static_cast<unsigned>(px)];if(symbol=="SetPixel"){pixel=pixel_color;export_dib_bitmap(memory,dc.bitmap);}result=pixel&0xffffff;}
     }else if(symbol.starts_with("ExtTextOut") || symbol.starts_with("TextOut")){
         const bool ext=symbol.starts_with("Ext"),wide=symbol.ends_with('W');const auto count=d(ext?6:4),options=ext?d(3):0;

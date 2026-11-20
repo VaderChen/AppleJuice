@@ -7,12 +7,13 @@
 namespace x64arm {
 namespace {
 constexpr std::uint32_t invalid=0x80070057U,pointer_error=0x80004003U,no_memory=0x8007000eU;
-constexpr std::uint32_t originate_exception=0x40080201U;
+constexpr std::uint32_t originate_exception=0x40080201U,transform_exception=0x40080202U;
 using winrt_error_detail::method;
 }
 std::span<const WindowsServiceDescriptor> winrt_error_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"combase.dll","RoOriginateError",2},{"combase.dll","RoOriginateErrorW",3},
+        {"combase.dll","RoTransformError",3},{"combase.dll","RoTransformErrorW",4},
         {"combase.dll","RoOriginateLanguageException",3},
         {"combase.dll","RoGetErrorReportingFlags",1},{"combase.dll","RoSetErrorReportingFlags",1},
         {"combase.dll","GetRestrictedErrorInfo",1},{"combase.dll","SetRestrictedErrorInfo",1},
@@ -125,6 +126,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt_error(GuestState& sta
                 }catch(const MemoryFault&){co_return done(false);}catch(const HostCallFault&){co_return done(false);}catch(const std::bad_alloc&){co_return done(false);}
             });
     }
+    const bool transform=name=="RoTransformError" || name=="RoTransformErrorW";
+    const bool report_error=transform || name=="RoOriginateError" || name=="RoOriginateErrorW";
     if(name=="RoGetMatchingRestrictedErrorInfo")return invoke_matching_restricted_error(state,memory,service);
     try{
         if(service.family=="internal-language-error"){
@@ -185,18 +188,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt_error(GuestState& sta
         }
         if(name=="Raise"){
             const auto& op=bridge.origins.at(arg(0));GuestState caller=state;arg.return_to(caller,0);
-            const std::array<std::uint64_t,3> parameters{op.hresult,op.length,op.payload};
-            begin_exception(caller,memory,originate_exception,0,parameters);exceptions_.stack.back().api_exception_boundary=true;state=caller;return std::nullopt;
+            const std::array<std::uint64_t,4> parameters{op.original_hresult.value_or(0),op.hresult,op.length,op.payload};
+            const auto args=std::span{parameters}.subspan(op.original_hresult?0:1);
+            begin_exception(caller,memory,op.original_hresult?transform_exception:originate_exception,0,args);
+            exceptions_.stack.back().api_exception_boundary=true;state=caller;return std::nullopt;
         }
-        if(name=="RoOriginateError" || name=="RoOriginateErrorW"){
-            const auto hr=static_cast<std::uint32_t>(arg(0));if(!(hr&0x80000000U))return done(0);
+        if(report_error){
+            const auto original=static_cast<std::uint32_t>(arg(0));
+            const unsigned index=transform?1U:0U;
+            const auto hr=static_cast<std::uint32_t>(arg(index));
+            const bool wide=name.ends_with("W");
+            if(transform && hr==original)return done(0);
+            const auto source=arg(index+(wide?2U:1U));
+            const bool new_failure=(hr&0x80000000U)!=0;
+            if(!new_failure && (!transform || !(original&0x80000000U) || !source))return done(0);
             auto generic=windows_error_message(hr);if(generic.empty())generic=windows_error_message(0x80004005U);
             std::u16string message;
-            const auto source=arg(name=="RoOriginateErrorW"?2:1);
             if(!source)message=com_error::reported_message(hr,std::nullopt,generic);
-            else if(name=="RoOriginateError")message=com_error::reported_message(hr,winrt_content(memory,winrt_string(memory,source),com_error::maximum_message_units),generic);
+            else if(!wide)message=com_error::reported_message(new_failure?hr:original,winrt_content(memory,winrt_string(memory,source),com_error::maximum_message_units),generic);
             else{
-                const auto count=static_cast<std::uint32_t>(arg(1)),limit=std::min(count?count:com_error::maximum_message_units,com_error::maximum_message_units);
+                const auto count=static_cast<std::uint32_t>(arg(index+1)),limit=std::min(count?count:com_error::maximum_message_units,com_error::maximum_message_units);
                 for(unsigned i=0;i<limit;++i){const auto offset=std::uint64_t{i}*2;if(source>UINT64_MAX-offset)throw HostCallFault("WinRT 訊息位址溢位");const auto c=static_cast<char16_t>(memory.load(GuestAddress{source+offset},16));if(!c)break;message+=c;}
             }
             // 文件的 empty return 表與段落互有差異；採用 FALSE 且不報告、不改 channel。
@@ -207,6 +218,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt_error(GuestState& sta
             if(!reporting.channel && !reporting.exception)return done(1);
             if(bridge.origins.size()>=4096)return done(0);
             const auto id=next_id();WinrtOriginOperation op;op.hresult=hr;op.length=static_cast<std::uint32_t>(message.size());op.exception=reporting.exception;
+            if(transform)op.original_hresult=original;
             if(reporting.exception){op.payload=allocate_heap(memory,(message.size()+1)*2);if(!op.payload)return done(0);
                 for(std::size_t i=0;i<message.size();++i)memory.store(GuestAddress{op.payload+i*2},16,message[i]);memory.store(GuestAddress{op.payload+message.size()*2},16,0);}
             try{
@@ -218,9 +230,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt_error(GuestState& sta
                 else start_callbacks(state,memory,{{resolve("internal-winrt-error","Raise").value,{id}}},Continuation::WinrtOriginFinish,id);
             }catch(...){discard_winrt_origin(state,memory,id);throw;}return std::nullopt;
         }
-    }catch(const MemoryFault&){return done(name.starts_with("RoOriginateError")?0:pointer_error);}
-    catch(const std::bad_alloc&){return done(name.starts_with("RoOriginateError")?0:no_memory);}
-    catch(const HostCallFault&){return done(name.starts_with("RoOriginateError")?0:pointer_error);}
+    }catch(const MemoryFault&){return done(report_error?0:pointer_error);}
+    catch(const std::bad_alloc&){return done(report_error?0:no_memory);}
+    catch(const HostCallFault&){return done(report_error?0:pointer_error);}
     throw HostCallFault("未知的 WinRT 錯誤資訊服務");
 }
 // RoGetMatchingRestrictedErrorInfo：取走目前執行緒的 restricted error（同 GetRestrictedErrorInfo）；HRESULT 相同時交回它，

@@ -180,6 +180,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_marshal(GuestState& sta
                 output(op.output,unit);memory.store(GuestAddress{op.output},bits,0);
                 if(!op.object)return done(pointer_error);
             }
+            if(name=="CoMarshalInterface" || name=="CoUnmarshalInterface")runtime_.initialize_implicit_com_security();
             return begin(op);
         }
         if(name=="CoGetStandardMarshal"){

@@ -38,21 +38,23 @@ inline std::string console_output_text(ConsoleBuffer& screen,std::string_view by
     pending.erase(0,position);return utf16_to_utf8(text);
 }
 // WriteConsoleInputA 的多 byte 字元可跨呼叫；已接受的記錄仍留在同一輸入佇列。
-inline void console_decode_input(ConsoleBuffer& buffer,std::span<const ConsoleRecord> incoming){
-    auto& pending=buffer.ansi_input_records;pending.insert(pending.end(),incoming.begin(),incoming.end());
+inline std::vector<ConsoleRecord> console_decode_input(std::deque<ConsoleRecord>& pending,std::uint32_t codepage){
+    std::vector<ConsoleRecord> records;
+    records.reserve(pending.size());
     while(!pending.empty()){
-        auto record=pending.front();if(console_field(record,0,2)!=1){buffer.records.push_back(record);pending.pop_front();continue;}
+        auto record=pending.front();if(console_field(record,0,2)!=1){records.push_back(record);pending.pop_front();continue;}
         std::array<std::uint8_t,8> bytes{};std::size_t available=0;
         for(const auto& item:pending){
             if(available==bytes.size() || console_field(item,0,2)!=1 || console_field(item,4)!=console_field(record,4))break;
             bytes[available++]=static_cast<std::uint8_t>(console_field(item,14,1));
         }
-        const auto decoded=windows_crt_decode(std::span(bytes).first(available),buffer.input_codepage);
+        const auto decoded=windows_crt_decode(std::span(bytes).first(available),codepage);
         if(decoded.status==CrtDecodedCharacter::Status::Partial && available==pending.size())break;
         const bool valid=decoded.status==CrtDecodedCharacter::Status::Complete;
         std::u16string text;console_append_scalar(text,valid?decoded.character:0xfffd);
-        for(const auto c:text){set_console_field(record,14,c,2);buffer.records.push_back(record);}
+        for(const auto c:text){set_console_field(record,14,c,2);records.push_back(record);}
         for(std::size_t i=0;i<(valid?decoded.bytes:1);++i)pending.pop_front();
     }
+    return records;
 }
 }

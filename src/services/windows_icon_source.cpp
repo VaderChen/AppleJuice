@@ -200,7 +200,7 @@ GuiIcon decode_icon_file(std::span<const std::uint8_t> bytes,bool cursor,std::ui
     for(std::uint32_t i=0;i<steps;++i){
         const auto index=(attributes&2U)?integer(sequence,static_cast<std::size_t>(i)*4,4):i;
         if(index>=frame_count)throw std::invalid_argument("ANI 播放索引超出影格");order.push_back(index);
-        const auto rate=rates.empty()?default_rate:integer(rates,static_cast<std::size_t>(i)*4,4);durations.push_back(rate?rate:6U);
+        const auto rate=rates.empty() || steps==1?default_rate:integer(rates,static_cast<std::size_t>(i)*4,4);durations.push_back(rate?rate:6U);
     }
     auto icon=decoded[order.front()];icon.animation_frames=std::move(decoded);icon.animation_sequence=std::move(order);icon.animation_rates=std::move(durations);return icon;
 }

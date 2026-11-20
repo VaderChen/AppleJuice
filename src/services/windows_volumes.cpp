@@ -205,6 +205,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
         }
         const auto point=filesystem_.reparse(std::move(path));if(point.error)return {0,point.error};return point.kind==3?std::pair{windows_volume_letter(std::string_view(point.target)),0U}:std::pair{char{0},4390U};
     };
+    const auto requested_volume=[&]()->std::pair<char,std::uint32_t>{
+        if(arg(0))return mount_volume(text(0));
+        const auto path=utf16_to_utf8(runtime_.current_directory);
+        if(root_letter(runtime_.current_directory))return mount_volume(path);
+        const auto location=filesystem_.volume_location(path,true);
+        return {location.volume,location.error};
+    };
     if(symbol.starts_with("SetVolumeMountPoint") || symbol.starts_with("DeleteVolumeMountPoint")){
         if(!arg(0) || (symbol.starts_with("Set") && !arg(1)))fail(87);
         else {const auto path=text(0);if(path.empty() || (path.back()!='\\' && path.back()!='/'))fail(123);
@@ -279,11 +286,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
             if (u32(0) >= count) { memory.write(GuestAddress{arg(1)}, bytes); result = count - 1; }
         }
     } else if (symbol.starts_with("GetDriveType")) {
-        const auto path = arg(0) ? text(0) : std::string("C:\\");
+        const auto path = arg(0) ? text(0) : utf16_to_utf8(full_windows_environment_path(u"\\",runtime_.current_directory,runtime_.environment));
         result = filesystem_.network_path(path)?4:!mount_volume(path).second?3:1;
     } else if (symbol.starts_with("GetDiskSpaceInformation")) {
         // DISK_SPACE_INFORMATION：與 GetDiskFreeSpaceEx 共用卷資訊，換算成配置單位；回傳 HRESULT。
-        const auto path = arg(0) ? text(0) : std::string("C:\\");
+        const auto path = arg(0) ? text(0) : utf16_to_utf8(full_windows_environment_path(u"\\",runtime_.current_directory,runtime_.environment));
         if (!arg(1)) result = 0x80070057U;
         else {
             const auto space = filesystem_.volume_space(path);
@@ -298,7 +305,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
         }
     } else if (symbol.starts_with("GetDiskFreeSpace")) {
         const bool extended = symbol.starts_with("GetDiskFreeSpaceEx");
-        const auto path = arg(0) ? text(0) : std::string("C:\\");
+        const auto path = arg(0) ? text(0) : utf16_to_utf8(extended?runtime_.current_directory:full_windows_environment_path(u"\\",runtime_.current_directory,runtime_.environment));
         if (!extended && !filesystem_.network_path(path) && mount_volume(path).second) fail(3);
         else {
             const auto space = filesystem_.volume_space(path);
@@ -310,30 +317,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
                 if (arg(3)) memory.store(GuestAddress{arg(3)}, 64, space.free);
                 result = 1;
             } else {
-                // 舊式 DWORD cluster 介面不能表示超大磁碟時明確回 overflow，不截斷容量。
-                if (space.total / space.allocation_unit > UINT32_MAX) fail(534);
-                else if (!arg(1) || !arg(2) || !arg(3) || !arg(4)) fail(87);
-                else {
-                    for (unsigned i = 1; i <= 4; ++i) memory.check(GuestAddress{arg(i)}, 4, Access::Write);
-                    memory.store(GuestAddress{arg(1)}, 32, space.allocation_unit / space.sector_size);
-                    memory.store(GuestAddress{arg(2)}, 32, space.sector_size);
-                    memory.store(GuestAddress{arg(3)}, 32, space.available / space.allocation_unit);
-                    memory.store(GuestAddress{arg(4)}, 32, space.total / space.allocation_unit);
-                    result = 1;
-                }
+                // 各 DWORD 輸出皆可省略；先檢查所有目的位址，再發布結果。
+                const std::array<std::uint64_t,4> values{space.allocation_unit/space.sector_size,space.sector_size,
+                    space.available/space.allocation_unit,space.total/space.allocation_unit};
+                for(unsigned i=1;i<=4;++i)if(arg(i))memory.check(GuestAddress{arg(i)},4,Access::Write);
+                for(unsigned i=1;i<=4;++i)if(arg(i))memory.store(GuestAddress{arg(i)},32,static_cast<std::uint32_t>(values[i-1]));
+                result=1;
             }
         }
     } else if (symbol.starts_with("SetVolumeLabel")) {
         if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許卷標宿主寫入");
-        const auto path=arg(0)?text(0):utf16_to_utf8(runtime_.current_directory);
-        const auto location=arg(0)?FileVolumeLocation{}:filesystem_.volume_location(path,true);
-        const auto [id,root_error]=arg(0)?mount_volume(path):std::pair<char,std::uint32_t>{location.volume,location.error};
+        const auto [id,root_error]=requested_volume();
         const auto error=root_error?root_error:filesystem_.set_volume_label(id,arg(1)?(wide?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16(text(1))):std::u16string{});
         if(error)fail(error);else result=1;
     } else if (symbol.starts_with("GetVolumeInformation")) {
-        const auto path = arg(0) ? text(0) : std::string("C:\\");
-        const auto [id,root_error]=mount_volume(path);
-        const auto info = filesystem_.information(root_error?path:windows_volume_path(id));
+        const auto [id,root_error]=requested_volume();
+        const auto info = root_error?FileInformation{}:filesystem_.information(windows_volume_path(id));
         const auto properties=root_error?FileVolumeProperties{}:filesystem_.volume_properties(id);
         const auto label=encoded(properties.label);
         if (root_error) fail(root_error==123 || root_error==4390?3U:root_error);
@@ -372,28 +371,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
             if(directory.error || !(directory.metadata.attributes&0x10)){fail(267);arg.return_to(state,0);return std::nullopt;}
             if(path.back()!=u'\\' && path.back()!=u'/')path+=u'\\';
             memory.check(GuestAddress{arg(3)},260*(wide?2U:1U),Access::Write);
-            const bool create=u32(2)==0;auto unique=static_cast<std::uint16_t>(create ? runtime_.clock_ticks : u32(2));
+            const bool create=static_cast<std::uint16_t>(u32(2))==0;auto unique=static_cast<std::uint16_t>(create ? runtime_.clock_ticks : u32(2));
             if(!unique)unique=1;
             for(unsigned attempts=0;attempts<65535;++attempts){
                 constexpr char16_t digits[]=u"0123456789ABCDEF";
-                auto filename=path+prefix;for(int shift=12;shift>=0;shift-=4)filename+=digits[(unique>>shift)&15];filename+=u".tmp";
+                auto filename=path+prefix;
+                for(int shift=12;shift>=0;shift-=4){
+                    if(unique>>shift)filename+=digits[(unique>>shift)&15];
+                }
+                filename+=u".tmp";
+                const auto filename_bytes=encoded(filename);
+                if(filename_bytes.size()>260*(wide?2U:1U)){fail(206);break;}
                 if(create){
                     auto opened=filesystem_.open_host(utf16_to_utf8(filename),0x40000000U,1,0,7);
                     if(opened.error==80 || opened.error==183 || opened.error==32){if(!++unique)++unique;if(attempts==65534)fail(80);continue;}
                     if(opened.error){fail(opened.error);break;}
                 }
-                memory.write(GuestAddress{arg(3)},encoded(filename));result=unique;break;
+                memory.write(GuestAddress{arg(3)},filename_bytes);result=unique;break;
             }
             if(!result && !last_error_)last_error_=80;
         }
     } else if (symbol.starts_with("GetTempPath")) {
         try {
             const auto path = temporary_directory();
-            if (path.size() > 260) fail(206);
+            if (path.size() >= 260) fail(206);
             else {
-                const auto bytes = encoded(path); const auto count = bytes.size() / (wide ? 2U : 1U);
-                result = count;
-                if (u32(0) >= count) { memory.write(GuestAddress{arg(1)}, bytes); result = count - 1; }
+                auto bytes = encoded(path); const auto count = bytes.size() / (wide ? 2U : 1U);
+                const auto capacity=u32(0);
+                result=count;
+                if(capacity>=count){
+                    if(wide)bytes.resize(2U*std::min(capacity,32767U));
+                    memory.write(GuestAddress{arg(1)},bytes);result=count-1;
+                }else if(wide && capacity){
+                    bytes.assign(capacity*2U,0);memory.write(GuestAddress{arg(1)},bytes);
+                }
             }
         } catch (const std::invalid_argument&) { fail(123); }
     } else throw HostCallFault("未知的 Windows 磁碟區查詢服務");

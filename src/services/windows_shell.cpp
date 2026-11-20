@@ -6,6 +6,7 @@
 #include "x64arm/windows_guid.hpp"
 #include "x64arm/windows_system_paths.hpp"
 #include "automation_value.hpp"
+#include "image_file_metadata.hpp"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -35,17 +36,19 @@ std::span<const WindowsServiceDescriptor> shell_service_descriptors() {
         {"internal-shell","IPropertyStore.QueryInterface",3},{"internal-shell","IPropertyStore.AddRef",1},{"internal-shell","IPropertyStore.Release",1},
         {"internal-shell","IPropertyStore.GetCount",2},{"internal-shell","IPropertyStore.GetAt",3},{"internal-shell","IPropertyStore.GetValue",3},{"internal-shell","IPropertyStore.SetValue",3},{"internal-shell","IPropertyStore.Commit",1},
         {"shell32.dll","SHGetKnownFolderPath",4},{"shell32.dll","SHGetKnownFolderIDList",4},
-        {"shell32.dll","SHGetFolderPathA",5},{"shell32.dll","SHGetFolderPathW",5},{"shell32.dll","SHGetFolderPathAndSubDirA",6},{"shell32.dll","SHGetFolderPathAndSubDirW",6},{"shell32.dll","SHGetSettings",2},{"shell32.dll","SHGetSetSettings",3},{"shell32.dll","ReadCabinetState",2},{"shell32.dll","SHGetImageList",3},{"shell32.dll","Shell_MergeMenus",6},{"shell32.dll","SHGetNewLinkInfoA",5},{"shell32.dll","SHGetNewLinkInfoW",5},{"shell32.dll","SHGetSetFolderCustomSettings",3},{"shell32.dll","SHIsFileAvailableOffline",2},{"shell32.dll","ShellAboutA",4},{"shell32.dll","ShellAboutW",4},
+        {"shell32.dll","#15",2},{"shell32.dll","#186",4,0,0,8},
+        {"shell32.dll","SHGetFolderPathA",5},{"shell32.dll","SHGetFolderPathW",5},{"shell32.dll","SHGetFolderPathAndSubDirA",6},{"shell32.dll","SHGetFolderPathAndSubDirW",6},{"shell32.dll","SHGetSettings",2},{"shell32.dll","SHGetSetSettings",3},{"shell32.dll","ReadCabinetState",2},{"shell32.dll","SHGetImageList",3},{"shell32.dll","SHGetNewLinkInfoA",5},{"shell32.dll","SHGetNewLinkInfoW",5},{"shell32.dll","SHGetSetFolderCustomSettings",3},{"shell32.dll","SHIsFileAvailableOffline",2},{"shell32.dll","ShellAboutA",4},{"shell32.dll","ShellAboutW",4},
         {"shell32.dll","OpenAs_RunDLL",4},{"shell32.dll","OpenAs_RunDLLA",4},{"shell32.dll","OpenAs_RunDLLW",4},{"internal-shell-about","DialogProc",4},{"shell32.dll","SHRestricted",1},
         {"shlwapi.dll","#266",4,0,0,1},{"shlwapi.dll","#271",3},{"shell32.dll","#244",2},
         {"shfolder.dll","SHGetFolderPathA",5},{"shfolder.dll","SHGetFolderPathW",5},
         {"shell32.dll","SHFreeNameMappings",1},{"shell32.dll","SHFileOperationA",1},{"shell32.dll","SHFileOperationW",1},{"windows.storage.dll","SHFileOperationWithAdditionalFlags",2,0,0,2},
-        {"shell32.dll","SHCloneSpecialIDList",3},{"shell32.dll","SHGetSpecialFolderLocation",3},{"shell32.dll","SHGetFolderLocation",5},{"shell32.dll","SHGetFileInfoA",5},{"shell32.dll","SHGetFileInfoW",5},
+        {"shell32.dll","SHCloneSpecialIDList",3},{"shell32.dll","SHGetSpecialFolderLocation",3},{"shell32.dll","SHGetFolderLocation",5},{"shell32.dll","SHGetFileInfoA",5,0,0,0x1a},{"shell32.dll","SHGetFileInfoW",5,0,0,0x1a},{"shlwapi.dll","#313",5,0,0,0x1a},
         {"shell32.dll","SHGetSpecialFolderPathA",4},{"shell32.dll","SHGetSpecialFolderPathW",4},
         {"shell32.dll","SHBrowseForFolderA",1},{"shell32.dll","SHBrowseForFolderW",1},
         {"shell32.dll","ILCreateFromPathA",1},{"shell32.dll","ILCreateFromPathW",1},
-        {"shell32.dll","SHILCreateFromPath",3},{"shell32.dll","ILFree",1},
+        {"shell32.dll","SHILCreateFromPath",3},{"shell32.dll","SHSimpleIDListFromPath",1},{"shell32.dll","ILFree",1},
         {"shell32.dll","SHGetMalloc",1},{"ole32.dll","CoGetMalloc",2},
+        {"internal-mapi-allocator","MAPIGetDefaultMalloc",0},{"internal-mapi-allocator","DllCanUnloadNow",0},
         {"internal-shell","IMalloc.QueryInterface",3},{"internal-shell","IMalloc.AddRef",1},{"internal-shell","IMalloc.Release",1},
         {"internal-shell","IMalloc.Alloc",2},{"internal-shell","IMalloc.Realloc",3},{"internal-shell","IMalloc.Free",2},
         {"internal-shell","IMalloc.GetSize",2},{"internal-shell","IMalloc.DidAlloc",2},{"internal-shell","IMalloc.HeapMinimize",1},
@@ -85,6 +88,22 @@ std::u16string known_folder(std::uint32_t id){
         case 5:return u"C:\\Users\\User\\Documents";
         case 6:return u"C:\\Users\\User\\Favorites";
         case 8:return u"C:\\Users\\User\\AppData\\Roaming\\Microsoft\\Windows\\Recent";
+        case 0x9:return u"C:\\Users\\User\\AppData\\Roaming\\Microsoft\\Windows\\SendTo";
+        case 0x13:return u"C:\\Users\\User\\AppData\\Roaming\\Microsoft\\Windows\\Network Shortcuts";
+        case 0x14:return u"C:\\Windows\\Fonts";
+        case 0x15:return u"C:\\Users\\User\\AppData\\Roaming\\Microsoft\\Windows\\Templates";
+        case 0x1b:return u"C:\\Users\\User\\AppData\\Roaming\\Microsoft\\Windows\\Printer Shortcuts";
+        case 0x1f:return u"C:\\Users\\Public\\Favorites";
+        case 0x20:return u"C:\\Users\\User\\AppData\\Local\\Microsoft\\Windows\\INetCache";
+        case 0x21:return u"C:\\Users\\User\\AppData\\Local\\Microsoft\\Windows\\INetCookies";
+        case 0x22:return u"C:\\Users\\User\\AppData\\Local\\Microsoft\\Windows\\History";
+        case 0x2d:return u"C:\\ProgramData\\Microsoft\\Windows\\Templates";
+        case 0x2f:return u"C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Administrative Tools";
+        case 0x30:return u"C:\\Users\\User\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Administrative Tools";
+        case 0x35:return u"C:\\Users\\Public\\Music";
+        case 0x36:return u"C:\\Users\\Public\\Pictures";
+        case 0x37:return u"C:\\Users\\Public\\Videos";
+        case 0x3b:return u"C:\\Users\\User\\AppData\\Local\\Microsoft\\Windows\\Burn\\Burn";
         case 0xd:return u"C:\\Users\\User\\Music";
         case 0xe:return u"C:\\Users\\User\\Videos";
         case 0x27:return u"C:\\Users\\User\\Pictures";
@@ -173,7 +192,11 @@ std::uint64_t WindowsServices::shell_encode_pidl(GuestMemory& memory,std::u16str
         bytes.push_back(type);bytes.push_back(0);for(const auto c:name){bytes.push_back(static_cast<std::uint8_t>(c));bytes.push_back(static_cast<std::uint8_t>(c>>8));}bytes.push_back(0);bytes.push_back(0);}
     bytes.push_back(0);bytes.push_back(0);
     const auto address=allocate_heap(memory,bytes.size());if(!address)return 0;memory.write(GuestAddress{address},bytes);
-    if(!absolute)return address;try{gui_.shell_pidls.emplace(address,std::move(path));}catch(...){(void)free_heap(memory,address,GuestState{});throw;}return address;
+    try{
+        gui_.task_allocations.insert(address);
+        if(absolute)gui_.shell_pidls.emplace(address,std::move(path));
+    }catch(...){gui_.task_allocations.erase(address);(void)free_heap(memory,address,GuestState{});throw;}
+    return address;
 }
 void WindowsServices::shell_browse_refresh(std::uint64_t handle){
     auto& data=gui_.shell_browsers.at(handle);auto& list=gui_.windows.at(gui_child(handle,412));list.items.clear();list.selection=-1;
@@ -268,69 +291,61 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
     if(service.symbol=="SHAppBarMessage" || service.symbol=="SHOpenFolderAndSelectItems" || service.symbol=="SHOpenWithDialog")return invoke_shell_desktop(state,memory,service);
     if(service.symbol=="SHChangeNotify")return invoke_shell_notification(state,memory,service);
     if(service.symbol.starts_with("ShellExecute") || service.symbol.starts_with("FindExecutable"))return invoke_shell_execute(state,memory,service);
-    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W') || symbol=="SHILCreateFromPath";
+    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W') || symbol=="SHILCreateFromPath" || symbol=="SHSimpleIDListFromPath";
     const auto read=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):utf8_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
     std::uint64_t result=0;
-    if(symbol=="SHGetSettings"){
-        // SHELLFLAGSTATE 為 4 位元組位元欄位；只改 dwMask 要求的欄位，其餘保留呼叫端內容。來源與 Windows 相同：
-        // HKCU\...\Explorer\Advanced 的 DWORD 設定，以及 Explorer\ShellState（SHELLSTATE 二進位，第 4 位元組起為第一組旗標）；沒有值時採 Windows 10 預設。
-        if(arg(0))try{
-            memory.check(GuestAddress{arg(0)},4,Access::Write);
-            auto flags=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)},32));const auto mask=static_cast<std::uint32_t>(arg(1));
-            RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
-            const auto lookup=[&](std::u16string_view path,std::u16string_view name)->const RegistryValue*{
-                if(transaction.error)return nullptr;const auto key=runtime_.registry.keys.find(std::u16string(1,1)+std::u16string(path));if(key==runtime_.registry.keys.end())return nullptr;
-                for(const auto& [entry,value]:key->second){if(entry.size()!=name.size())continue;bool same=true;
-                    for(std::size_t i=0;i<name.size() && same;++i){auto c=entry[i];if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);same=c==name[i];}if(same)return &value;}
-                return nullptr;};
-            const auto dword=[&](std::u16string_view name,std::uint32_t fallback){
-                const auto* value=lookup(u"\\software\\microsoft\\windows\\currentversion\\explorer\\advanced",name);
-                if(!value || value->type!=4 || value->bytes.size()<4)return fallback;const auto& b=value->bytes;
-                return static_cast<std::uint32_t>(b[0])|static_cast<std::uint32_t>(b[1])<<8|static_cast<std::uint32_t>(b[2])<<16|static_cast<std::uint32_t>(b[3])<<24;};
-            std::uint32_t shell_state=0x20U; // fDoubleClickInWebView 預設開啟
-            if(const auto* value=lookup(u"\\software\\microsoft\\windows\\currentversion\\explorer",u"shellstate");value && value->type==3 && value->bytes.size()>=8){
-                const auto& b=value->bytes;shell_state=static_cast<std::uint32_t>(b[4])|static_cast<std::uint32_t>(b[5])<<8|static_cast<std::uint32_t>(b[6])<<16|static_cast<std::uint32_t>(b[7])<<24;}
-            const auto set=[&](std::uint32_t request,unsigned bit,bool on){if(mask&request)flags=on?flags|(1U<<bit):flags&~(1U<<bit);};
-            set(0x1,0,dword(u"hidden",2)==1);            // SSF_SHOWALLOBJECTS
-            set(0x2,1,dword(u"hidefileext",1)==0);       // SSF_SHOWEXTENSIONS
-            set(0x8000,2,(shell_state>>2)&1);            // SSF_NOCONFIRMRECYCLE
-            set(0x20,3,dword(u"showsuperhidden",0)!=0);  // SSF_SHOWSYSFILES
-            set(0x8,4,dword(u"showcompcolor",1)!=0);     // SSF_SHOWCOMPCOLOR
-            set(0x80,5,(shell_state>>5)&1);              // SSF_DOUBLECLICKINWEBVIEW
-            set(0x200,6,(shell_state>>6)&1);             // SSF_DESKTOPHTML
-            set(0x400,7,(shell_state>>7)&1);             // SSF_WIN95CLASSIC
-            set(0x800,8,dword(u"dontprettypath",0)!=0);  // SSF_DONTPRETTYPATH
-            set(0x100,9,dword(u"showattribcol",0)!=0);   // SSF_SHOWATTRIBCOL
-            set(0x1000,10,dword(u"mapnetdrvbtn",0)!=0);  // SSF_MAPNETDRVBUTTON
-            set(0x2000,11,dword(u"showinfotip",1)!=0);   // SSF_SHOWINFOTIP
-            set(0x4000,12,dword(u"hideicons",0)!=0);     // SSF_HIDEICONS
-            set(0x800000,13,dword(u"autocheckselect",0)!=0); // SSF_AUTOCHECKSELECT
-            set(0x1000000,14,dword(u"iconsonly",0)!=0);  // SSF_ICONSONLY
-            memory.store(GuestAddress{arg(0)},32,flags);
-        }catch(const MemoryFault&){}
-        arg.return_to(state,0);return std::nullopt;
-    }
-    if(symbol=="SHGetMalloc" || symbol=="CoGetMalloc" || symbol.starts_with("IMalloc.")){
+    if(symbol=="SHGetMalloc" || symbol=="CoGetMalloc" || service.family=="internal-mapi-allocator" || symbol.starts_with("IMalloc.")){
         const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
         const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
-        if(symbol=="SHGetMalloc" || symbol=="CoGetMalloc"){
-            const auto output=arg(symbol=="SHGetMalloc"?0:1);if(!output)return finish(0x80070057U);
-            memory.store(GuestAddress{output},bits,0);if(symbol=="CoGetMalloc" && arg(0)!=1)return finish(0x80070057U);
+        // 兩個單例各有自己的介面地址，共用九個 IMalloc 槽位。MAPI 引用數置於兩個介面之後。
+        const auto mapi_count=[&](){return GuestAddress{gui_.task_allocator+2*unit};};
+        if(symbol=="DllCanUnloadNow")return finish(gui_.task_allocator && memory.load(mapi_count(),32)!=0);
+        if(symbol=="SHGetMalloc" || symbol=="CoGetMalloc" || symbol=="MAPIGetDefaultMalloc"){
+            std::uint64_t output=0;
+            if(symbol!="MAPIGetDefaultMalloc"){
+                output=arg(symbol=="SHGetMalloc"?0:1);if(!output)return finish(0x80070057U);
+                memory.store(GuestAddress{output},bits,0);if(symbol=="CoGetMalloc" && arg(0)!=1)return finish(0x80070057U);
+            }
             if(!gui_.task_allocator){
                 constexpr std::array names{"QueryInterface","AddRef","Release","Alloc","Realloc","Free","GetSize","DidAlloc","HeapMinimize"};
-                const auto block=runtime_allocate(memory,{},(names.size()+1)*unit);
-                for(unsigned i=0;i<names.size();++i)memory.store(GuestAddress{block+(i+1)*unit},bits,resolve("internal-shell",std::string("IMalloc.")+names[i]).value);
-                memory.store(GuestAddress{block},bits,block+unit);gui_.task_allocator=block;
+                const auto block=runtime_allocate(memory,{},(names.size()+3)*unit);
+                const auto table=block+3*unit;
+                for(unsigned i=0;i<names.size();++i)memory.store(GuestAddress{table+i*unit},bits,resolve("internal-shell",std::string("IMalloc.")+names[i]).value);
+                memory.store(GuestAddress{block},bits,table);
+                memory.store(GuestAddress{block+unit},bits,table);
+                memory.store(GuestAddress{block+2*unit},32,0);
+                gui_.task_allocator=block;
+            }
+            if(symbol=="MAPIGetDefaultMalloc"){
+                memory.store(mapi_count(),32,memory.load(mapi_count(),32)+1);
+                return finish(gui_.task_allocator+unit);
             }
             ++gui_.task_allocator_references;memory.store(GuestAddress{output},bits,gui_.task_allocator);return finish(0);
         }
-        if(!arg(0) || arg(0)!=gui_.task_allocator)throw HostCallFault("無效的 IMalloc 介面");
+        const bool mapi=gui_.task_allocator && arg(0)==gui_.task_allocator+unit;
+        if(!arg(0) || (!mapi && arg(0)!=gui_.task_allocator))throw HostCallFault("無效的 IMalloc 介面");
         if(symbol=="IMalloc.QueryInterface"){
-            if(!arg(2))return finish(0x80004003U);memory.store(GuestAddress{arg(2)},bits,0);if(!arg(1))return finish(0x80004003U);
+            if(!arg(2))return finish(0x80004003U);if(!mapi)memory.store(GuestAddress{arg(2)},bits,0);if(!arg(1))return finish(0x80004003U);
             std::array<std::uint8_t,16> iid{};memory.read(GuestAddress{arg(1)},iid);
             constexpr std::array<std::uint8_t,16> unknown{0,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46},allocator{2,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
             if(iid!=unknown && iid!=allocator)return finish(0x80004002U);
-            ++gui_.task_allocator_references;memory.store(GuestAddress{arg(2)},bits,arg(0));return finish(0);
+            if(!mapi)++gui_.task_allocator_references;memory.store(GuestAddress{arg(2)},bits,arg(0));return finish(0);
+        }
+        if(mapi){
+            if(symbol=="IMalloc.AddRef" || symbol=="IMalloc.Release"){
+                const auto refs=memory.load(mapi_count(),32);
+                memory.store(mapi_count(),32,symbol=="IMalloc.AddRef"?refs+1:refs-1);
+                return finish(1);
+            }
+            if(symbol=="IMalloc.DidAlloc")return finish(UINT32_MAX);
+            if(symbol=="IMalloc.HeapMinimize")return finish(0);
+            if(symbol=="IMalloc.GetSize")return finish(nested_service(state,memory,"kernel32.dll","LocalSize",{arg(1)}));
+            if(symbol=="IMalloc.Alloc" || (symbol=="IMalloc.Realloc" && !arg(1)))
+                return finish(nested_service(state,memory,"kernel32.dll","LocalAlloc",{0,arg(symbol=="IMalloc.Alloc"?1:2)}));
+            if(symbol=="IMalloc.Realloc" && arg(2))
+                return finish(nested_service(state,memory,"kernel32.dll","LocalReAlloc",{arg(1),arg(2),2}));
+            (void)nested_service(state,memory,"kernel32.dll","LocalFree",{arg(1)});
+            return finish(0);
         }
         if(symbol=="IMalloc.AddRef")return finish(++gui_.task_allocator_references);
         if(symbol=="IMalloc.Release"){if(gui_.task_allocator_references)--gui_.task_allocator_references;return finish(gui_.task_allocator_references);}
@@ -511,17 +526,35 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
             }
             if(symbol=="PropVariantClear" || symbol=="PropVariantCopy"){
                 if(!arg(0) || (symbol=="PropVariantCopy" && !arg(1)))return finish(pointer_error);
-                // VT_UNKNOWN／VT_DISPATCH 持有介面：清除時 Release，複製時 AddRef（媒體事件值常用這個型別）。
-                const auto interface_variant=[&](std::uint64_t address){const auto type=memory.load(GuestAddress{address},16);return type==13 || type==9;};
+                // 介面型別持有一份 COM 參照；VERSIONEDSTREAM 另有獨立配置的 GUID 與指標。
+                const auto interface_variant=[&](std::uint64_t address){const auto type=memory.load(GuestAddress{address},16);return type==13 || type==9 || (type>=66 && type<=69) || type==73;};
+                if(symbol=="PropVariantCopy" && arg(0)==arg(1))return finish(0);
+                const auto owned_type=memory.load(GuestAddress{arg(symbol=="PropVariantCopy"?1:0)},16);
+                if(owned_type==71 || owned_type==0x1047 || owned_type==0x100c ||
+                   (!owned_type && symbol=="PropVariantClear" && service_callback::completed(this,threads_.current,"ole32 包裝函式",state)))
+                    return invoke_ole_wrappers(state,memory,service);
                 if(symbol=="PropVariantClear" && interface_variant(arg(0))){
-                    memory.check(GuestAddress{arg(0)},size,Access::Write);const auto pointer=memory.load(GuestAddress{arg(0)+8},bits);
+                    memory.check(GuestAddress{arg(0)},size,Access::Write);auto pointer=memory.load(GuestAddress{arg(0)+8},bits);
+                    if(pointer && memory.load(GuestAddress{arg(0)},16)==73){
+                        const auto wrapper=pointer;pointer=memory.load(GuestAddress{wrapper+16},bits);
+                        if(!free_heap(memory,wrapper,state))return finish(invalid_argument);
+                        gui_.task_allocations.erase(wrapper);
+                    }
                     memory.write(GuestAddress{arg(0)},std::vector<std::uint8_t>(size));
                     if(pointer){const auto table=memory.load(GuestAddress{pointer},bits);start_callbacks(state,memory,{{memory.load(GuestAddress{table+2*unit},bits),{pointer}}},Continuation::Return,0);return std::nullopt;}
                     return finish(0);
                 }
                 if(symbol=="PropVariantCopy" && interface_variant(arg(1))){
-                    memory.check(GuestAddress{arg(0)},size,Access::Write);std::vector<std::uint8_t> copy(size);memory.read(GuestAddress{arg(1)},copy);memory.write(GuestAddress{arg(0)},copy);
-                    const auto pointer=memory.load(GuestAddress{arg(1)+8},bits);
+                    memory.check(GuestAddress{arg(0)},size,Access::Write);std::vector<std::uint8_t> copy(size);memory.read(GuestAddress{arg(1)},copy);
+                    auto pointer=memory.load(GuestAddress{arg(1)+8},bits);
+                    if(pointer && memory.load(GuestAddress{arg(1)},16)==73){
+                        std::vector<std::uint8_t> wrapper(16+unit);memory.read(GuestAddress{pointer},wrapper);
+                        pointer=memory.load(GuestAddress{pointer+16},bits);
+                        const auto clone=allocate_heap(memory,wrapper.size());if(!clone)return finish(0x8007000eU);
+                        memory.write(GuestAddress{clone},wrapper);gui_.task_allocations.insert(clone);
+                        for(unsigned i=0;i<unit;++i)copy[8+i]=static_cast<std::uint8_t>(clone>>(8*i));
+                    }
+                    memory.write(GuestAddress{arg(0)},copy);
                     if(pointer){const auto table=memory.load(GuestAddress{pointer},bits);start_callbacks(state,memory,{{memory.load(GuestAddress{table+unit},bits),{pointer}}},Continuation::Return,0);return std::nullopt;}
                     return finish(0);
                 }
@@ -787,7 +820,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
                 const auto open=[&](std::uint64_t hive){
                     return nested_service(state,memory,"advapi32.dll","RegOpenKeyW",{hive,root,slot});
                 };
-                // 先選可開啟的政策根，再查該根底下的子鍵和值。
+                // 參考實作先選可開啟的政策根，再查該根底下的子鍵和值。
                 if(!open(0x80000002U) || !open(0x80000001U)){
                     const auto key=memory.load(GuestAddress{slot},bits);
                     memory.store(GuestAddress{slot+8},32,0);
@@ -836,9 +869,35 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
             }
         }
         if(clone)result=0; // 指標 API 的失敗值不能回傳 HRESULT。
+    }else if(symbol=="#313" && service.family=="shlwapi.dll"){
+        result=static_cast<std::uint32_t>(nested_service(state,memory,"shell32.dll","SHGetFileInfoW",{arg(0),arg(1),arg(2),arg(3),arg(4)}));
     }else if(symbol=="SHGetFileInfoA" || symbol=="SHGetFileInfoW"){
         const auto flags=static_cast<std::uint32_t>(arg(4));const auto output=arg(2);const auto unit=x86_?4U:8U;const auto size=wide?(x86_?692U:696U):(x86_?352U:360U);
-        constexpr std::uint32_t supported=1|2|4|8|16|32|64|0x100|0x200|0x400|0x800|0x4000|0x8000|0x20000;
+        if(flags&0x2000U){
+            // EXETYPE 單獨使用，可省略 SHFILEINFO。與 GetBinaryType 共用限界讀取及格式檢查。
+            if(flags==0x2000U && arg(0)){
+                const auto path=utf16_to_utf8(read(arg(0)));
+                const auto source=filesystem_.open_library_reader(path);
+                if(!source.error)try{
+                    image_file::Reader reader(*source.file);
+                    const auto type=image_file::binary_type(reader,path);
+                    if(type && (*type==1 || *type==3))result=0x4d5a;
+                    else if(type){
+                        const auto at=reader.integer(60,4);
+                        if(*type==2){
+                            if(reader.integer(at+54,1)==2)result=0x454eU|(reader.integer(at+62,2)<<16);
+                        }else if(*type!=5){
+                            const auto header=image_file::pe_header(reader,at);
+                            result=0x4550;
+                            if(header.subsystem==2)result|=(reader.integer(at+24+48,1)<<24)|(reader.integer(at+24+50,1)<<16);
+                        }
+                    }
+                    reader.finish();
+                }catch(const SecurityDescriptorError&){result=0;}catch(const std::invalid_argument&){result=0;}
+            }
+            arg.return_to(state,result);return std::nullopt;
+        }
+        constexpr std::uint32_t supported=1|2|4|8|16|32|64|0x100|0x200|0x400|0x800|0x1000|0x4000|0x8000|0x20000;
         std::uint32_t error=0;
         if(flags&~supported)error=50;
         else if(!arg(0) || !output || static_cast<std::uint32_t>(arg(3))<size ||
@@ -868,6 +927,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
             if(!folder && !drive){const auto leaf=leaf_name(path);const auto dot=leaf.find_last_of(u'.');if(dot!=leaf.npos && dot+1<leaf.size()){type=leaf.substr(dot+1);for(auto& c:type)if(c>=u'a' && c<=u'z')c-=32;type+=u" 檔案";}}
             text(output+unit+8+(wide?520:260),type,80);
         }
+        if(flags&0x1000){
+            // 與 IExtractIconW 使用相同的檔案關聯、路徑展開與內建圖示索引。
+            GuestScratch scratch(*this,memory,state);
+            const auto source=scratch.text(path),slot=scratch.allocate(8),location=scratch.allocate(520);
+            const auto iid=scratch.allocate(16),fields=scratch.allocate(8);
+            if(!source || !slot || !location || !iid || !fields){arg.return_to(state,0);return std::nullopt;}
+            constexpr std::array<std::uint8_t,16> extract_iid{0xfa,0x14,2,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
+            memory.write(GuestAddress{iid},extract_iid);
+            if(nested_service(state,memory,"shell32.dll","SHCreateFileExtractIconW",{source,attributes,iid,slot})){
+                arg.return_to(state,0);return std::nullopt;
+            }
+            const auto object=memory.load(GuestAddress{slot},x86_?32:64);
+            const auto status=nested_service(state,memory,"internal-extract-icon","GetIconLocation",{object,0,location,260,fields,fields+4});
+            (void)nested_service(state,memory,"internal-extract-icon","Release",{object});
+            if(status){arg.return_to(state,0);return std::nullopt;}
+            text(output+unit+8,read_utf16(memory,GuestAddress{location},260),260);
+            memory.store(GuestAddress{output+unit},32,memory.load(GuestAddress{fields},32));
+        }
         if(flags&0x800){const auto shell_attributes=0x40000000U|(folder?0x20000000U:0U)|((attributes&1)?0x40000U:0U)|((attributes&2)?0x80000U:0U);memory.store(GuestAddress{output+unit+4},32,shell_attributes&mask);}
         if(flags&(0x100|0x4000))memory.store(GuestAddress{output+unit},32,index);
         if(flags&0x100){auto icon=native_stock_icon(drive?8U:folder?3U:0U,width);if(!icon)icon=GuiIcon{{},width,width,0x10001U+index};icon->system=0x10001U+index;const auto handle=store_gui_icon(std::move(*icon));memory.store(GuestAddress{output},x86_?32:64,handle);}
@@ -875,15 +952,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
         if(flags&0x4000){
             result=shell_image_list(width);
         }
-    }else if(symbol.starts_with("ILCreateFromPath") || symbol=="SHILCreateFromPath"){
-        const bool hr=symbol=="SHILCreateFromPath";auto path=normalized(read(arg(0)));
-        if(hr && !arg(1))result=invalid_argument;
-        else {
-            if(hr)memory.store(GuestAddress{arg(1)},64,0);
-            const auto info=path.empty()?FileInformation{{},{},123}:filesystem_.information(utf16_to_utf8(path));
-            if(info.error){last_error_=info.error;result=hr?hresult(info.error):0;}
-            else {const auto pidl=shell_make_pidl(memory,path);if(hr){if(pidl){memory.store(GuestAddress{arg(1)},64,pidl);if(arg(2)){const auto requested=memory.load(GuestAddress{arg(2)},32);const auto flags=0x40000000U|((info.metadata.attributes&16)?0x20000000U:0U)|((info.metadata.attributes&1)?0x40000U:0U);memory.store(GuestAddress{arg(2)},32,requested&flags);}result=0;}else result=0x8007000eU;}else result=pidl;}
+    }else if(symbol.starts_with("ILCreateFromPath") || symbol=="SHILCreateFromPath" || symbol=="SHSimpleIDListFromPath"){
+        const bool hr=symbol=="SHILCreateFromPath";
+        const auto output=hr?arg(1):0,attributes=hr?arg(2):0;
+        if(hr && !output){arg.return_to(state,invalid_argument);return std::nullopt;}
+        const auto bits=static_cast<std::uint8_t>(x86_?32:64);
+        if(output)memory.store(GuestAddress{output},bits,0);
+        const auto path=normalized(read(arg(0)));
+        std::uint32_t masked=0,status=0;
+        if(path.empty())status=hresult(123);
+        else if(symbol!="SHSimpleIDListFromPath"){
+            const auto requested=attributes?static_cast<std::uint32_t>(memory.load(GuestAddress{attributes},32)):0U;
+            status=shell_path_attributes(path,requested,masked);
         }
+        if(!status){
+            const auto pidl=shell_make_pidl(memory,path);
+            if(!pidl)status=0x8007000eU;
+            else if(hr){
+                memory.store(GuestAddress{output},bits,pidl);
+                if(attributes)memory.store(GuestAddress{attributes},32,masked);
+            }else result=pidl;
+        }
+        if(status){last_error_=status&0xffffU;result=hr?status:0U;}
     }else if(symbol=="SHGetKnownFolderPath" || symbol=="SHGetKnownFolderIDList"){
         const bool pidl=symbol=="SHGetKnownFolderIDList";const auto flags=static_cast<std::uint32_t>(arg(1));std::uint32_t error=0;
         if(!arg(3))result=invalid_argument;
@@ -910,6 +1000,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
         // SHGetFolderPathAndSubDir：在資料夾後接相對子目錄 pszSubDir（可多層），CSIDL_FLAG_CREATE 時連子目錄一併建立；子目錄不可為絕對路徑。
         const bool special=symbol.starts_with("SHGetSpecial"),with_subdir=symbol.starts_with("SHGetFolderPathAndSubDir");const auto flags=static_cast<std::uint32_t>(arg(special?2:1));const auto output=arg(special?1:with_subdir?5:4);
         const bool create=(flags&0x8000) || (special && arg(3));auto path=known_folder(flags&0xff);
+        if(output)memory.store(GuestAddress{output},wide?16:8,0);
         std::uint32_t error=0;
         const auto subdir=with_subdir?read(arg(4)):std::u16string{};
         if(!output || (flags&~0xc8ffU) || (!special && (arg(2) || arg(3)>1)))error=87;
@@ -917,8 +1008,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
         else if(path.empty())error=50;
         else {
             if(!subdir.empty()){path+=u'\\';for(auto c:subdir)path.push_back(c==u'/'?u'\\':c);while(path.size()>3 && path.back()==u'\\')path.pop_back();}
-            if(path.size()>=260)error=206;
-            memory.store(GuestAddress{output},wide?16:8,0);
+            if(path.size()>=260 || (!wide && utf16_to_utf8(path).size()>=260))error=206;
             if(error){}
             else if(create){
                 for(std::size_t at=3;at<=path.size();++at)if(at==path.size() || path[at]==u'\\'){

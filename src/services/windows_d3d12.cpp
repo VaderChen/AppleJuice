@@ -5,6 +5,7 @@
 #include "x64arm/unicode.hpp"
 #include "windows_display_identity.hpp"
 #include "builtin_module_data.hpp"
+#include "monotonic_clock.hpp"
 #include "x64arm/shared_wake.hpp"
 #include "d3d12_root_binding_layout.h"
 #include "d3d12_descriptor_layout.h"
@@ -273,14 +274,19 @@ struct D3D12State {
         // 來源大小（預設為緩衝大小，ResizeBuffers 時重設）與最大幀延遲（可等待交換鏈預設 1）。
         std::array<std::uint8_t,20> fullscreen{};std::array<std::uint8_t,16> background{};
         std::uint32_t rotation{1},source_width{},source_height{},latency{1};
-        // 幀延遲等待物件（DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT）：號誌狀態的 identity；每次 Present 排入後釋放一格。
+        // 幀延遲等待物件（DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT）：號誌狀態的 identity；每幀 GPU 完成後釋放一格。
         std::uint64_t latency_identity{};
+        // 依 DXGI 契約，最大幀延遲（預設 3，可等待交換鏈依 SetMaximumFrameLatency）限制的是「已 Present、GPU 尚未完成」的幀數，
+        // 不是提交執行緒尚未編碼的幀數。每個在途幀一個紀錄：提交執行緒編碼 Present 後掛上 GPU 完成旗標；以提交鎖保護。
+        struct InflightFrame {bool encoded{};std::shared_ptr<const std::atomic<bool>> gpu;};
+        std::deque<std::shared_ptr<InflightFrame>> inflight;
     };
     // 物件、資源、命令清單與管線表每次服務呼叫或每次繪製都會查詢（數萬筆時 std::map 樹狀查找以快取未命中為主）：改雜湊表。
     // 沒有依序走訪；元素參照在重新雜湊後仍有效（重播的資源指標快取依此），只在建立／釋放時增刪。
     std::unordered_map<std::uint64_t,Object> objects=reserved<Object>(1U<<16);
     std::map<std::uint64_t,Device> devices;std::unordered_map<std::uint64_t,Resource> resources=reserved<Resource>(1U<<15);std::map<std::uint64_t,Heap> heaps;
     std::map<std::uint64_t,RootSignature> roots;std::unordered_map<std::uint64_t,Pipeline> pipelines=reserved<Pipeline>(1U<<13);std::unordered_map<std::uint64_t,List> lists=reserved<List>(1U<<10);
+    std::map<std::uint64_t,std::pair<std::uint32_t,std::uint32_t>> queue_priorities; // ID3D12CommandQueue1：{行程內, 全域}，未設定時 {NORMAL, DEFAULT}。
     std::map<std::uint64_t,std::shared_ptr<Fence>> fences;std::map<std::uint64_t,std::vector<std::uint8_t>> blobs;std::map<std::uint64_t,std::uint32_t> queues;std::map<std::uint64_t,SwapChain> swaps;
     std::map<std::uint64_t,MemoryHeap> memory_heaps;std::map<std::uint64_t,QueryHeap> query_heaps;
     // 非同步提交：ExecuteCommandLists 不等 GPU，記錄各佇列最近一次提交的完成旗標與待讀回資源（READBACK 堆積）。
@@ -386,6 +392,7 @@ struct D3D12Submitter {
         std::shared_ptr<D3D12State::Fence> fence;
         std::shared_ptr<const std::atomic<bool>> dependency;
         std::uint64_t queue{},ticket{};
+        std::shared_ptr<D3D12State::SwapChain::InflightFrame> frame; // Present：編碼後掛上 GPU 完成旗標。
     };
     std::mutex mutex;std::condition_variable wake,idle;std::deque<Job> jobs;
     std::uint64_t queued{},done{},finished{};std::set<std::uint64_t> completed;unsigned pending_waits{};bool stopping{};
@@ -965,6 +972,11 @@ std::uint64_t WindowsServices::gpu_signal_wakeup_ns() const {
     return std::atomic_ref(const_cast<std::size_t&>(gpu_signal_count_)).load(std::memory_order_relaxed)?interval:0;
 }
 namespace {
+bool d3d12_trace_latency(){static const bool value=std::getenv("X64ARM_TRACE_DXGI_LATENCY")!=nullptr;return value;}
+// X64ARM_D3D12_FRAME_LATENCY_GPU=1：最大幀延遲改依 DXGI 契約限制「GPU 尚未完成」的幀數，等待物件在該幀 GPU 完成後才釋放。
+// 預設關閉（待 FPS 對照）：未開啟時只限制提交執行緒尚未編碼的 Present、等待物件在排入時就釋放。
+// 2026-11-20 死亡擱淺：開啟後載入崩潰仍為 2／4，不是該崩潰的修正。
+bool d3d12_frame_latency_gpu(){static const bool value=[] {const auto* text=std::getenv("X64ARM_D3D12_FRAME_LATENCY_GPU");return text && std::string_view(text)=="1";}();return value;}
 bool d3d12_async_submit_enabled(){static const bool value=[] {const auto* text=std::getenv("X64ARM_D3D12_ASYNC_SUBMIT");return !text || std::string_view(text)!="0";}();return value;}
 const WindowsServiceDescriptor d3d12_execute_method{"internal-d3d12","Queue.ExecuteCommandLists",4};
 const WindowsServiceDescriptor d3d12_signal_method{"internal-d3d12","Queue.Signal",3};
@@ -1272,6 +1284,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
     // 診斷：X64ARM_TRACE_D3D12_FRAME_DRAWS=1 每次 Present 輸出期間重播的繪製數（直接、GPU 間接、運算、述詞略過、零元素）
     // 與直接繪製的元素總數，用來分辨幾何缺漏發生在客體送出的命令（數量變動）或後端繪製結果（數量不變）。
     static const bool trace_frame_draws=std::getenv("X64ARM_TRACE_D3D12_FRAME_DRAWS")!=nullptr;
+    static const bool trace_resource_lifetime=std::getenv("X64ARM_TRACE_D3D12_RESOURCE_LIFETIME")!=nullptr;
     static std::array<std::atomic<std::uint64_t>,6> frame_draws{};
     // 診斷（X64ARM_TRACE_D3D12_READBACK）：本幀已重播的提交中被 GPU 寫入（UAV／複製目的）的資源，只由重播端讀寫。
     static std::set<std::uint64_t> frame_written;
@@ -1523,6 +1536,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         const auto remaining=found->second.references;
         if(!remaining){
             const auto device=found->second.device;
+            if(trace_resource_lifetime && kind==Kind::Resource){std::uint64_t caller=0;try{caller=load(state.reg(Gpr::Rsp),64);}catch(const MemoryFault&){}
+                std::fprintf(stderr,"[d3d12_lifetime] free object=0x%llx caller=0x%llx\n",static_cast<unsigned long long>(self),static_cast<unsigned long long>(caller));}
             // 交換鏈：先銷毀 D3D11／DXGI 橋接層的顯示身分；仍在全螢幕時還原視窗（與 D3D11 交換鏈釋放相同），並釋放它持有的輸出、介面卡與工廠。
             if(kind==Kind::SwapChain && call)(void)invoke_d3d11_full(state,memory,WindowsServiceDescriptor{"internal-d3d12-swap","DisplayRelease",1});
             // 零複製映射撤除客體範圍；宿主記憶體由 GPU 別名持有到在途命令完成。
@@ -1731,6 +1746,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                     }
                 }
                 catch(const std::exception& error){note(std::string("d3d12_note=Present 失敗：")+error.what());}
+                if(const auto frame=submit_job->frame){
+                    std::shared_ptr<const std::atomic<bool>> done;
+                    try{std::unique_lock<GraphicsMutex> relock(graphics_mutex(),std::defer_lock);if(!graphics_guard.owns_lock())lock_graphics(relock);done=device.native->graphics_fence();}
+                    catch(const std::exception& error){note(std::string("d3d12_note=Present 完成旗標失敗：")+error.what());}
+                    if(d3d12_submitter_){const std::lock_guard lock(d3d12_submitter_->mutex);frame->gpu=done;frame->encoded=true;}
+                    if(d3d12_submitter_)d3d12_submitter_->idle.notify_all();
+                    // 幀延遲等待物件：該幀 GPU 完成後才釋放一格（DXGI：「交換鏈完成呈現一幀」時發出訊號），由客體端的 GPU 完成輪詢套用。
+                    if(swap.latency_identity)queue_gpu_signal(memory,done,self,[this,identity=swap.latency_identity](GuestMemory&){
+                        if(const auto semaphore=runtime_.wait_states.find(identity);semaphore!=runtime_.wait_states.end())semaphore->second.release_semaphore(1,nullptr,true);},false);
+                }
                 return std::nullopt;
             }
             // 幀延遲等待物件：Present 排入後釋放一格（狀態已因全部 handle 關閉而回收時停止追蹤）。
@@ -1742,7 +1767,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             };
             // 在途上限：可等待交換鏈依 SetMaximumFrameLatency，其餘為 DXGI 預設 3。
             static const bool present_gpu_wait=[] {const auto* value=std::getenv("X64ARM_D3D12_PRESENT_GPU_WAIT");return value && std::string_view(value)=="1";}();
-            const unsigned inflight_limit=present_gpu_wait?1U:(swap.flags&0x40U)?swap.latency:3U;
+            // 診斷：X64ARM_D3D12_FRAME_LATENCY_LIMIT=<1～16> 覆寫在途幀上限（對照用）；X64ARM_TRACE_DXGI_LATENCY=1 列出交換鏈旗標與幀延遲設定。
+            static const unsigned limit_override=[] {const auto* value=std::getenv("X64ARM_D3D12_FRAME_LATENCY_LIMIT");
+                return value?static_cast<unsigned>(std::clamp<unsigned long>(std::strtoul(value,nullptr,10),0UL,16UL)):0U;}();
+            const unsigned inflight_limit=limit_override?limit_override:present_gpu_wait?1U:(swap.flags&0x40U)?swap.latency:3U;
+            if(d3d12_trace_latency() && swap.frames<2)std::fprintf(stderr,"[dxgi_latency] present swap=0x%llx flags=0x%x latency=%u limit=%u waitable=%d\n",
+                static_cast<unsigned long long>(self),swap.flags,swap.latency,inflight_limit,swap.latency_identity!=0);
             if(d3d12_submitter_){
                 auto& submitter=*d3d12_submitter_;
                 D3D12Submitter::Job job;job.method=&d3d12_present_method;
@@ -1757,10 +1787,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         if(start)submitter.stats.present_wait.fetch_add(D3D12Submitter::now_ns()-start,std::memory_order_relaxed);
                         D3D12Submitter::stall("guest_present_inflight",start);
                     }
+                    // GPU 尚未完成的幀達上限時先等最舊的一幀完成（GPU 依序完成）；未開啟 X64ARM_D3D12_FRAME_LATENCY_GPU 時只限制未編碼的 Present。
+                    if(d3d12_frame_latency_gpu()){
+                        const auto retire=[&]{while(!swap.inflight.empty()){const auto& front=*swap.inflight.front();
+                            if(!front.encoded || (front.gpu && !front.gpu->load(std::memory_order_acquire)))break;swap.inflight.pop_front();}};
+                        retire();
+                        if(swap.inflight.size()>=inflight_limit){
+                            const auto start=D3D12Submitter::timed()?D3D12Submitter::now_ns():0;
+                            // GPU 完成旗標沒有通知：以 0.25 ms 間隔重查（與 GPU 完成通知的輪詢間隔相同）；編碼完成時提交執行緒會喚醒。
+                            while(retire(),swap.inflight.size()>=inflight_limit)submitter.idle.wait_for(lock,std::chrono::microseconds(250));
+                            if(start)submitter.stats.present_wait.fetch_add(D3D12Submitter::now_ns()-start,std::memory_order_relaxed);
+                            D3D12Submitter::stall("guest_present_gpu_frames",start);
+                        }
+                        job.frame=std::make_shared<D3D12State::SwapChain::InflightFrame>();swap.inflight.push_back(job.frame);
+                    }
                     ++submitter.presents;
                 }
+                const bool deferred_latency=job.frame!=nullptr;
                 d3d12_enqueue(submitter,std::move(job),false);
-                swap.index=(swap.index+1)%static_cast<std::uint32_t>(swap.buffers.size());++swap.frames;release_latency();return finish(ok);
+                swap.index=(swap.index+1)%static_cast<std::uint32_t>(swap.buffers.size());++swap.frames;if(!deferred_latency)release_latency();return finish(ok);
             }
             try{present(native,*swap.native,frame_view(swap.index),u32(1),gui_.windows.contains(swap.window));}
             catch(const std::exception& error){runtime_.module_events.push_back(std::string("d3d12_note=Present 失敗：")+error.what());return finish(fail);}
@@ -1824,6 +1869,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         if(member=="GetSourceSize"){if(!arg(1) || !arg(2))return finish(invalid);store(arg(1),32,swap.source_width);store(arg(2),32,swap.source_height);return finish(ok);}
         // 最大幀延遲與等待物件只屬於以 FRAME_LATENCY_WAITABLE_OBJECT 建立的交換鏈，其餘回 DXGI_ERROR_INVALID_CALL。
         if(member=="SetMaximumFrameLatency"){
+            if(d3d12_trace_latency())std::fprintf(stderr,"[dxgi_latency] set swap=0x%llx flags=0x%x value=%u\n",static_cast<unsigned long long>(self),swap.flags,u32(1));
             if(!(swap.flags&0x40U))return finish(0x887a0001U);if(!u32(1) || u32(1)>16)return finish(invalid);
             if(u32(1)>swap.latency && swap.latency_identity)
                 if(const auto semaphore=runtime_.wait_states.find(swap.latency_identity);semaphore!=runtime_.wait_states.end())semaphore->second.release_semaphore(u32(1)-swap.latency,nullptr,true);
@@ -1831,6 +1877,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         }
         if(member=="GetMaximumFrameLatency"){if(!(swap.flags&0x40U))return finish(0x887a0001U);if(!arg(1))return finish(invalid);store(arg(1),32,swap.latency);return finish(ok);}
         if(member=="GetFrameLatencyWaitableObject"){
+            if(d3d12_trace_latency())std::fprintf(stderr,"[dxgi_latency] waitable swap=0x%llx flags=0x%x latency=%u\n",static_cast<unsigned long long>(self),swap.flags,swap.latency);
             // 每次呼叫回傳新 handle（呼叫端以 CloseHandle 釋放），共用同一號誌狀態；初值為目前的最大幀延遲。
             if(!(swap.flags&0x40U) || runtime_.wait_objects.size()>=process_handle_limit)return finish(0);
             const auto handle=runtime_.allocate_wait_handle();
@@ -2305,6 +2352,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             if(r.dimension==1){r.address=bridge.next_address;bridge.next_address+=(r.width+0xffffU)&~UINT64_C(0xffff);}
             const auto object=create(Kind::Resource,self);if(r.address)bridge.addresses[r.address]=object;
             store(object+8,64,r.address); // 客體常式 D3D12ResourceGetGPUVirtualAddress 讀取（紋理為 0）。
+            // 診斷：X64ARM_TRACE_D3D12_RESOURCE_LIFETIME=1 列出每個資源的建立（遊戲給的輸出位址、呼叫點）與最後釋放，
+            // 用來判斷遊戲物件中空的資源欄位是從未建立還是已被釋放。只讀客體堆疊，不改變結果。
+            if(trace_resource_lifetime){std::uint64_t caller=0;try{caller=load(state.reg(Gpr::Rsp),64);}catch(const MemoryFault&){}
+                std::fprintf(stderr,"[d3d12_lifetime] create object=0x%llx out=0x%llx dim=%u width=%llu heap=%u placed=%d caller=0x%llx\n",static_cast<unsigned long long>(object),
+                    static_cast<unsigned long long>(out),r.dimension,static_cast<unsigned long long>(r.width),r.heap_type,placed!=nullptr,static_cast<unsigned long long>(caller));}
             bridge.resources[object]=std::move(r);return give(object,riid,out);
         };
         if(member=="CreateCommittedResource" || member=="CreateCommittedResource1" || member=="CreateCommittedResource2" || member=="CreateCommittedResource3"){
@@ -2562,6 +2614,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         if(member=="Signal"){signal(arg(1));return finish(ok);}
         if(member=="SetEventOnCompletion"){
             const auto value=fence.value.load(std::memory_order_acquire);
+            // 診斷（X64ARM_TRACE_D3D12）：登記的目標值、目前值與事件 handle（queue 欄位放事件 handle），與 complete 紀錄對照可看出誰的完成沒到。
+            trace_d3d12_fence("event_register",self,arg(1),value,arg(2));
             if(!arg(2)){
                 if(value>=arg(1))return finish(ok);
                 // 沿用一般物件等待與內部 handle 回收；只停駐本執行緒，不阻塞協調者或其他 vCPU。
@@ -2718,6 +2772,34 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             // 頻率是常數，不取樣。原本每次呼叫都取一次 GPU 時間戳，等 GPU 做完全部在途工作（RE8 每幀一次、每次約 5 ms）。
             if(!arg(1))return finish(pointer_error);
             store(arg(1),64,GraphicsTimestamp{}.frequency);return finish(ok);
+        }
+        if(member=="GetClockCalibration"){
+            // GPU 與 CPU 時鐘同一時刻的配對取樣：GPU 值與 GetTimestampFrequency／TIMESTAMP 查詢同一時基，
+            // CPU 值為 QueryPerformanceCounter 的計數（10 MHz）。後端沒有免提交的時鐘時退回同步取樣一次。
+            if(!arg(1) || !arg(2))return finish(pointer_error);
+            std::optional<std::uint64_t> gpu;
+            try{gpu=native.graphics_gpu_clock();if(!gpu)gpu=native.graphics_timestamp().ticks;}catch(const std::exception&){gpu.reset();}
+            if(!gpu)return finish(fail);
+            const auto cpu=runtime_.host_clock?detail::monotonic_ticks():runtime_.clock_ticks;
+            store(arg(1),64,*gpu);store(arg(2),64,cpu);return finish(ok);
+        }
+        // PIX 事件與標記：沒有附加擷取工具時沒有可觀察效果（命令清單版在重播時同樣略過）。
+        if(member=="SetMarker" || member=="BeginEvent" || member=="EndEvent")return finish(0);
+        // ID3D12CommandQueue1：行程內優先序（NORMAL／HIGH）與全域優先序（IDLE、DEFAULT、NORMAL_0、SOFT_REALTIME_0～13、HARD_REALTIME）。
+        // 即時等級需要提高排程優先權的權限，一般程序回 E_ACCESSDENIED；其餘值 E_INVALIDARG。設定值逐佇列保存並由 Get 回讀。
+        if(member=="SetProcessPriority" || member=="SetGlobalPriority"){
+            const auto value=u32(1);auto& priority=bridge.queue_priorities[self];
+            if(member=="SetProcessPriority"){if(value>1)return finish(invalid);priority.first=value;return finish(ok);}
+            if(value>32 || (value>2 && value<18))return finish(invalid);
+            if(value>=18)return finish(0x80070005U);
+            priority.second=value;return finish(ok);
+        }
+        if(member=="GetProcessPriority" || member=="GetGlobalPriority"){
+            if(!arg(1))return finish(pointer_error);
+            const auto found_priority=bridge.queue_priorities.find(self);
+            const auto value=found_priority==bridge.queue_priorities.end()?(member=="GetProcessPriority"?0U:1U):
+                (member=="GetProcessPriority"?found_priority->second.first:found_priority->second.second);
+            store(arg(1),32,value);return finish(ok);
         }
         if(member=="GetDesc"){if(arg(1)){store(arg(1),32,bridge.queues.at(self));store(arg(1)+4,32,0);store(arg(1)+8,32,0);store(arg(1)+12,32,0);}return finish(arg(1));}
         if(member=="Wait"){

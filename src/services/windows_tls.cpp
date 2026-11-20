@@ -165,10 +165,11 @@ std::span<const WindowsServiceDescriptor> tls_service_descriptors() {
         {"secur32.dll","QuerySecurityPackageInfoA",2},{"secur32.dll","QuerySecurityPackageInfoW",2},
         {"secur32.dll","EnumerateSecurityPackagesA",2},{"secur32.dll","EnumerateSecurityPackagesW",2},
         {"secur32.dll","AcquireCredentialsHandleW",9},{"secur32.dll","AcquireCredentialsHandleA",9},
-        {"secur32.dll","FreeCredentialsHandle",1},{"secur32.dll","InitializeSecurityContextA",12},{"secur32.dll","InitializeSecurityContextW",12},
-        {"secur32.dll","AcceptSecurityContext",9},{"secur32.dll","CompleteAuthToken",2},{"secur32.dll","DeleteSecurityContext",1},{"secur32.dll","FreeContextBuffer",1},
-        {"secur32.dll","QueryContextAttributesA",3},{"secur32.dll","QueryContextAttributesW",3},
-        {"secur32.dll","SetContextAttributesA",4},{"secur32.dll","SetContextAttributesW",4},
+        {"secur32.dll","FreeCredentialsHandle",1},{"secur32.dll","InitializeSecurityContextA",12,0,0,0xb8},{"secur32.dll","InitializeSecurityContextW",12,0,0,0xb8},
+        {"secur32.dll","AcceptSecurityContext",9,0,0,0x18},{"secur32.dll","CompleteAuthToken",2},{"secur32.dll","DeleteSecurityContext",1},{"secur32.dll","FreeContextBuffer",1},
+        {"secur32.dll","QueryContextAttributesA",3,0,0,0x2},{"secur32.dll","QueryContextAttributesW",3,0,0,0x2},
+        {"secur32.dll","QueryContextAttributesExA",4,0,0,0xa},{"secur32.dll","QueryContextAttributesExW",4,0,0,0xa},
+        {"secur32.dll","SetContextAttributesA",4,0,0,0xa},{"secur32.dll","SetContextAttributesW",4,0,0,0xa},
         {"secur32.dll","EncryptMessage",4},{"secur32.dll","DecryptMessage",4},{"secur32.dll","ApplyControlToken",2},
         {"secur32.dll","InitSecurityInterfaceW",0},{"secur32.dll","InitSecurityInterfaceA",0},
         {"secur32.dll","QueryCredentialsAttributesA",3,0,0,0x2},{"secur32.dll","QueryCredentialsAttributesW",3,0,0,0x2},
@@ -459,10 +460,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_tls(GuestState& state,Guest
                 }catch(const MemoryFault&){result=bad_parameter;}
             } else if(symbol.starts_with("QueryContextAttributes")) {
                 const auto kind=arg(1),destination=arg(2);
+                const unsigned unit=x86_?4:8;
+                unsigned required=0;
+                switch(kind){
+                case 4: required=20; break;
+                case 94: required=8+unit; break;
+                case 100: required=680; break;
+                case 107: required=2*unit; break;
+                }
                 if(!SSL_is_init_finished(ssl))result=invalid;
+                else if(!required)result=unsupported;
+                else if(!destination)result=0x8009035d;
+                else if(symbol.starts_with("QueryContextAttributesEx") && arg(3)<required)result=small_buffer;
                 else if(kind==4) {const std::array<std::uint32_t,5> sizes{5,256,16384,4,1};for(std::size_t i=0;i<sizes.size();++i)memory.store(GuestAddress{destination+i*4},32,sizes[i]);}
                 else if(kind==94 || kind==107){
-                    const unsigned unit=x86_?4:8;const auto width=static_cast<std::uint8_t>(unit*8);const auto size=kind==94?8+unit:2*unit;
+                    const auto width=static_cast<std::uint8_t>(unit*8);const auto size=required;
                     memory.check(GuestAddress{destination},size,Access::Write);std::vector<std::uint8_t> payload;
                     if(kind==94)payload=session.application_data;
                     else if(!session.keying_size)result=0x8009035d;

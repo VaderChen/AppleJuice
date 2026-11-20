@@ -834,9 +834,11 @@ private:
     std::uint64_t allocate_gui_window();
     SharedWindowInfo describe_gui_window(std::uint64_t);
     std::uint64_t query_shell_window();
+    std::uint64_t desktop_manager_window(bool taskman,std::optional<std::uint64_t> replacement);
     bool register_shell_window(std::uint64_t,std::uint64_t);
     void publish_gui_window(std::uint64_t);
     void unpublish_gui_window(std::uint64_t);
+    std::uint64_t find_gui_window(GuestMemory&,const WindowsCall&,std::string_view);
     std::optional<SharedWindowInfo> shared_gui_window(std::uint64_t,bool enforce_job=true);
     bool invoke_remote_gui(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool invoke_remote_gui_message(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1072,6 +1074,7 @@ private:
     // RtlCreateAtomTable 建立的 atom 表格（與本機 atom 相同的表格型別）與釘選的 atom。
     struct RtlAtomTable {LocalAtomTable atoms;std::set<std::uint16_t> pinned;};std::map<std::uint64_t,RtlAtomTable> rtl_atom_tables_;
     // SHSetThreadRef 的每執行緒參照（不 AddRef）、SHCreateThreadRef 建立的物件與其 vtable，以及 SHSetInstanceExplorer 的程序參照。
+    std::uint32_t shell_browser_platform_{};
     std::map<std::uint64_t,std::uint64_t> shell_thread_refs_;std::set<std::uint64_t> shell_thread_ref_objects_;std::uint64_t shell_thread_ref_vtable_{},shell_instance_explorer_{};
     std::uint64_t shell_inverse_cmap_{}; // SHGetInverseCMAP 的 32768 位元組反查表（常駐客體記憶體）
     // SHOpenRegStream：讓既有記憶體 IStream 在最後一次 Release 時把內容寫回登錄值（接手 key 的所有權）。
@@ -1349,7 +1352,7 @@ private:
     std::optional<std::uint32_t> open_bluetooth(GuestState&,GuestMemory&,const WindowsServiceDescriptor&,const std::u16string&,const FileOpenArguments&);
     std::optional<std::uint32_t> duplicate_bluetooth(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_device_configuration(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
-    std::uint32_t system_metric(std::uint32_t index,std::uint32_t dpi=96);
+    std::uint32_t system_metric(const GuestMemory&,std::uint32_t index,std::uint32_t dpi=96);
     std::u16string keyboard_layout_name();
     std::vector<std::u16string>* current_thread_ui_languages();
     std::pair<std::uint32_t,DirectorySearch> search_directory(const std::string& path);
@@ -1373,8 +1376,8 @@ private:
     std::shared_ptr<DemangleState> demangle_;
     std::shared_ptr<Msvcp100State> msvcp100_;
     void initialize_msvcp100(GuestMemory&);
-    GuestAddress msvcp100_data(std::string_view,bool modern=false) const;
-    void initialize_msvcp_numeric_facet(GuestState&,GuestMemory&,std::uint64_t,bool,bool,const CrtLocaleCategory&,std::uint32_t,bool=false);
+    GuestAddress msvcp100_data(std::string_view,bool modern=false,bool vc12=false) const;
+    void initialize_msvcp_numeric_facet(GuestState&,GuestMemory&,std::uint64_t,bool,bool,const CrtLocaleCategory&,std::uint32_t,bool=false,unsigned variant=0);
     void queue_msvcp_facet_retirement(std::uint64_t);
     std::optional<std::uint32_t> invoke_msvcp100(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_msvcp100(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
@@ -1543,6 +1546,9 @@ private:
     std::optional<std::uint32_t> open_usb(GuestState&,GuestMemory&,const WindowsServiceDescriptor&,const std::u16string&,const FileOpenArguments* = nullptr);
     void finish_dinput_enumeration(std::uint64_t,GuestMemory&,const GuestState&);
     std::optional<std::uint32_t> invoke_dsound(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
+    bool invoke_dsound_worker(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
+    bool pipe_peek_worker(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
+    bool file_read_worker(GuestState&, GuestMemory&);
     std::shared_ptr<D3D9State> d3d9_;
     std::optional<std::uint32_t> resume_d3dx_progress(GuestState&, GuestMemory&, std::uint64_t, std::uint32_t);
     void discard_d3dx_progress(GuestState&,GuestMemory&,std::uint64_t);
@@ -2006,6 +2012,7 @@ private:
     bool finish_duplicate_remote_handle(GuestState&,GuestMemory&,std::uint64_t);
     void cancel_duplicate_remote_handle(GuestMemory&,std::uint64_t);
     bool mapping_handle(std::uint64_t) const;
+    std::shared_ptr<const void> retain_mapping_object(std::uint64_t) const;
     bool shared_mapping_page(std::uint64_t) const;
     struct MappingViewInfo {std::uint64_t base{},size{};std::uint32_t protection{};};
     std::optional<MappingViewInfo> mapping_view_info(std::uint64_t) const;
@@ -2017,6 +2024,7 @@ private:
     void initialize_gui_timing(GuestMemory&,bool shared=false);
     std::uint32_t gui_timing(const GuestMemory&,unsigned) const;
     void set_gui_timing(GuestMemory&,unsigned,std::uint32_t);
+    void reset_input_queue(std::uint64_t);
     bool gui_input_connected(std::uint64_t,std::uint64_t) const;
     GuiCaret* gui_caret(std::uint64_t);
     void draw_gui_caret(GuestMemory&,GuiCaret&,bool);
@@ -2053,13 +2061,14 @@ private:
     // only 非零時只抽取該 socket 的監看（WSAEnumNetworkEvents）；為零時全量抽取，距上次未滿 X64ARM_NETWORK_PUMP_US 則略過。
     void pump_gui_network(std::uint64_t only=0);
     void enqueue_gui_message(GuiMessage);
-    void remember_gui_message(const GuiMessage&);
+    void remember_gui_message(GuestMemory&,const GuiMessage&);
     // 游標：控制代碼解析（自訂、被 SetSystemCursor 取代或原生系統游標）、依目前游標重設原生游標、回收動畫幀控制代碼。
     const GuiIcon* resolve_gui_cursor(std::uint64_t handle,GuiIcon& system) const;
     void present_gui_cursor();
     void release_cursor_frames(std::uint64_t cursor);
     // SwapMouseButton：實體左右鍵轉成邏輯按鍵（訊息、MK_* 旗標）；GetMouseMovePointsEx 的移動歷程記錄。
-    void swap_gui_mouse_buttons(GuiMessage&) const;
+    bool exchange_mouse_buttons(GuestMemory&,bool);
+    void swap_gui_mouse_buttons(const GuestMemory&,GuiMessage&) const;
     void record_mouse_move_point(std::int64_t x,std::int64_t y,std::uint32_t time,std::uint64_t extra);
     // InSendMessage／GetCIMSSM 共用：最內層作用中的跨執行緒（或跨程序）傳送與其回呼框架位置。
     std::pair<std::map<std::uint64_t,GuiSentMessage>::iterator,std::size_t> active_gui_sent_message(std::uint64_t* text_token=nullptr);
@@ -2082,7 +2091,7 @@ private:
     bool translate_gui_key(const GuiMessage&);
     std::optional<std::uint64_t> gui_edit_input(GuestMemory&,const GuiMessage&,bool);
     void refresh_clipboard(bool local = false);
-    void notify_clipboard();
+    void notify_clipboard(const GuiClipboardNoticeResult* published=nullptr);
     GuiClipboardNoticeResult clipboard_notice(ClipboardNoticeAction,std::uint64_t=0,std::uint64_t=0,std::optional<std::uint64_t> = {});
     void dispatch_clipboard_notifications(GuestState&,GuestMemory&);
     void pump_mouse_tracking();
@@ -2437,6 +2446,8 @@ private:
     std::uint64_t msvc_exception_cells(GuestState&,GuestMemory&,bool create,bool refresh=false);
     std::uint32_t msvc_uncaught_count() const noexcept;
     void sync_msvc_uncaught(GuestMemory&) const;
+    std::uint32_t gui_registered_message(std::u16string_view name);
+    std::uint32_t gui_station_atom(std::u16string_view name,std::uint32_t id);
     std::optional<std::uint32_t> invoke_gui_extra(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_common_dialog(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_gui_busy(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);

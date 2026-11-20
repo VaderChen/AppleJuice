@@ -1,6 +1,6 @@
 // shell32 公用函式（以既有 COM、設定檔、登錄與 ShellExecuteEx 服務轉接；HRESULT 依 Windows 文件）：
 // - SHCreateStdEnumFmtEtc：複製 FORMATETC 陣列（含 ptd 的 DVTARGETDEVICE）成 IEnumFORMATETC，與 OLE 剪貼簿資料物件共用同一個列舉物件。
-// - SHCLSIDFromString：CLSIDFromString。SHCoCreateInstance：字串 CLSID 優先、否則用 pclsid，以 CLSCTX_INPROC_SERVER 呼叫 CoCreateInstance。
+// - SHCLSIDFromString：CLSIDFromString。SHCoCreateInstance：pclsid 優先、否則解析字串 CLSID，以 CLSCTX_INPROC_SERVER 呼叫 CoCreateInstance。
 // - SHGetLocalizedName／SHSetLocalizedName／SHRemoveLocalizedName：資料夾 desktop.ini 的 [.ShellClassInfo] LocalizedResourceName＝@模組,-資源識別碼；
 //   設定時 desktop.ini 設為隱藏＋系統、資料夾加上唯讀屬性（PathMakeSystemFolder 的預設）；沒有名稱時 HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)。
 // - SHSetUnreadMailCountW／SHGetUnreadMailCountW／SHEnumerateUnreadMailAccountsW：HKCU（或指定的使用者機碼）\Software\Microsoft\Windows\CurrentVersion\UnreadMail\<帳號>
@@ -9,6 +9,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
+#include "shell_defclass_layout.h"
 #include <algorithm>
 #include <bit>
 #include <ctime>
@@ -20,7 +21,10 @@ constexpr std::uint32_t hresult_win32(std::uint32_t error){return error?0x800700
 }
 std::span<const WindowsServiceDescriptor> shell_utility_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
-        {"shell32.dll","SHCreateStdEnumFmtEtc",3,0,0,0x1},{"shell32.dll","SHCLSIDFromString",2},{"shell32.dll","SHCoCreateInstance",5},
+        {"internal-shell-factory","SHCreateDefClassObject",5},{"internal-shell-factory","ShellFactoryQuery",3},
+        {"internal-shell-factory","AddRef",1},{"internal-shell-factory","Release",1},{"internal-shell-factory","ShellFactoryCreate",4},
+        {"internal-shell-factory","ShellFactoryLock",2},{"internal-shell-factory","ShellFactoryDestroy",1},
+        {"shell32.dll","SHCreateStdEnumFmtEtc",3,0,0,0x1},{"shell32.dll","SHCoCreateInstance",5},
         {"shell32.dll","SHGetLocalizedName",4,0,0,0x4},{"shell32.dll","SHSetLocalizedName",3,0,0,0x4},{"shell32.dll","SHRemoveLocalizedName",1},
         {"shell32.dll","SHSetUnreadMailCountW",3,0,0,0x2},{"shell32.dll","SHGetUnreadMailCountW",6,0,0,0x20},{"shell32.dll","SHEnumerateUnreadMailAccountsW",4,0,0,0xa},
         {"shell32.dll","ShellExec_RunDLL",4,0,0,0x8},{"shell32.dll","ShellExec_RunDLLA",4,0,0,0x8},{"shell32.dll","ShellExec_RunDLLW",4,0,0,0x8}};
@@ -65,16 +69,79 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_utilities(GuestState&
         };
         const std::uint64_t current_user=x86_?0x80000001ULL:0xffffffff80000001ULL;
         try{
-            if(name=="SHCLSIDFromString"){
-                if(!call(0) || !call(1))co_return finish(e_invalidarg);
-                co_return finish(static_cast<std::uint32_t>(co_await api("ole32.dll","CLSIDFromString",{call(0),call(1)})));
+            if(service.family=="internal-shell-factory"){
+                constexpr std::uint32_t no_interface=0x80004002U;
+                const auto same=[&](std::uint64_t at,const unsigned char *expected){
+                    std::array<std::uint8_t,16> guid{};
+                    m.read(GuestAddress{at},guid);
+                    return std::equal(guid.begin(),guid.end(),expected);
+                };
+                const auto self=call(0);
+                if(name=="SHCreateDefClassObject"){
+                    if(!self || !call(1))co_return finish(e_pointer);
+                    if(!same(self,shell_factory_iid))co_return finish(no_interface);
+                    if(!call(2))co_return finish(e_invalidarg);
+                    m.check(GuestAddress{call(1)},unit,Access::Write);
+                    const auto object=scratch(SHELL_FACTORY_VTABLE+5*unit);
+                    const auto table=object+SHELL_FACTORY_VTABLE;
+                    m.store(GuestAddress{object},bits,table);
+                    m.store(GuestAddress{object+COM_AGILE_REFS},32,1);
+                    m.store(GuestAddress{object+COM_AGILE_DESTROY},bits,resolve(service.family,"ShellFactoryDestroy").value);
+                    m.store(GuestAddress{object+SHELL_FACTORY_CALLBACK},bits,call(2));
+                    m.store(GuestAddress{object+SHELL_FACTORY_DLL_COUNT},bits,call(3));
+                    m.store(GuestAddress{object+SHELL_FACTORY_FILTER},bits,call(4));
+                    unsigned slot=0;
+                    for(const auto method:{"ShellFactoryQuery","AddRef","Release","ShellFactoryCreate","ShellFactoryLock"})
+                        m.store(GuestAddress{table+unit*slot++},bits,resolve(service.family,method).value);
+                    if(call(3))m.atomic_rmw(GuestAddress{call(3)},32,GuestMemory::AtomicRmw::Add,1);
+                    m.store(GuestAddress{call(1)},bits,object);
+                    blocks.pop_back();
+                    co_return finish(0);
+                }
+                const auto refs=GuestAddress{self+COM_AGILE_REFS};
+                if(name=="ShellFactoryLock")co_return finish(0x80004001U);
+                if(name=="AddRef")co_return finish(static_cast<std::uint32_t>(m.atomic_rmw(refs,32,GuestMemory::AtomicRmw::Add,1)+1));
+                if(name=="Release" || name=="ShellFactoryDestroy"){
+                    if(name=="Release"){
+                        const auto count=static_cast<std::uint32_t>(m.atomic_rmw(refs,32,GuestMemory::AtomicRmw::Add,UINT32_MAX)-1);
+                        if(count)co_return finish(count);
+                    }
+                    const auto dll=m.load(GuestAddress{self+SHELL_FACTORY_DLL_COUNT},bits);
+                    if(dll)m.atomic_rmw(GuestAddress{dll},32,GuestMemory::AtomicRmw::Add,UINT32_MAX);
+                    (void)free_heap(m,self,s);
+                    co_return finish(0);
+                }
+                const bool query=name=="ShellFactoryQuery";
+                const auto iid=call(query?1:2),out=call(query?2:3);
+                if(!out)co_return finish(e_pointer);
+                m.store(GuestAddress{out},bits,0);
+                if(!iid)co_return finish(e_invalidarg);
+                if(query){
+                    if(!same(iid,com_agile_iunknown) && !same(iid,shell_factory_iid))co_return finish(no_interface);
+                    m.atomic_rmw(refs,32,GuestMemory::AtomicRmw::Add,1);
+                    m.store(GuestAddress{out},bits,self);
+                    co_return finish(0);
+                }
+                const auto filter=m.load(GuestAddress{self+SHELL_FACTORY_FILTER},bits);
+                if(filter && !same(iid,com_agile_iunknown)){
+                    std::array<std::uint8_t,16> allowed{};
+                    m.read(GuestAddress{filter},allowed);
+                    if(!same(iid,allowed.data()))co_return finish(no_interface);
+                }
+                const auto create=m.load(GuestAddress{self+SHELL_FACTORY_CALLBACK},bits);
+                co_return finish(static_cast<std::uint32_t>(co_await service_callback::call(create,{call(1),iid,out})));
             }
             if(name=="SHCoCreateInstance"){
                 // (pszCLSID, pclsid, pUnkOuter, riid, ppv)
                 if(!call(4))co_return finish(e_pointer);m.store(GuestAddress{call(4)},bits,0);
                 std::uint64_t clsid=call(1);
-                if(call(0)){clsid=scratch(16);const auto parsed=static_cast<std::uint32_t>(co_await api("ole32.dll","CLSIDFromString",{call(0),clsid}));if(parsed&0x80000000U)co_return finish(parsed);}
-                if(!clsid || !call(3))co_return finish(e_invalidarg);
+                if(!clsid){
+                    if(!call(0))co_return finish(0x80040154U);
+                    clsid=scratch(16);
+                    const auto hr=static_cast<std::uint32_t>(co_await api("ole32.dll","CLSIDFromString",{call(0),clsid}));
+                    if(hr&0x80000000U)co_return finish(hr);
+                }
+                if(!call(3))co_return finish(e_invalidarg);
                 co_return finish(static_cast<std::uint32_t>(co_await api("ole32.dll","CoCreateInstance",{clsid,call(2),1,call(3),call(4)})));
             }
             if(name=="SHGetLocalizedName" || name=="SHSetLocalizedName" || name=="SHRemoveLocalizedName"){

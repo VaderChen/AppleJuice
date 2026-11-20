@@ -155,6 +155,7 @@ AppleJuice のライブラリに登録したゲームは、EXE ごとの表示�
 | イースVIII -Lacrimosa of DANA- | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | オクトパストラベラーII | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | トゥームレイダー（2013） | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| ドラゴンクエストI&II | x64 | D3D12（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | ドラゴンクエストIII　そして伝説へ… | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | ファイナルファンタジーIX | x64 | D3D9（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | ファイナルファンタジーVIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
@@ -167,16 +168,20 @@ AppleJuice のライブラリに登録したゲームは、EXE ごとの表示�
 | シャドウ オブ ザ トゥームレイダー | x64 | D3D12 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="良好（MetalFX）" title="良好（MetalFX）"> |
 | ライズ オブ ザ トゥームレイダー | x64 | D3D11 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="良好（MetalFX）" title="良好（MetalFX）"> |
 | 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
+| CONTROL アルティメット・エディション | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | It Takes Two | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | サイバーパンク2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
+| テイルズ オブ ベルセリア | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | 三國志X with パワーアップキット | x86 | 不明 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | DEATH STRANDING DIRECTOR'S CUT | x64 | D3D12 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="起動可" title="起動可"> |
 | デイヴ・ザ・ダイバー | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="起動可" title="起動可"> |
 | 特警シグナルフォース | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="起動可" title="起動可"> |
+| ウィッチャー3 ワイルドハント 次世代版 | x64 | D3D12 | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="動作不可・対応中" title="動作不可・対応中"> |
 | バイオハザード ヴィレッジ | x64 | D3D12（RE Engine） | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="動作不可・対応中" title="動作不可・対応中"> |
+| ペルソナ5 ザ・ロイヤル | x64 | 不明（保護層） | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="動作不可・対応中" title="動作不可・対応中"> |
 
 「良好（MetalFX）」は、Launcher のフレーム補間または 2 倍拡大（MetalFX）を有効にすると「良好」の基準を満たすことを示します。無効の場合は「低効率」です。
 

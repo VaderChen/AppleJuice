@@ -149,6 +149,7 @@ For a game already in the AppleJuice library, its EXE's saved display settings t
 | Application | x64/x86 | Core technology | Support level |
 | --- | --- | --- | :---: |
 | 7-Zip | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
+| DRAGON QUEST I & II HD-2D Remake | x64 | D3D12 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | DRAGON QUEST III HD-2D Remake | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | FINAL FANTASY IX | x64 | D3D9 (Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | FINAL FANTASY VIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
@@ -167,16 +168,20 @@ For a game already in the AppleJuice library, its EXE's saved display settings t
 | Rise of the Tomb Raider | x64 | D3D11 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="Works well (MetalFX)" title="Works well (MetalFX)"> |
 | Shadow of the Tomb Raider | x64 | D3D12 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="Works well (MetalFX)" title="Works well (MetalFX)"> |
 | 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
+| Control Ultimate Edition | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Cyberpunk 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | It Takes Two | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Romance of the Three Kingdoms X with Power Up Kit | x86 | Unknown | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Steam | x64 | Chromium (CEF) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
+| Tales of Berseria | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | DAVE THE DIVER | x64 | D3D11 (Unity) | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="Launches" title="Launches"> |
 | DEATH STRANDING DIRECTOR'S CUT | x64 | D3D12 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="Launches" title="Launches"> |
 | Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="Launches" title="Launches"> |
+| Persona 5 Royal | x64 | Unknown (protection layer) | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="Not working (WIP)" title="Not working (WIP)"> |
 | Resident Evil Village | x64 | D3D12 (RE Engine) | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="Not working (WIP)" title="Not working (WIP)"> |
+| The Witcher 3: Wild Hunt (Next-Gen) | x64 | D3D12 | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="Not working (WIP)" title="Not working (WIP)"> |
 
 "Works well (MetalFX)" means the game meets the works-well criterion with the Launcher's frame interpolation or 2× upscaling (MetalFX) turned on; without them it is rated Slow.
 

@@ -4,6 +4,8 @@
         // 不等 GPU、不讀回、不重新配置；Unmap 仍照常上傳。其他寫入路徑（UpdateSubresource、Copy*）使區塊失效。
         // Steam GPU 程序實測 Map 平均 0.35 ms，主要在 graphics_read 的 wait_resource。X64ARM_D3D11_PERSISTENT_MAP=0 關閉。
         static const bool persistent_maps_enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_PERSISTENT_MAP");return !value || std::string_view(value)!="0";}();
+        // 從未寫入的 STAGING 資源 Map 回零填區塊、不讀回 GPU（見 Identity::pristine）。X64ARM_D3D11_PRISTINE_STAGING=0 關閉。
+        static const bool pristine_staging_enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_PRISTINE_STAGING");return !value || std::string_view(value)!="0";}();
         const auto drop_persistent=[&](auto& target){
             for(auto it=target->persistent_maps.begin();it!=target->persistent_maps.end();){
                 if(target->subresource_maps.contains(it->first)){++it;continue;}
@@ -276,7 +278,7 @@
                 if(symbol=="CopyResource" || symbol=="CopySubresourceRegion"){const auto source=object(arg(symbol=="CopyResource"?2:6)).identity;if(source && staging(*source))staging_fence.source=source;}
                 if(staging_fence.target || staging_fence.source)staging_fence.native=context->native;
             }
-            if(symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource")drop_persistent(resource);
+            if(symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource"){drop_persistent(resource);resource->pristine=false;}
             if(symbol=="CopyResource" || symbol=="CopySubresourceRegion"){const bool full=symbol=="CopyResource";auto source=object(arg(full?2:6)).identity;require(source->device==context->device && bool(source->resource));const auto& d=resource->resource->desc;const auto& s=source->resource->desc;if(std::getenv("X64ARM_TRACE_GRAPHICS_STATE"))std::fprintf(stderr,"[d3d11_copy] %.*s dst=%u/%u/%u/%u/%u/%u/%u/%u src=%u/%u/%u/%u/%u/%u/%u/%u\n",static_cast<int>(symbol.size()),symbol.data(),d.dimension,d.width,d.height,d.depth,d.levels,d.layers,d.format,d.samples,s.dimension,s.width,s.height,s.depth,s.levels,s.layers,s.format,s.samples);require(d.dimension==s.dimension && d.samples==s.samples && copy_compatible(d.format,s.format));if(full){require(resource->subresource_maps.empty() && source->subresource_maps.empty());require(d.width==s.width && d.height==s.height && d.depth==s.depth && d.levels==s.levels && d.layers==s.layers);for(unsigned i=0;i<d.levels*d.layers;++i){const auto dst=subresource(resource,i),src=subresource(source,i);submit(context,{[dst,src](auto& native){native.graphics_copy(dst,src,{0,0,0},{});}});}}else{require(!resource->subresource_maps.contains(u32(2)) && !source->subresource_maps.contains(u32(7)));std::array<std::uint32_t,6> box{};if(arg(8)){const auto values=bytes32(arg(8),6);std::copy(values.begin(),values.end(),box.begin());}const auto dst=subresource(resource,u32(2)),src=subresource(source,u32(7));const std::array origin{u32(3),u32(4),u32(5)};submit(context,{[dst,src,origin,box](auto& native){native.graphics_copy(dst,src,origin,box);}});}}
             else if(symbol=="UpdateSubresource"){
                 require(!resource->subresource_maps.contains(u32(2)));auto view=subresource(resource,u32(2));const auto& d=resource->resource->desc;
@@ -335,6 +337,13 @@
                         else pointer=allocate_heap(memory,mapped_size);
                         if(!pointer)throw std::bad_alloc{};resource->allocations.push_back(pointer);
                         if(map_zero)memory.write(GuestAddress{pointer},std::vector<std::uint8_t>(mapped_size));
+                    }else if(resource->pristine && type<=3 && usage==3){
+                        // 從未被寫入的 staging 資源：回零填區塊（內容未定義），不同步讀回 GPU。寫入型 Map 之後由 Unmap 上傳，內容不再未定義。
+                        const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));
+                        const auto size=std::uint64_t{pitch[0]}*pitch[1]*std::max(1U,d.depth>>view.level);require(size && size<=512U*1024U*1024U);
+                        mapped_size=static_cast<std::size_t>(size);pointer=allocate_heap(memory,mapped_size);if(!pointer)throw std::bad_alloc{};
+                        resource->allocations.push_back(pointer);memory.fill(GuestAddress{pointer},0,mapped_size);
+                        if(type!=1)resource->pristine=false;
                     }else{
                         // 最後一次 GPU 存取已完成的 staging 緩衝直接讀（不必等命令執行緒排空）；其他照舊同步讀回。
                         auto data=resource->gpu_fence && resource->gpu_fence->load(std::memory_order_acquire)?context->native->graphics_read_completed(view):context->native->graphics_read(view);
@@ -462,7 +471,7 @@
                 }
             }
             if(!arg(3))result=1;
-            else{auto native=device->native->graphics_resource(d);++bridge.resource_creations[std::string(symbol)];auto id=create(buffer?Kind::BufferObject:one?Kind::Texture1D:three?Kind::Texture3D:Kind::Texture,device->root);id->resource=std::move(native);id->desc=desc;if(!buffer && !one && !three)for(unsigned i=0;i<11;++i)id->texture_desc[i]=word(desc,4*i);
+            else{auto native=device->native->graphics_resource(d);++bridge.resource_creations[std::string(symbol)];auto id=create(buffer?Kind::BufferObject:one?Kind::Texture1D:three?Kind::Texture3D:Kind::Texture,device->root);id->resource=std::move(native);id->desc=desc;id->pristine=pristine_staging_enabled && usage==3 && !arg(2);if(!buffer && !one && !three)for(unsigned i=0;i<11;++i)id->texture_desc[i]=word(desc,4*i);
                 try{if(arg(2))for(unsigned i=0;i<d.levels*d.layers;++i){const auto at=arg(2)+i*(x86_?12:16);const auto data=memory.load(GuestAddress{at},pointer_bits);const auto row=static_cast<std::uint32_t>(memory.load(GuestAddress{at+pointer_size},32)),depth=static_cast<std::uint32_t>(memory.load(GuestAddress{at+pointer_size+4},32));const auto w=std::max(1U,d.width>>(i%d.levels)),h=std::max(1U,d.height>>(i%d.levels)),z=std::max(1U,d.depth>>(i%d.levels));const auto pitch=buffer?std::array{d.width,1U}:graphics_format_pitch(d.format,w,h);require(buffer || one || row>=pitch[0]);const auto size=buffer?d.width:std::uint64_t{depth}*(z-1)+std::uint64_t{row}*(pitch[1]-1)+pitch[0];require(size<=512*1024*1024);device->native->graphics_write(subresource(id,i),read_bytes(memory,data,static_cast<std::size_t>(size)),one?pitch[0]:row,three?depth:0);}}
                 catch(...){release(id->root);throw;}write_pointer(arg(3),id->root);}
         }else if(symbol=="OpenSharedResource"){
@@ -605,10 +614,15 @@
                 for(unsigned i=0;i<count;++i)if(values[i] && offsets[i]!=UINT32_MAX){auto resource=object(values[i]).identity->resource;const auto offset=offsets[i];submit(context,{[resource,offset](auto& native){native.graphics_post([resource,offset](auto&){resource->stream_cursor=offset;resource->stream_vertices=0;});}},false);}
             }else if(arg(2))for(unsigned i=0;i<count;++i){const auto pointer=binding(context,"StreamOutput",i);if(pointer)hold(pointer);write_pointer(arg(2)+i*pointer_size,pointer);}
         }else if(symbol=="Draw" || symbol=="DrawIndexed" || symbol=="DrawInstanced" || symbol=="DrawIndexedInstanced"){
-            graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto& draw=draw_state(context);draw.count=u32(1);draw.indexed=symbol.find("Indexed")!=symbol.npos;const bool instanced=symbol.find("Instanced")!=symbol.npos;draw.instances=instanced?u32(2):1;draw.start=u32(instanced?3:2);if(draw.indexed)draw.base_vertex=static_cast<std::int32_t>(u32(instanced?4:3));if(instanced)draw.start_instance=u32(draw.indexed?5:4);assign_visibility(context,draw);
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);
+            // 延遲內容：從快照池取一份快取物件，就地更新後直接交給命令清單（見 D3D11DeferredDrawPool）。
+            std::unique_ptr<D3D11DrawCache> lease;
+            if(context->context_type && d3d11_deferred_draw_pool_enabled()){if(!context->deferred_draw_pool)context->deferred_draw_pool=std::make_shared<D3D11DeferredDrawPool>();lease=context->deferred_draw_pool->acquire();}
+            auto& draw=lease?d3d11_draw_state(bridge,context,D3D11DrawScope::All,symbol,lease.get()):draw_state(context);draw.count=u32(1);draw.indexed=symbol.find("Indexed")!=symbol.npos;const bool instanced=symbol.find("Instanced")!=symbol.npos;draw.instances=instanced?u32(2):1;draw.start=u32(instanced?3:2);if(draw.indexed)draw.base_vertex=static_cast<std::int32_t>(u32(instanced?4:3));if(instanced)draw.start_instance=u32(draw.indexed?5:4);assign_visibility(context,draw);
             // 立即模式且未設 predicate 時直接執行：submit 對立即 context 本來就同步呼叫，包成 std::function 只多一次
             // 63 KB 狀態的搬移與堆積配置（微基準每次約 3.9 µs）。延遲 context 與 predicate 仍走 submit。
             if(direct_submit(context)){context->native->graphics_draw_retained(draw);count_direct(context,1,0);}
+            else if(lease)submit(context,recorded_draw_pooled(context->deferred_draw_pool,std::move(lease)));
             else submit(context,recorded_draw(draw));
         }else if(symbol=="DrawIndexedInstancedIndirect" || symbol=="DrawInstancedIndirect" || symbol=="DispatchIndirect"){
             // 參數 buffer 須以 D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS 建立，offset 4 位元組對齊且整組參數在範圍內；
@@ -955,16 +969,23 @@
 
         else if(symbol.starts_with("D3DX11CompileFrom") || symbol=="D3DCompile" || symbol=="D3DCompile2" || symbol=="D3DDisassemble" || symbol=="D3DCreateBlob" || symbol=="BlobPointer" || symbol=="BlobSize" || symbol=="D3DGetInputSignatureBlob" || symbol=="D3DGetOutputSignatureBlob" || symbol=="D3DGetInputAndOutputSignatureBlob" ||
                 symbol=="D3D10CompileShader" || symbol=="D3D10CompileEffectFromMemory" || symbol=="D3D10GetShaderDebugInfo" || (symbol.starts_with("D3D10Get") && symbol.ends_with("ShaderProfile")) ||
-                symbol=="D3DPreprocess" || symbol=="D3DGetBlobPart" || symbol=="D3DStripShader" || symbol=="D3DGetDebugInfo" || symbol=="D3DReadFileToBlob" || symbol=="D3DWriteBlobToFile" ||
+                symbol=="D3DPreprocess" || symbol=="D3DSetBlobPart" || symbol=="D3DGetBlobPart" || symbol=="D3DStripShader" || symbol=="D3DGetDebugInfo" || symbol=="D3DReadFileToBlob" ||
                 symbol=="D3DCompileFromFile" || symbol=="D3DAssemble" || symbol=="D3DX10PreprocessShaderFromMemory"){
             graphics_handled=true;
             const auto blob=[&](std::span<const std::uint8_t> data){auto id=create(Kind::Blob);try{const auto ptr=allocate_heap(memory,std::max<std::size_t>(1,data.size()));if(!ptr)throw std::bad_alloc{};id->allocations.push_back(ptr);id->mapped=ptr;id->sequence=data.size();memory.write(GuestAddress{ptr},data);}catch(...){release(id->root);throw;}return id->root;};
             if(symbol=="BlobPointer")result=typed(arg(0),Kind::Blob)->mapped;
             else if(symbol=="BlobSize")result=typed(arg(0),Kind::Blob)->sequence;
             else if(symbol=="D3DGetInputSignatureBlob" || symbol=="D3DGetOutputSignatureBlob" || symbol=="D3DGetInputAndOutputSignatureBlob"){
-                output(2);write_pointer(arg(2),0);require(arg(1)>0 && arg(1)<=16U*1024U*1024U);
-                const auto mask=symbol=="D3DGetInputSignatureBlob"?1U:symbol=="D3DGetOutputSignatureBlob"?2U:3U;
-                const auto data=graphics_signature_blob(read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1))),mask);write_pointer(arg(2),blob(data));
+                if(!arg(0) || !arg(2) || arg(1)<32)result=0x8876086cU;
+                else{
+                    memory.check(GuestAddress{arg(2)},x86_?4:8,Access::Write);
+                    memory.check(GuestAddress{arg(0)},arg(1),Access::Read);
+                    const auto mask=symbol=="D3DGetInputSignatureBlob"?1U:symbol=="D3DGetOutputSignatureBlob"?2U:3U;
+                    try{
+                        const auto data=graphics_signature_blob(read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1))),mask);
+                        write_pointer(arg(2),blob(data));
+                    }catch(const std::invalid_argument&){result=0x80004005U;}
+                }
             }
             else if(symbol=="D3DDisassemble"){
                 output(4);write_pointer(arg(4),0);require(arg(0) && arg(1)>=4 && arg(1)<=16U*1024U*1024U);
@@ -982,9 +1003,32 @@
             }
             else if(symbol=="D3D10GetShaderDebugInfo" || symbol=="D3DGetDebugInfo"){
                 // (Bytecode, Length, ppDebugInfo)：DXBC 容器中的 SDBG 區塊；沒有偵錯資訊時回 E_FAIL。
-                output(2);write_pointer(arg(2),0);require(arg(0) && arg(1)>=32 && arg(1)<=16U*1024U*1024U);
-                const auto debug=graphics_dxbc_section(read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1))),0x47424453U);
-                if(!debug)result=0x80004005U;else write_pointer(arg(2),blob(*debug));
+                if(!arg(0) || arg(1)<32 || !arg(2))result=0x8876086cU;
+                else{
+                    output(2);write_pointer(arg(2),0);
+                    memory.check(GuestAddress{arg(0)},arg(1),Access::Read);
+                    try{
+                        const auto debug=graphics_dxbc_section(read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1))),0x47424453U);
+                        if(debug)write_pointer(arg(2),blob(*debug));
+                        else result=0x80004005U;
+                    }catch(const std::invalid_argument&){result=0x80004005U;}
+                }
+            }
+            else if(symbol=="D3DSetBlobPart"){
+                output(6);
+                require(arg(0) && arg(1)>=32 && u32(2)==10 && !u32(3) && (arg(4) || !arg(5)));
+                // DXBC 的總長度與區塊長度都是 DWORD。先驗證客體範圍，再複製來源。
+                require(arg(1)<=UINT32_MAX && arg(5)<=UINT32_MAX-44);
+                memory.check(GuestAddress{arg(0)},arg(1),Access::Read);
+                if(arg(5))memory.check(GuestAddress{arg(4)},arg(5),Access::Read);
+                const auto source=read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1)));
+                std::vector<std::uint8_t> data;
+                if(arg(5))data=read_bytes(memory,arg(4),static_cast<std::size_t>(arg(5)));
+                constexpr std::uint32_t priv=0x56495250U;
+                try{
+                    const auto updated=graphics_dxbc_filter(source,[](auto tag){return tag!=priv;},priv,data);
+                    write_pointer(arg(6),blob(updated));
+                }catch(const std::invalid_argument&){result=0x80004005U;}
             }
             else if(symbol=="D3DGetBlobPart"){
                 // (Data, Size, D3D_BLOB_PART, Flags, ppPart)：簽章部分回傳只含簽章的 DXBC 容器；其他部分回傳對應區塊的原始資料；不存在回 E_FAIL。
@@ -998,39 +1042,36 @@
                 else result=0x80070057U;
             }
             else if(symbol=="D3DStripShader"){
-                // (Bytecode, Length, StripFlags, ppStripped)：REFLECTION_DATA 1 移除 RDEF／STAT、DEBUG_INFO 2 移除 SDBG／SPDB／ILDB／ILDN、TEST_BLOBS 4、
-                // PRIVATE_DATA 8 移除 PRIV、ROOT_SIGNATURE 16 移除 RTS0；其餘區塊保留並重算校驗和。
-                output(3);write_pointer(arg(3),0);require(arg(0) && arg(1)>=32 && arg(1)<=16U*1024U*1024U);const auto flags=u32(2);
-                const auto stripped=graphics_dxbc_filter(read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1))),[&](std::uint32_t tag){
-                    if((flags&1U) && (tag==0x46454452U || tag==0x54415453U))return false;
-                    if((flags&2U) && (tag==0x47424453U || tag==0x42445053U || tag==0x42444c49U || tag==0x4e444c49U))return false;
-                    if((flags&8U) && tag==0x56495250U)return false;
-                    if((flags&16U) && tag==0x30535452U)return false;
-                    return true;});
-                write_pointer(arg(3),blob(stripped));
+                if(!arg(3))result=0x80004005U;
+                else if(!arg(0) || arg(1)<32)result=0x8876086cU;
+                else{
+                    output(3);
+                    memory.check(GuestAddress{arg(0)},arg(1),Access::Read);
+                    // 44 起可移除私有資料，47 起可移除根簽章。其他區塊依原序重新封裝。
+                    const auto supported=service.family=="d3dcompiler_47.dll"?0x1fU:service.family=="d3dcompiler_46.dll"?0x0fU:0x07U;
+                    const auto flags=u32(2)&supported;
+                    try{
+                        const auto stripped=graphics_dxbc_filter(read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1))),[flags](std::uint32_t tag){
+                            if((flags&1U) && (tag==0x46454452U || tag==0x54415453U))return false;
+                            if((flags&2U) && (tag==0x47424453U || tag==0x42445053U || tag==0x42444c49U || tag==0x4e444c49U))return false;
+                            if((flags&8U) && tag==0x56495250U)return false;
+                            if((flags&16U) && tag==0x30535452U)return false;
+                            return true;
+                        });
+                        write_pointer(arg(3),blob(stripped));
+                    }catch(const std::invalid_argument&){result=0x80004005U;}
+                }
             }
             else if(symbol=="D3DReadFileToBlob"){
                 // (FileName（寬字元）, ppContents)
                 output(1);write_pointer(arg(1),0);require(arg(0));
-                const auto opened=filesystem_.open_reader(utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})));
+                const auto path=utf16_to_utf8(normalized_windows_path(read_utf16(memory,GuestAddress{arg(0)}),runtime_.current_directory));
+                const auto opened=filesystem_.writable()?filesystem_.open_host(path,0x80000000U,3,0x80,1):
+                    filesystem_.open_reader(path,{},{},1);
                 if(opened.error)result=0x80070000U|opened.error;
                 else{const auto info=opened.file->information();if(info.error)result=0x80070000U|info.error;
                     else{require(info.metadata.size<=256U*1024U*1024U);std::vector<std::uint8_t> data(static_cast<std::size_t>(info.metadata.size));const auto io=opened.file->read(data,0);
                         if(io.error || io.bytes!=data.size())result=0x80070000U|(io.error?io.error:38U);else write_pointer(arg(1),blob(data));}}
-            }
-            else if(symbol=="D3DWriteBlobToFile"){
-                // (Blob, FileName（寬字元）, bOverwrite)：經 CreateFileW（CREATE_ALWAYS 或 CREATE_NEW）與 WriteFile 寫出 blob 內容。
-                auto source=typed(arg(0),Kind::Blob);require(arg(1));
-                const auto invalid_handle=x86_?UINT64_C(0xffffffff):UINT64_MAX;
-                const auto file=nested_service(state,memory,"kernel32.dll","CreateFileW",{arg(1),0x40000000U,0,0,u32(2)?2U:1U,0x80,0});
-                if(file==invalid_handle || !file)result=0x80070000U|(last_error_?last_error_:5U);
-                else{
-                    const auto written=allocate_heap(memory,4);if(!written)throw std::bad_alloc{};
-                    const auto ok=nested_service(state,memory,"kernel32.dll","WriteFile",{file,source->mapped,source->sequence,written,0})&UINT32_MAX;
-                    const auto count=memory.load(GuestAddress{written},32);(void)free_heap(memory,written,state);const auto error=last_error_;
-                    (void)nested_service(state,memory,"kernel32.dll","CloseHandle",{file});
-                    if(!ok || count!=source->sequence)result=0x80070000U|(error?error:29U);
-                }
             }
             else {
                 // 遊戲已載入自帶的 HLSL 編譯器（app-local d3dcompiler，見 load_module）：D3DX11CompileFromMemory 直接尾呼叫它的 D3DCompile。

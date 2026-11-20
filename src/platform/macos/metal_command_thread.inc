@@ -128,6 +128,9 @@ public:
         if(!direct_capability_queries())graphics_sync();
         return inner_->graphics_vertex_format_supported(format);
     }
+    std::shared_ptr<GraphicsShader> graphics_legacy_shader_variant(std::uint32_t stage,std::span<const std::uint8_t> bytes,std::uint32_t shadow_samplers) override {
+        graphics_sync();return inner_->graphics_legacy_shader_variant(stage,bytes,shadow_samplers);
+    }
     std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes) override {
         // 建立 DXBC／DXIL 只讀 bytecode 與裝置，和背景 prefetch 共用具備同步保護的入口。
         // 私有複本還會讀取繪圖執行緒更新的函式狀態，仍由下方 graphics_shader_private 等編碼完成。
@@ -155,6 +158,8 @@ public:
     }
     bool graphics_timestamp_supported()const override {return inner_->graphics_timestamp_supported();}
     GraphicsTimestamp graphics_timestamp() override {graphics_sync();return inner_->graphics_timestamp();}
+    // 只讀裝置時鐘，不需等命令佇列。
+    std::optional<std::uint64_t> graphics_gpu_clock() override {return inner_->graphics_gpu_clock();}
     // 時間戳查詢（電馭判客每幀數百次）：先回傳未完成的 future，取樣由命令執行緒依序編入，前端不等佇列清空。
     std::shared_ptr<const GraphicsTimestampFuture> graphics_timestamp_future() override {
         auto future=std::make_shared<GraphicsTimestampFuture>();post([this,future]{metal_timestamp_relay(*inner_,future);});return future;

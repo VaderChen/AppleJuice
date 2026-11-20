@@ -1,41 +1,72 @@
-#include "x64arm/windows_keyboard.hpp"
+#include "windows_input_layout.hpp"
 #include "x64arm/input.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
 #include <unicode/ucnv.h>
 
 namespace x64arm {
+namespace {
+constexpr std::pair<unsigned,unsigned> extended_keys[]{
+    {0xe010,0xb1},{0xe019,0xb0},{0xe01c,13},{0xe01d,0xa3},{0xe020,0xad},{0xe021,0xb7},
+    {0xe022,0xb3},{0xe024,0xb2},{0xe02e,0xae},{0xe030,0xaf},{0xe032,0xac},{0xe035,0x6f},
+    {0xe037,0x2c},{0xe038,0xa5},{0xe046,3},{0xe047,0x24},{0xe048,0x26},{0xe049,0x21},
+    {0xe04b,0x25},{0xe04d,0x27},{0xe04f,0x23},{0xe050,0x28},{0xe051,0x22},{0xe052,0x2d},
+    {0xe053,0x2e},{0xe05b,0x5b},{0xe05c,0x5c},{0xe05d,0x5d},{0xe05f,0x5f},{0xe065,0xaa},
+    {0xe066,0xab},{0xe067,0xa8},{0xe068,0xa9},{0xe069,0xa7},{0xe06a,0xa6},{0xe06b,0xb6},
+    {0xe06c,0xb4},{0xe06d,0xb5},{0xe11d,0x13}
+};
+}
 // 虛擬鍵盤固定為 en-US；scan code 採 PC Set 1，與 GetKeyboardLayout 的 0409 一致。
 std::uint32_t windows_map_virtual_key(std::uint32_t code,std::uint32_t type){
     static const auto keys=[] {
         std::array<std::uint16_t,128> table{};
         const auto row=[&](unsigned start,std::u16string_view values){for(const auto value:values)table[start++]=value;};
         row(2,u"1234567890");row(0x10,u"QWERTYUIOP");row(0x1e,u"ASDFGHJKL");row(0x2c,u"ZXCVBNM");
-        const std::array<std::pair<unsigned,unsigned>,41> values{{{1,27},{12,0xbd},{13,0xbb},{14,8},{15,9},{26,0xdb},{27,0xdd},{28,13},{29,0xa2},{39,0xba},{40,0xde},{41,0xc0},{42,0xa0},{43,0xdc},{51,0xbc},{52,0xbe},{53,0xbf},{54,0xa1},{55,0x6a},{56,0xa4},{57,32},{58,20},{69,0x90},{70,0x91},{71,0x24},{72,0x26},{73,0x21},{74,0x6d},{75,0x25},{76,0x0c},{77,0x27},{78,0x6b},{79,0x23},{80,0x28},{81,0x22},{82,0x2d},{83,0x2e},{84,0x2c},{86,0xe2},{87,0x7a},{88,0x7b}}};
-        for(const auto& [scan,vk]:values)table[scan]=static_cast<std::uint16_t>(vk);for(unsigned i=0;i<10;++i)table[59+i]=static_cast<std::uint16_t>(0x70+i);return table;
+        constexpr std::pair<unsigned,unsigned> values[]{{1,27},{12,0xbd},{13,0xbb},{14,8},{15,9},{26,0xdb},{27,0xdd},{28,13},{29,0xa2},{39,0xba},{40,0xde},{41,0xc0},{42,0xa0},{43,0xdc},{51,0xbc},{52,0xbe},{53,0xbf},{54,0xa1},{55,0x6a},{56,0xa4},{57,32},{58,20},{69,0x90},{70,0x91},{71,0x24},{72,0x26},{73,0x21},{74,0x6d},{75,0x25},{76,0x0c},{77,0x27},{78,0x6b},{79,0x23},{80,0x28},{81,0x22},{82,0x2d},{83,0x2e},{84,0x2c},{86,0xe2},{87,0x7a},{88,0x7b},
+            {0x59,0x0c},{0x5a,0xee},{0x5b,0xf1},{0x5c,0xea},{0x5d,0xf9},{0x5e,0xf5},
+            {0x5f,0xf3},{0x62,0xfb},{0x63,0x2f},{0x6f,0xed},{0x71,0xe9},{0x73,0xc1},
+            {0x76,0x87},{0x7b,0xeb},{0x7c,9},{0x7e,0xc2}};
+        for(const auto& [scan,vk]:values)table[scan]=static_cast<std::uint16_t>(vk);for(unsigned i=0;i<10;++i)table[59+i]=static_cast<std::uint16_t>(0x70+i);
+        for(unsigned i=0;i<11;++i)table[0x64+i]=static_cast<std::uint16_t>(0x7c+i);
+        return table;
     }();
-    static constexpr std::array<std::pair<std::uint32_t,std::uint32_t>,20> extended{{{0xe01c,13},{0xe01d,0xa3},{0xe035,0x6f},{0xe037,0x2c},{0xe038,0xa5},{0xe047,0x24},{0xe048,0x26},{0xe049,0x21},{0xe04b,0x25},{0xe04d,0x27},{0xe04f,0x23},{0xe050,0x28},{0xe051,0x22},{0xe052,0x2d},{0xe053,0x2e},{0xe05b,0x5b},{0xe05c,0x5c},{0xe05d,0x5d},{0xe046,3},{0xe11d,0x13}}};
-    if(type==2){if((code>='A' && code<='Z') || (code>='0' && code<='9') || code==8 || code==9 || code==13 || code==27 || code==32)return code;if(code>=0x60 && code<=0x69)return code-0x60+'0';
+    if(type==2){if((code>='A' && code<='Z') || (code>='0' && code<='9') || code==3 || code==8 || code==9 || code==13 || code==27 || code==32)return code;if(code>=0x60 && code<=0x69)return code-0x60+'0';
         switch(code){case 0x6a:return '*';case 0x6b:return '+';case 0x6d:return '-';case 0x6e:return '.';case 0x6f:return '/';case 0xba:return ';';case 0xbb:return '=';case 0xbc:return ',';case 0xbd:return '-';case 0xbe:return '.';case 0xbf:return '/';case 0xc0:return '`';case 0xdb:return '[';case 0xdc:case 0xe2:return '\\';case 0xdd:return ']';case 0xde:return '\'';default:return 0;}}
-    if(type==1 || type==3){std::uint32_t vk=code<keys.size()?keys[code]:0;for(const auto& [scan,value]:extended)if(scan==code)vk=value;
+    if(type==1 || type==3){std::uint32_t vk=code<keys.size()?keys[code]:0;for(const auto& [scan,value]:extended_keys)if(scan==code)vk=value;
         if(type==1){if(vk==0xa0 || vk==0xa1)vk=16;if(vk==0xa2 || vk==0xa3)vk=17;if(vk==0xa4 || vk==0xa5)vk=18;}return vk;}
     if(type==0 || type==4){if(code==16)code=0xa0;if(code==17)code=0xa2;if(code==18)code=0xa4;
         if(code>=0x60 && code<=0x69){constexpr std::array<unsigned,10> scans{0x52,0x4f,0x50,0x51,0x4b,0x4c,0x4d,0x47,0x48,0x49};return scans[code-0x60];}
         if(code==0x6e)return 0x53;
-        if(code!=13)for(const auto& [scan,value]:extended)if(value==code)return type==4?scan:scan&255;
         if(code)for(std::uint32_t scan=1;scan<keys.size();++scan)if(keys[scan]==code)return scan;
+        for(const auto& [scan,value]:extended_keys)if(value==code){
+            if(type==4)return scan;
+            return scan>=0xe100?0:scan&255;
+        }
     }return 0;
+}
+// 實體注入須辨識獨立方向鍵與數字鍵盤，MapVirtualKey 則使用配置中的第一個掃描碼。
+std::uint32_t windows_physical_scan(std::uint32_t key){
+    if(key!=13)for(const auto& [scan,value]:extended_keys)if(value==key)return scan;
+    return windows_map_virtual_key(key,4);
 }
 std::u16string windows_key_name(std::uint32_t parameter){
     const auto scan=(parameter>>16)&255U;const bool extended=parameter&0x1000000U,ignore=parameter&0x2000000U;
     if(scan==0x45)return extended?u"Num Lock":u"Pause";
+    if(scan==0x54)return extended?u"<00>":u"Sys Req";
+    if(extended && scan==0x46)return u"Break";
+    if(extended && scan==0x56)return u"Help";
+    if(!extended && scan>=0x7c && scan<=0x87)return u"F"+utf8_to_utf16(std::to_string(13+scan-0x7c));
     const auto key=windows_map_virtual_key(extended?0xe000U|scan:scan,3);
-    if((key>='A' && key<='Z') || (key>='0' && key<='9'))return {static_cast<char16_t>(key)};
-    if(ignore && (key==0xa0 || key==0xa1))return u"Shift";
-    if(ignore && (key==0xa2 || key==0xa3))return u"Ctrl";
-    if(ignore && (key==0xa4 || key==0xa5))return u"Alt";
-    if(!key)return {};
-    return utf8_to_utf16(input::key_name(scan|(extended?0x80U:0)));
+    if((ignore || key==0xa0) && (key==0xa0 || key==0xa1))return u"Shift";
+    if((ignore || key==0xa2) && (key==0xa2 || key==0xa3))return u"Ctrl";
+    if((ignore || key==0xa4) && (key==0xa4 || key==0xa5))return u"Alt";
+    const auto label=input::key_name(scan|(extended?0x80U:0));
+    // 可列印鍵或缺少顯示名稱的鍵，依既有配置取得基礎掃描碼的未按 Shift 字元。
+    if(!key || label.starts_with("Scan code ") || (key>='0' && key<='9') || (key>='A' && key<='Z') || (key>=0xba && key<=0xe2)){
+        const auto character=windows_map_virtual_key(windows_map_virtual_key(scan,1),2);
+        return character?std::u16string(1,static_cast<char16_t>(character)):std::u16string{};
+    }
+    return utf8_to_utf16(label);
 }
 namespace {
 char16_t alt_character(unsigned number,bool ansi){
@@ -62,7 +93,7 @@ std::u16string windows_key_text(std::uint32_t vk,std::uint32_t scan,const std::a
         if(alt && digit<10){if(!up){if(!next.alt_digits)next.ansi=digit==0;next.alt_digits=true;next.alt_number=(next.alt_number*10+digit)&65535U;}return commit();}
         if((vk==18 || vk==0xa4 || vk==0xa5) && up && next.alt_digits){result.push_back(alt_character(next.alt_number,next.ansi));next={};return commit();}
     }
-    if(up)return commit();
+    if(up && !(flags&2U))return commit();
     if(!alt)next={};
     if(control){
         if(vk>='A' && vk<='Z')result.push_back(static_cast<char16_t>(vk-'A'+1));

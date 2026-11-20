@@ -590,5 +590,93 @@ copy_nx StrCpyNXW, 2
 #include "guest_shell_security.inc"
 #include "guest_shell_copy_encoding.inc"
 
+
+// ECX／EDX 與 stdcall 兩種入口共用 CMPXCHG8B 迴圈；慢路徑保留原始參數。
+.macro push_list name, fast
+entry \name
+.if !\fast
+    mov ecx, [esp + 4]
+    mov edx, [esp + 8]
+.endif
+    test ecx, ecx
+    jz 2f
+    test ecx, 7
+    jnz 2f
+    test edx, edx
+    jz 2f
+    test edx, 3
+    jnz 2f
+    mov eax, [esp + 12 - 8 * \fast]
+    test eax, eax
+    jz 2f
+    test eax, 3
+    jnz 2f
+    push esi
+    push edi
+    push ebx
+    push ebp
+    mov esi, ecx
+    mov ebx, edx
+    mov edi, eax
+    mov ebp, [esp + 32 - 8 * \fast]
+    mov eax, [esi]
+    mov edx, [esi + 4]
+1:
+    mov [edi], eax
+    lea ecx, [edx + 65536]
+    add cx, bp
+    lock cmpxchg8b qword ptr [esi]
+    jne 1b
+    pop ebp
+    pop ebx
+    pop edi
+    pop esi
+    ret 16 - 8 * \fast
+2:
+slow_end \name
+.endm
+push_list InterlockedPushListSList, 1
+push_list InterlockedPushListSListEx, 0
+
+#include "guest_rtl_run_string.inc"
+#include "ole_build_version.h"
+
+#include "message_metadata_layout.h"
+entry GetMessagePos
+    mov eax, dword ptr fs:[X64ARM_MESSAGE_X86_BASE+X64ARM_MESSAGE_POSITION]
+    ret
+end GetMessagePos
+entry GetMessageTime
+    mov eax, dword ptr fs:[X64ARM_MESSAGE_X86_BASE+X64ARM_MESSAGE_TIME]
+    ret
+end GetMessageTime
+entry GetMessageExtraInfo
+    mov eax, dword ptr fs:[X64ARM_MESSAGE_X86_BASE+X64ARM_MESSAGE_EXTRA]
+    ret
+end GetMessageExtraInfo
+entry SetMessageExtraInfo
+    mov eax, dword ptr fs:[X64ARM_MESSAGE_X86_BASE+X64ARM_MESSAGE_EXTRA]
+    mov ecx, dword ptr [esp+4]
+    mov dword ptr fs:[X64ARM_MESSAGE_X86_BASE+X64ARM_MESSAGE_EXTRA], ecx
+    ret 4
+end SetMessageExtraInfo
+
+#include "../../include/x64arm/windows_keyboard_model.h"
+
+entry SwapMouseButton
+    .byte 0xba
+Lswap_patch:
+    .long 0
+    mov edx, dword ptr [edx]
+    mov ecx, dword ptr [esp+4]
+    xor eax, eax
+    test ecx, ecx
+    setne al
+    xchg dword ptr [edx+X64ARM_GUI_MOUSE_SWAP_OFFSET], eax
+    ret 4
+end SwapMouseButton
+.globl _guest_SwapMouseButton_gui_timing_patch
+.set _guest_SwapMouseButton_gui_timing_patch, Lswap_patch - _guest_SwapMouseButton
+
 .globl _guest_thread_end
 _guest_thread_end:

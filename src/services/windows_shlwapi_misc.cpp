@@ -1,8 +1,10 @@
 #include "gui_timing_layout.h"
+#include "mapi_property_tag.h"
 #include "x64arm/security_descriptor.hpp"
 #include "shell_dispatch_layout.h"
 #include "shell_window_interfaces.h"
 #include "windows_path_character.h"
+#include "urlmon_uri_parse.hpp"
 #include "x64arm/windows_guid.hpp"
 #include "x64arm/windows_gui_abi.hpp"
 #include "x64arm/windows_services.hpp"
@@ -118,6 +120,10 @@ std::span<const WindowsServiceDescriptor> shlwapi_misc_service_descriptors(){
         {"shlwapi.dll","WhichPlatform",0},{"shlwapi.dll","SHIsLowMemoryMachine",1,0,0,0x1},{"shlwapi.dll","IsInternetESCEnabled",0},
         {"shlwapi.dll","#166",1},{"shlwapi.dll","IStream_Read",3,0,0,0x4},{"shlwapi.dll","IStream_Write",3,0,0,0x4},{"shlwapi.dll","IStream_Reset",1},{"shlwapi.dll","IStream_Size",2},
         {"shlwapi.dll","#267",4},{"shlwapi.dll","#268",2},
+        {"internal-mapi-table","HrAddColumns",4},{"internal-mapi-table","HrAddColumnsEx",5},
+        {"internal-mapi-table","HrQueryAllRows",6,0,0,16},
+        {"internal-mapi-one","HrGetOneProp",3,0,0,2},{"internal-mapi-one","HrSetOneProp",2},{"internal-mapi-one","FPropExists",2,0,0,2},
+        {"internal-mapi-reference","UlAddRef",1},{"internal-mapi-reference","UlRelease",1},
         {"shlwapi.dll","IUnknown_AtomicRelease",1},{"shlwapi.dll","IUnknown_Set",2},{"shlwapi.dll","IUnknown_GetSite",3},{"shlwapi.dll","IUnknown_SetSite",2},{"shlwapi.dll","IUnknown_GetWindow",2},
         {"shlwapi.dll","ConnectToConnectionPoint",6,0,0,0x4},
         {"shlwapi.dll","SHSetThreadRef",1},{"shlwapi.dll","SHGetThreadRef",1},{"shlwapi.dll","SHReleaseThreadRef",0},{"shlwapi.dll","SHCreateThreadRef",2},
@@ -153,6 +159,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
     const auto handle=[&](std::uint64_t value){return x86_?value&UINT32_MAX:value;};
     const auto host=[&](std::string_view dll,std::string_view symbol,std::initializer_list<std::uint64_t> args){return nested_service(state,memory,dll,symbol,args);};
     const auto pointer_bits=static_cast<std::uint8_t>(x86_?32:64);
+    if(service.family=="internal-mapi-reference"){
+        const auto object=arg(0);
+        if(!object)return done(0);
+        // 包裝函式與 COM 方法均只有 this，引數及呼叫端返回位址可直接沿用。
+        const auto table=memory.load(GuestAddress{object},pointer_bits);
+        const unsigned slot=name=="UlAddRef"?1:2;
+        state.rip=GuestAddress{memory.load(GuestAddress{table+slot*(pointer_bits/8)},pointer_bits)};
+        return std::nullopt;
+    }
     if(name=="#491"){
         static constexpr std::u16string_view bases[]{
             u"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer",u"Software\\Microsoft\\Windows\\Shell",
@@ -541,7 +556,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         (void)close(local);
         return done(view?view+4:0);
     }
-    if(name=="WhichPlatform")return done(2); // PLATFORM_INTEGRATED：殼層與瀏覽器整合（Windows 2000 以後皆是）
+    if(name=="WhichPlatform" && shell_browser_platform_)return done(shell_browser_platform_);
     if(name=="SHIsLowMemoryMachine"){
         // ILMM_IE4（0）：總實體記憶體少於 64 MiB 視為低記憶體。
         GuestScratch temporary(*this,memory,state);const auto status=temporary.allocate(64);if(!status)return done(0);memory.store(GuestAddress{status},32,64);
@@ -573,7 +588,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         return done(remaining);
     }
     if(name=="SHSetThreadRef"){if(arg(0))shell_thread_refs_[threads_.current]=arg(0);else shell_thread_refs_.erase(threads_.current);return done(0);}
-    if(name=="SHSetInstanceExplorer"){shell_instance_explorer_=arg(0);return done(0);}
+    if(name=="SHSetInstanceExplorer"){
+        // 常駐映像與慢路徑皆以此位址作為程序唯一的參照槽。
+        if(!shell_instance_explorer_)shell_instance_explorer_=runtime_allocate(memory,{},pointer_bits/8);
+        memory.store(GuestAddress{shell_instance_explorer_},pointer_bits,arg(0));
+        return done(0);
+    }
     if(name=="SHCreateThreadRef"){
         if(!arg(1))return done(0x80070057U);memory.store(GuestAddress{arg(1)},pointer_bits,0);if(!arg(0))return done(0x80070057U);
         if(!shell_thread_ref_vtable_){const auto table=runtime_allocate(memory,{},3*unit);if(!table)return done(0x8007000eU);unsigned i=0;
@@ -614,21 +634,50 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         std::vector<std::uint8_t> bytes(std::min<std::uint32_t>(u32(1),32768));memory.read(GuestAddress{shell_inverse_cmap_},bytes);memory.write(GuestAddress{arg(0)},bytes);return done(0);
     }
     if(name=="UrlFixupW"){
-        // 修正 scheme 拼字：已知 scheme 原樣回 S_OK；去除重複字母後相同或只差一個字元，且只對應一個已知 scheme 時改正並回 S_OK；無法辨識回 S_FALSE（輸出原字串）。
-        if(!arg(0) || !arg(1) || !u32(2))return done(0x80070057U);auto url=text_at(arg(0));const auto colon=url.find(u':');std::uint32_t status=1;
-        static constexpr std::u16string_view schemes[]{u"http",u"https",u"ftp",u"file",u"mailto",u"news",u"nntp",u"telnet",u"gopher"};
+        if(!arg(0))return done(0x80004005U);
+        if(!arg(1) || !u32(2))return done(0x80070057U);
+        auto url=text_at(arg(0));
+        const auto colon=url.find(u':');
+        const uri_model::Scheme* match=nullptr;
         if(colon!=url.npos && colon){
-            std::u16string scheme;for(std::size_t i=0;i<colon;++i){auto c=url[i];if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);scheme.push_back(c);}
-            const auto collapse=[](std::u16string_view text){std::u16string out;for(const auto c:text)if(out.empty() || out.back()!=c)out.push_back(c);return out;};
-            const auto near=[](std::u16string_view a,std::u16string_view b){
-                if(a.size()==b.size()){std::size_t diff=0;for(std::size_t i=0;i<a.size();++i)diff+=a[i]!=b[i];return diff==1;}
-                if(a.size()+1!=b.size() && b.size()+1!=a.size())return false;const auto& longer=a.size()>b.size()?a:b;const auto& shorter=a.size()>b.size()?b:a;
-                for(std::size_t i=0;i<longer.size();++i){std::u16string removed(longer);removed.erase(i,1);if(removed==shorter)return true;}return false;};
-            if(std::find(std::begin(schemes),std::end(schemes),scheme)!=std::end(schemes))status=0;
-            else {std::u16string_view match;unsigned matches=0;for(const auto candidate:schemes)if(collapse(scheme)==collapse(candidate) || (candidate.size()>=3 && near(scheme,candidate))){match=candidate;++matches;}
-                if(matches==1){url=std::u16string(match)+url.substr(colon);status=0;}}
+            const auto scheme=uri_model::lowered(std::u16string_view(url).substr(0,colon));
+            match=uri_model::find_scheme(scheme);
+            if(!match && scheme.size()>=2){
+                // 重複鍵、單一錯字與縮寫皆以首字母優先；同分歧義保留原輸入。
+                const auto collapse=[](std::u16string text){
+                    text.erase(std::unique(text.begin(),text.end()),text.end());
+                    return text;
+                };
+                const auto collapsed=collapse(scheme);
+                unsigned best=0;
+                for(const auto& candidate:uri_model::schemes){
+                    const auto spelling=candidate.name;
+                    unsigned score=0;
+                    if(collapsed==collapse(std::u16string(spelling)))score=3;
+                    else{
+                        const auto pos=static_cast<std::size_t>(std::mismatch(scheme.begin(),scheme.end(),spelling.begin(),spelling.end()).first-scheme.begin());
+                        const auto a=std::u16string_view(scheme).substr(pos),b=spelling.substr(pos);
+                        if((a.size() && a.substr(1)==b) || (b.size() && b.substr(1)==a) ||
+                           (a.size() && b.size() && a.substr(1)==b.substr(1)))score=2;
+                        else if(scheme.size()>=3 && spelling.starts_with(scheme))score=1;
+                    }
+                    if(!score)continue;
+                    if(scheme.front()==spelling.front())score+=4;
+                    if(score>best){match=&candidate;best=score;}
+                    else if(score==best)match=nullptr;
+                }
+                if(match)url.replace(0,colon,match->name);
+            }
+            if(match && match->hierarchical && match->port){
+                const auto start=url.find(u':')+1;
+                auto end=start;
+                while(end<url.size() && end-start<2 && (url[end]==u'/' || url[end]==u'\\'))++end;
+                url.replace(start,end-start,u"//");
+            }
         }
-        if(url.size()>=u32(2))return done(0x80004003U);write_text(arg(1),u32(2),url);return done(status);
+        if(url.size()>=u32(2))return done(0x80004003U);
+        write_text(arg(1),u32(2),url);
+        return done(match?0:1);
     }
     if(name.starts_with("SHFormatDateTime")){
         // (FILETIME* UTC, flags* 可為 NULL＝FDTF_DEFAULT, buffer, cch)：轉成本地時間後依使用者地區組合日期與時間（以空白分隔）；回傳含 NUL 的寫入數。
@@ -656,25 +705,54 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         return done(write_text(arg(2),u32(3),result)+1);
     }
     if(name.starts_with("SHOpenRegStream")){
-        // (HKEY, subkey, value, grfMode)：讀取登錄值到記憶體 IStream；寫入模式在最後一次 Release 時以 REG_BINARY 寫回。
-        // SHOpenRegStream2 失敗回 NULL；舊版 SHOpenRegStream 失敗時回傳空的唯讀資料流。
-        const bool legacy=!name.starts_with("SHOpenRegStream2");const auto mode=u32(3);const bool write=(mode&3U)!=0;
-        const auto empty=[&]{return legacy?handle(host("shlwapi.dll","SHCreateMemStream",{0,0})):0;};
-        GuestScratch temporary(*this,memory,state);const auto subkey=arg(1)?temporary.text(text_at(arg(1))):0,value=arg(2)?temporary.text(text_at(arg(2))):0;
-        const auto key_slot=temporary.allocate(8),type=temporary.allocate(4),size=temporary.allocate(4);if(!key_slot || !type || !size)return done(empty());memory.store(GuestAddress{key_slot},64,0);
-        const auto opened=write?host("advapi32.dll","RegCreateKeyExW",{arg(0),subkey,0,0,0,0x2001f,0,key_slot,0}):host("advapi32.dll","RegOpenKeyExW",{arg(0),subkey,0,0x20019,key_slot});
-        if(opened&UINT32_MAX)return done(empty());const auto key=handle(memory.load(GuestAddress{key_slot},pointer_bits));
-        memory.store(GuestAddress{size},32,0);std::uint64_t data=0;std::uint32_t length=0;
-        if(!(host("advapi32.dll","RegQueryValueExW",{key,value,0,type,0,size})&UINT32_MAX) && !(write && (mode&0x1000U))){
-            length=static_cast<std::uint32_t>(memory.load(GuestAddress{size},32));if(length){data=temporary.allocate(length);if(!data || (host("advapi32.dll","RegQueryValueExW",{key,value,0,type,data,size})&UINT32_MAX))length=0;}}
-        else if(!write){(void)host("advapi32.dll","RegCloseKey",{key});return done(empty());}
-        const auto stream=handle(host("shlwapi.dll","SHCreateMemStream",{length?data:0,length}));
-        if(!stream){(void)host("advapi32.dll","RegCloseKey",{key});return done(empty());}
-        if(write)(void)bind_registry_stream(stream,key,arg(2)?text_at(arg(2)):std::u16string{});else (void)host("advapi32.dll","RegCloseKey",{key});
+        const bool legacy=!name.starts_with("SHOpenRegStream2");
+        const auto mode=u32(3),access=mode&3U;
+        const bool write=access==1 || access==2;
+        const auto failure=[&]{return legacy?handle(host("internal-registry-stream","Dummy",{})):0;};
+        if(access==3)return done(failure());
+        GuestScratch temporary(*this,memory,state);
+        const auto value_name=text_at(arg(2));
+        const auto subkey=arg(1)?temporary.text(text_at(arg(1))):0;
+        const auto value=arg(2)?temporary.text(value_name):0;
+        const auto key_slot=temporary.allocate(pointer_bits/8),size=temporary.allocate(4);
+        if(!key_slot || !size || (arg(1) && !subkey) || (arg(2) && !value))return done(failure());
+        const auto opened=write?host("advapi32.dll","RegCreateKeyExW",{arg(0),subkey,0,0,0,0x2001f,0,key_slot,0}):
+                                host("advapi32.dll","RegOpenKeyExW",{arg(0),subkey,0,0x20019,key_slot});
+        if(opened&UINT32_MAX)return done(failure());
+        const auto key=handle(memory.load(GuestAddress{key_slot},pointer_bits));
+        const auto close=[&]{(void)host("advapi32.dll","RegCloseKey",{key});};
+        std::uint32_t length=0;
+        std::uint64_t data=0;
+        if(access!=1 && !(write && (mode&0x1000U))){
+            memory.store(GuestAddress{size},32,0);
+            auto error=static_cast<std::uint32_t>(host("advapi32.dll","RegQueryValueExW",{key,value,0,0,0,size}));
+            if(!error){
+                length=static_cast<std::uint32_t>(memory.load(GuestAddress{size},32));
+                if(length){
+                    data=length<=output_limit?temporary.allocate(length):0;
+                    error=data?static_cast<std::uint32_t>(host("advapi32.dll","RegQueryValueExW",{key,value,0,0,data,size})):8;
+                    if(!error)length=static_cast<std::uint32_t>(memory.load(GuestAddress{size},32));
+                }
+            }
+            // 機碼存在而值尚未建立時，提供長度為零的資料流。
+            if(error==2){length=0;data=0;}
+            else if(error){
+                close();
+                return done(failure());
+            }
+        }
+        const auto stream=handle(host("shlwapi.dll","SHCreateMemStream",{data,length}));
+        if(!stream){close();return done(failure());}
+        if(!write)close();
+        else if(!bind_registry_stream(stream,key,value_name)){
+            close();
+            (void)host("internal-ole-stream","Release",{stream});
+            return done(failure());
+        }
         return done(stream);
     }
     if(name=="SHIsChildOrSelf"){
-        // 回傳的 BOOL 在兩者相同或有子孫關係時為 FALSE，空控制代碼為 TRUE。
+        // 參考實作的 BOOL 在兩者相同或有子孫關係時為 FALSE，空控制代碼為 TRUE。
         const auto parent=arg(0), child=arg(1);
         if(!parent || !child)return done(1);
         if(parent==child)return done(0);
@@ -706,6 +784,138 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         const auto entry=[&](std::string_view dll,std::string_view target){const auto stub=host_service_stub(dll,target);return stub.value?stub.value:resolve(dll,target).value;};
         const auto handle_of=[&](std::uint64_t value){return x86_?value&UINT32_MAX:value;};
         const bool wide=symbol.ends_with('W');
+        if(symbol=="HrAddColumns" || symbol=="HrAddColumnsEx"){
+            const auto table=call(0),added=call(1),alloc=call(2),release=call(3);
+            const auto filter=symbol=="HrAddColumnsEx"?call(4):0;
+            if(!table || !added || !alloc || !release)co_return finish(0x80070057U);
+            const auto slot=temporary.allocate(size);
+            if(!slot)co_return finish(0x8007000eU);
+            m.store(GuestAddress{slot},bits,0);
+            auto hr=status(co_await service_callback::call(method(table,8),{table,0,slot}));
+            if(failed(hr))co_return finish(hr);
+            const auto old=m.load(GuestAddress{slot},bits);
+            if(!old)co_return finish(0x80004005U);
+            const auto capacity=m.load(GuestAddress{old},32);
+            if(filter)(void)co_await service_callback::call(filter,{old});
+            const auto previous=m.load(GuestAddress{old},32),extra=m.load(GuestAddress{added},32);
+            if(previous>capacity)hr=0x80070057U;
+            else if(extra+previous>0x3ffffffeU)hr=0x8007000eU;
+            else{
+                m.store(GuestAddress{slot},bits,0);
+                hr=status(co_await service_callback::call(alloc,{(extra+previous+1)*4,slot}));
+                if(!failed(hr)){
+                    const auto merged=m.load(GuestAddress{slot},bits);
+                    if(!merged)hr=0x8007000eU;
+                    else{
+                        auto count=extra;
+                        if(extra)m.move(GuestAddress{merged+4},GuestAddress{added+4},extra*4);
+                        for(std::uint64_t i=1;i<=previous;++i){
+                            const auto tag=m.load(GuestAddress{old+4*i},32);
+                            std::uint64_t j=1;
+                            while(j<=extra && m.load(GuestAddress{merged+4*j},32)!=tag)++j;
+                            if(j>extra)m.store(GuestAddress{merged+4*(++count)},32,tag);
+                        }
+                        m.store(GuestAddress{merged},32,count);
+                        hr=status(co_await service_callback::call(method(table,7),{table,merged,0}));
+                        (void)co_await service_callback::call(release,{merged});
+                    }
+                }
+            }
+            (void)co_await service_callback::call(release,{old});
+            co_return finish(hr);
+        }
+        if(symbol=="HrQueryAllRows"){
+            const auto table=call(0),columns=call(1),filter=call(2),sort=call(3),out=call(5);
+            const auto limit=static_cast<std::int32_t>(call(4));
+            if(!out)co_return finish(0x80070057U);
+            m.store(GuestAddress{out},bits,0);
+            if(!table || limit<0)co_return finish(0x80070057U);
+            const auto slot=temporary.allocate(size);
+            if(!slot)co_return finish(0x8007000eU);
+            std::uint32_t hr=0;
+            if(columns)hr=status(co_await service_callback::call(method(table,7),{table,columns,0}));
+            if(!failed(hr) && filter)hr=status(co_await service_callback::call(method(table,14),{table,filter,0}));
+            if(!failed(hr) && sort)hr=status(co_await service_callback::call(method(table,17),{table,sort,0}));
+            if(!failed(hr))hr=status(co_await service_callback::call(method(table,10),{table,0,0,0}));
+            const unsigned stride=8+size;
+            std::uint64_t total=0;
+            std::vector<std::pair<std::uint64_t,std::uint32_t>> pages;
+            const auto free_rows=[&](std::uint64_t rows){
+                (void)nested_service(s,m,"internal-mapi-buffer","FreeProws",{rows});
+            };
+            while(!failed(hr)){
+                const auto request=limit?std::min<std::uint64_t>(128,static_cast<unsigned>(limit)-total+1):128;
+                m.store(GuestAddress{slot},bits,0);
+                hr=status(co_await service_callback::call(method(table,19),{table,request,0,slot}));
+                if(failed(hr))break;
+                const auto rows=m.load(GuestAddress{slot},bits);
+                if(!rows){hr=0x80004005U;break;}
+                const auto count=status(m.load(GuestAddress{rows},32));
+                if(!count){free_rows(rows);break;}
+                if((limit && total+count>static_cast<unsigned>(limit)) || total+count>(UINT32_MAX-size)/stride){
+                    free_rows(rows);hr=0x80040403U;break;
+                }
+                try{pages.emplace_back(rows,count);}
+                catch(const std::bad_alloc&){free_rows(rows);hr=0x8007000eU;break;}
+                total+=count;
+            }
+            if(!failed(hr)){
+                hr=status(nested_service(s,m,"internal-mapi-buffer","MAPIAllocateBuffer",{size+total*stride,slot}));
+                if(!failed(hr)){
+                    const auto answer=m.load(GuestAddress{slot},bits);
+                    m.store(GuestAddress{answer},32,total);
+                    auto dest=answer+size;
+                    for(const auto& [page,count]:pages){
+                        const auto bytes=std::uint64_t(count)*stride;
+                        m.move(GuestAddress{dest},GuestAddress{page+size},bytes);
+                        for(std::uint64_t i=0;i<count;++i){
+                            const auto row=dest+i*stride;
+                            const auto props=m.load(GuestAddress{row+8},bits),n=m.load(GuestAddress{row+4},32);
+                            for(std::uint64_t j=0;j<n;++j){
+                                const auto at=props+j*mapi_property_stride(size);
+                                if((m.load(GuestAddress{at},32)&0xffffU)==10 && m.load(GuestAddress{at+8},32)==0x8004010fU)
+                                    m.store(GuestAddress{at},32,1);
+                            }
+                        }
+                        // 列中的屬性陣列轉交新列集，只釋放原頁的外層配置。
+                        m.store(GuestAddress{page},32,0);
+                        dest+=bytes;
+                    }
+                    m.store(GuestAddress{out},bits,answer);
+                }
+            }
+            for(const auto& page:pages)free_rows(page.first);
+            co_return finish(hr);
+        }
+        if(service.family=="internal-mapi-one"){
+            const auto object=call(0),input=call(1);
+            if(symbol=="HrSetOneProp")
+                co_return finish(status(co_await service_callback::call(method(object,8),{object,1,input,0})));
+            const bool get=symbol=="HrGetOneProp";
+            if(!get && !object)co_return finish(0);
+            const auto scratch=temporary.allocate(get?12:size);
+            if(!scratch)co_return finish(get?0x8007000eU:0);
+            const auto release=entry("internal-mapi-buffer","MAPIFreeBuffer");
+            if(get){
+                const auto output=call(2);
+                m.store(GuestAddress{scratch},32,1);
+                m.store(GuestAddress{scratch+4},32,input);
+                const auto hr=status(co_await service_callback::call(method(object,5),{object,scratch,0,scratch+8,output}));
+                if(hr!=0x40380U)co_return finish(hr);
+                const auto value=m.load(GuestAddress{output},bits);
+                (void)co_await service_callback::call(release,{value});
+                m.store(GuestAddress{output},bits,0);
+                co_return finish(0x8004010fU);
+            }
+            const auto hr=status(co_await service_callback::call(method(object,6),{object,0,scratch}));
+            if(failed(hr))co_return finish(0);
+            const auto tags=m.load(GuestAddress{scratch},bits),count=m.load(GuestAddress{tags},32);
+            bool found=false;
+            for(std::uint64_t i=0;i<count && !found;++i)
+                found=mapi_property_matches(status(m.load(GuestAddress{tags+4+i*4},32)),status(input),0);
+            (void)co_await service_callback::call(release,{tags});
+            co_return finish(found);
+        }
         if(symbol=="IUnknown_GetWindow" || symbol=="IUnknown_SetOwner" || symbol=="IUnknown_GetClassID"){
             const auto object=call(0), argument=call(1);
             const bool class_id=symbol=="IUnknown_GetClassID";
@@ -1063,7 +1273,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
                 if(call(1))m.store(GuestAddress{call(1)},64,length);
             }
             if(!check_empty)co_return finish(result);
-            // Stat 失敗時從當前位置試讀 DWORD；依既有契約，只有讀滿才重設位置。
+            // Stat 失敗時從當前位置試讀 DWORD；依 參考實作契約，只有讀滿才重設位置。
             const auto read=status(co_await service_callback::call(method(stream,3),{stream,slot+4,4,slot}));
             if(failed(read) || m.load(GuestAddress{slot},32)!=4)co_return finish(1);
             (void)co_await service_callback::call(entry("shlwapi.dll","IStream_Reset"),{stream});
@@ -1150,9 +1360,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         if(symbol=="SHGetThreadRef" || symbol=="SHGetInstanceExplorer" || symbol=="_SHGetInstanceExplorer"){
             // 回傳已 AddRef 的參照；沒有時執行緒參照回 E_NOINTERFACE，Explorer 參照回 E_FAIL。
             if(!call(0))co_return finish(0x80070057U);m.store(GuestAddress{call(0)},bits,0);const bool thread=symbol=="SHGetThreadRef";
-            std::uint64_t object=shell_instance_explorer_;if(thread){const auto found=shell_thread_refs_.find(threads_.current);object=found==shell_thread_refs_.end()?0:found->second;}
+            std::uint64_t object=0;if(thread){const auto found=shell_thread_refs_.find(threads_.current);object=found==shell_thread_refs_.end()?0:found->second;}
+            else if(shell_instance_explorer_)object=m.load(GuestAddress{shell_instance_explorer_},bits);
             if(!object)co_return finish(thread?0x80004002U:0x80004005U);
-            (void)co_await service_callback::call(method(object,1),{object});m.store(GuestAddress{call(0)},bits,object);co_return finish(0);
+            if(!thread)m.store(GuestAddress{call(0)},bits,object);
+            (void)co_await service_callback::call(method(object,1),{object});
+            if(thread)m.store(GuestAddress{call(0)},bits,object);
+            co_return finish(0);
         }
         if(symbol=="SHReleaseThreadRef"){
             // 清除目前執行緒的參照並釋放一次（SHCreateThread 以 CTF_THREAD_REF 交給新執行緒的參照）。
@@ -1160,14 +1374,38 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
             const auto object=found->second;shell_thread_refs_.erase(found);(void)co_await service_callback::call(method(object,2),{object});co_return finish(0);
         }
         const auto text_at=[&](std::uint64_t address)->std::u16string{if(!address)return {};return wide?read_utf16(m,GuestAddress{address},32768):utf8_to_utf16_lossy(read_ansi(m,address,32768));};
-        if(symbol=="#542"){ // GetUIVersion：以實際載入的 shell32 查詢介面版本。
+        if(symbol=="#542" || symbol=="WhichPlatform"){
             const auto library=temporary.text(u"shell32.dll"),info=temporary.allocate(20),proc=temporary.allocate(14);
             if(!library || !proc || !info)co_return finish(0);
             constexpr std::uint8_t version_name[]="DllGetVersion";
             m.write(GuestAddress{proc},version_name);
             const auto module=handle_of(co_await service_callback::call_value(entry("kernel32.dll","LoadLibraryW"),{library}));
+            const auto fn=module?handle_of(co_await service_callback::call_value(entry("kernel32.dll","GetProcAddress"),{module,proc})):0;
+            if(symbol=="WhichPlatform"){
+                if(module)(void)co_await service_callback::call(entry("kernel32.dll","FreeLibrary"),{module});
+                // DLL 回呼期間可能有另一執行緒已完成同一程序的查詢。
+                if(shell_browser_platform_)co_return finish(shell_browser_platform_);
+                shell_browser_platform_=fn?2:1;
+                const auto path=temporary.text(u"Software\\Microsoft\\Internet Explorer");
+                const auto value=temporary.text(u"IntegratedBrowser");
+                if(!path || !value)co_return finish(shell_browser_platform_);
+                const auto root=handle_of(UINT64_C(0xffffffff80000002));
+                const auto opened=co_await service_callback::call(entry("advapi32.dll","RegOpenKeyExW"),{root,path,0,0xf003f,slot});
+                if(!opened){
+                    const auto key=m.load(GuestAddress{slot},bits);
+                    m.store(GuestAddress{info},32,4);
+                    const auto query=co_await service_callback::call(entry("advapi32.dll","RegQueryValueExW"),{key,value,0,0,info+4,info});
+                    if(query && fn){
+                        m.store(GuestAddress{info+4},32,1);
+                        (void)co_await service_callback::call(entry("advapi32.dll","RegSetValueExW"),{key,value,0,4,info+4,4});
+                    }else if(!query && !fn){
+                        (void)co_await service_callback::call(entry("advapi32.dll","RegDeleteValueW"),{key,value});
+                    }
+                    (void)co_await service_callback::call(entry("advapi32.dll","RegCloseKey"),{key});
+                }
+                co_return finish(shell_browser_platform_);
+            }
             if(!module)co_return finish(0);
-            const auto fn=handle_of(co_await service_callback::call_value(entry("kernel32.dll","GetProcAddress"),{module,proc}));
             std::uint32_t major=0;
             if(fn){
                 m.store(GuestAddress{info},32,20);
@@ -1321,7 +1559,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
             const auto proc=call(0),data=call(1),callback=call(3);const auto flags=static_cast<std::uint32_t>(call(2));if(!proc)co_return finish(0);
             std::uint64_t thread_ref=0,process_ref=0,module=0;
             if(flags&2U){const auto found=shell_thread_refs_.find(threads_.current);if(found==shell_thread_refs_.end())co_return finish(0);thread_ref=found->second;(void)co_await service_callback::call(method(thread_ref,1),{thread_ref});}
-            if((flags&4U) && shell_instance_explorer_){process_ref=shell_instance_explorer_;(void)co_await service_callback::call(method(process_ref,1),{process_ref});}
+            if((flags&4U) && shell_instance_explorer_){process_ref=m.load(GuestAddress{shell_instance_explorer_},bits);if(process_ref)(void)co_await service_callback::call(method(process_ref,1),{process_ref});}
             if(flags&0x10U){m.store(GuestAddress{slot},bits,0);if(co_await service_callback::call(entry("kernel32.dll","GetModuleHandleExW"),{4,proc,slot}))module=take();}
             const auto context=allocate_heap(m,80);const auto event=context?handle_of(co_await service_callback::call_value(entry("kernel32.dll","CreateEventW"),{0,1,0,0})):0;
             std::uint64_t thread=0;

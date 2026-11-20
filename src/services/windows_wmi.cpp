@@ -139,7 +139,7 @@ std::optional<std::vector<WmiRow>> rows(std::u16string name,const GuestMemory& m
 }
 std::span<const WindowsServiceDescriptor> wmi_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
-        {"ole32.dll","CoSetProxyBlanket",8},{"ole32.dll","CoQueryProxyBlanket",8},
+        {"ole32.dll","CoCopyProxy",2},{"ole32.dll","CoSetProxyBlanket",8},{"ole32.dll","CoQueryProxyBlanket",8},
         {"internal-wmi","QueryInterface",3},{"internal-wmi","AddRef",1},{"internal-wmi","Release",1},
         {"internal-wmi","ConnectServer",9},{"internal-wmi","ExecQuery",6},{"internal-wmi","CreateInstanceEnum",5},
         {"internal-wmi","Reset",1},{"internal-wmi","Next",5},{"internal-wmi","Clone",2},{"internal-wmi","Skip",3},
@@ -148,18 +148,41 @@ std::span<const WindowsServiceDescriptor> wmi_service_descriptors(){
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_wmi(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    if(service.symbol=="CoSetProxyBlanket" || service.symbol=="CoQueryProxyBlanket"){
+    if(service.symbol=="CoCopyProxy" || service.symbol=="CoSetProxyBlanket" || service.symbol=="CoQueryProxyBlanket"){
         return service_callback::invoke<std::optional<std::uint32_t>>(
             this,threads_.current,state,memory,service.symbol,
             [this](GuestState& s,GuestMemory& m,std::uint64_t target,std::vector<std::uint64_t> args,std::uint64_t id){start_callbacks(s,m,{{target,std::move(args)}},Continuation::NestedResult,id);},
             [this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
                 const WindowsCall call(s,m,service);const auto done=[&](std::uint32_t hr){call.return_to(s,hr);return std::optional<std::uint32_t>{};};
                 const bool setting=service.symbol=="CoSetProxyBlanket";const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);
-                if(!call(0))co_return done(0x80070057U);
+                const bool copying=service.symbol=="CoCopyProxy";
+                if(!call(0) || (copying && !call(1)))co_return done(0x80070057U);
                 try{
                     if(auto found=runtime_.wmi_objects.find(call(0));found!=runtime_.wmi_objects.end()){
                         auto& proxy=found->second;
-                        if(setting){
+                        if(copying){
+                            m.store(GuestAddress{call(1)},bits,0);
+                            const auto original=proxy.original_proxy?proxy.original_proxy:call(0);
+                            auto& target=runtime_.wmi_objects.at(original);
+                            if(runtime_.wmi_objects.size()>=4096 || target.references==UINT32_MAX)co_return done(0x8007000eU);
+                            WmiObject copy;
+                            copy.original_proxy=original;
+                            copy.kind=target.kind;
+                            if(runtime_.com_security){
+                                copy.authn_level=(*runtime_.com_security)[0];
+                                copy.imp_level=(*runtime_.com_security)[1];
+                                copy.security_capabilities=(*runtime_.com_security)[2]&0x60U;
+                            }
+                            const auto table=runtime_.wmi_vtables.at(target.kind);
+                            const auto pointer=allocate_heap(m,unit);
+                            if(!pointer)co_return done(0x8007000eU);
+                            try{
+                                m.store(GuestAddress{pointer},bits,table);
+                                runtime_.wmi_objects.emplace(pointer,std::move(copy));
+                            }catch(...){(void)free_heap(m,pointer,s);throw;}
+                            ++target.references;
+                            m.store(GuestAddress{call(1)},bits,pointer);
+                        }else if(setting){
                             // 本機 WMI 不建立遠端身分或 principal；絕不接受卻捨棄呼叫端的認證。
                             const auto sentinel=static_cast<std::uint64_t>(x86_?UINT32_MAX:UINT64_MAX);
                             if((call(3) && call(3)!=sentinel) || (call(6) && call(6)!=sentinel))co_return done(0x80004001U);
@@ -169,7 +192,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wmi(GuestState& state,Guest
                             if(authn==UINT32_MAX)authn=10;if(authz==UINT32_MAX)authz=0;if(!level || level==UINT32_MAX)level=defaults[0]?defaults[0]:3;if(!imp || imp==UINT32_MAX)imp=defaults[1]?defaults[1]:3;
                             if(cap==0x800U)cap=defaults[2]&0x60U;
                             if(level>6 || imp>4 || (cap&~0x60U) || (cap&0x60U)==0x60U)co_return done(0x80070057U);
-                            if((authn!=0 && authn!=10 && authn!=16) || authz)co_return done(0x800706d3U);
+                            if((authn!=0 && !ComAuthenticationService::supports(authn)) || authz)co_return done(0x800706d3U);
                             proxy.authn_service=authn;proxy.authz_service=authz;proxy.authn_level=level;proxy.imp_level=imp;proxy.security_capabilities=cap;
                         }else{
                             for(unsigned i=1;i<8;++i)if(call(i))m.check(GuestAddress{call(i)},i==3 || i==6?unit:4,Access::Write);
@@ -183,12 +206,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_wmi(GuestState& state,Guest
                     constexpr WindowsGuid client_security{0x3d,0x01,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
                     m.store(GuestAddress{scratch},bits,0);m.write(GuestAddress{scratch+unit},client_security);
                     const auto method=[&](std::uint64_t proxy_pointer,unsigned slot){const auto table=m.load(GuestAddress{proxy_pointer},bits);return m.load(GuestAddress{table+slot*unit},bits);};
-                    std::vector<std::uint64_t> args{0};for(unsigned i=0;i<8;++i)args.push_back(call(i));
+                    std::vector<std::uint64_t> args{0};for(unsigned i=0;i<(copying?2U:8U);++i)args.push_back(call(i));
                     auto hr=static_cast<std::uint32_t>(co_await service_callback::call(method(call(0),0),{call(0),scratch+unit,scratch}));
                     if(hr&0x80000000U)co_return done(hr);const auto security=m.load(GuestAddress{scratch},bits);if(!security)co_return done(0x80004002U);
                     args[0]=security;
                     // 先解析兩個入口，避免 provider 方法返回後才發現無法釋放。
-                    const auto target=method(security,setting?4:3),release=method(security,2);
+                    const auto target=method(security,copying?5:setting?4:3),release=method(security,2);
                     hr=static_cast<std::uint32_t>(co_await service_callback::call(target,std::move(args)));
                     (void)co_await service_callback::call(release,{security});co_return done(hr);
                 }catch(const MemoryFault&){co_return done(0x80004003U);}catch(const HostCallFault&){co_return done(0x80004003U);}catch(const std::bad_alloc&){co_return done(0x8007000eU);}
@@ -234,14 +257,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_wmi(GuestState& state,Guest
     }
     const auto found=runtime_.wmi_objects.find(arg(0));
     if(found==runtime_.wmi_objects.end())throw HostCallFault("WMI 介面物件已失效");
-    auto& current=found->second;
+    auto& proxy=found->second;
+    const auto original=proxy.original_proxy?proxy.original_proxy:arg(0);
+    auto& current=runtime_.wmi_objects.at(original);
+    const auto release=[&](std::uint64_t pointer){
+        auto item=runtime_.wmi_objects.find(pointer);
+        const auto remaining=--item->second.references;
+        if(!remaining){runtime_.wmi_objects.erase(item);(void)free_heap(memory,pointer,state);}
+        return remaining;
+    };
     if(name=="QueryInterface"){
         if(!arg(2))result=0x80004003U;
         else {output(arg(2),0);const auto iid=guid(memory,arg(1));
             if(iid!=interfaces[current.kind] && iid!="00000000-0000-0000-c000-000000000046")result=0x80004002U;
-            else {if(current.references==UINT32_MAX)throw HostCallFault("WMI 引用計數溢位");++current.references;output(arg(2),arg(0));}}
-    } else if(name=="AddRef"){if(current.references==UINT32_MAX)throw HostCallFault("WMI 引用計數溢位");result=++current.references;}
-    else if(name=="Release"){result=--current.references;if(!result){runtime_.wmi_objects.erase(found);(void)free_heap(memory,arg(0),state);}}
+            else {if(current.references==UINT32_MAX)throw HostCallFault("WMI 引用計數溢位");++current.references;output(arg(2),original);}}
+    } else if(name=="AddRef"){if(proxy.references==UINT32_MAX)throw HostCallFault("WMI 引用計數溢位");result=++proxy.references;}
+    else if(name=="Release"){result=release(arg(0));if(!result && original!=arg(0))release(original);}
     else if(name=="ConnectServer" && current.kind==locator){
         if(!arg(8))result=0x80004003U;
         else {output(arg(8),0);auto path=key(read_utf16(memory,GuestAddress{arg(1)},1024));std::replace(path.begin(),path.end(),u'/',u'\\');

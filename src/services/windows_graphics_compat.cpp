@@ -1,3 +1,4 @@
+#include "gui_window_menu.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_geometry.hpp"
@@ -13,6 +14,7 @@ std::span<const WindowsServiceDescriptor> graphics_compat_service_descriptors() 
         {"gdi32.dll","CreateRoundRectRgn",6},{"gdi32.dll","CreateEllipticRgn",4},{"gdi32.dll","CreateEllipticRgnIndirect",1},
         {"gdi32.dll","CombineRgn",4},{"gdi32.dll","OffsetRgn",3},{"gdi32.dll","GetRgnBox",2},
         {"gdi32.dll","PtInRegion",3},{"gdi32.dll","RectInRegion",2},{"gdi32.dll","EqualRgn",2},{"gdi32.dll","GetRegionData",3},
+        {"win32u.dll","NtUserGetWindowRgnEx",3},
         {"user32.dll","GetWindowRgn",2},{"user32.dll","GetWindowRgnBox",2},{"user32.dll","SetWindowRgn",3},
         {"user32.dll","RedrawWindow",4},{"user32.dll","ValidateRect",2},{"user32.dll","ValidateRgn",2},
         {"user32.dll","GetUpdateRgn",3},{"user32.dll","ExcludeUpdateRgn",2},
@@ -24,6 +26,7 @@ std::span<const WindowsServiceDescriptor> graphics_compat_service_descriptors() 
         {"user32.dll","SetWindowLongA",3},{"user32.dll","SetWindowLongW",3},
         {"user32.dll","GetUpdateRect",3},
         {"user32.dll","GetWindow",2},{"user32.dll","GetTopWindow",1},
+        {"win32u.dll","NtUserUpdateLayeredWindow",10},
         {"user32.dll","PrintWindow",3},{"user32.dll","UpdateLayeredWindow",9},{"user32.dll","UpdateLayeredWindowIndirect",2},
         {"user32.dll","SetLayeredWindowAttributes",4},{"user32.dll","GetLayeredWindowAttributes",4},
         {"user32.dll","UnregisterClassA",2},{"user32.dll","UnregisterClassW",2}
@@ -33,13 +36,14 @@ std::span<const WindowsServiceDescriptor> graphics_compat_service_descriptors() 
 
 void WindowsServices::clear_layered_content(std::uint64_t handle){
     const auto found=gui_.windows.find(handle);if(found==gui_.windows.end() || found->second.layered_pixels.empty())return;
-    found->second.layered_pixels.clear();rasters_.erase(0x10000000U+handle);if(native_gui_)native_gui_->graphics_surface(handle,{});
+    found->second.layered_stride=0;found->second.layered_pixels.clear();rasters_.erase(0x10000000U+handle);if(native_gui_)native_gui_->graphics_surface(handle,{});
 }
 std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     if(service.symbol=="ExcludeUpdateRgn")return invoke_gdi_state(state,memory,service);
     if(invoke_remote_gui(state,memory,service))return std::nullopt;
     const WindowsCall arg(state,memory,service);
-    const auto symbol=service.symbol;
+    // 參考實作的 GetWindowRgnEx 保留第三個 UINT，兩個入口查詢相同外形。
+    const auto symbol=service.symbol=="NtUserGetWindowRgnEx" ? std::string_view{"GetWindowRgn"} : service.symbol;
     std::uint64_t result{};
     const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
     if(symbol=="CreateRoundRectRgn" || symbol=="CreateEllipticRgn" || symbol=="CreateEllipticRgnIndirect"){
@@ -73,7 +77,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
             const auto source=make_hardware_raster(image->width,image->height,image->pixels);const auto rectangle=std::array<std::int32_t,4>{0,0,static_cast<std::int32_t>(image->width),static_cast<std::int32_t>(image->height)};
             destination->blit(*source,rectangle,rectangle,gui_.contexts.at(arg(1)),UINT32_MAX);return done(0);
         }catch(const std::bad_alloc&){return done(8);}catch(const std::runtime_error&){return done(50);}
-    }else if(symbol=="UpdateLayeredWindow" || symbol=="UpdateLayeredWindowIndirect"){
+    }else if(symbol=="UpdateLayeredWindow" || symbol=="UpdateLayeredWindowIndirect" || symbol=="NtUserUpdateLayeredWindow"){
         const auto done=[&](std::uint32_t error){if(error)last_error_=error;arg.return_to(state,error?0:1);return std::optional<std::uint32_t>{};};
         const auto window=gui_.windows.find(arg(0));if(window==gui_.windows.end())return done(1400);
         auto& w=window->second;if(!(w.ex_style&0x80000U) || w.layered_initialized)return done(87);
@@ -82,8 +86,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
             if(!arg(1))return done(87);const auto info=arg(1);const unsigned size=x86_?40:80;memory.check(GuestAddress{info},size,Access::Read);if(memory.load(GuestAddress{info},32)!=size)return done(87);
             const std::array<unsigned,9> offsets=x86_?std::array<unsigned,9>{4,8,12,16,20,24,28,32,36}:std::array<unsigned,9>{8,16,24,32,40,48,56,64,72};
             for(unsigned i=1;i<10;++i)values[i]=memory.load(GuestAddress{info+offsets[i-1]},i==6 || i==8?32:x86_?32:64);
-            if(values[9])return done(50); // dirty RECT 的局部提交另行實作。
-        }else for(unsigned i=1;i<9;++i)values[i]=arg(i);
+        }else{
+            for(unsigned i=1;i<9;++i)values[i]=arg(i);
+            if(symbol=="NtUserUpdateLayeredWindow")values[9]=arg(9);
+            else if(values[8]&8U)return done(87);
+        }
         const auto flags=static_cast<std::uint32_t>(values[8]),mode=flags&7U;
         if((flags&~15U) || (mode && (mode&(mode-1))))return done(87);
         const auto frame=gui_frame_insets(w);if(w.builtin || w.dialog || w.combo_owner || frame.left || frame.top || frame.right || frame.bottom)return done(50);
@@ -91,7 +98,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
         auto position=std::array<std::int32_t,2>{w.x,w.y};if(values[2]){position=pair(values[2]);if(w.style&0x40000000U){const auto origin=gui_client_origin(gui_,w.parent);const auto x=static_cast<std::int64_t>(position[0])-origin[0],y=static_cast<std::int64_t>(position[1])-origin[1];if(x<INT32_MIN || x>INT32_MAX || y<INT32_MIN || y>INT32_MAX)return done(87);position={static_cast<std::int32_t>(x),static_cast<std::int32_t>(y)};}}
         auto size=std::array<std::int32_t,2>{static_cast<std::int32_t>(w.width),static_cast<std::int32_t>(w.height)};if(values[3])size=pair(values[3]);
         if(size[0]<=0 || size[1]<=0 || size[0]>16384 || size[1]>16384 || static_cast<std::uint64_t>(size[0])*static_cast<unsigned>(size[1])>output_limit/4)return done(87);
-        if((flags&8U) && (static_cast<unsigned>(size[0])!=w.width || static_cast<unsigned>(size[1])!=w.height))return done(87);
+        if((flags&8U) && (static_cast<unsigned>(size[0])!=w.width || static_cast<unsigned>(size[1])!=w.height))return done(1462);
         if(values[1] && values[1]!=0x10000000U)return done(6);
         std::vector<std::uint32_t> pixels;std::shared_ptr<RasterSurface> surface;bool reused=false;
         if(!values[4]){if(values[1] || values[3] || values[5] || values[7] || mode)return done(87);if(w.layered_pixels.empty())return done(87);}
@@ -100,30 +107,44 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
             const auto& dc=context->second;const auto bitmap=gui_.bitmaps.find(dc.bitmap);if(bitmap==gui_.bitmaps.end())return done(50);
             if(gui_device_transform(dc)!=gui_identity)return done(50);
             const auto source=values[5]?pair(values[5]):std::array<std::int32_t,2>{};
-            if(source[0]<0 || source[1]<0 || static_cast<std::uint64_t>(source[0])+static_cast<unsigned>(size[0])>bitmap->second.width || static_cast<std::uint64_t>(source[1])+static_cast<unsigned>(size[1])>bitmap->second.height)return done(87);
+            GuiRect dirty{0,0,size[0],size[1]};
+            if(values[9]){
+                const auto first=pair(values[9]),last=pair(values[9]+8);
+                dirty={std::clamp(first[0],0,size[0]),std::clamp(first[1],0,size[1]),
+                       std::clamp(last[0],0,size[0]),std::clamp(last[1],0,size[1])};
+            }
+            if(dirty[0]<dirty[2] && dirty[1]<dirty[3] &&
+               (std::int64_t{source[0]}+dirty[0]<0 || std::int64_t{source[1]}+dirty[1]<0 ||
+                std::int64_t{source[0]}+dirty[2]>bitmap->second.width || std::int64_t{source[1]}+dirty[3]>bitmap->second.height))return done(87);
             unsigned constant=255;bool per_pixel=false;
             if(mode==2){if(!values[7])return done(87);const auto blend=static_cast<std::uint32_t>(memory.load(GuestAddress{values[7]},32));if((blend&0xffffU) || (blend>>24)>1)return done(87);constant=(blend>>16)&255;per_pixel=(blend>>24)==1;if(per_pixel && bitmap->second.bits_per_pixel!=32)return done(87);}
             try{
                 import_dib_bitmap(memory,dc.bitmap);sync_raster_bitmap(memory,dc.bitmap);pixels.resize(static_cast<std::size_t>(size[0])*static_cast<unsigned>(size[1]));
-                for(unsigned y=0;y<static_cast<unsigned>(size[1]);++y)for(unsigned x=0;x<static_cast<unsigned>(size[0]);++x){
-                    const auto color=bitmap->second.pixels[(y+static_cast<unsigned>(source[1]))*bitmap->second.width+x+static_cast<unsigned>(source[0])];std::uint32_t output=color|0xff000000U;
+                if(values[9] && w.layered_stride){
+                    const auto rows=std::min(static_cast<std::size_t>(size[1]),w.layered_pixels.size()/w.layered_stride);
+                    const auto columns=std::min(static_cast<unsigned>(size[0]),w.layered_stride);
+                    for(std::size_t y=0;y<rows;++y)
+                        std::copy_n(w.layered_pixels.data()+y*w.layered_stride,columns,pixels.data()+y*static_cast<unsigned>(size[0]));
+                }
+                for(int y=dirty[1];y<dirty[3];++y)for(int x=dirty[0];x<dirty[2];++x){
+                    const auto color=bitmap->second.pixels[static_cast<std::size_t>(std::int64_t{y}+source[1])*bitmap->second.width+static_cast<std::size_t>(std::int64_t{x}+source[0])];std::uint32_t output=color|0xff000000U;
                     if(mode==1 && (color&0xffffffU)==(values[6]&0xffffffU))output=0;
                     if(mode==2){output=0;for(unsigned channel=0;channel<3;++channel)output|=((((color>>(channel*8))&255)*constant+127)/255)<<(channel*8);output|=(((per_pixel?color>>24:255)*constant+127)/255)<<24;}
-                    pixels[static_cast<std::size_t>(y)*static_cast<unsigned>(size[0])+x]=output;
+                    pixels[static_cast<std::size_t>(y)*static_cast<unsigned>(size[0])+static_cast<unsigned>(x)]=output;
                 }
-                if(native_gui_){
+                if(native_gui_ || rasters_.contains(0x10000000U+arg(0))){
                     // 尺寸不變時沿用上一次 UpdateLayeredWindow 已掛在原生視窗上的表面，只更新像素：
                     // 每幀換新表面會讓視窗在新表面呈現前短暫空白（動畫啟動畫面閃爍），也多一次建立與掛載成本。
                     if(!w.layered_pixels.empty())if(const auto existing=rasters_.find(0x10000000U+arg(0));existing!=rasters_.end() && existing->second &&
                         existing->second->width()==static_cast<unsigned>(size[0]) && existing->second->height()==static_cast<unsigned>(size[1])){surface=existing->second;reused=true;}
-                    if(!surface)surface=make_hardware_raster(static_cast<unsigned>(size[0]),static_cast<unsigned>(size[1]),{},native_gui_->graphics_view(arg(0)));
+                    if(!surface)surface=make_hardware_raster(static_cast<unsigned>(size[0]),static_cast<unsigned>(size[1]),{},native_gui_?native_gui_->graphics_view(arg(0)):nullptr);
                     surface->upload(pixels,true);surface->set_transparent(true);
                 }
             }catch(const std::bad_alloc&){return done(8);}catch(const std::runtime_error&){return done(50);}
         }
         const bool moved=position[0]!=w.x || position[1]!=w.y,resized=static_cast<unsigned>(size[0])!=w.width || static_cast<unsigned>(size[1])!=w.height;
         w.x=position[0];w.y=position[1];w.width=static_cast<unsigned>(size[0]);w.height=static_cast<unsigned>(size[1]);
-        if(values[4]){w.layered_pixels=std::move(pixels);w.drawing.clear();gui_.contexts.try_emplace(0x10000000U+arg(0));gui_.dc_objects.try_emplace(0x10000000U+arg(0),0xb011);if(surface && !reused){rasters_[0x10000000U+arg(0)]=surface;native_gui_->graphics_surface(arg(0),surface);}}
+        if(values[4]){w.layered_stride=w.width;w.layered_pixels=std::move(pixels);w.drawing.clear();gui_.contexts.try_emplace(0x10000000U+arg(0));gui_.dc_objects.try_emplace(0x10000000U+arg(0),0xb011);if(surface && !reused){rasters_[0x10000000U+arg(0)]=surface;if(native_gui_)native_gui_->graphics_surface(arg(0),surface);}}
         present_gui(arg(0));if(surface)surface->flush(true);
         if(w.procedure && (moved || resized)){std::vector<GuestCallback> callbacks;if(moved)callbacks.push_back({w.procedure,{arg(0),3,0,gui_move_lparam(w)}});if(resized)callbacks.push_back({w.procedure,{arg(0),5,0,(w.width&65535U)|((w.height&65535U)<<16)}});start_callbacks(state,memory,std::move(callbacks),Continuation::Return,1);return {};}
         return done(0);
@@ -158,7 +179,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
                 else if(!gui_region_coordinates({r}))fail(87);
                 else {GuiRegion region;if(!gui_rect_empty(r))region.push_back(r);if(set){found->second=std::move(region);result=1;}else if(gui_.regions.size()>=65536)fail(8);else {result=gui_.next_object++;gui_.regions.emplace(result,std::move(region));}}
             }else if(symbol=="GetWindowRgn" || symbol=="GetWindowRgnBox"){
-                if(!gui_.windows.contains(arg(0)))fail(1400);
+                if(symbol=="GetWindowRgnBox" && !arg(1))result=0;
+                else if(!gui_.windows.contains(arg(0)))fail(1400);
                 else if(symbol=="GetWindowRgn" && !gui_.regions.contains(arg(1)))fail(6);
                 else if(const auto& shape=gui_.windows.at(arg(0)).window_region;shape){
                     if(symbol=="GetWindowRgn")gui_.regions.at(arg(1))=*shape;else write_rect(arg(1),gui_region_bounds(*shape));result=gui_region_kind(*shape);
@@ -362,7 +384,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
                 else if(index>=0 && static_cast<std::uint64_t>(index)+4<=window.extra.size()) {
                     for(unsigned i=0;i<4;++i)result|=static_cast<std::uint64_t>(window.extra[static_cast<std::size_t>(index)+i])<<(i*8);
                     if(set)for(unsigned i=0;i<4;++i)window.extra[static_cast<std::size_t>(index)+i]=static_cast<std::uint8_t>(value>>(i*8));
-                } else if(index==-12) {result=window.id;if(set)window.id=value;}
+                } else if(index==-12) {result=gui_menu_or_control_id(window);if(set){gui_menu_or_control_id(window)=value;publish_gui_window(arg(0));}}
                 else if(index==-21) {result=window.user_data;if(set)window.user_data=value;}
                 // x64 中的指標或 handle 必須透過 LongPtr API，避免截斷寫入。
                 else fail(1413);

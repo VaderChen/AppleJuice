@@ -20,6 +20,7 @@ struct ComContextOperation {
 };
 struct ComContextBridge {
     com_context::State contexts;
+    std::map<std::uint64_t,std::vector<std::uint64_t>> cancel_stacks; // 執行緒的同步呼叫由內向外取消。
     std::map<std::uint64_t,ComContextEnumerator> enumerators;
     std::map<std::uint64_t,ComContextOperation> operations;
     // 尚在取得快照引用時，來源持有的引用不能被重入 Remove／Uninitialize 提早釋放。

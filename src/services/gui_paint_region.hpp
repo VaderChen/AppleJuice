@@ -15,6 +15,7 @@ inline GuiRegion gui_update_region(const GuiWindow& window) {
 inline std::optional<GuiRegion> gui_dc_clip(const GuiDc& dc,bool system=true) {
     auto region=dc.application_clip;
     if(dc.meta_clip)region=region?gui_region_combine(*region,*dc.meta_clip,1):dc.meta_clip;
+    if(system && dc.acquisition_clip)region=region?gui_region_combine(*region,*dc.acquisition_clip,1):dc.acquisition_clip;
     if(system && dc.paint_clip)region=region?gui_region_combine(*region,*dc.paint_clip,1):dc.paint_clip;
     return region;
 }

@@ -221,11 +221,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_accessible(GuestState& stat
         }
         if(name=="GetProcessHandleFromHwnd"){
             // 視窗所屬程序，存取權為 PROCESS_DUP_HANDLE｜VM_OPERATION｜VM_READ｜VM_WRITE｜SYNCHRONIZE；無效視窗回 NULL。
-            const auto saved=last_error_;const auto slot=allocate_heap(memory,8);if(!slot)return finish(0);
-            struct Free {WindowsServices& self;GuestMemory& memory;const GuestState& state;std::uint64_t at;~Free(){(void)self.free_heap(memory,at,state);}} release{*this,memory,state,slot};
-            memory.store(GuestAddress{slot},32,0);
-            if(!nested_service(state,memory,"user32.dll","GetWindowThreadProcessId",{arg(0),slot})){last_error_=1400;return finish(0);}
-            const auto pid=memory.load(GuestAddress{slot},32);const auto handle=nested_service(state,memory,"kernel32.dll","OpenProcess",{0x100078U,0,pid})&(x86_?UINT32_MAX:UINT64_MAX);
+            const auto saved=last_error_;
+            const auto handle=nested_service(state,memory,"win32u.dll","NtUserGetWindowProcessHandle",{arg(0),0x100078U});
             if(handle)last_error_=saved;return finish(handle);
         }
         if(name=="LresultFromObject"){

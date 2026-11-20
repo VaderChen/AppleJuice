@@ -192,11 +192,30 @@ std::string WindowsServices::dsound_diagnostics() const {
         out<<"dsound_output handle="<<handle<<" channels="<<pcm.channels<<" rate="<<pcm.rate<<" bits="<<pcm.bits<<" rendered_frames="<<pcm.rendered_frames<<" peak_left="<<pcm.rendered_left_peak<<" peak_right="<<pcm.rendered_right_peak<<" playing="<<pcm.playing<<'\n';
     }return out.str();
 }
+namespace {
+thread_local bool dsound_worker_call=false; // worker 上執行時略過通知輪詢（會觸發客體事件，屬協調者工作）。
+}
+// worker 上可執行的 DirectSound 緩衝方法：只讀寫該緩衝在自己 pcm 鎖下的狀態與參數指向的輸出，物件表由共用映射鎖保護
+// （建立與釋放都在協調者、持獨占映射鎖）。主緩衝會連動所有子緩衝，效果、裝置與 3D 介面會走訪物件表，都留在協調者。
+// 回傳 false 表示交回協調者。音訊執行緒每幀大量設定音高與音量時，不必每次都經協調者往返。
+bool WindowsServices::invoke_dsound_worker(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    constexpr std::string_view names[]{"GetCurrentPosition","GetVolume","GetPan","GetFrequency","GetStatus","SetVolume","SetPan","SetFrequency"};
+    if(!dsound_ || !runtime_.network.external_io || service.family!="internal-dsound" || std::find(std::begin(names),std::end(names),service.symbol)==std::end(names))return false;
+    {
+        const WindowsCall arg(state,memory,service);const auto found=dsound_->objects.find(arg(0));
+        if(found==dsound_->objects.end() || found->first!=found->second->canonical)return false;
+        const auto& o=*found->second;if(o.primary || o.effect || o.device || o.factory || o.duplex)return false;
+    }
+    dsound_worker_call=true;
+    try{const auto exit=invoke_dsound(state,memory,service);dsound_worker_call=false;if(exit)throw std::logic_error("worker 上的 DirectSound 服務意外終止客體");}
+    catch(...){dsound_worker_call=false;throw;}
+    return true;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_dsound(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(!runtime_.network.external_io)throw HostCallFault("DirectSound 不能在 compare 模式使用");
     if(!dsound_)dsound_=std::make_shared<DirectSoundState>();
     auto& bridge=*dsound_;const WindowsCall arg(state,memory,service);const auto name=service.symbol;
-    poll_dsound();
+    if(!dsound_worker_call)poll_dsound();
     const unsigned unit=x86_?4U:8U;const std::uint8_t bits=x86_?32:64;
     const auto read=[&](std::uint64_t p,unsigned offset,std::uint8_t width=32){return memory.load(GuestAddress{p+offset},width);};
     const auto write=[&](std::uint64_t p,std::uint64_t value,std::uint8_t width=32){if(!p)throw std::invalid_argument("null output");memory.store(GuestAddress{p},width,value);};

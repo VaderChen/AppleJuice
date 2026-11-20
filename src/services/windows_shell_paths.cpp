@@ -1,6 +1,11 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "x64arm/windows_paths.hpp"
+#include "x64arm/windows_system_paths.hpp"
+#include "windows_path_character.h"
 #include "service_callback_task.hpp"
+#include "shell_extension_text.h"
+#include "mpr_state.hpp"
 #include <algorithm>
 
 // shell32 磁碟、路徑與回收區家族：DriveType／RealDriveType／IsNetDrive、IsLFNDrive、PathCleanupSpec、PathGetShortPath、PathIsExe、
@@ -12,6 +17,7 @@ namespace x64arm {
 std::span<const WindowsServiceDescriptor> shell_path_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"shell32.dll","DriveType",1,0,0,0x1},{"shell32.dll","RealDriveType",2,0,0,0x3},{"shell32.dll","IsNetDrive",1,0,0,0x1},
+        {"shell32.dll","#65",1,0,0,0x1},{"shell32.dll","RealDriveTypeFlags",2,0,0,0x3},
         {"shell32.dll","IsLFNDriveA",1},{"shell32.dll","IsLFNDriveW",1},{"shell32.dll","PathCleanupSpec",2},{"shell32.dll","PathGetShortPath",1},
         {"shell32.dll","PathIsExe",1},{"shell32.dll","PathMakeUniqueName",5,0,0,0x2},{"shell32.dll","PathYetAnotherMakeUniqueName",4},
         {"shell32.dll","PathQualify",1},{"shell32.dll","PathResolve",3,0,0,0x4},
@@ -33,8 +39,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_paths(GuestState& sta
         if(narrow){const auto bytes=utf16_to_utf8_lossy(text);if(bytes.size()>=capacity)return false;std::vector<std::uint8_t> data(bytes.begin(),bytes.end());data.push_back(0);memory.write(GuestAddress{at},data);return true;}
         if(text.size()>=capacity)return false;memory.write(GuestAddress{at},utf16_bytes(text));return true;};
     GuestScratch temporary(*this,memory,state);
-    const auto attributes=[&](const std::u16string& path)->std::uint32_t{const auto text=temporary.text(path);return text?static_cast<std::uint32_t>(host("GetFileAttributesW",{text})):UINT32_MAX;};
-    const auto exists=[&](const std::u16string& path){return !path.empty() && attributes(path)!=UINT32_MAX;};
     const auto full_path=[&](const std::u16string& path)->std::optional<std::u16string>{
         const auto text=temporary.text(path),buffer=temporary.allocate(2*32768);if(!text || !buffer)return std::nullopt;
         const auto length=host("GetFullPathNameW",{text,32767,buffer,0});if(!length || length>=32767)return std::nullopt;return read_utf16(memory,GuestAddress{buffer},32767);};
@@ -44,25 +48,101 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_paths(GuestState& sta
         if(path.size()>=2 && path[1]==u':')return path.substr(0,2)+u"\\";
         if(path.starts_with(u"\\\\")){const auto server=path.find(u'\\',2);if(server==path.npos)return {};const auto share=path.find(u'\\',server+1);return (share==path.npos?path:path.substr(0,share))+u"\\";}
         return {};};
+    const auto volume_long_names=[&](std::uint64_t root,bool ansi)->bool{
+        const auto maximum=temporary.allocate(4);
+        if(!maximum){last_error_=8;return false;}
+        return host(ansi?"GetVolumeInformationA":"GetVolumeInformationW",{root,0,0,0,maximum,0,0,0}) &&
+               memory.load(GuestAddress{maximum},32)>12;
+    };
     const auto long_names=[&](const std::u16string& path)->bool{
-        const auto root=root_of(path);const auto text=root.empty()?0:temporary.text(root),maximum=temporary.allocate(4);if(!maximum || (!root.empty() && !text))return false;
-        return host("GetVolumeInformationW",{text,0,0,0,maximum,0,0,0}) && memory.load(GuestAddress{maximum},32)>12;};
+        const auto root=root_of(path);
+        const auto text=root.empty()?0:temporary.text(root);
+        return (root.empty() || text) && volume_long_names(text,false);
+    };
     const auto extension_of=[](const std::u16string& path)->std::u16string{const auto slash=path.find_last_of(u"\\/:");const auto dot=path.rfind(u'.');
         if(dot==path.npos || (slash!=path.npos && dot<slash))return {};auto out=path.substr(dot);for(auto& c:out)c=unicode_case_unit(c,false);return out;};
     const auto join=[](const std::u16string& directory,const std::u16string& file){if(directory.empty())return file;return directory.back()==u'\\'?directory+file:directory+u"\\"+file;};
-    // 在目錄中產生不存在的名稱：先試原名，再於副檔名前加 " (n)"（n 從 2 起）。
-    const auto unique_name=[&](const std::u16string& directory,const std::u16string& base)->std::optional<std::u16string>{
-        if(base.empty())return std::nullopt;const auto candidate=join(directory,base);if(!exists(candidate))return candidate;
-        const auto dot=base.rfind(u'.');const auto stem=dot==base.npos || !dot?base:base.substr(0,dot),extension=dot==base.npos || !dot?std::u16string{}:base.substr(dot);
-        for(unsigned n=2;n<1000;++n){const auto digits=std::to_string(n);auto next=join(directory,stem+u" ("+std::u16string(digits.begin(),digits.end())+u")"+extension);if(!exists(next))return next;}
-        return std::nullopt;};
-    if(name=="DriveType" || name=="RealDriveType")return done(drive_type(u32(0)));
-    if(name=="IsNetDrive")return done(drive_type(u32(0))==4?1U:0U); // DRIVE_REMOTE：已連線的網路磁碟
-    if(name.starts_with("IsLFNDrive"))return done(long_names(read(arg(0)))?1U:0U);
+    if(name=="#65"){
+        refresh_file_security_context();
+        if(mpr_){
+            auto scope=mpr_->drive_capabilities.find(filesystem_.network_scope());
+            if(scope!=mpr_->drive_capabilities.end()){
+                if(static_cast<std::int32_t>(u32(0))<0)mpr_->drive_capabilities.erase(scope);
+                else scope->second.erase(u32(0));
+            }
+        }
+        return done(0);
+    }
+    if(name=="DriveType" || name=="RealDriveType" || name=="RealDriveTypeFlags" || name=="IsNetDrive"){
+        unsigned drive=u32(0);
+        const bool letter_query=(name=="RealDriveType" || name=="DriveType") && drive>='A' && drive<='Z';
+        if(letter_query)drive-='A';
+        refresh_file_security_context();
+        const auto type=drive_type(drive);
+        if(name=="IsNetDrive")return done(type==4);
+        if(!letter_query && name!="RealDriveTypeFlags")return done(type);
+        if(drive>=26)return done(0);
+
+        constexpr unsigned long_name_flag=0x20, shell_open=0x400, security=0x800;
+        constexpr unsigned compressed=0x1000, compressible=0x2000;
+        unsigned flags=type | (type==5?0:shell_open);
+        const bool probe_volume=name=="DriveType" || u32(1)!=0;
+        if(!mpr_)mpr_=std::make_shared<MprState>();
+        auto& cache=mpr_->drive_capabilities[filesystem_.network_scope()];
+        auto cached=cache.find(drive);
+        const bool reuse=cached!=cache.end() && cached->second.type==type;
+        if(reuse){
+            flags=cached->second.flags;
+            if(!probe_volume || cached->second.probed)return done(flags);
+        }
+        const std::u16string path{static_cast<char16_t>(u'A'+drive),u':',u'\\'};
+        const auto root=temporary.text(path);
+        if(!root)return done(flags);
+        if(!reuse && type==1){
+            const auto letter=temporary.text(path.substr(0,2)),buffer=temporary.allocate(4),size=temporary.allocate(4);
+            if(letter && buffer && size){
+                memory.store(GuestAddress{size},32,2);
+                if(nested_service(state,memory,"mpr.dll","WNetGetConnectionW",{letter,buffer,size})==1201)flags|=0x200;
+            }
+        }
+        if(!reuse && type==3){
+            const auto inf=temporary.text(path+u"autorun.inf");
+            if(inf && host("GetFileAttributesW",{inf})!=UINT32_MAX){
+                const auto restricted=[&](unsigned policy){
+                    return nested_service(state,memory,"shell32.dll","SHRestricted",{policy});
+                };
+                if(!(restricted(0x200)&(1U<<drive)) && !(restricted(0x400)&(1U<<type))){
+                    const auto keys=temporary.allocate(1024);
+                    const auto has_keys=[&](const char16_t* section){
+                        const auto section_name=temporary.text(section);
+                        return section_name && keys && host("GetPrivateProfileStringW",{section_name,0,0,keys,512,inf})>=4;
+                    };
+                    if(has_keys(x86_?u"autorun.x86":u"autorun.amd64") || has_keys(u"autorun"))flags|=0x140;
+                }
+            }
+        }
+        auto& capabilities=cache.insert_or_assign(drive,MprState::DriveCapabilities{type,flags,false}).first->second;
+        if(probe_volume && type>2){
+            const auto info=temporary.allocate(8);
+            if(root && info && host("GetVolumeInformationW",{root,0,0,0,info,info+4,0,0})){
+                const auto volume_flags=memory.load(GuestAddress{info+4},32);
+                if(memory.load(GuestAddress{info},32)>12)flags|=long_name_flag;
+                if(volume_flags&8)flags|=security;
+                if(volume_flags&0x10){
+                    flags|=compressible;
+                    const auto attrs=host("GetFileAttributesW",{root});
+                    if(attrs!=UINT32_MAX && (attrs&0x800))flags|=compressed;
+                }
+                capabilities={type,flags,true};
+            }
+        }
+        return done(flags);
+    }
+    if(name.starts_with("IsLFNDrive"))return done(volume_long_names(arg(0),narrow)?1U:0U);
     if(name=="PathIsExe"){
-        // 可直接執行的副檔名。
-        static constexpr std::u16string_view executable[]{u".exe",u".com",u".pif",u".cmd",u".bat",u".scf",u".scr"};
-        const auto extension=extension_of(read(arg(0)));return done(std::find(std::begin(executable),std::end(executable),extension)!=std::end(executable)?1U:0U);
+        return done(shell_is_exe(&memory,arg(0),[](void* ctx,unsigned long long at,unsigned unit){
+            return static_cast<unsigned>(static_cast<GuestMemory*>(ctx)->load(GuestAddress{at},static_cast<std::uint8_t>(unit*8)));
+        }));
     }
     if(name=="PathGetShortPath" || name=="PathQualify"){
         // 原地換成短檔名／完整路徑；失敗時保持原狀。
@@ -72,49 +152,110 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_paths(GuestState& sta
         if(result)(void)write(arg(0),*result);return done(0);
     }
     if(name=="PathCleanupSpec"){
-        // (目錄, 檔名規格 輸入輸出)：移除非法字元（PCS_REMOVEDCHAR 2）；目錄不支援長檔名時空白改底線（PCS_REPLACEDCHAR 1）並截成 8.3（PCS_TRUNCATED 4）；
-        // 目錄加檔名超過 MAX_PATH 時截短檔名（PCS_TRUNCATED），完全放不下回 PCS_FATAL｜PCS_PATHTOOLONG。
-        if(!arg(1))return done(0x80000000U);const auto directory=read(arg(0));auto spec=read(arg(1));std::uint32_t flags=0;
-        std::u16string clean;for(const auto c:spec){if(c<32 || std::u16string_view(u"\\/:*?\"<>|").find(c)!=std::u16string_view::npos){flags|=2;continue;}clean.push_back(c);}
-        if(!directory.empty() && !long_names(directory)){
-            for(auto& c:clean)if(c==u' '){c=u'_';flags|=1;}
-            const auto dot=clean.rfind(u'.');auto stem=dot==clean.npos?clean:clean.substr(0,dot),extension=dot==clean.npos?std::u16string{}:clean.substr(dot+1);
-            if(stem.size()>8){stem.resize(8);flags|=4;}if(extension.size()>3){extension.resize(3);flags|=4;}clean=extension.empty()?stem:stem+u"."+extension;
+        constexpr unsigned replaced=1,removed=2,truncated=4,too_long=0x80000008U;
+        if(!arg(1))return done(too_long);
+        const auto directory=read(arg(0));
+        const bool short_names=!long_names(arg(0)?directory:windows_directory);
+        std::u16string clean;
+        unsigned flags=0;
+        for(const auto c:read(arg(1))){
+            const auto type=path_character_type(c);
+            if(type==0 || type==4 || type==8 || (short_names && (c==u';' || c==u','))){
+                flags|=removed;
+            }else if(short_names && c==u' '){
+                clean.push_back(u'_');
+                flags|=replaced;
+            }else clean.push_back(c);
         }
-        const auto prefix=directory.empty()?0:directory.size()+(directory.back()==u'\\'?0:1);
-        if(prefix+clean.size()>=260){if(prefix>=259)return done(0x80000008U);clean.resize(259-prefix);flags|=4;}
-        (void)write(arg(1),clean);return done(flags);
+        if(short_names){
+            const auto dot=clean.rfind(u'.');
+            auto stem=clean.substr(0,dot);
+            auto ext=dot==clean.npos?std::u16string{}:clean.substr(dot+1);
+            if(std::erase(stem,u'.') || (dot!=clean.npos && ext.empty()))flags|=removed;
+            if(stem.size()>8){stem.resize(8);flags|=truncated;}
+            if(ext.size()>3){ext.resize(3);flags|=truncated;}
+            clean=ext.empty()?stem:stem+u"."+ext;
+        }
+        if(directory.size()+clean.size()>=260)return done(flags|too_long);
+        write(arg(1),clean);
+        return done(flags);
     }
     if(name=="PathMakeUniqueName" || name=="PathYetAnotherMakeUniqueName"){
         // PathMakeUniqueName(out, cch, 短樣板, 長樣板, 目錄)：支援長檔名時用長樣板；PathYetAnotherMakeUniqueName(out MAX_PATH, 目錄, 短名, 長名)。
-        const bool yet=name=="PathYetAnotherMakeUniqueName";if(!arg(0))return done(0);
-        const auto directory=read(arg(yet?1:4)),short_name=read(arg(yet?2:2)),long_name=read(arg(3));const auto capacity=yet?260U:u32(1);
-        const auto base=!long_name.empty() && (directory.empty() || long_names(directory))?long_name:short_name;
-        const auto result=unique_name(directory,base);if(!result || !write(arg(0),*result,capacity))return done(0);return done(1);
+        const bool yet=name=="PathYetAnotherMakeUniqueName";
+        const unsigned capacity=yet?260U:u32(1);
+        const auto directory=arg(yet?1:4);
+        const auto short_name=arg(2),long_name=arg(3);
+        const auto file=long_name && (yet || !directory || long_names(read(directory)))?long_name:short_name;
+        if(!arg(0) || !capacity || !file || read(file).empty())return done(0);
+        const auto buffer=temporary.allocate(260*sizeof(char16_t));
+        if(!buffer || !nested_service(state,memory,"shlwapi.dll","PathCombineW",{buffer,directory,file}))return done(0);
+        const auto original=read(buffer);
+        const auto extension_at=nested_service(state,memory,"shlwapi.dll","PathFindExtensionW",{buffer});
+        if(extension_at<buffer || extension_at>buffer+original.size()*2)return done(0);
+        const auto split=(extension_at-buffer)/2;
+        const auto stem=original.substr(0,split),extension=original.substr(split);
+        auto candidate=original;
+        for(std::uint64_t suffix=2;candidate.size()<capacity;++suffix){
+            if(host("GetFileAttributesW",{buffer})==UINT32_MAX)return done(write(arg(0),candidate,capacity));
+            const auto digits=std::to_string(suffix);
+            candidate=stem+u" ("+std::u16string(digits.begin(),digits.end())+u")"+extension;
+            if(!write(buffer,candidate,260))break;
+        }
+        return done(0);
     }
     if(name=="PathResolve"){
         // (路徑 輸入輸出 MAX_PATH, NULL 結尾目錄陣列, PRF_*)：VERIFYEXISTS 1、TRYPROGRAMEXTENSIONS 3、FIRSTDIRDEF 4、DONTFINDLNK 8、REQUIREABSOLUTE 16。
-        if(!arg(0))return done(0);const auto path=read(arg(0));const auto flags=u32(2);const bool verify=(flags&1U)!=0,extensions=(flags&3U)==3U;
-        std::vector<std::u16string> directories;
-        if(arg(1)){const unsigned unit=x86_?4U:8U;for(unsigned i=0;i<64;++i){const auto entry=memory.load(GuestAddress{arg(1)+i*unit},static_cast<std::uint8_t>(unit*8));if(!entry)break;directories.push_back(read_utf16(memory,GuestAddress{entry},32768));}}
-        const auto found=[&](const std::u16string& candidate)->std::optional<std::u16string>{
-            if(exists(candidate))return candidate;if(!extensions || !extension_of(candidate).empty())return std::nullopt;
-            for(const auto extension:{u".pif",u".com",u".exe",u".bat",u".lnk",u".cmd"}){if((flags&8U) && std::u16string_view(extension)==u".lnk")continue;if(exists(candidate+extension))return candidate+extension;}
-            return std::nullopt;};
+        if(!arg(0))return done(0);
+        const auto path=read(arg(0));
+        const auto flags=u32(2);
+        const auto type=windows_dos_path_type(path);
+        const auto extension=extension_of(path);
+        const auto missing=[&]{last_error_=2;return done(0);};
+        if(path.empty() || ((flags&8U) && extension==u".lnk"))return missing();
+        if((flags&16U) && type!=WindowsDosPathType::DriveAbsolute && type!=WindowsDosPathType::UncAbsolute &&
+           type!=WindowsDosPathType::LocalDevice)return missing();
         const bool bare=path.find_first_of(u"\\/:")==path.npos;
+        const bool try_extensions=(flags&3U)==3U && extension.empty();
+        const auto probe=[&](const std::u16string& candidate,bool search)->std::optional<std::u16string>{
+            GuestScratch scratch(*this,memory,state);
+            const auto output=search?scratch.allocate(260*2):0;
+            if(search && !output)return std::nullopt;
+            const auto lookup=[&](const std::u16string& file)->std::optional<std::u16string>{
+                const auto input=scratch.text(file);
+                if(!input)return std::nullopt;
+                if(!search){
+                    if(host("GetFileAttributesW",{input})!=UINT32_MAX)return file;
+                }else{
+                    const auto size=host("SearchPathW",{0,input,0,260,output,0});
+                    if(size && size<260)return read_utf16(memory,GuestAddress{output},259);
+                }
+                return std::nullopt;
+            };
+            if(auto hit=lookup(candidate))return hit;
+            if(try_extensions)for(const auto suffix:{u".pif",u".com",u".exe",u".bat",u".lnk",u".cmd"}){
+                if((flags&8U) && std::u16string_view(suffix)==u".lnk")continue;
+                if(auto hit=lookup(candidate+suffix))return hit;
+            }
+            return std::nullopt;
+        };
+        auto candidate=path;
+        std::optional<std::u16string> hit;
         if(bare){
-            if(flags&16U){last_error_=2;return done(0);}
-            for(const auto& directory:directories)if(auto hit=found(join(directory,path))){if(auto full=full_path(*hit);full && write(arg(0),*full))return done(1);}
-            {const auto text=temporary.text(path),buffer=temporary.allocate(2*260);
-                if(text && buffer){const auto length=host("SearchPathW",{0,text,0,260,buffer,0});if(length && length<260){const auto hit=read_utf16(memory,GuestAddress{buffer},259);if(write(arg(0),hit))return done(1);}}
-                if(extensions)for(const auto extension:{u".pif",u".com",u".exe",u".bat",u".cmd"}){const auto name_text=temporary.text(path+extension);if(!name_text || !buffer)break;
-                    const auto length=host("SearchPathW",{0,name_text,0,260,buffer,0});if(length && length<260 && write(arg(0),read_utf16(memory,GuestAddress{buffer},259)))return done(1);}}
-            if(verify){last_error_=2;return done(0);}
-            const auto base=(flags&4U) && !directories.empty()?join(directories.front(),path):path;if(auto full=full_path(base);full && write(arg(0),*full))return done(1);return done(0);
-        }
-        auto full=full_path(path);if(!full)return done(0);
-        if(verify){const auto hit=found(*full);if(!hit){last_error_=2;return done(0);}full=hit;}
-        return done(write(arg(0),*full)?1U:0U);
+            const unsigned unit=x86_?4U:8U;
+            for(auto slot=arg(1);slot;slot+=unit){
+                const auto entry=memory.load(GuestAddress{slot},static_cast<std::uint8_t>(unit*8));
+                if(!entry)break;
+                const auto file=join(read(entry),path);
+                if(slot==arg(1) && (flags&4U))candidate=file;
+                hit=probe(file,false);
+                if(hit)break;
+            }
+            if(!hit)hit=probe(path,true);
+        }else if(flags&1U)hit=probe(path,false);
+        if(!hit && (flags&1U))return missing();
+        const auto full=full_path(hit?*hit:candidate);
+        return done(full && write(arg(0),*full));
     }
     if(name.starts_with("SHPathPrepareForWrite")){
         return nested_continuation(state,memory,"SHPathPrepareForWrite",[this,service,root_of](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{

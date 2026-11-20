@@ -1014,7 +1014,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             // NT 沒有 Win32 的「未設 BACKUP_SEMANTICS 就禁止目錄」限制；
             // 未指定 FILE_NON_DIRECTORY_FILE 時，既有共用 provider 可接受兩種型別。
             // 這個內部旗標只開放目錄 handle，存取權與分享仍由 provider 驗證。
-            if(!(options&0x40U))flags|=0x02000000U;
+            if(!device && !(options&0x40U))flags|=0x02000000U;
             const auto at=scratch(128+file.size()*2+2);memory.write(GuestAddress{at+128},utf16_bytes(file));security(attr,at);
             unsigned win_disposition=disposition==0 || disposition==5?2U:disposition==1?3U:disposition==2?1U:disposition==3?4U:5U;
             if(existed && (info.metadata.attributes&0x10U) && disposition==3)win_disposition=3;

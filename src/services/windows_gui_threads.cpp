@@ -1,3 +1,4 @@
+#include "gui_message_contract.hpp"
 #include "x64arm/windows_services.hpp"
 #include <algorithm>
 
@@ -33,10 +34,32 @@ void WindowsServices::cancel_gui_send(std::uint64_t token,std::uint32_t error) {
     if(!found->second.sender && !found->second.abandoned && !found->second.rpc)discard_gui_control_notify(found->second.message);
     found->second.error=error;found->second.result=0;found->second.done=true;found->second.active=false;
 }
+void WindowsServices::reset_input_queue(std::uint64_t thread){
+    std::set<std::uint64_t> group{thread};
+    std::vector<std::uint64_t> pending{thread};
+    for(std::size_t i=0;i<pending.size();++i){
+        for(const auto& [a,b]:gui_.input_attachments){
+            const auto peer=a==pending[i]?b:b==pending[i]?a:0;
+            if(peer && group.insert(peer).second)pending.push_back(peer);
+        }
+    }
+    const auto owner=*group.begin();
+    auto& queue=threads_.items.at(owner).keyboard_queue;
+    std::int64_t count=0;
+    for(auto id:group)count+=threads_.items.at(id).cursor_show_delta;
+    queue.cursor_count=static_cast<std::int32_t>(std::clamp<std::int64_t>(count,INT32_MIN,INT32_MAX));
+    queue.keys.fill(0);
+    queue.last_physical=gui_.input_keyboard;
+    for(auto id:group)threads_.items.at(id).keyboard_queue_owner=id==owner?0:owner;
+    const auto active=gui_.windows.find(gui_.active);
+    if(group.contains(active==gui_.windows.end()?1:active->second.thread)){
+        present_gui_cursor();
+    }
+}
 void WindowsServices::cancel_gui_thread(std::uint64_t thread,GuestMemory& memory,const GuestState& state) {
     gdi_batches_.erase(thread);
     gui_.clipboard_notifications.erase(thread);
-    if(gui_.clipboard_open_thread==thread){(void)clipboard_notice(ClipboardNoticeAction::Close,0,thread);gui_.clipboard_open_thread=gui_.clipboard_open_window=0;if(gui_.clipboard_dirty)notify_clipboard();}
+    if(gui_.clipboard_open_thread==thread){const auto closed=clipboard_notice(ClipboardNoticeAction::Close,0,thread);gui_.clipboard_open_thread=gui_.clipboard_open_window=0;if(closed.notify)notify_clipboard(&closed);}
     std::vector<std::uint64_t> text_operations;
     for(const auto& [token,operation]:gui_text_thunks_)if(operation.thread==thread)text_operations.push_back(token);
     for(const auto token:text_operations)discard_gui_text_thunk(memory,state,token);
@@ -52,6 +75,12 @@ void WindowsServices::cancel_gui_thread(std::uint64_t thread,GuestMemory& memory
     std::erase_if(gui_.mouse_inputs,[&](const auto& item){return item.second.thread==thread;});
     release_raw_input(0,0,thread);
     std::erase_if(gui_.hotkeys,[&](const auto& entry){return entry.thread==thread;});
+    std::vector<std::uint64_t> peers;
+    std::erase_if(gui_.input_attachments,[&](const auto& link){
+        if(link.first!=thread && link.second!=thread)return false;
+        peers.push_back(link.first==thread?link.second:link.first);return true;
+    });
+    for(auto peer:peers)reset_input_queue(peer);
     gui_.keyboard_translation.erase(thread);
     if(const auto caret=gui_.carets.find(thread);caret!=gui_.carets.end()){draw_gui_caret(memory,caret->second,false);gui_.carets.erase(caret);}
     gui_.mouse_clicks.erase(thread);
@@ -76,7 +105,14 @@ void WindowsServices::cancel_gui_thread(std::uint64_t thread,GuestMemory& memory
     std::vector<std::uint64_t> fonts;
     for(const auto& [token,operation]:font_enumerations_)if(operation.thread==thread)fonts.push_back(token);
     for(const auto token:fonts)discard_font_enumeration(token,memory,state);
-    runtime_.activation_stacks.erase(thread);
+    gui_.exiting_message_threads.erase(thread);
+    gui_.message_threads.erase(thread);
+    if(const auto current=opengl_.current.find(thread);current!=opengl_.current.end()){
+        auto& context=opengl_.contexts.at(current->second);
+        context.native->execute(GlOperation::Flush);
+        context.thread=0;
+        opengl_.current.erase(current);
+    }
     std::erase_if(gui_.hooks,[&](const auto& entry){return entry.second.owner==thread || entry.second.thread==thread;});
     for(auto it=gui_.sent_messages.begin();it!=gui_.sent_messages.end();){
         auto& request=it->second;
@@ -193,6 +229,25 @@ bool WindowsServices::dispatch_gui_send(GuestState& state,GuestMemory& memory,st
         if(target==gui_.windows.end() || target->second.thread!=threads_.current){cancel_gui_send(token,1400);continue;}
         const auto message=request.message;
         request.active=true;request.resume_modal=modal;request.resume_wait=wait_message;
+        if(message.message==gui_move_minimized_window){
+            if(!(target->second.style&0x20000000U)){finish_gui_send(memory,token,0);continue;}
+            start_callbacks(state,memory,{{resolve("user32.dll","SetWindowPos").value,
+                {message.window,0,message.wparam,message.lparam,0,0,0x15}}},Continuation::GuiSentMessage,token);
+            return true;
+        }
+        if(request.remote_server && message.message==gui_owned_popup_request){
+            const auto& window=target->second;
+            const bool show=message.lparam!=0;
+            if(window.destroying || window.parent || window.owner!=message.wparam ||
+               !(show?window.owned_popup_hidden:window.visible)){finish_gui_send(memory,token,0);continue;}
+            start_callbacks(state,memory,{{resolve("user32.dll","SendMessageW").value,
+                {message.window,0x18,show?1U:0U,show?3U:1U}}},Continuation::GuiSentMessage,token);
+            return true;
+        }
+        if(message.message==gui_show_window_message){
+            start_callbacks(state,memory,{{resolve("user32.dll","ShowWindow").value,{message.window,message.wparam}}},Continuation::GuiSentMessage,token);
+            return true;
+        }
         if(begin_gui_text_thunk(state,memory,message,request.wide,Continuation::GuiSentMessage,token))return true;
         request.active=false;
         if(const auto result=default_gui_control(memory,message,request.wide)){finish_gui_send(memory,token,*result);continue;}

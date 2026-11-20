@@ -9,7 +9,7 @@
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> lsa_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
-        {"secur32.dll","LsaConnectUntrusted",1},{"secur32.dll","LsaDeregisterLogonProcess",1},
+        {"secur32.dll","LsaRegisterLogonProcess",3},{"secur32.dll","LsaConnectUntrusted",1},{"secur32.dll","LsaDeregisterLogonProcess",1},
         {"secur32.dll","LsaFreeReturnBuffer",1},{"secur32.dll","LsaLookupAuthenticationPackage",3},
         {"secur32.dll","LsaLogonUser",14},{"secur32.dll","LsaGetLogonSessionData",2},
         {"secur32.dll","LsaEnumerateLogonSessions",2}
@@ -91,8 +91,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_lsa(GuestState& state,Guest
     };
     std::uint64_t owned_buffer=0,new_token=0;
     try {
-        if(name=="LsaConnectUntrusted"){
-            out(arg(0),unit);write(arg(0),0);if(runtime_.lsa.connections.size()>=1024)throw Failure{0xc000009aU};const auto h=runtime_.allocate_wait_handle();runtime_.lsa.connections.insert(h);write(arg(0),h);
+        if(name=="LsaConnectUntrusted" || name=="LsaRegisterLogonProcess"){
+            const bool registered=name=="LsaRegisterLogonProcess";
+            const auto result=arg(registered?1:0);
+            out(result,unit);
+            std::optional<std::string> process_name;
+            if(registered){
+                out(arg(2),4);
+                process_name=ansi_counted(memory,arg(0),x86_);
+                if(process_name->size()>127)throw Failure{0xc0000106U};
+                refresh_file_security_context();
+                if(!runtime_.token_objects.at(effective_token_id()).has_privilege(7,true))
+                    throw Failure{0xc0000041U}; // STATUS_PORT_CONNECTION_REFUSED
+            }
+            write(result,0);
+            if(runtime_.lsa.connections.size()>=1024)throw Failure{0xc000009aU};
+            const auto handle=runtime_.allocate_wait_handle();
+            runtime_.lsa.connections.emplace(handle,std::move(process_name));
+            write(result,handle);
+            if(registered)write(arg(2),0,32);
         }else if(name=="LsaDeregisterLogonProcess"){
             connection();runtime_.lsa.connections.erase(arg(0));
         }else if(name=="LsaFreeReturnBuffer"){

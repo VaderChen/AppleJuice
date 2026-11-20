@@ -1,4 +1,4 @@
-#include "x64arm/windows_services.hpp"
+#include "winrt_string_header.hpp"
 #include "x64arm/registry_store.hpp"
 #include "x64arm/unicode.hpp"
 #include "xaudio_interfaces.hpp"
@@ -7,7 +7,6 @@
 namespace x64arm {
 namespace {
 constexpr std::uint32_t invalid=0x80070057U,pointer_error=0x80004003U,no_memory=0x8007000eU;
-constexpr std::uint32_t reference_magic=0x52534858U;
 constexpr std::uint32_t not_initialized=0x800401f0U,class_not_registered=0x80040154U,no_interface=0x80004002U;
 enum Phase : unsigned { Load,FindFactory,GetFactory,QueryFactory,Activate,ReleaseFactory,FindUnload=10,CanUnload,FreeModule };
 constexpr unsigned operation_size=160,header_offset=96,class_offset=160;
@@ -89,7 +88,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt_activation(GuestState
         if(!activate)memory.move(GuestAddress{scratch+64},GuestAddress{arg(1)},16);
         memory.write(GuestAddress{scratch+class_offset},class_bytes);memory.write(GuestAddress{scratch+path_offset},path_bytes);
         memory.store(GuestAddress{scratch+48},64,scratch+path_offset);
-        memory.store(GuestAddress{scratch+header_offset},32,reference_magic);memory.store(GuestAddress{scratch+header_offset+4},32,class_name.size());memory.store(GuestAddress{scratch+header_offset+8},bits,scratch+class_offset);
+        winrt_header::write(memory,scratch+header_offset,scratch+class_offset,static_cast<std::uint32_t>(class_name.size()),true);
         memory.write(GuestAddress{scratch+128},std::array<std::uint8_t,24>{'D','l','l','G','e','t','A','c','t','i','v','a','t','i','o','n','F','a','c','t','o','r','y',0});
         if(registered!=winrt_class_factories_.end()){
             memory.store(GuestAddress{scratch},32,GetFactory);memory.store(GuestAddress{scratch+80},bits,0);

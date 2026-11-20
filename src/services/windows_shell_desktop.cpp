@@ -55,21 +55,29 @@ const std::vector<GuiMonitor>& WindowsServices::gui_monitors(){refresh_gui_areas
 // 空矩形以左上角的點判斷，與 MonitorFromPoint 共用。
 std::uint64_t WindowsServices::gui_monitor_from_rect(const std::array<std::int32_t,4>& input,std::uint32_t flags){
     const auto& monitors=gui_monitors();
-    auto rect=input;if(rect[0]>=rect[2] || rect[1]>=rect[3]){rect[2]=rect[0]+1;rect[3]=rect[1]+1;}
-    std::uint64_t best=0;std::int64_t best_area=0;
+    std::array<std::int64_t,4> rect{input[0],input[1],input[2],input[3]};
+    if(rect[0]>=rect[2] || rect[1]>=rect[3]){rect[2]=rect[0]+1;rect[3]=rect[1]+1;}
+    std::uint64_t best=0,best_area=0;
     for(std::size_t i=0;i<monitors.size();++i){
         const auto& m=monitors[i].rect;
         const std::int64_t w=std::min<std::int64_t>(rect[2],m[2])-std::max<std::int64_t>(rect[0],m[0]),h=std::min<std::int64_t>(rect[3],m[3])-std::max<std::int64_t>(rect[1],m[1]);
-        if(w>0 && h>0 && w*h>best_area){best_area=w*h;best=i+1;}
+        if(w<=0 || h<=0)continue;
+        const auto area=static_cast<std::uint64_t>(w)*static_cast<std::uint64_t>(h);
+        if(area>best_area){best_area=area;best=i+1;}
     }
     if(best || flags==0)return best;
     if(flags==1)return 1;
-    std::uint64_t nearest=1;std::int64_t nearest_distance=INT64_MAX;
+    std::uint64_t nearest=1;
+    // LONG 的兩端相差可達 32 位元，兩軸平方和需要 65 位元。
+    using Distance=unsigned __int128;
+    Distance nearest_distance=0;
     for(std::size_t i=0;i<monitors.size();++i){
         const auto& m=monitors[i].rect;
         const auto dx=std::max<std::int64_t>({0,static_cast<std::int64_t>(m[0])-rect[2]+1,static_cast<std::int64_t>(rect[0])-m[2]+1});
         const auto dy=std::max<std::int64_t>({0,static_cast<std::int64_t>(m[1])-rect[3]+1,static_cast<std::int64_t>(rect[1])-m[3]+1});
-        if(dx*dx+dy*dy<nearest_distance){nearest_distance=dx*dx+dy*dy;nearest=i+1;}
+        const auto x=static_cast<Distance>(dx),y=static_cast<Distance>(dy);
+        const auto distance=x*x+y*y;
+        if(i==0 || distance<nearest_distance){nearest_distance=distance;nearest=i+1;}
     }
     return nearest;
 }

@@ -14,7 +14,7 @@ struct OleStreamState {
         bool external{};std::uint64_t capacity{};
     };
     struct Stream {std::shared_ptr<Storage> storage;std::uint64_t position{};unsigned references{1};bool lock_bytes{};};
-    std::map<std::uint64_t,Stream> streams;std::uint64_t table{},lock_table{};
+    std::map<std::uint64_t,Stream> streams;std::uint64_t table{},lock_table{},registry_dummy{};
 };
 std::span<const WindowsServiceDescriptor> shell_memory_stream_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
@@ -24,6 +24,7 @@ std::span<const WindowsServiceDescriptor> shell_memory_stream_descriptors(){
 }
 std::span<const WindowsServiceDescriptor> ole_stream_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"internal-registry-stream","Dummy",0},
         {"ole32.dll","CreateStreamOnHGlobal",3},{"ole32.dll","GetHGlobalFromStream",2},
         {"ole32.dll","CreateILockBytesOnHGlobal",3},{"ole32.dll","GetHGlobalFromILockBytes",2},
         {"ole32.dll","ReadClassStm",2},{"ole32.dll","WriteClassStm",2},
@@ -40,12 +41,13 @@ std::span<const WindowsServiceDescriptor> ole_stream_service_descriptors(){
 bool WindowsServices::same_ole_streams(const WindowsServices& other)const{
     if(!ole_streams_ || !other.ole_streams_)return ole_streams_==other.ole_streams_;
     const auto& left=*ole_streams_;const auto& right=*other.ole_streams_;
-    if(left.table!=right.table || left.lock_table!=right.lock_table || left.streams.size()!=right.streams.size())return false;
+    if(left.registry_dummy!=right.registry_dummy || left.table!=right.table || left.lock_table!=right.lock_table || left.streams.size()!=right.streams.size())return false;
     std::map<const OleStreamState::Storage*,std::uint64_t> left_aliases,right_aliases;
     for(const auto& [handle,stream]:left.streams){
         const auto found=right.streams.find(handle);if(found==right.streams.end())return false;const auto& candidate=found->second;
         if(stream.position!=candidate.position || stream.references!=candidate.references || stream.lock_bytes!=candidate.lock_bytes ||
            stream.storage->global!=candidate.storage->global || stream.storage->release!=candidate.storage->release || stream.storage->shell_memory!=candidate.storage->shell_memory ||
+           stream.storage->registry_key!=candidate.storage->registry_key || stream.storage->registry_value!=candidate.storage->registry_value ||
            stream.storage->file!=candidate.storage->file || stream.storage->path!=candidate.storage->path || stream.storage->mode!=candidate.storage->mode)return false;
         const auto alias=left_aliases.emplace(stream.storage.get(),handle).first->second;
         if(alias!=right_aliases.emplace(candidate.storage.get(),handle).first->second)return false;
@@ -140,6 +142,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_stream(GuestState& stat
             }catch(...){gui_.global_memory.erase(handle);throw;}
             gui_.global_memory.erase(handle);return finish(out_of_memory);
         }
+        if(service.family=="internal-registry-stream"){
+            if(!bridge.registry_dummy)bridge.registry_dummy=nested_service(state,memory,"shlwapi.dll","SHCreateMemStream",{0,0});
+            return finish(bridge.registry_dummy);
+        }
         if(shell_memory){
             // 複製初始 bytes，不借用呼叫者的 buffer；公開介面不暴露 HGLOBAL。
             const auto count=d(1);if((!arg(0) && count) || count>output_limit || gui_.global_memory.size()>=65536)return finish(0);
@@ -165,11 +171,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_stream(GuestState& stat
         const bool lock_bytes=service.family=="internal-ole-lockbytes" || name=="GetHGlobalFromILockBytes";
         if(lock_bytes!=stream.lock_bytes)return finish(invalid);
         if(get_global){if(stream.storage->shell_memory || stream.storage->file)return finish(invalid);memory.store(GuestAddress{arg(1)},bits,stream.storage->global);return finish(0);}
+        const bool dummy=arg(0)==bridge.registry_dummy;
+        if(dummy){
+            if(name=="AddRef")return finish(2);
+            if(name=="Release")return finish(1);
+            if(name=="Read"){
+                if(arg(3))memory.store(GuestAddress{arg(3)},32,0);
+                return finish(0x80004001U);
+            }
+        }
         if(name=="QueryInterface"){
             if(!arg(2))return finish(0x80004003U);std::array<std::uint8_t,16> iid{};if(arg(1))memory.read(GuestAddress{arg(1)},iid);memory.store(GuestAddress{arg(2)},bits,0);if(!arg(1))return finish(0x80004003U);
             constexpr std::array<std::uint8_t,16> unknown{0,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46},istream{12,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46},sequential{0x30,0x3a,0x73,0x0c,0x1c,0x2a,0xce,0x11,0xad,0xe5,0,0xaa,0,0x44,0x77,0x3d};
             constexpr std::array<std::uint8_t,16> ilockbytes{10,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
-            if(iid!=unknown && (lock_bytes?iid!=ilockbytes:iid!=istream && iid!=sequential))return finish(0x80004002U);++stream.references;memory.store(GuestAddress{arg(2)},bits,arg(0));return finish(0);
+            if(iid!=unknown && (lock_bytes?iid!=ilockbytes:iid!=istream && iid!=sequential))return finish(0x80004002U);if(!dummy)++stream.references;memory.store(GuestAddress{arg(2)},bits,arg(0));return finish(0);
         }
         if(name=="AddRef")return finish(++stream.references);
         if(name=="Release"){
@@ -177,7 +192,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_stream(GuestState& stat
             if(storage.use_count()==1 && storage->registry_key){
                 // 登錄資料流：以 REG_BINARY 寫回目前內容後關閉機碼。
                 const auto block=gui_.global_memory.find(storage->global);GuestScratch temporary(*this,memory,state);const auto value=temporary.text(storage->registry_value);
-                if(value && block!=gui_.global_memory.end())(void)nested_service(state,memory,"advapi32.dll","RegSetValueExW",{storage->registry_key,value,0,3,block->second.address,block->second.size});
+                if(value && block!=gui_.global_memory.end()){
+                    if(block->second.size)(void)nested_service(state,memory,"advapi32.dll","RegSetValueExW",{storage->registry_key,value,0,3,block->second.address,block->second.size});
+                    else (void)nested_service(state,memory,"advapi32.dll","RegDeleteValueW",{storage->registry_key,value});
+                }
                 (void)nested_service(state,memory,"advapi32.dll","RegCloseKey",{storage->registry_key});storage->registry_key=0;
             }
             if(storage.use_count()==1 && storage->external)gui_.global_memory.erase(storage->global);

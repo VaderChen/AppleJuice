@@ -67,7 +67,15 @@ std::uint32_t WindowsServices::receive_remote_gui_message(std::uint32_t pid,std:
     const bool sender32=(mode&~wide_mode)==32;
     request.message={values[0],sender32||x86_?static_cast<std::uint32_t>(values[2]):values[2],
         x86_?static_cast<std::uint32_t>(values[3]):sender32?signed_dword(values[3]):values[3],message};
-    if(operation==post_operation){enqueue_gui_message(request.message);request.done=true;request.result=1;}
+    if(operation==post_operation){
+        if(message==gui_show_window_message){
+            if(gui_.sent_messages.size()+2>8192)return 1816;
+            GuiSentMessage notify;notify.receiver=request.receiver;notify.message=request.message;
+            notify.kind=GuiSentMessage::Kind::Notify;
+            gui_.sent_messages.emplace(gui_.next_object++,std::move(notify));
+        }else enqueue_gui_message(request.message);
+        request.done=true;request.result=1;
+    }
     gui_.sent_messages.emplace(gui_.next_object++,std::move(request));
     return 0;
 }

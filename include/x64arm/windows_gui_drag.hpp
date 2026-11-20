@@ -7,7 +7,7 @@ struct GuiDragDetection {
     mouse_drag::Detection detection;
     std::uint64_t window{},thread{},message_buffer{},capture_generation{};
     std::uint32_t quit_code{};
-    bool quit{};
+    bool quit{},client_coordinates{};
     bool operator==(const GuiDragDetection&) const = default;
 };
 }

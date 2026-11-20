@@ -311,7 +311,24 @@ struct MetalVarying {
 struct MetalPendingLibrary {
     std::mutex mutex;std::condition_variable ready;bool done{};
     id<MTLLibrary> library;std::string error;NSString* entry;
+    // 運算著色器：函式庫完成後立即在背景建立 compute pipeline（每個約 100 ms），第一次運算時直接取用，不在命令執行緒同步建立。
+    // compute_pending 表示背景建立已排入；compute_done 後 compute 為結果（nil 時改走同步建立以取得錯誤訊息）。
+    bool compute_pending{},compute_done{};id<MTLFunction> function;id<MTLComputePipelineState> compute;
 };
+// 運算著色器的 compute pipeline 背景建立（X64ARM_METAL_ASYNC_COMPUTE_PIPELINE=0 關閉）。呼叫端不得持 pending->mutex：
+// 已快取的 pipeline 可能在同一執行緒同步呼叫完成回呼，回呼內會取同一把鎖。函式庫完成與排入之間若已被第一次使用取走，
+// 使用端改走同步建立，這次背景結果只是多做的工作。
+inline void metal_prebuild_compute(id<MTLDevice> device,const std::shared_ptr<MetalPendingLibrary>& pending,id<MTLLibrary> library){
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_METAL_ASYNC_COMPUTE_PIPELINE");return !value || std::string_view(value)!="0";}();
+    if(!enabled || !library)return;
+    id<MTLFunction> function=[library newFunctionWithName:pending->entry];if(!function)return;
+    {std::lock_guard lock(pending->mutex);if(pending->compute_pending)return;pending->function=function;pending->compute_pending=true;}
+    // block 擷取 C++ 參照時不複製物件：先複製 shared_ptr，回呼持有自己的所有權（參數是參照，函式返回後即懸空）。
+    auto owner=pending;
+    [device newComputePipelineStateWithFunction:function completionHandler:^(id<MTLComputePipelineState> state,NSError*){
+        std::lock_guard lock(owner->mutex);owner->compute=state;owner->compute_done=true;owner->ready.notify_all();
+    }];
+}
 // 診斷：X64ARM_METAL_LABELS=1 時以著色器內容雜湊標記 encoder（Metal System Trace 可依標籤彙總 GPU 時間）。
 inline bool metal_labels() noexcept {static const bool enabled=std::getenv("X64ARM_METAL_LABELS")!=nullptr;return enabled;}
 // 診斷 X64ARM_METAL_GPU_PROFILE=<檔案>（須同時設 X64ARM_METAL_LABELS=1）：每個 encoder 一個命令緩衝，依標籤累計 GPU 時間，每 5 秒附加一份累計表到檔案。
@@ -371,12 +388,16 @@ bool metal_queue_shader_library(id<MTLDevice> device,MetalShader& shader,const s
     const auto& text=compilation.source.empty()?source:compilation.source;
     if(!compilation.source.empty())options=compilation.options;
     const auto request=metal_library_request(text,options);
-    if(auto library=metal_library_cached(device,request)){pending->library=library;pending->done=true;return true;}
+    const bool compute=shader.stage==5;
+    if(auto library=metal_library_cached(device,request)){
+        {std::lock_guard lock(pending->mutex);pending->library=library;pending->done=true;}
+        if(compute)metal_prebuild_compute(device,pending,library);return true;}
     metal_library_capture(request,text);
     [device newLibraryWithSource:[NSString stringWithUTF8String:text.c_str()] options:options completionHandler:^(id<MTLLibrary> library,NSError* failure){
-        std::lock_guard lock(pending->mutex);pending->library=library;
-        if(!library)pending->error=failure?std::string(failure.localizedDescription.UTF8String):std::string("未知錯誤");
-        pending->done=true;pending->ready.notify_all();
+        {std::lock_guard lock(pending->mutex);pending->library=library;
+            if(!library)pending->error=failure?std::string(failure.localizedDescription.UTF8String):std::string("未知錯誤");
+            pending->done=true;pending->ready.notify_all();}
+        if(library && compute)metal_prebuild_compute(device,pending,library);
     }];
     return true;
 }
@@ -389,6 +410,14 @@ void metal_resolve_shader(id<MTLDevice> device,MetalShader& shader){
     {MetalStallScope timing("shader_library_wait",shader.serial,shader.stage);
         std::unique_lock lock(pending->mutex);pending->ready.wait(lock,[&]{return pending->done;});}
     if(!pending->library)throw std::invalid_argument("Metal 著色器編譯失敗："+pending->error+"\n"+shader.source);
+    // 背景已建立 compute pipeline：等它完成（通常早已完成）並直接取用；失敗（nil）時落到同步建立以回報錯誤。
+    if(shader.stage==5){
+        std::unique_lock lock(pending->mutex);
+        if(pending->compute_pending){
+            if(!pending->compute_done){MetalStallScope timing("compute_pipeline_wait",shader.serial,shader.stage);pending->ready.wait(lock,[&]{return pending->compute_done;});}
+            if(pending->compute){shader.function=pending->function;shader.compute=pending->compute;lock.unlock();shader.pending.reset();return;}
+        }
+    }
     {MetalStallScope timing("shader_function_create",shader.serial,shader.stage);
         shader.function=[pending->library newFunctionWithName:pending->entry];}
     if(!shader.function)throw std::invalid_argument("Metal 著色器沒有入口");

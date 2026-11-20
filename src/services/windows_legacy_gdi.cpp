@@ -1,3 +1,8 @@
+#include "adapter_multisampling.hpp"
+#include "d3d9_format_contract.h"
+#include "gpu_budget_request.hpp"
+#include "vidpn_ownership.hpp"
+#include "monotonic_clock.hpp"
 #include "windows_wmf.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
@@ -27,9 +32,17 @@ std::span<const WindowsServiceDescriptor> legacy_gdi_service_descriptors(){
         {"gdi32.dll","GetMetaFileA",1},{"gdi32.dll","GetMetaFileW",1},{"gdi32.dll","DeleteMetaFile",1},
         {"gdi32.dll","D3DKMTOpenAdapterFromHdc",1},{"gdi32.dll","D3DKMTOpenAdapterFromGdiDisplayName",1},{"gdi32.dll","D3DKMTOpenAdapterFromDeviceName",1},
         {"gdi32.dll","D3DKMTOpenAdapterFromLuid",1},{"gdi32.dll","D3DKMTEnumAdapters2",1},{"gdi32.dll","D3DKMTCloseAdapter",1},
+        {"gdi32.dll","D3DKMTGetDisplayModeList",1},{"gdi32.dll","D3DKMTGetMultisampleMethodList",1},
         {"gdi32.dll","D3DKMTQueryAdapterInfo",1},{"gdi32.dll","D3DKMTQueryStatistics",1},
         {"gdi32.dll","D3DKMTEnumAdapters",1},{"gdi32.dll","D3DKMTQueryVideoMemoryInfo",1},{"gdi32.dll","D3DKMTCheckOcclusion",1},
-        {"gdi32.dll","D3DKMTCreateDevice",1},{"gdi32.dll","D3DKMTDestroyDevice",1},{"gdi32.dll","D3DKMTSetQueuedLimit",1},
+        {"d3d8thk.dll","OsThunkDdCreateDirectDrawObject",1},{"d3d8thk.dll","OsThunkDdDeleteDirectDrawObject",1},
+        {"d3d8thk.dll","OsThunkDdWaitForVerticalBlank",2},{"gdi32.dll","D3DKMTWaitForVerticalBlankEvent",1},
+        {"gdi32.dll","D3DKMTWaitForVerticalBlankEvent2",1},{"gdi32.dll","D3DKMTGetDWMVerticalBlankEvent",1},
+        {"d3d8thk.dll","OsThunkDdGetScanLine",2},{"gdi32.dll","D3DKMTGetScanLine",1},
+        {"gdi32.dll","D3DKMTCreateDevice",1},{"gdi32.dll","D3DKMTSetQueuedLimit",1},
+        {"win32u.dll","NtGdiDdDDIChangeVideoMemoryReservation",1},
+        {"win32u.dll","NtGdiDdDDICheckExclusiveOwnership",0},{"win32u.dll","NtGdiDdDDIQueryVidPnExclusiveOwnership",1},
+        {"win32u.dll","NtGdiDdDDIReleaseProcessVidPnSourceOwners",1},
         {"gdi32.dll","D3DKMTCheckVidPnExclusiveOwnership",1},{"gdi32.dll","D3DKMTSetVidPnSourceOwner",1},
         {"gdi32.dll","D3DKMTCreateDCFromMemory",1},{"gdi32.dll","D3DKMTDestroyDCFromMemory",1}
     };return table;
@@ -111,11 +124,196 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
     const auto fail=[&](std::uint32_t error){last_error_=error;return finish(name.starts_with("GetTextCharset")?1U:0U);};
     const auto integer=[&](unsigned i){return static_cast<std::int32_t>(arg(i));};
     const auto known_dc=[&](std::uint64_t h){return h && (gui_.contexts.contains(h) || gui_.dc_objects.contains(h) || (h>=0x10000000 && gui_.windows.contains(h-0x10000000)));};
-    const auto window=arg(0)>=0x10000000?gui_.windows.find(arg(0)-0x10000000):gui_.windows.end();
+    const auto display_dc=[&](std::uint64_t dc){
+        return dc==0x10000000 || (dc>0x10000000 && gui_.windows.contains(dc-0x10000000)) ||
+               (gui_.contexts.contains(dc) && gui_.contexts.at(dc).display);
+    };
+    const auto window=name!="NtGdiDdDDICheckExclusiveOwnership" && arg(0)>=0x10000000?gui_.windows.find(arg(0)-0x10000000):gui_.windows.end();
     std::vector<std::uint64_t> scratch;
     struct Release {WindowsServices& self;GuestMemory& memory;const GuestState& state;std::vector<std::uint64_t>& pointers;~Release(){for(const auto p:pointers)(void)self.free_heap(memory,p,state);}} release{*this,memory,state,scratch};
     const auto temporary=[&](std::size_t size){const auto p=allocate_heap(memory,std::max<std::size_t>(size,8));if(!p)throw std::bad_alloc();scratch.push_back(p);return p;};
     try {
+        if(name=="D3DKMTGetDisplayModeList"){
+            const auto p=arg(0);
+            if(!p || !gui_.kmt_adapters.contains(static_cast<unsigned>(memory.load(GuestAddress{p},32))) ||
+               memory.load(GuestAddress{p+4},32))return finish(0xc000000dU);
+            const auto output=memory.load(GuestAddress{p+8},x86_?32:64);
+            const GuestAddress count{p+(x86_?12U:16U)};
+            const auto capacity=memory.load(count,32);
+            if(!output && capacity)return finish(0xc000000dU);
+
+            const auto& monitors=gui_monitors();
+            const auto primary=std::find_if(monitors.begin(),monitors.end(),[](const auto& m){return m.primary;});
+            if(primary==monitors.end())return finish(0xc01e0333U);
+            auto modes=native_gui_?native_gui_->display_modes():std::vector<GuiDisplayMode>{};
+            if(modes.empty()){
+                const GuiDisplayMode fallback{static_cast<unsigned>(primary->rect[2]-primary->rect[0]),
+                    static_cast<unsigned>(primary->rect[3]-primary->rect[1]),primary->refresh,1};
+                const auto current=native_gui_?native_gui_->current_display_mode():std::optional<GuiDisplayMode>{};
+                modes.push_back(current.value_or(fallback));
+            }
+            // D3DKMT_DISPLAYMODE 的旗標佔兩個 DWORD，兩種客體的每筆步距均為 44。
+            constexpr unsigned stride=44;
+            memory.check(count,4,Access::Write);
+            if(output && capacity>=modes.size())memory.check(GuestAddress{output},modes.size()*stride,Access::Write);
+            memory.store(count,32,modes.size());
+            if(!output)return finish(0);
+            if(capacity<modes.size())return finish(0xc0000023U);
+            auto dest=output;
+            for(const auto& mode:modes){
+                const auto numerator=mode.refresh_numerator && mode.refresh_denominator?mode.refresh_numerator:primary->refresh;
+                const auto denominator=mode.refresh_numerator && mode.refresh_denominator?mode.refresh_denominator:1U;
+                const auto hz=static_cast<unsigned>((std::uint64_t{numerator}+denominator/2)/denominator);
+                // 與 D3D9 的掃描輸出一致，使用 X8R8G8B8、原向與驅動建議模式。
+                const std::array<std::uint32_t,11> entry{mode.width,mode.height,22,hz,numerator,denominator,
+                    mode.scanline,1,0,0,7};
+                memory.write(GuestAddress{dest},std::span(reinterpret_cast<const std::uint8_t*>(entry.data()),stride));
+                dest+=stride;
+            }
+            return finish(0);
+        }
+        if(name=="D3DKMTGetMultisampleMethodList"){
+            const auto p=arg(0);
+            if(!p)return finish(0xc000000dU);
+            const auto field=[&](unsigned offset){return static_cast<unsigned>(memory.load(GuestAddress{p+offset},32));};
+            const auto width=field(8),height=field(12),format=field(16);
+            if(!gui_.kmt_adapters.contains(field(0)) || field(4) || !width || !height ||
+               width>16384 || height>16384 || !format)return finish(0xc000000dU);
+            const auto methods=memory.load(GuestAddress{p+(x86_?20U:24U)},x86_?32:64);
+            const auto count_offset=x86_?24U:32U;
+            const auto capacity=field(count_offset);
+            const auto native=d9_render_color(format)?d9_native_format(format):d9_depth_format(format);
+            const auto mask=adapter_multisample_mask(native);
+            if(!mask)return finish(0xc00002b6U);
+            const auto required=static_cast<unsigned>(std::popcount(*mask));
+            memory.check(GuestAddress{p+count_offset},4,Access::Write);
+            if(methods && capacity>=required && required)
+                memory.check(GuestAddress{methods},required*12,Access::Write);
+            memory.store(GuestAddress{p+count_offset},32,required);
+            if(!methods)return finish(0);
+            if(capacity<required)return finish(0xc0000023U);
+            unsigned offset=0;
+            for(unsigned samples=2;samples<=16;++samples){
+                if(!(*mask & (1U<<samples)))continue;
+                memory.store(GuestAddress{methods+offset},32,samples);
+                memory.store(GuestAddress{methods+offset+4},32,1);
+                memory.store(GuestAddress{methods+offset+8},32,0);
+                offset+=12;
+            }
+            return finish(0);
+        }
+        if(name=="OsThunkDdCreateDirectDrawObject"){
+            if((arg(0) && !display_dc(arg(0))) || gui_.directdraw_objects.size()>=4096)return finish(0);
+            const auto handle=gui_.next_kmt_sync+=4;
+            gui_.directdraw_objects.insert(handle);return finish(handle);
+        }
+        if(name=="OsThunkDdDeleteDirectDrawObject")return finish(gui_.directdraw_objects.erase(arg(0)));
+        struct Raster {std::uint32_t line;bool blank;std::uint64_t begin,end,period;};
+        const auto raster=[this]()->std::optional<Raster>{
+            const auto& monitors=gui_monitors();
+            const auto primary=std::find_if(monitors.begin(),monitors.end(),[](const auto& m){return m.primary;});
+            if(primary==monitors.end())return {};
+            const auto mode=native_gui_ && !gui_.display_mode?native_gui_->current_display_mode():std::optional<GuiDisplayMode>{};
+            const auto height=mode && mode->height?mode->height:static_cast<std::uint32_t>(primary->rect[3]-primary->rect[1]);
+            const bool rational=mode && mode->refresh_numerator && mode->refresh_denominator;
+            const auto num=rational?mode->refresh_numerator:(primary->refresh?primary->refresh:60U);
+            const auto den=rational?mode->refresh_denominator:1U;
+            const auto rate=static_cast<std::uint32_t>((std::uint64_t{num}+den/2)/den);
+            const auto lines=std::uint64_t{height}+display_identity::vertical_blank_lines(height,rate);
+            const auto ticks=runtime_.host_clock?detail::monotonic_ticks():runtime_.clock_ticks;
+            const auto period=UINT64_C(10000000)*den;
+            const auto phase=(static_cast<unsigned __int128>(ticks)*num)%period;
+            const auto line=static_cast<std::uint32_t>(phase*lines/period);
+            const bool blank=line>=height;
+            const auto edge=(static_cast<unsigned __int128>(period)*height+lines-1)/lines;
+            const auto until_begin=(phase<edge?edge-phase:period+edge-phase);
+            return Raster{line,blank,ticks+static_cast<std::uint64_t>((until_begin+num-1)/num),
+                          ticks+static_cast<std::uint64_t>((period-phase+num-1)/num),(period+num/2)/num};
+        };
+        if(name=="OsThunkDdWaitForVerticalBlank" || name=="D3DKMTGetDWMVerticalBlankEvent" || name.starts_with("D3DKMTWaitForVerticalBlankEvent"))
+            return nested_continuation(state,memory,"垂直遮沒等待",[this,service,raster](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall call(s,m,service);
+                const auto finish=[&](std::uint32_t status){call.return_to(s,status);return std::optional<std::uint32_t>{};};
+                const auto name=service.symbol;
+                const bool legacy=name=="OsThunkDdWaitForVerticalBlank",get=name=="D3DKMTGetDWMVerticalBlankEvent";
+                const auto p=call(legacy?1:0);
+                const unsigned unit=x86_?4U:8U;
+                const auto bits=static_cast<std::uint8_t>(unit*8);
+                const auto timing=raster();
+                if(!timing)co_return finish(legacy?0U:0xc00002b6U);
+                bool end=false;
+                std::uint64_t output=0;
+                std::uint32_t count=0;
+                std::array<std::uint64_t,9> handles{};
+                if(legacy){
+                    if(!p || !gui_.directdraw_objects.contains(call(0)))co_return finish(0);
+                    const auto flag=m.load(GuestAddress{p+unit},32);
+                    output=p+2*unit+8;
+                    m.check(GuestAddress{output},4,Access::Write);
+                    if(flag==0x80000006U){
+                        m.store(GuestAddress{p+unit+4},32,timing->blank);m.store(GuestAddress{output},32,0);co_return finish(1);
+                    }
+                    if(flag!=1 && flag!=4){
+                        m.store(GuestAddress{output},32,flag==2?0x80004001U:0x80070057U);co_return finish(1);
+                    }
+                    end=flag==4;
+                }else{
+                    if(!p)co_return finish(0xc000000dU);
+                    const auto adapter=static_cast<std::uint32_t>(m.load(GuestAddress{p},32));
+                    const auto device=static_cast<std::uint32_t>(m.load(GuestAddress{p+4},32));
+                    const auto it=gui_.kmt_devices.find(device);
+                    if(!gui_.kmt_adapters.contains(adapter) || (device && (it==gui_.kmt_devices.end() || it->second.adapter!=adapter)) ||
+                       m.load(GuestAddress{p+8},32))co_return finish(0xc000000dU);
+                    if(get){
+                        output=m.load(GuestAddress{p+(x86_?12U:16U)},bits);
+                        if(!output)co_return finish(0xc000000dU);
+                        m.check(GuestAddress{output},unit,Access::Write);
+                    }else if(name.ends_with('2')){
+                        count=static_cast<std::uint32_t>(m.load(GuestAddress{p+12},32));
+                        if(count>8)co_return finish(0xc000000dU);
+                        for(unsigned i=0;i<count;++i)handles[1+i]=m.load(GuestAddress{p+16+i*unit},bits);
+                    }
+                }
+                if(runtime_.wait_objects.size()>=process_handle_limit)co_return finish(legacy?0U:0xc0000017U);
+                const auto handle=runtime_.allocate_wait_handle();
+                WaitObject event;event.kind=WaitObject::Kind::Event;event.display_event=true;event.maximum=1;
+                event.due=event.timer_nominal_due=end?timing->end:timing->begin;
+                event.period=get?timing->period:0;event.active=true;
+                runtime_.wait_states.emplace(handle,event);
+                event.identity=handle;event.access=0x100000;
+                try{runtime_.wait_objects.emplace(handle,event);}catch(...){runtime_.wait_states.erase(handle);throw;}
+                if(get){m.store(GuestAddress{output},bits,handle);co_return finish(0);}
+                handles[0]=handle;
+                const auto array=allocate_heap(m,(count+1)*unit);
+                if(!array){(void)nested_service(s,m,"kernel32.dll","CloseHandle",{handle});co_return finish(legacy?0U:0xc0000017U);}
+                for(unsigned i=0;i<=count;++i)m.store(GuestAddress{array+i*unit},bits,handles[i]);
+                const auto status=co_await service_callback::call(resolve("ntdll.dll","NtWaitForMultipleObjects").value,{count+1,array,1,0,0});
+                (void)free_heap(m,array,s);(void)nested_service(s,m,"kernel32.dll","CloseHandle",{handle});
+                if(legacy){m.store(GuestAddress{output},32,status?0x80004005U:0);co_return finish(1);}
+                co_return finish(status<=count?static_cast<std::uint32_t>(status):0xc000000dU);
+            });
+        if(name=="OsThunkDdGetScanLine" || name=="D3DKMTGetScanLine"){
+            const bool legacy=name=="OsThunkDdGetScanLine";
+            const auto p=arg(legacy?1:0);
+            if(legacy){
+                if(!p || !gui_.directdraw_objects.contains(arg(0)))return finish(0);
+            }else if(!p || !gui_.kmt_adapters.contains(static_cast<std::uint32_t>(memory.load(GuestAddress{p},32))) ||
+                     memory.load(GuestAddress{p+4},32))return finish(0xc000000dU);
+            const auto timing=raster();
+            if(!timing)return finish(legacy?0U:0xc00002b6U);
+            const auto line=timing->line;
+            const bool blank=timing->blank;
+            if(legacy){
+                const auto out=p+(x86_?4U:8U);
+                memory.check(GuestAddress{out},8,Access::Write);
+                if(!blank)memory.store(GuestAddress{out},32,line);
+                memory.store(GuestAddress{out+4},32,blank?0x88760219U:0);
+                return finish(1);
+            }
+            memory.check(GuestAddress{p+8},8,Access::Write);
+            memory.store(GuestAddress{p+8},8,blank);memory.store(GuestAddress{p+12},32,line);
+            return finish(0);
+        }
         if(name=="GetTextCharsetInfo" || name=="GetTextCharset"){
             if(!known_dc(arg(0)))return fail(6);
             auto charset=gui_font(gui_,gui_.contexts[arg(0)].font).charset;if(charset==1)charset=0; // 已實現字型不會保留 DEFAULT_CHARSET。
@@ -246,77 +444,177 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
             }
             return finish(bitmap);
         }
+        if(name=="D3DKMTSetVidPnSourceOwner" || name=="D3DKMTCheckVidPnExclusiveOwnership" ||
+           name=="NtGdiDdDDICheckExclusiveOwnership" || name=="NtGdiDdDDIQueryVidPnExclusiveOwnership" ||
+           name=="NtGdiDdDDIReleaseProcessVidPnSourceOwners"){
+            constexpr auto invalid=0xc000000dU;
+            const auto dir=processes_ && runtime_.network.external_io?mapping_session():std::string{};
+            std::uint32_t current{};
+            const auto owner=[&](std::uint32_t pid,std::uint32_t device,std::optional<std::uint32_t> type){
+                return vidpn_ownership(gui_,dir,process_id(),pid,device,type,current);
+            };
+            if(name=="NtGdiDdDDICheckExclusiveOwnership"){owner(0,0,{});return finish(current==2);}
+            const auto p=arg(0);if(!p)return finish(invalid);
+            if(name=="NtGdiDdDDIReleaseProcessVidPnSourceOwners"){
+                const auto pid=process_handle_pid(p,0x200);return finish(pid?owner(pid,0,0):invalid);
+            }
+            const unsigned unit=x86_?4U:8U;
+            const auto bits=static_cast<std::uint8_t>(unit*8);
+            if(name=="NtGdiDdDDIQueryVidPnExclusiveOwnership"){
+                const auto pid=process_handle_pid(memory.load(GuestAddress{p},bits),0x1000);
+                if(!pid)return finish(invalid);
+                const auto hwnd=memory.load(GuestAddress{p+unit},bits);
+                if(hwnd && !(pid==process_id() && (gui_.windows.contains(hwnd) || hwnd==gui_.desktop))){
+                    const auto remote=shared_gui_window(hwnd);if(!remote || remote->process!=pid)return finish(invalid);
+                }
+                const auto status=owner(pid,0,{});if(status)return finish(status);
+                const auto out=p+2*unit;memory.check(GuestAddress{out},16,Access::Write);
+                memory.store(GuestAddress{out},32,0);memory.store(GuestAddress{out+4},64,display_identity::adapter_luid);
+                memory.store(GuestAddress{out+12},32,current);return finish(0);
+            }
+            const auto handle=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));
+            if(name=="D3DKMTCheckVidPnExclusiveOwnership"){
+                if(!gui_.kmt_adapters.contains(handle) || memory.load(GuestAddress{p+4},32))return finish(invalid);
+                owner(0,0,{});return finish(current==2?0xc01e0006U:0U);
+            }
+            if(!gui_.kmt_devices.contains(handle))return finish(invalid);
+            const auto count=memory.load(GuestAddress{p+3*unit},32);
+            const auto types=memory.load(GuestAddress{p+unit},bits),sources=memory.load(GuestAddress{p+2*unit},bits);
+            if(!count)return finish(!types && !sources?owner(process_id(),handle,0):0);
+            if(count!=1 || !types || !sources || memory.load(GuestAddress{sources},32))return finish(invalid);
+            return finish(owner(process_id(),handle,static_cast<std::uint32_t>(memory.load(GuestAddress{types},32))));
+        }
+        if(name=="D3DKMTQueryVideoMemoryInfo" || name=="NtGdiDdDDIChangeVideoMemoryReservation"){
+            const bool change=name=="NtGdiDdDDIChangeVideoMemoryReservation";
+            const unsigned unit=x86_?4U:8U;
+            const auto p=arg(0);
+            if(!p)return finish(0xc000000dU);
+            const auto process=memory.load(GuestAddress{p},x86_?32:64);
+            const auto adapter=static_cast<std::uint32_t>(memory.load(GuestAddress{p+unit},32));
+            const auto group=memory.load(GuestAddress{p+unit+4},32);
+            if(!gui_.kmt_adapters.contains(adapter) || group>1 || memory.load(GuestAddress{p+(change?24U:48U)},32))return finish(0xc000000dU);
+            if(!change)memory.check(GuestAddress{p+16},32,Access::Write);
+            std::array<std::uint64_t,5> values{group,change?memory.load(GuestAddress{p+16},64):0,0,0,0};
+            std::uint32_t pid=process_id(),bits=0;
+            std::uint64_t birth=0;
+            auto error=process?process_memory_target(memory,process,change?0x200U:0x400U,pid,birth):0U;
+            if(!error){
+                const auto operation=change?gpu_budget_request::change:gpu_budget_request::query;
+                error=pid==process_id()?local_process_information(operation,values,bits,-1):
+                    remote_process_request(memory,pid,birth,14,operation,values,bits);
+            }
+            if(error){
+                switch(error){
+                case 5:return finish(0xc0000022U);
+                case 6:return finish(0xc0000008U);
+                case 50:return finish(0xc00000bbU);
+                case 121:return finish(0xc00000b5U);
+                default:return finish(0xc000000dU);
+                }
+            }
+            if(!change)for(unsigned i=0;i<4;++i)memory.store(GuestAddress{p+16+i*8},64,values[i]);
+            return finish(0);
+        }
         if(name.starts_with("D3DKMT")){
             // 顯示核心介面：與 DXGI／DXCore 共用同一個虛擬 UMA 配接器（LUID、vendor 0x106B、共享記憶體額度）。
             // 未提供的查詢類型回 STATUS_NOT_SUPPORTED 並記錄一次診斷。版面依 d3dkmthk.h，指標欄位隨客體位元寬度調整。
             constexpr std::uint32_t ok=0,invalid=0xc000000dU,unsupported=0xc00000bbU,not_found=0xc0000225U;
             (void)unsupported;const auto p=arg(0);if(!p)return finish(invalid);const unsigned unit=x86_?4U:8U;const auto pointer_bits=static_cast<std::uint8_t>(unit*8);
             const auto luid=display_identity::adapter_luid;const bool available=metal_opengl_identity().has_value();
-            const auto open=[&](std::uint64_t handle_at,std::uint64_t luid_at)->std::uint64_t{
-                if(!available)return not_found;if(gui_.kmt_adapters.size()>=4096)return 0xc000009aU;const auto handle=gui_.next_kmt_adapter++;gui_.kmt_adapters.insert(handle);
-                memory.store(GuestAddress{p+handle_at},32,handle);memory.store(GuestAddress{p+luid_at},32,static_cast<std::uint32_t>(luid));memory.store(GuestAddress{p+luid_at+4},32,static_cast<std::uint32_t>(luid>>32));return ok;
+            const auto open=[&](std::uint64_t handle,std::uint64_t id)->std::uint32_t{
+                if(!available)return not_found;
+                if(gui_.kmt_adapters.size()>=4096)return 0xc000009aU;
+                memory.check(GuestAddress{handle},4,Access::Write);
+                memory.check(GuestAddress{id},8,Access::Write);
+                const auto token=gui_.next_kmt_adapter++;
+                gui_.kmt_adapters.insert(token);
+                memory.store(GuestAddress{handle},32,token);
+                memory.store(GuestAddress{id},64,luid);
+                return ok;
             };
             const auto diagnose=[&](const char* api,std::uint32_t type){static std::set<std::pair<std::string,std::uint32_t>> seen;if(seen.emplace(api,type).second)std::fprintf(stderr,"[d3dkmt] %s type=%u 未支援\n",api,type);};
             if(name=="D3DKMTOpenAdapterFromHdc"){
-                const auto dc=memory.load(GuestAddress{p},pointer_bits);const bool display=dc>=0x10000000 || (gui_.contexts.contains(dc) && gui_.contexts.at(dc).display);
-                if(!display)return finish(invalid);const auto status=open(unit,unit+4);if(!status)memory.store(GuestAddress{p+unit+12},32,0);return finish(status);
+                const auto dc=memory.load(GuestAddress{p},pointer_bits);const bool display=display_dc(dc);
+                if(!display)return finish(invalid);memory.check(GuestAddress{p+unit+12},4,Access::Write);const auto status=open(p+unit,p+unit+4);if(!status)memory.store(GuestAddress{p+unit+12},32,0);return finish(status);
             }
             if(name=="D3DKMTOpenAdapterFromGdiDisplayName"){
                 std::u16string device;for(unsigned i=0;i<32;++i){const auto c=static_cast<char16_t>(memory.load(GuestAddress{p+i*2},16));if(!c)break;device.push_back(c>=u'a' && c<=u'z'?static_cast<char16_t>(c-32):c);}
-                if(device!=u"\\\\.\\DISPLAY1")return finish(invalid);const auto status=open(64,68);if(!status)memory.store(GuestAddress{p+76},32,0);return finish(status);
+                if(device!=u"\\\\.\\DISPLAY1")return finish(invalid);memory.check(GuestAddress{p+76},4,Access::Write);const auto status=open(p+64,p+68);if(!status)memory.store(GuestAddress{p+76},32,0);return finish(status);
             }
             if(name=="D3DKMTOpenAdapterFromDeviceName"){
                 const auto at=memory.load(GuestAddress{p},pointer_bits);if(!at)return finish(invalid);auto path=read_utf16(memory,GuestAddress{at});for(auto& c:path)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
                 // 介面路徑：GUID_DISPLAY_DEVICE_ARRIVAL 或 GUID_DEVINTERFACE_DISPLAY_ADAPTER。
                 if(path!=u"\\\\?\\pci#ven_106b&dev_0000&subsys_00000000&rev_00#0&0&0000#{1ca05180-a699-450a-9a0c-de4fbe3ddd89}" && path!=u"\\\\?\\pci#ven_106b&dev_0000&subsys_00000000&rev_00#0&0&0000#{5b45201d-f2f2-4f3b-85bb-30ff1f953599}")return finish(invalid);
-                return finish(open(unit,unit+4));
+                return finish(open(p+unit,p+unit+4));
             }
-            if(name=="D3DKMTOpenAdapterFromLuid"){if((static_cast<std::uint64_t>(memory.load(GuestAddress{p+4},32))<<32|memory.load(GuestAddress{p},32))!=luid)return finish(invalid);return finish(open(8,0));}
-            if(name=="D3DKMTEnumAdapters2"){
-                const auto capacity=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));const auto adapters=memory.load(GuestAddress{p+unit},pointer_bits);const std::uint32_t count=available?1U:0U;
-                if(!adapters){memory.store(GuestAddress{p},32,count);return finish(ok);}if(capacity<count){memory.store(GuestAddress{p},32,count);return finish(0xc0000023U);}
-                memory.store(GuestAddress{p},32,count);if(count){memory.fill(GuestAddress{adapters},0,20);const auto handle_store=adapters;(void)handle_store;
-                    if(gui_.kmt_adapters.size()>=4096)return finish(0xc000009aU);const auto handle=gui_.next_kmt_adapter++;gui_.kmt_adapters.insert(handle);
-                    memory.store(GuestAddress{adapters},32,handle);memory.store(GuestAddress{adapters+4},32,static_cast<std::uint32_t>(luid));memory.store(GuestAddress{adapters+8},32,static_cast<std::uint32_t>(luid>>32));memory.store(GuestAddress{adapters+12},32,1);}
-                return finish(ok);
-            }
+            if(name=="D3DKMTOpenAdapterFromLuid"){if((static_cast<std::uint64_t>(memory.load(GuestAddress{p+4},32))<<32|memory.load(GuestAddress{p},32))!=luid)return finish(invalid);return finish(open(p+8,p));}
             if(name=="D3DKMTCloseAdapter")return finish(gui_.kmt_adapters.erase(static_cast<std::uint32_t>(memory.load(GuestAddress{p},32)))?ok:invalid);
-            if(name=="D3DKMTEnumAdapters"){
-                // D3DKMT_ENUMADAPTERS：NumAdapters 與 16 筆 {hAdapter, AdapterLuid, NumOfSources, bPresentMoveRegionsPreferred}。
-                const std::uint32_t count=available?1U:0U;memory.check(GuestAddress{p},4+16*20,Access::Write);memory.fill(GuestAddress{p},0,4+16*20);
+            if(name=="D3DKMTEnumAdapters2" || name=="D3DKMTEnumAdapters"){
+                const bool indirect=name=="D3DKMTEnumAdapters2";
+                const auto capacity=indirect?memory.load(GuestAddress{p},32):16U;
+                const auto entries=indirect?memory.load(GuestAddress{p+unit},pointer_bits):p+4;
+                const std::uint32_t count=available?1U:0U;
+                memory.check(GuestAddress{p},4,Access::Write);
+                if(!entries){memory.store(GuestAddress{p},32,count);return finish(ok);}
+                if(capacity<count)return finish(0xc0000023U);
+                if(!indirect)memory.check(GuestAddress{entries},16*20,Access::Write);
+                if(count){
+                    memory.check(GuestAddress{entries},20,Access::Write);
+                    const auto status=open(entries,entries+4);
+                    if(status)return finish(status);
+                    memory.store(GuestAddress{entries+12},32,1);
+                    memory.store(GuestAddress{entries+16},32,0);
+                }
+                if(!indirect)memory.fill(GuestAddress{entries+count*20},0,(16-count)*20);
                 memory.store(GuestAddress{p},32,count);
-                if(count){if(gui_.kmt_adapters.size()>=4096)return finish(0xc000009aU);const auto handle=gui_.next_kmt_adapter++;gui_.kmt_adapters.insert(handle);
-                    memory.store(GuestAddress{p+4},32,handle);memory.store(GuestAddress{p+8},32,static_cast<std::uint32_t>(luid));memory.store(GuestAddress{p+12},32,static_cast<std::uint32_t>(luid>>32));memory.store(GuestAddress{p+16},32,1);}
-                return finish(ok);
-            }
-            if(name=="D3DKMTQueryVideoMemoryInfo"){
-                // 與 DXGI IDXGIAdapter3::QueryVideoMemoryInfo 共用同一份程序 GPU 記憶體預算；欄位順序為 Budget、CurrentUsage、CurrentReservation、AvailableForReservation。
-                const auto process=memory.load(GuestAddress{p},pointer_bits);const auto adapter=static_cast<std::uint32_t>(memory.load(GuestAddress{p+unit},32));
-                const auto group=static_cast<std::uint32_t>(memory.load(GuestAddress{p+unit+4},32)),physical=static_cast<std::uint32_t>(memory.load(GuestAddress{p+48},32));
-                if((process && process!=(x86_?UINT32_MAX:UINT64_MAX)) || !gui_.kmt_adapters.contains(adapter) || group>1 || physical)return finish(invalid);
-                const auto budget=gpu_memory_budget(group==0);
-                memory.store(GuestAddress{p+16},64,budget.budget);memory.store(GuestAddress{p+24},64,budget.usage);memory.store(GuestAddress{p+32},64,budget.reservation);memory.store(GuestAddress{p+40},64,budget.available);
                 return finish(ok);
             }
             if(name=="D3DKMTCheckOcclusion"){
-                // 視窗最小化或不可見時，Present 會被遮蔽（STATUS_GRAPHICS_PRESENT_OCCLUDED）。
-                const auto target=gui_.windows.find(memory.load(GuestAddress{p},pointer_bits));if(target==gui_.windows.end())return finish(invalid);
-                return finish(target->second.show_command==2 || !target->second.visible?0xc01e0006U:ok);
+                constexpr auto occluded=0xc01e0006U;
+                const auto target=memory.load(GuestAddress{p},pointer_bits);
+                if(!target)return finish(invalid);
+                auto hwnd=target;
+                std::uint32_t window_pid=process_id();
+                std::set<std::uint64_t> visited;
+                while(hwnd && hwnd!=gui_.desktop){
+                    if(hwnd==gui_message_parent)return finish(hwnd==target?invalid:occluded);
+                    if(!visited.insert(hwnd).second)return finish(invalid);
+                    bool hidden,empty;
+                    std::uint64_t parent;
+                    if(const auto it=gui_.windows.find(hwnd);it!=gui_.windows.end()){
+                        const auto& w=it->second;
+                        hidden=!w.visible || w.show_command==2;
+                        empty=!w.width || !w.height;
+                        parent=w.parent;
+                    }else{
+                        const auto w=shared_gui_window(hwnd);
+                        if(!w)return finish(invalid);
+                        if(hwnd==target)window_pid=w->process;
+                        hidden=!w->visible || w->show==2;
+                        empty=!w->width || !w->height;
+                        parent=w->parent;
+                    }
+                    if(empty && hwnd==target)return finish(ok);
+                    if(hidden || empty)return finish(occluded);
+                    hwnd=parent;
+                }
+                // 共用同一個 VidPn 來源；讀取同一份快照中的擁有者與類型。
+                std::uint32_t type{},pid{};
+                const auto dir=processes_ && runtime_.network.external_io?mapping_session():std::string{};
+                const auto status=vidpn_ownership(gui_,dir,process_id(),0,0,{},type,&pid);
+                if(status)return finish(status);
+                return finish(type==2 && pid!=window_pid?occluded:ok);
             }
             if(name=="D3DKMTCreateDevice"){
                 // WDDM 2 裝置不配發舊式 DMA 命令緩衝區與配置清單（輸出為空）。
                 const auto adapter=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));if(!gui_.kmt_adapters.contains(adapter))return finish(invalid);
                 if(gui_.kmt_devices.size()>=4096)return finish(0xc000009aU);
+                // 所有輸出可寫後才發布裝置，避免結構跨入不可寫頁面時遺留 handle。
+                memory.check(GuestAddress{p+unit+4},x86_?28U:48U,Access::Write);
                 const auto handle=gui_.next_kmt_device++;gui_.kmt_devices.emplace(handle,GuiState::KmtDevice{adapter});
                 memory.store(GuestAddress{p+unit+4},32,handle);
                 for(const auto offset:{x86_?12U:16U,x86_?20U:32U,x86_?28U:48U})memory.store(GuestAddress{p+offset},pointer_bits,0);
                 for(const auto offset:{x86_?16U:24U,x86_?24U:40U,x86_?32U:56U})memory.store(GuestAddress{p+offset},32,0);
-                return finish(ok);
-            }
-            if(name=="D3DKMTDestroyDevice"){
-                const auto device=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));
-                if(!gui_.kmt_devices.erase(device))return finish(invalid);
-                if(gui_.kmt_vidpn_owner==device){gui_.kmt_vidpn_owner=0;gui_.kmt_vidpn_owner_type=0;}
                 return finish(ok);
             }
             if(name=="D3DKMTSetQueuedLimit"){
@@ -326,22 +624,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
                 if(type==1){device->second.present_limit=static_cast<std::uint32_t>(memory.load(GuestAddress{p+8},32));return finish(ok);}
                 if(type==2){if(memory.load(GuestAddress{p+8},32))return finish(invalid);device->second.flip_limit=static_cast<std::uint32_t>(memory.load(GuestAddress{p+12},32));return finish(ok);}
                 return finish(invalid);
-            }
-            if(name=="D3DKMTCheckVidPnExclusiveOwnership"){
-                // 只有一個 VidPn 來源（0）；由其他裝置以排他方式擁有時回報遮蔽。
-                const auto adapter=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));
-                if(!gui_.kmt_adapters.contains(adapter) || memory.load(GuestAddress{p+4},32))return finish(invalid);
-                return finish(gui_.kmt_vidpn_owner_type==2 || gui_.kmt_vidpn_owner_type==3?0xc01e0006U:ok);
-            }
-            if(name=="D3DKMTSetVidPnSourceOwner"){
-                const auto device=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));if(!gui_.kmt_devices.contains(device))return finish(invalid);
-                const auto types=memory.load(GuestAddress{p+unit},pointer_bits),sources=memory.load(GuestAddress{p+2*unit},pointer_bits);
-                const auto count=static_cast<std::uint32_t>(memory.load(GuestAddress{p+3*unit},32));
-                if(!count){if(gui_.kmt_vidpn_owner==device){gui_.kmt_vidpn_owner=0;gui_.kmt_vidpn_owner_type=0;}return finish(ok);}   // 釋放擁有權
-                if(count!=1 || !types || !sources || memory.load(GuestAddress{sources},32))return finish(invalid);
-                const auto type=static_cast<std::uint32_t>(memory.load(GuestAddress{types},32));if(type>4)return finish(invalid);
-                if(gui_.kmt_vidpn_owner && gui_.kmt_vidpn_owner!=device && (gui_.kmt_vidpn_owner_type==2 || gui_.kmt_vidpn_owner_type==3) && type)return finish(0xc01e0007U); // STATUS_GRAPHICS_PRESENT_DENIED
-                gui_.kmt_vidpn_owner=type?device:0;gui_.kmt_vidpn_owner_type=type;return finish(ok);
             }
             if(name=="D3DKMTCreateDCFromMemory"){
                 // 以呼叫端記憶體（由上而下、指定 Pitch）建立 DIB 並選入相容的記憶體 DC；位元不複製，GDI 繪製直接寫回 pMemory。
@@ -357,26 +639,54 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
                 case 23:depth=16;masks={0xf800,0x7e0,0x1f,0};break;               // R5G6B5
                 case 24:depth=16;masks={0x7c00,0x3e0,0x1f,0};break;               // X1R5G5B5
                 case 25:depth=16;masks={0x7c00,0x3e0,0x1f,0x8000};break;          // A1R5G5B5
+                case 26:case 30:depth=16;masks={0xf00,0xf0,0xf,0};break;          // A4R4G4B4、X4R4G4B4
                 case 41:depth=8;break;                                            // P8
                 default:return finish(invalid);
                 }
-                if(!bits || !width || !height || width>16384 || height>16384 || pitch<(std::uint64_t{width}*depth+7)/8 || (depth==8 && !colors))return finish(invalid);
+                const auto minimum_pitch=((std::uint64_t{width}*depth+31)/32)*4;
+                if(!bits || !device_dc || !width || !height || width>16384 || height>16384 ||
+                    pitch<minimum_pitch || height>UINT32_MAX/pitch)return finish(invalid);
+                const auto output=p+3*unit+16;
+                memory.check(GuestAddress{output},2*unit,Access::Write);
                 memory.check(GuestAddress{bits},static_cast<std::size_t>(pitch)*height,Access::Read);
-                std::vector<std::uint32_t> palette;
-                if(depth==8){memory.check(GuestAddress{colors},1024,Access::Read);for(unsigned i=0;i<256;++i){const auto entry=static_cast<std::uint32_t>(memory.load(GuestAddress{colors+i*4},32));palette.push_back(entry&0xffffffU);}}  // PALETTEENTRY 即 COLORREF 順序
-                const auto dc=nested_service(state,memory,"gdi32.dll","CreateCompatibleDC",{device_dc});if(!dc)return finish(0xc0000017U);
                 GuiBitmap bitmap{width,height,std::vector<std::uint32_t>(static_cast<std::size_t>(width)*height)};
-                bitmap.dib_address=bits;bitmap.dib_external=true;bitmap.stride=pitch;bitmap.bits_per_pixel=depth;bitmap.signed_height=-static_cast<std::int32_t>(height);
-                bitmap.dib_compression=depth==16 || depth==32?3U:0U;bitmap.dib_masks=masks;bitmap.dib_palette=depth==8?std::move(palette):gui_dib_palette(depth);
-                const auto handle=gui_.next_object++;gui_.bitmaps.emplace(handle,std::move(bitmap));
-                try{import_dib_bitmap(memory,handle);}catch(...){gui_.bitmaps.erase(handle);(void)nested_service(state,memory,"gdi32.dll","DeleteDC",{dc});throw;}
-                (void)nested_service(state,memory,"gdi32.dll","SelectObject",{dc,handle});
-                memory.store(GuestAddress{p+3*unit+16},pointer_bits,dc);memory.store(GuestAddress{p+4*unit+16},pointer_bits,handle);
+                bitmap.dib_address=bits;bitmap.dib_external=true;bitmap.stride=pitch;bitmap.bits_per_pixel=depth;
+                bitmap.signed_height=-static_cast<std::int32_t>(height);
+                bitmap.dib_compression=depth==16?3U:0U;bitmap.dib_masks=masks;
+                if(depth==8 && colors){
+                    memory.check(GuestAddress{colors},1024,Access::Read);
+                    for(unsigned i=0;i<256;++i)bitmap.dib_palette.push_back(static_cast<std::uint32_t>(memory.load(GuestAddress{colors+i*4},32))&0xffffffU);
+                }else if(depth==8){
+                    // 預設 P8 DIB 使用 3:3:2 色表，首尾各十色沿用系統保留色。
+                    bitmap.dib_palette.assign(gui_default_palette.begin(),gui_default_palette.begin()+10);
+                    for(unsigned i=10;i<246;++i)
+                        bitmap.dib_palette.push_back((i&7U)*32U | ((i>>3)&7U)*0x2000U | (i>>6)*0x400000U);
+                    bitmap.dib_palette.insert(bitmap.dib_palette.end(),gui_default_palette.begin()+10,gui_default_palette.end());
+                }
+                const auto dc=nested_service(state,memory,"gdi32.dll","CreateCompatibleDC",{device_dc});
+                if(!dc)return finish(invalid);
+                const auto handle=gui_.next_object++;
+                try{
+                    gui_.bitmaps.emplace(handle,std::move(bitmap));
+                    import_dib_bitmap(memory,handle);
+                    if(!nested_service(state,memory,"gdi32.dll","SelectObject",{dc,handle})){
+                        gui_.bitmaps.erase(handle);
+                        (void)nested_service(state,memory,"gdi32.dll","DeleteDC",{dc});
+                        return finish(invalid);
+                    }
+                }catch(...){
+                    gui_.bitmaps.erase(handle);
+                    (void)nested_service(state,memory,"gdi32.dll","DeleteDC",{dc});
+                    throw;
+                }
+                memory.store(GuestAddress{output},pointer_bits,dc);
+                memory.store(GuestAddress{output+unit},pointer_bits,handle);
                 return finish(ok);
             }
             if(name=="D3DKMTDestroyDCFromMemory"){
                 const auto dc=memory.load(GuestAddress{p},pointer_bits),bitmap=memory.load(GuestAddress{p+unit},pointer_bits);
-                const auto found=gui_.bitmaps.find(bitmap);if(found==gui_.bitmaps.end() || !found->second.dib_external || !gui_.contexts.contains(dc))return finish(invalid);
+                if(!gui_.bitmaps.contains(bitmap) || dc==0x10000000U ||
+                    nested_service(state,memory,"gdi32.dll","GetObjectType",{dc})!=10)return finish(invalid);
                 (void)nested_service(state,memory,"gdi32.dll","DeleteDC",{dc});(void)nested_service(state,memory,"gdi32.dll","DeleteObject",{bitmap});
                 return finish(ok);
             }

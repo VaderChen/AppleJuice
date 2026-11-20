@@ -71,18 +71,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3dkmt_sync(GuestState& sta
             // 期限以系統時間（100 ns）保存，被喚醒但又被其他持有者搶先時以剩餘時間繼續等待。
             std::optional<std::int64_t> deadline;
             if(timeout_pointer){const auto value=std::bit_cast<std::int64_t>(m.load(GuestAddress{timeout_pointer},64));
-                const auto now=static_cast<std::int64_t>(runtime_.system_filetime());deadline=value<0?now-value:value;}
+                const auto now=static_cast<std::int64_t>(runtime_.system_filetime());deadline=value<0?(value<now-INT64_MAX?INT64_MAX:now-value):value;}
             for(;;){
                 auto found=gui_.kmt_mutexes.find(mutex);if(found==gui_.kmt_mutexes.end())co_return finish(kmt_invalid);auto& state_=found->second;
                 if(!state_.owned && state_.key==key){
-                    state_.owned=true;state_.owner=handle;m.store(GuestAddress{p+24},64,state_.fence);
-                    if(second){const auto data=m.load(GuestAddress{p+32},bits);const auto size=static_cast<std::uint32_t>(m.load(GuestAddress{p+32+unit},32));
-                        if(data && size)m.write(GuestAddress{data},std::span(state_.private_data).first(std::min<std::size_t>(size,state_.private_data.size())));}
+                    m.check(GuestAddress{p+24},8,Access::Write);
+                    if(second){
+                        const auto data=m.load(GuestAddress{p+32},bits);
+                        const auto size=m.load(GuestAddress{p+32+unit},32);
+                        if(size && !data)co_return finish(kmt_invalid);
+                        if(data && size)m.write(GuestAddress{data},std::span(state_.private_data).first(std::min<std::size_t>(size,state_.private_data.size())));
+                    }
+                    m.store(GuestAddress{p+24},64,state_.fence);
+                    state_.owned=true;state_.owner=handle;
                     co_return finish(kmt_ok);
                 }
                 std::uint32_t milliseconds=UINT32_MAX;
                 if(deadline){const auto left=*deadline-static_cast<std::int64_t>(runtime_.system_filetime());
-                    milliseconds=left<=0?0U:static_cast<std::uint32_t>(std::min<std::int64_t>((left+9999)/10000,0xfffffffe));}
+                    milliseconds=left<=0?0U:static_cast<std::uint32_t>(std::min<std::int64_t>(left/10000+(left%10000!=0),0xfffffffe));}
                 if(!milliseconds)co_return finish(kmt_timeout);
                 GuiState::KmtWaiter waiter;waiter.mutex=mutex;waiter.key=key;waiter.event=make_event();if(!waiter.event)co_return finish(kmt_no_memory);
                 const auto own=waiter.event;gui_.kmt_waiters.push_back(std::move(waiter));
@@ -131,7 +137,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3dkmt_sync(GuestState& sta
         }
         if(name=="D3DKMTDestroySynchronizationObject"){
             const auto found=gui_.kmt_sync_handles.find(static_cast<std::uint32_t>(memory.load(GuestAddress{p},32)));if(found==gui_.kmt_sync_handles.end())return finish(kmt_invalid);
-            const auto object=found->second;gui_.kmt_sync_handles.erase(found);
+            const auto object=found->second;
+            if(gui_.kmt_sync_objects.at(object).paging)return finish(kmt_invalid);
+            gui_.kmt_sync_handles.erase(found);
             if(std::none_of(gui_.kmt_sync_handles.begin(),gui_.kmt_sync_handles.end(),[&](const auto& item){return item.second==object;})){
                 if(const auto address=gui_.kmt_sync_objects.at(object).cpu_address)(void)free_heap(memory,address,state);
                 gui_.kmt_sync_objects.erase(object);std::erase_if(gui_.kmt_sync_shared,[&](const auto& item){return item.second==object;});
@@ -149,7 +157,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3dkmt_sync(GuestState& sta
             std::vector<std::pair<std::uint64_t,std::uint64_t>> updates;
             for(std::uint32_t i=0;i<count;++i){
                 const auto found=gui_.kmt_sync_handles.find(static_cast<std::uint32_t>(memory.load(GuestAddress{handles+i*4},32)));if(found==gui_.kmt_sync_handles.end())return finish(kmt_invalid);
-                const auto& sync=gui_.kmt_sync_objects.at(found->second);if(sync.type!=3 && sync.type!=5)return finish(kmt_invalid);
+                const auto& sync=gui_.kmt_sync_objects.at(found->second);if(sync.paging || (sync.type!=3 && sync.type!=5))return finish(kmt_invalid);
                 updates.emplace_back(found->second,memory.load(GuestAddress{values+i*8},64));
             }
             for(const auto& [object,value]:updates){auto& sync=gui_.kmt_sync_objects.at(object);sync.value=rewind?value:std::max(sync.value,value);if(sync.cpu_address)memory.store(GuestAddress{sync.cpu_address},64,sync.value);}
@@ -158,18 +166,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3dkmt_sync(GuestState& sta
         if(name.starts_with("D3DKMTCreateKeyedMutex")){
             // {InitialValue, hSharedHandle（輸出）, hKeyedMutex（輸出）[, 私有資料, 大小, Flags]}：建立時即以 InitialValue 為 key 的釋放狀態。
             if(handle_count>=4096)return finish(kmt_no_memory);GuiState::KmtMutex mutex;mutex.key=memory.load(GuestAddress{p},64);
+            bool nt_sharing=false;
             if(name.ends_with('2')){const auto data=memory.load(GuestAddress{p+16},bits);const auto size=static_cast<std::uint32_t>(memory.load(GuestAddress{p+16+unit},32));
-                if(size>65536 || (size && !data))return finish(kmt_invalid);mutex.private_data.resize(size);if(size)memory.read(GuestAddress{data},mutex.private_data);}
-            const auto object=gui_.next_kmt_object++;const auto shared=new_handle(),handle=new_handle();
-            gui_.kmt_mutexes.emplace(object,std::move(mutex));gui_.kmt_mutex_shared.emplace(shared,object);gui_.kmt_mutex_handles.emplace(handle,object);
+                const auto flags=memory.load(GuestAddress{p+20+unit},32);
+                if(flags&~1U)return finish(kmt_invalid);
+                nt_sharing=(flags&1U)!=0;
+                if(size>65536 || (size && !data))return finish(kmt_invalid);std::vector<std::uint8_t> bytes(size);if(size)memory.read(GuestAddress{data},bytes);mutex.private_data=std::move(bytes);}
+            memory.check(GuestAddress{p+8},8,Access::Write);
+            const auto object=gui_.next_kmt_object++;const auto shared=nt_sharing?0U:new_handle(),handle=new_handle();
+            gui_.kmt_mutexes.emplace(object,std::move(mutex));if(shared)gui_.kmt_mutex_shared.emplace(shared,object);gui_.kmt_mutex_handles.emplace(handle,object);
             memory.store(GuestAddress{p+8},32,shared);memory.store(GuestAddress{p+12},32,handle);return finish(kmt_ok);
         }
         if(name.starts_with("D3DKMTOpenKeyedMutex")){
             const auto shared=gui_.kmt_mutex_shared.find(static_cast<std::uint32_t>(memory.load(GuestAddress{p},32)));if(shared==gui_.kmt_mutex_shared.end())return finish(kmt_invalid);
+            if(handle_count>=4096)return finish(kmt_no_memory);
+            memory.check(GuestAddress{p+4},4,Access::Write);
             // 2 版的私有資料是輸入：keyed mutex 尚無私有資料時才複製。
             if(name.ends_with('2')){const auto data=memory.load(GuestAddress{p+8},bits);const auto size=static_cast<std::uint32_t>(memory.load(GuestAddress{p+8+unit},32));
                 if(size>65536 || (size && !data))return finish(kmt_invalid);auto& stored=gui_.kmt_mutexes.at(shared->second).private_data;
-                if(stored.empty() && size){stored.resize(size);memory.read(GuestAddress{data},stored);}}
+                if(stored.empty() && size){std::vector<std::uint8_t> initial(size);memory.read(GuestAddress{data},initial);stored=std::move(initial);}}
             const auto handle=new_handle();gui_.kmt_mutex_handles.emplace(handle,shared->second);memory.store(GuestAddress{p+4},32,handle);return finish(kmt_ok);
         }
         if(name=="D3DKMTDestroyKeyedMutex"){
@@ -184,9 +199,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3dkmt_sync(GuestState& sta
             // {hKeyedMutex, Key, FenceValue[, 私有資料, 大小]}：只有持有者可釋放；以新 key 釋放並喚醒等待該 key 的取得者。
             const auto found=gui_.kmt_mutex_handles.find(static_cast<std::uint32_t>(memory.load(GuestAddress{p},32)));if(found==gui_.kmt_mutex_handles.end())return finish(kmt_invalid);
             auto& mutex=gui_.kmt_mutexes.at(found->second);if(!mutex.owned || mutex.owner!=found->first)return finish(kmt_invalid);
+            const auto key=memory.load(GuestAddress{p+8},64),fence=memory.load(GuestAddress{p+16},64);
             if(name.ends_with('2')){const auto data=memory.load(GuestAddress{p+24},bits);const auto size=static_cast<std::uint32_t>(memory.load(GuestAddress{p+24+unit},32));
-                if(size>65536 || (size && !data))return finish(kmt_invalid);mutex.private_data.resize(size);if(size)memory.read(GuestAddress{data},mutex.private_data);}
-            mutex.key=memory.load(GuestAddress{p+8},64);mutex.fence=memory.load(GuestAddress{p+16},64);mutex.owned=false;mutex.owner=0;
+                if(size>65536 || (size && !data))return finish(kmt_invalid);std::vector<std::uint8_t> bytes(size);if(size)memory.read(GuestAddress{data},bytes);mutex.private_data=std::move(bytes);}
+            mutex.key=key;mutex.fence=fence;mutex.owned=false;mutex.owner=0;
             kmt_wake_waiters(state,memory);return finish(kmt_ok);
         }
     }catch(const MemoryFault&){return finish(0xc0000005U);}

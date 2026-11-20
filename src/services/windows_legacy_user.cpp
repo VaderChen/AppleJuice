@@ -1,6 +1,9 @@
+#include "gui_message_contract.hpp"
+#include "shared_window_order.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_geometry.hpp"
+#include "gui_paint_region.hpp"
 #include "x64arm/windows_region.hpp"
 #include "x64arm/windows_transform.hpp"
 #include "x64arm/unicode.hpp"
@@ -16,6 +19,7 @@ std::span<const WindowsServiceDescriptor> legacy_user_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"user32.dll","EnableScrollBar",3},{"user32.dll","ShowScrollBar",3},{"user32.dll","SetScrollPos",4},
         {"user32.dll","SetScrollRange",5},{"user32.dll","GetScrollRange",4},
+        {"comctl32.dll","#382",1},
         {"user32.dll","ScrollWindow",5},{"user32.dll","ScrollWindowEx",8},{"user32.dll","ScrollDC",7},
         {"user32.dll","ShowOwnedPopups",2},
         {"user32.dll","IsCharLowerA",1},{"user32.dll","IsCharLowerW",1},{"user32.dll","IsCharUpperA",1},{"user32.dll","IsCharUpperW",1},
@@ -41,7 +45,10 @@ bool dde_packed(std::uint32_t message){return message==0x3e4 || message==0x3e2 |
 constexpr std::uint32_t dde_execute=0x3e8;
 GuiRect normalized(GuiRect r){return {std::min(r[0],r[2]),std::min(r[1],r[3]),std::max(r[0],r[2]),std::max(r[1],r[3])};}
 GuiRect intersect(const GuiRect& a,const GuiRect& b){GuiRect r{std::max(a[0],b[0]),std::max(a[1],b[1]),std::min(a[2],b[2]),std::min(a[3],b[3])};return gui_rect_empty(r)?GuiRect{}:r;}
-GuiRect offset(GuiRect r,std::int32_t dx,std::int32_t dy){r[0]+=dx;r[2]+=dx;r[1]+=dy;r[3]+=dy;return r;}
+GuiRect offset(GuiRect rect,std::int64_t dx,std::int64_t dy){
+    for(unsigned i=0;i<4;++i)rect[i]=static_cast<std::int32_t>(std::clamp<std::int64_t>(rect[i]+(i%2?dy:dx),INT32_MIN,INT32_MAX));
+    return rect;
+}
 // ParseNetworkString（iphlpapi）與網路位址控制項共用：依 NET_STRING_* 類型逐一比對，輸出 NET_ADDRESS_INFO 欄位。
 struct NetworkString {unsigned format{};std::array<std::uint8_t,16> address{};std::uint32_t scope{};std::string name;std::uint16_t port{};std::uint8_t prefix{255};};
 std::optional<std::uint16_t> network_port(std::string_view text){
@@ -113,13 +120,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_user(GuestState& sta
     const auto callbacks=[&](std::vector<GuestCallback> calls,std::uint64_t value){
         if(calls.empty())return finish(value);start_callbacks(state,memory,std::move(calls),Continuation::Return,value);return std::optional<std::uint32_t>{};
     };
-    // 標準捲軸與 SB_CTL 共用 SetScrollInfo／GetScrollInfo 的資料模型與範圍修正。
-    const auto scroll_info=[&](bool set,std::uint32_t mask,std::int32_t a,std::int32_t b){
-        const auto info=temporary(28);memory.store(GuestAddress{info},32,28);memory.store(GuestAddress{info+4},32,mask);
-        if(set){if(mask&1U){memory.store(GuestAddress{info+8},32,static_cast<std::uint32_t>(a));memory.store(GuestAddress{info+12},32,static_cast<std::uint32_t>(b));}if(mask&4U)memory.store(GuestAddress{info+20},32,static_cast<std::uint32_t>(a));}
-        const auto result=set?nested_service(state,memory,"user32.dll","SetScrollInfo",{arg(0),arg(1),info,arg(set && name=="SetScrollRange"?4:3)}):nested_service(state,memory,"user32.dll","GetScrollInfo",{arg(0),arg(1),info});
-        return std::pair{result,info};
-    };
     try {
         if(name=="IsAccelerator" || name=="OleTranslateAccelerator"){
             // 與 ole32 相同的比對：WM_CHAR 對非 ALT 字元項目、虛擬鍵比對 SHIFT／CTRL、ALT 字元需 lParam 的 context 位元。
@@ -136,7 +136,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_user(GuestState& sta
                     for(std::size_t i=0;i<limit && !command;++i){
                         const auto& entry=found->second[i];if(entry[1]!=wparam)continue;const auto flags=entry[0];
                         if(message==0x102){if(!(flags&0x10U) && !(flags&1U))command=entry[2];}
-                        else if(flags&1U){const unsigned mask=((gui_.keyboard[16]&128)?4U:0U)|((gui_.keyboard[17]&128)?8U:0U);if(mask==(flags&12U))command=entry[2];}
+                        else if(flags&1U){const unsigned mask=((threads_.input_queue(threads_.current).keys[16]&128)?4U:0U)|((threads_.input_queue(threads_.current).keys[17]&128)?8U:0U);if(mask==(flags&12U))command=entry[2];}
                         else if((lparam&0x20000000U) && (flags&0x10U) && (message==0x106 || message==0x104))command=entry[2];
                     }
                 }
@@ -363,19 +363,35 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_user(GuestState& sta
         if(name=="SetScrollPos" || name=="SetScrollRange" || name=="GetScrollRange" || name=="EnableScrollBar" || name=="ShowScrollBar"){
             const auto found=gui_.windows.find(arg(0));if(found==gui_.windows.end())return fail(1400);
             const auto bar=static_cast<std::uint32_t>(arg(1));
-            if(name=="SetScrollPos"){
-                if(bar>2)return fail(87);const auto previous=nested_service(state,memory,"user32.dll","GetScrollPos",{arg(0),arg(1)});
-                (void)scroll_info(true,4,integer(2),0);return finish(static_cast<std::uint32_t>(previous));
-            }
-            if(name=="SetScrollRange"){
-                if(bar>2)return fail(87);if(static_cast<std::int64_t>(integer(3))-integer(2)>INT32_MAX)return fail(1448);
-                (void)scroll_info(true,1,integer(2),integer(3));return finish(1);
-            }
-            if(name=="GetScrollRange"){
-                if(bar>2)return fail(87);if(!arg(2) || !arg(3))return fail(87);
-                const auto [ok,info]=scroll_info(false,1,0,0);if(!ok)return finish(0);
-                memory.check(GuestAddress{arg(2)},4,Access::Write);memory.check(GuestAddress{arg(3)},4,Access::Write);
-                memory.store(GuestAddress{arg(2)},32,memory.load(GuestAddress{info+8},32));memory.store(GuestAddress{arg(3)},32,memory.load(GuestAddress{info+12},32));return finish(1);
+            if(name=="SetScrollPos" || name=="SetScrollRange" || name=="GetScrollRange"){
+                if(bar>2)return fail(87);
+                if(name=="SetScrollRange" && static_cast<std::int64_t>(integer(3))-integer(2)>INT32_MAX)return fail(1448);
+                return nested_continuation(state,memory,"捲軸位置與範圍",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                    const WindowsCall call(s,m,service);
+                    const bool get=service.symbol=="GetScrollRange",position=service.symbol=="SetScrollPos";
+                    GuestScratch storage(*this,m,s);
+                    const auto info=storage.allocate(28);
+                    if(!info){last_error_=8;call.return_to(s,0);co_return std::nullopt;}
+                    m.fill(GuestAddress{info},0,28);m.store(GuestAddress{info},32,28);
+                    m.store(GuestAddress{info+4},32,position?0x1004:1);
+                    std::uint64_t result=1;
+                    if(get){
+                        if(call(1)==2){
+                            (void)co_await service_callback::call(resolve("user32.dll","SendMessageW").value,{call(0),0xe3,call(2),call(3)});
+                        }else {
+                            result=co_await service_callback::call(resolve("user32.dll","GetScrollInfo").value,{call(0),call(1),info});
+                            if(result){
+                                for(unsigned i=0;i<2;++i)if(call(2+i))m.store(GuestAddress{call(2+i)},32,m.load(GuestAddress{info+8+4*i},32));
+                            }
+                        }
+                    }else {
+                        if(position)m.store(GuestAddress{info+20},32,call(2));
+                        else {m.store(GuestAddress{info+8},32,call(2));m.store(GuestAddress{info+12},32,call(3));}
+                        const auto prev=co_await service_callback::call(resolve("user32.dll","SetScrollInfo").value,{call(0),call(1),info,call(position?3:4)});
+                        if(position)result=prev;
+                    }
+                    call.return_to(s,result);co_return std::nullopt;
+                });
             }
             if(name=="EnableScrollBar"){
                 // ESB_*：位元 0 停用左／上箭頭，位元 1 停用右／下箭頭；SB_BOTH 同時套用兩個標準捲軸。
@@ -394,6 +410,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_user(GuestState& sta
             if(!window.frame_insets)gui_refresh_frame(window);window.style=style;
             return callbacks({{resolve("user32.dll","SetWindowPos").value,{arg(0),0,0,0,0,0,0x37}}},1);
         }
+        if(service.family=="comctl32.dll" && name=="#382"){
+            return nested_continuation(state,memory,"視窗平滑捲動",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall call(s,m,service);
+                const auto address=call(0);
+                const unsigned ptr=x86_?4U:8U;
+                const auto size=x86_?56U:80U;
+                if(!address || m.load(GuestAddress{address},32)!=size){call.return_to(s,0);co_return std::nullopt;}
+                m.check(GuestAddress{address},size,Access::Read);
+                const auto field=[&](unsigned at,unsigned bytes){return m.load(GuestAddress{address+at},static_cast<std::uint8_t>(8*bytes));};
+                const auto start=8+ptr+8;
+                const auto flags_at=start+4*ptr;
+                const auto override_callback=field(4,4)&1U;
+                const auto callback=field(flags_at+16,ptr);
+                const auto target=override_callback && callback?callback:resolve("user32.dll","ScrollWindowEx").value;
+                GuestScratch scratch(*this,m,s);
+                const auto supplied=field(start+3*ptr,ptr);
+                const auto update=supplied?supplied:scratch.allocate(16);
+                if(!update){last_error_=8;call.return_to(s,0);co_return std::nullopt;}
+                const auto hwnd=field(8,ptr),dx=field(8+ptr,4),dy=field(12+ptr,4);
+                const auto scroll=field(start,ptr),clip=field(start+ptr,ptr),region=field(start+2*ptr,ptr),flags=field(flags_at,4);
+                m.fill(GuestAddress{update},0,16);
+                const auto value=co_await service_callback::call(target,{hwnd,dx,dy,scroll,clip,region,update,flags&0xffffU});
+                call.return_to(s,value);co_return std::nullopt;
+            });
+        }
         if(name=="ScrollDC" || name=="ScrollWindow" || name=="ScrollWindowEx"){
             const bool dc_call=name=="ScrollDC";const auto dx=integer(1),dy=integer(2);
             const auto scroll_pointer=arg(3),clip_pointer=arg(4);
@@ -407,21 +448,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_user(GuestState& sta
             const auto box=temporary(16);if(!nested_service(state,memory,"gdi32.dll","GetClipBox",{hdc,box}))return fail(6);
             const auto visible=read_rect(box);const auto clip=clip_pointer?intersect(normalized(read_rect(clip_pointer)),visible):visible;
             // 只捲動仍落在裁切矩形內的像素；指定捲動矩形時再限制來源。
-            auto source=intersect(clip,offset(clip,-dx,-dy));if(scroll_pointer)source=intersect(source,normalized(read_rect(scroll_pointer)));
+            auto source=intersect(clip,offset(clip,-std::int64_t{dx},-std::int64_t{dy}));if(scroll_pointer)source=intersect(source,normalized(read_rect(scroll_pointer)));
             if(!gui_rect_empty(source) && (dx || dy))
                 if(!nested_service(state,memory,"gdi32.dll","BitBlt",{hdc,static_cast<std::uint32_t>(source[0]+dx),static_cast<std::uint32_t>(source[1]+dy),static_cast<std::uint32_t>(source[2]-source[0]),static_cast<std::uint32_t>(source[3]-source[1]),hdc,static_cast<std::uint32_t>(source[0]),static_cast<std::uint32_t>(source[1]),0x00cc0020U}))return finish(0);
             const auto area=scroll_pointer?intersect(clip,normalized(read_rect(scroll_pointer))):clip;
             auto update=gui_rect_empty(area)?GuiRegion{}:gui_region_combine(GuiRegion{area},gui_rect_empty(source)?GuiRegion{}:GuiRegion{intersect(offset(source,dx,dy),area)},4);
             if(!dx && !dy)update.clear();
-            if(region_handle)gui_.regions[region_handle]=update;
+            const auto previous=window_handle && (dx || dy) && !gui_rect_empty(clip)?gui_update_region(gui_.windows.at(window_handle)):GuiRegion{};
+            GuiRegion moved;
+            for(const auto& rect:previous){
+                const auto part=intersect(offset(rect,dx,dy),clip);
+                if(!gui_rect_empty(part))moved.push_back(part);
+            }
+            if(region_handle)gui_.regions[region_handle]=gui_region_combine(update,gui_region_combine(previous,moved,2),2);
             if(update_pointer)write_rect(update_pointer,gui_rect_empty(gui_region_bounds(update))?GuiRect{}:gui_region_bounds(update));
-            const auto kind=gui_region_kind(update);
+            const auto kind=gui_region_kind(previous);
             if(dc_call)return finish(1);
             std::vector<GuestCallback> calls;
-            if((flags&2U) && !update.empty()){
+            if(flags&6U)moved=gui_region_combine(moved,update,2);
+            if(!moved.empty()){
                 // SW_INVALIDATE／SW_ERASE 透過一般 InvalidateRgn 排入 WM_PAINT／WM_ERASEBKGND。
-                const auto temporary_region=gui_.next_object++;gui_.regions.emplace(temporary_region,update);
-                (void)nested_service(state,memory,"user32.dll","InvalidateRgn",{window_handle,temporary_region,(flags&4U)?1U:0U});gui_.regions.erase(temporary_region);
+                const auto temporary_region=gui_.next_object++;gui_.regions.emplace(temporary_region,std::move(moved));
+                (void)nested_service(state,memory,"user32.dll","InvalidateRgn",{window_handle,temporary_region,(flags&6U)==6U?1U:0U});gui_.regions.erase(temporary_region);
             }
             if(flags&1U){
                 const auto limit=scroll_pointer?std::optional<GuiRect>{normalized(read_rect(scroll_pointer))}:std::nullopt;
@@ -429,21 +477,34 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_user(GuestState& sta
                     if(w.parent!=window_handle || (w.style&0x40000000U)==0)continue;
                     const GuiRect bounds{w.x,w.y,static_cast<std::int32_t>(w.x+static_cast<std::int64_t>(w.width)),static_cast<std::int32_t>(w.y+static_cast<std::int64_t>(w.height))};
                     if(limit && gui_rect_empty(intersect(*limit,bounds)))continue;
-                    calls.push_back({resolve("user32.dll","SetWindowPos").value,{child,0,static_cast<std::uint32_t>(w.x+dx),static_cast<std::uint32_t>(w.y+dy),0,0,0x2015}});
+                    calls.push_back({resolve("user32.dll","SetWindowPos").value,{child,0,static_cast<std::uint32_t>(w.x)+static_cast<std::uint32_t>(dx),static_cast<std::uint32_t>(w.y)+static_cast<std::uint32_t>(dy),0,0,0x2015}});
                 }
             }
             const std::uint64_t value=name=="ScrollWindow"?1U:kind;
             return callbacks(std::move(calls),value);
         }
         if(name=="ShowOwnedPopups"){
-            if(!gui_.windows.contains(arg(0)))return fail(1400);
-            // 與 Windows 相同：以 WM_SHOWWINDOW（SW_PARENTCLOSING／SW_PARENTOPENING）通知，由預設視窗程序實際切換。
-            std::vector<GuestCallback> calls;const auto send=resolve("user32.dll","SendMessageW").value;
-            for(const auto& [handle,w]:gui_.windows){
-                if(w.owner!=arg(0) || w.parent || w.destroying)continue;
-                if(arg(1)?w.owned_popup_hidden:w.visible)calls.push_back({send,{handle,0x18,arg(1)?1U:0U,arg(1)?3U:1U}});
-            }
-            return callbacks(std::move(calls),1);
+            return nested_continuation(state,memory,"顯示擁有的快顯視窗",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall call(s,m,service);
+                const auto owner=call(0),desktop=thread_desktop_object(threads_.current);
+                const bool show=static_cast<std::uint32_t>(call(1))!=0;
+                initialize_shared_windows();
+                const auto handles=snapshot_window_order(shared_windows_.get(),gui_.z_order);
+                const auto send=resolve("user32.dll","SendMessageW").value;
+                // 由底向頂通知；前一個回呼可能已銷毀、隱藏或改派下一個視窗。
+                for(auto it=handles.rbegin();it!=handles.rend();++it){
+                    const auto handle=*it;
+                    if(const auto found=gui_.windows.find(handle);found!=gui_.windows.end()){
+                        const auto& w=found->second;
+                        if(w.desktop_object!=desktop || w.owner!=owner || w.parent || w.destroying ||
+                           !(show?w.owned_popup_hidden:w.visible))continue;
+                        (void)co_await service_callback::call(send,{handle,0x18,show?1U:0U,show?3U:1U});
+                    }else if(const auto w=shared_gui_window(handle);w && w->desktop==desktop && !w->parent && w->owner==owner){
+                        (void)co_await service_callback::call(send,{handle,gui_owned_popup_request,owner,show?1U:0U});
+                    }
+                }
+                call.return_to(s,1);co_return std::optional<std::uint32_t>{};
+            });
         }
         if(name.starts_with("IsChar")){
             const bool wide=name.ends_with('W');const auto buffer=temporary(8);std::uint64_t character=arg(0)&0xffffU;

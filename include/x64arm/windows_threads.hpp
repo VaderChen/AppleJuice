@@ -70,6 +70,7 @@ struct GuestThread {
     std::uint64_t teb{}, exception_area{}, stack_base{}, stack_size{}, errno_cell{}, entry{};
     ThreadStackGuard stack_guard;
     bool owns_stack{true},skip_thread_attach{};
+    bool async_shell_registration{};
     std::uint64_t static_tls_base{},static_tls_size{};
     std::uint64_t fiber{},fiber_stack_allocation{},desktop_handle{};
     std::uint64_t msvc_exception_cells{},msvc_exception_area{};
@@ -114,6 +115,14 @@ struct GuestThread {
     std::uint32_t last_native_status{};
     std::optional<std::uint32_t> error_mode; // 未覆寫時沿用程序錯誤模式。
     std::u16string description;
+    std::int32_t cursor_show_delta{};
+    struct KeyboardQueue {
+        std::uint64_t cursor{0xd000+32512};
+        std::int32_t cursor_count{};
+        std::array<std::uint8_t,256> keys{},last_physical{};
+        bool operator==(const KeyboardQueue&) const=default;
+    } keyboard_queue;
+    std::uint64_t keyboard_queue_owner{};
     std::uint64_t gui_pump_time{},dpi_context{};
     std::uint64_t message_extra{};std::uint32_t message_time{},message_position{};
     std::uint8_t message_source_device{},message_source_origin{}; // 最近取出訊息的 INPUT_MESSAGE_SOURCE。
@@ -144,6 +153,12 @@ struct ThreadRuntime {
     std::map<std::uint64_t,GuestFiber> fibers;
     std::map<std::u16string,std::uint32_t> multimedia_task_indices;
     std::uint64_t current{1}, next_id{2}, remaining{4096};
+    template<class Self> static auto& input_queue(Self& self,std::uint64_t id){
+        auto& thread=self.items.at(id);
+        return thread.keyboard_queue_owner?self.items.at(thread.keyboard_queue_owner).keyboard_queue:thread.keyboard_queue;
+    }
+    auto& input_queue(std::uint64_t id){return input_queue(*this,id);}
+    const auto& input_queue(std::uint64_t id) const{return input_queue(*this,id);}
     std::uint64_t slice_deadline{UINT64_MAX}; // 宿主時鐘模式的時間片上限，單位 100 ns。
     std::uint64_t preempt_not_before{}; // 剛釋放互斥鎖：這個時間點（100 ns）前的服務邊界不換人，見 ReleaseMutex。
     HostInstructionBudget host_instruction_budget;

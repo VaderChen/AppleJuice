@@ -1,3 +1,14 @@
+#include "shell_icon_location.h"
+#include "shell_unc_path.h"
+#include "shell_drive_root.h"
+#include "shell_file_name.h"
+#include "shell_quote_text.h"
+#include "shell_parse_field.h"
+#include "shell_ole_string.h"
+#include "shell_extension_text.h"
+#include "shell_end_slash.h"
+#include "shell_remove_file_spec.h"
+#include "shell_path_join.h"
 #include "x64arm/windows_system_paths.hpp"
 #include "x64arm/windows_services.hpp"
 #include "service_callback_task.hpp"
@@ -14,10 +25,16 @@ std::span<const WindowsServiceDescriptor> path_service_descriptors() {
         {"shlwapi.dll","PathCombineA",3},{"shlwapi.dll","PathCombineW",3},
         {"shlwapi.dll","PathAppendA",2},{"shlwapi.dll","PathAppendW",2},
         {"shlwapi.dll","PathRemoveFileSpecA",1},{"shlwapi.dll","PathRemoveFileSpecW",1},
+        {"shlwapi.dll","PathAddBackslashA",1},{"shlwapi.dll","PathAddBackslashW",1},{"shlwapi.dll","PathRemoveBackslashA",1},{"shlwapi.dll","PathRemoveBackslashW",1},
+        {"shlwapi.dll","PathIsRootA",1},{"shlwapi.dll","PathIsRootW",1},{"shlwapi.dll","PathSkipRootA",1},{"shlwapi.dll","PathSkipRootW",1},
         {"shlwapi.dll","PathStripToRootA",1},{"shlwapi.dll","PathStripToRootW",1},
         {"shlwapi.dll","PathCanonicalizeA",2},{"shlwapi.dll","PathCanonicalizeW",2},{"shlwapi.dll","PathIsDirectoryA",1},{"shlwapi.dll","PathIsDirectoryW",1},{"kernel32.dll","SearchPathA",6},{"kernel32.dll","SearchPathW",6},{"kernel32.dll","SetSearchPathMode",1},
         {"shlwapi.dll","PathMatchSpecA",2},{"shlwapi.dll","PathMatchSpecW",2},
         {"shlwapi.dll","PathMatchSpecExA",3},{"shlwapi.dll","PathMatchSpecExW",3},
+        {"internal-shell-ole-string","OleStrToStrN",4,0,0,0xa},{"internal-shell-ole-string","StrToOleStr",2},
+        {"internal-shell-field","ParseFieldW",4},
+        {"internal-shell-extension","PathGetExtension",3,0,0,6},
+        {"shlwapi.dll","PathFindExtensionA",1},{"shlwapi.dll","PathFindExtensionW",1},
         {"shlwapi.dll","PathAddExtensionA",2},{"shlwapi.dll","PathAddExtensionW",2},
         {"shlwapi.dll","PathRemoveExtensionA",1},{"shlwapi.dll","PathRemoveExtensionW",1},
         {"shlwapi.dll","PathRenameExtensionA",2},{"shlwapi.dll","PathRenameExtensionW",2},
@@ -38,7 +55,7 @@ std::span<const WindowsServiceDescriptor> path_service_descriptors() {
         // 副檔名增刪改、\\?\ 前綴移除、附加路徑、配置結果的正規化／合併與 UNC 判斷（Windows 8 起的 pathcch 介面）。
         {"pathcch.dll","PathCchAddExtension",3},{"pathcch.dll","PathCchRemoveExtension",2},{"pathcch.dll","PathCchRenameExtension",3},
         {"pathcch.dll","PathCchStripPrefix",2},{"pathcch.dll","PathCchAppend",3},{"pathcch.dll","PathCchAppendEx",4,0,0,0x8},
-        {"pathcch.dll","PathAllocCanonicalize",3,0,0,0x2},{"pathcch.dll","PathAllocCombine",4,0,0,0x4},{"pathcch.dll","PathIsUNCEx",2}
+        {"pathcch.dll","PathAllocCanonicalize",3,0,0,0x2},{"pathcch.dll","PathAllocCombine",4,0,0,0x4}
     };return table;
 }
 namespace {
@@ -384,51 +401,76 @@ std::uint32_t WindowsServices::default_search_paths(GuestMemory& memory,std::vec
 
 std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     if(service.symbol.starts_with("Assoc") || service.family=="internal-query-associations")return invoke_association(state,memory,service);
-    if(service.symbol.starts_with("PathStripToRoot")){
-        const WindowsCall call(state,memory,service);const bool wide=service.symbol.ends_with('W');std::uint64_t result=0;
-        if(call(0)){
-            // A 版本按原始位元組縮短，保留 ACP／UTF-8 路徑的原有編碼與大小寫。
-            const auto path=wide?read_utf16(memory,GuestAddress{call(0)},259):[&]{const auto bytes=read_ansi(memory,call(0),259);return std::u16string(bytes.begin(),bytes.end());}();
-            auto end=root_end(path).value_or(0);
-            if(path.starts_with(u"\\\\") && end>2 && path[end-1]==u'\\')--end;
-            result=end && !(drive(path) && end==2);
-            if(end<path.size())memory.store(GuestAddress{call(0)+end*(wide?2U:1U)},wide?16:8,0);
+    const auto symbol=service.symbol;
+    if(service.family=="internal-shell-ole-string" || symbol=="ParseFieldW" || symbol.starts_with("PathCombine") || symbol.starts_with("PathAppend") || symbol=="PathCchRemoveFileSpec" || symbol.starts_with("PathRemoveFileSpec") ||
+       symbol.starts_with("PathCchAddBackslash") || symbol.starts_with("PathCchRemoveBackslash") ||
+       symbol.starts_with("PathAddBackslash") || symbol.starts_with("PathRemoveBackslash")){
+        const WindowsCall call(state,memory,service);
+        const ShellRootInput input{&memory,call(0),symbol.ends_with('A')?1U:2U,
+            [](void* ctx,ShellRootAddress at,unsigned unit){
+                return static_cast<unsigned>(static_cast<GuestMemory*>(ctx)->load(GuestAddress{at},static_cast<std::uint8_t>(unit*8)));
+            }};
+        const auto write=[](void* ctx,ShellRootAddress at,unsigned unit,unsigned ch){
+            static_cast<GuestMemory*>(ctx)->store(GuestAddress{at},static_cast<std::uint8_t>(unit*8),ch);
+        };
+        if(service.family=="internal-shell-ole-string"){
+            const bool bounded=symbol=="OleStrToStrN";
+            try{
+                call.return_to(state,shell_ole_string(&memory,call(0),bounded?static_cast<unsigned>(call(1)):UINT32_MAX,
+                    call(bounded?2:1),input.read,write));
+            }catch(const MemoryFault&){last_error_=87;call.return_to(state,0);}
+            return std::nullopt;
         }
-        call.return_to(state,result);return std::nullopt;
-    }
-    if(service.symbol.starts_with("PathCombine") || service.symbol.starts_with("PathAppend") || service.symbol.starts_with("PathRemoveFileSpec")){
-        const WindowsCall call(state,memory,service);const bool wide=service.symbol.ends_with('W');
-        const bool remove=service.symbol.starts_with("PathRemove"),append=service.symbol.starts_with("PathAppend");
-        std::uint64_t result=0;
-        const auto read=[&](std::uint64_t at){if(wide)return read_utf16(memory,GuestAddress{at},259);const auto bytes=read_ansi(memory,at,259);return std::u16string(bytes.begin(),bytes.end());};
-        try {
-            if(call(0) && (remove || (append?call(1)!=0:(call(1)!=0 || call(2)!=0)))){
-                if(remove){
-                    const auto path=read(call(0));std::size_t floor=0;
-                    if(path.starts_with(u"\\\\"))floor=2;
-                    else if(!path.empty() && path.front()==u'\\')floor=1;
-                    else if(drive(path))floor=2+(path.size()>2 && path[2]==u'\\'?1U:0U);
-                    const auto last=path.find_last_of(u'\\');const auto end=std::max(floor,last==path.npos?std::size_t{0}:last);
-                    if(end<path.size()){memory.store(GuestAddress{call(0)+end*(wide?2U:1U)},wide?16:8,0);result=1;}
-                }else{
-                    auto first=(append || call(1))?read(call(append?0:1)):std::u16string{};
-                    auto more=call(append?1:2)?read(call(append?1:2)):std::u16string{};
-                    // PathAppend 的前導反斜線表示附加元件；PathCombine 則保留根相對語義。
-                    if(append)more.erase(0,more.find_first_not_of(u'\\'));
-                    auto combined=combine_path(std::move(first),std::move(more));
-                    // 舊 SHLWAPI 對起始 .\ 與 ..\ 移除句點但保留根反斜線。
-                    if(combined.starts_with(u".\\"))combined.erase(0,1);
-                    else if(combined.starts_with(u"..\\"))combined.erase(0,2);
-                    std::u16string output;const auto error=canonicalize(std::move(combined),0,260,output);
-                    if(!error){
-                        if(wide)memory.write(GuestAddress{call(0)},utf16_bytes(output));
-                        else{std::vector<std::uint8_t> bytes(output.begin(),output.end());bytes.push_back(0);memory.write(GuestAddress{call(0)},bytes);}
-                        result=append?1:call(0);
-                    }else if(!append)memory.store(GuestAddress{call(0)},wide?16:8,0);
-                }
+        if(symbol=="ParseFieldW"){
+            call.return_to(state,shell_parse_field(&memory,call(0),static_cast<unsigned>(call(1)),
+                call(2),static_cast<unsigned>(call(3)),input.read,write));
+            return std::nullopt;
+        }
+        if(symbol.starts_with("PathCombine") || symbol.starts_with("PathAppend")){
+            const bool append=symbol.starts_with("PathAppend");
+            call.return_to(state,shell_path_join(input,call(append?0:1),call(append?1:2),append,write));
+            return std::nullopt;
+        }
+        if(symbol=="PathCchRemoveFileSpec" || symbol.starts_with("PathRemoveFileSpec")){
+            const bool cch=symbol=="PathCchRemoveFileSpec";
+            call.return_to(state,shell_remove_file_spec(input,cch,cch?call(1):0,write));
+            return std::nullopt;
+        }
+        const bool add=symbol.find("Add")!=symbol.npos;
+        if(!symbol.starts_with("PathCch"))call.return_to(state,shell_legacy_end_slash(input,add,write));
+        else{
+            const bool ex=symbol.ends_with("Ex");
+            const auto end_slot=ex?call(2):0,remaining_slot=ex?call(3):0;
+            ShellRootAddress end=0,remaining=0;
+            const auto status=shell_cch_end_slash(input,call(1),add,!ex || end_slot?&end:nullptr,!ex || remaining_slot?&remaining:nullptr,write);
+            if(ex && (add || status!=SHELL_ROOT_INVALID || !call(1) || !end_slot || !remaining_slot)){
+                if(end_slot)memory.store(GuestAddress{end_slot},x86_?32:64,end);
+                if(remaining_slot)memory.store(GuestAddress{remaining_slot},x86_?32:64,remaining);
             }
-        }catch(const std::invalid_argument&){if(!remove && !append && call(0))memory.store(GuestAddress{call(0)},wide?16:8,0);}
-        call.return_to(state,result);return {};
+            call.return_to(state,status);
+        }
+        return std::nullopt;
+    }
+    if(symbol.starts_with("PathStripToRoot") || symbol.starts_with("PathIsRoot") || symbol.starts_with("PathSkipRoot") ||
+       symbol=="PathCchIsRoot" || symbol=="PathCchStripToRoot" || symbol=="PathCchSkipRoot"){
+        const WindowsCall call(state,memory,service);
+        const bool cch=symbol.starts_with("PathCch");
+        const auto action=symbol.starts_with("PathStrip") || symbol=="PathCchStripToRoot"?ShellStripRoot:
+            symbol=="PathCchSkipRoot"?ShellSkipCchRoot:symbol.starts_with("PathSkip")?ShellSkipLegacyRoot:ShellIsRoot;
+        if(action==ShellSkipCchRoot && !call(1)){call.return_to(state,SHELL_ROOT_INVALID);return std::nullopt;}
+        const ShellRootInput input{&memory,call(0),symbol.ends_with('A')?1U:2U,
+            [](void* ctx,ShellRootAddress at,unsigned unit){
+                return static_cast<unsigned>(static_cast<GuestMemory*>(ctx)->load(GuestAddress{at},static_cast<std::uint8_t>(unit*8)));
+            }};
+        auto value=shell_root_query(input,action,cch && action==ShellStripRoot?call(1):32768,
+            [](void* ctx,ShellRootAddress at,unsigned unit,unsigned ch){
+                static_cast<GuestMemory*>(ctx)->store(GuestAddress{at},static_cast<std::uint8_t>(unit*8),ch);
+            });
+        if(action==ShellSkipCchRoot){
+            if(value!=SHELL_ROOT_KEEP_OUTPUT)memory.store(GuestAddress{call(1)},x86_?32:64,value);
+            value=value && value!=SHELL_ROOT_KEEP_OUTPUT?0:SHELL_ROOT_INVALID;
+        }else if(action==ShellStripRoot && !cch)value=value<=1;
+        call.return_to(state,value);return std::nullopt;
     }
     if(service.symbol=="PathCanonicalizeA" || service.symbol=="PathCanonicalizeW"){
         const WindowsCall call(state,memory,service);std::uint64_t result=0;
@@ -443,24 +485,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
         const WindowsCall arg(state,memory,service);std::uint32_t value=0;const auto previous=last_error_;
         try{if(arg(0)){
             const auto path=service.symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},32768):utf8_to_utf16(read_ansi(memory,arg(0)));
-            const auto info=query_native_file_attributes(state,memory,path,false);if(!info.error)value=info.metadata.attributes&0x10U;
+            if(!path.empty()){const auto info=query_native_file_attributes(state,memory,path,false);if(!info.error)value=info.metadata.attributes&0x10U;}
         }}catch(const MemoryFault&){}catch(const std::invalid_argument&){}catch(const std::bad_alloc&){}
         last_error_=previous;
         arg.return_to(state,value);return std::nullopt;
     }
     const WindowsCall arg(state,memory,service);std::uint32_t result=0;
     try {
-    if(service.symbol.starts_with("PathAddExtension") || service.symbol.starts_with("PathRemoveExtension") || service.symbol.starts_with("PathRenameExtension")){
-        const bool wide=service.symbol.ends_with('W'),remove=service.symbol.starts_with("PathRemove"),add=service.symbol.starts_with("PathAdd");
-        const auto read=[&](std::uint64_t at){if(wide)return read_utf16(memory,GuestAddress{at},259);const auto bytes=read_ansi(memory,at,259);return std::u16string(bytes.begin(),bytes.end());};
-        if(arg(0) && (remove || add || arg(1))){
-            auto path=read(arg(0));const auto offset=windows_extension_offset(path);
-            if(remove){memory.store(GuestAddress{arg(0)+offset*(wide?2:1)},wide?16:8,0);}
-            else if(!add || offset==path.size()){
-                auto extension=arg(1)?read(arg(1)):std::u16string{};if(add && extension.empty())extension=u".exe";
-                path.resize(offset);if(path.size()+extension.size()<260){path+=extension;if(wide)memory.write(GuestAddress{arg(0)},utf16_bytes(path));else{std::vector<std::uint8_t> bytes(path.begin(),path.end());bytes.push_back(0);memory.write(GuestAddress{arg(0)},bytes);}result=1;}
-            }
-        }
+    if(service.symbol.ends_with("ExtensionA") || service.symbol.ends_with("ExtensionW") || service.family=="internal-shell-extension"){
+        const auto name=service.symbol;
+        const auto action=name.starts_with("PathFind")?ShellFindExtension:name.starts_with("PathGet")?ShellGetExtension:
+            name.starts_with("PathRemove")?ShellRemoveExtension:name.starts_with("PathAdd")?ShellAddExtension:ShellRenameExtension;
+        const auto ext=action==ShellAddExtension || action==ShellRenameExtension?arg(1):0;
+        const auto value=shell_extension_text(&memory,arg(0),ext,name.ends_with('A')?1U:2U,action,
+            [](void* ctx,unsigned long long at,unsigned unit)->unsigned{
+                return static_cast<unsigned>(static_cast<GuestMemory*>(ctx)->load(GuestAddress{at},static_cast<std::uint8_t>(unit*8)));
+            },
+            [](void* ctx,unsigned long long at,unsigned unit,unsigned c){
+                static_cast<GuestMemory*>(ctx)->store(GuestAddress{at},static_cast<std::uint8_t>(unit*8),c);
+            });
+        arg.return_to(state,value);return std::nullopt;
     }else if(service.symbol.starts_with("PathMatchSpec")){
 
         const bool wide=service.symbol.ends_with('W'),extended=service.symbol.starts_with("PathMatchSpecEx");const auto flags=extended?static_cast<std::uint32_t>(arg(2)):1U;
@@ -468,7 +512,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
         else{
             const auto read=[&](unsigned i){return wide?read_utf16(memory,GuestAddress{arg(i)},32768):utf8_to_utf16(read_ansi(memory,arg(i),32768));};
             const auto file=read(0),spec=read(1);bool matched=false;
-            for(std::size_t at=0;at<=spec.size();){const auto end=(flags&1)?spec.find(u';',at):spec.npos;auto part=std::u16string_view(spec).substr(at,end==spec.npos?spec.size()-at:end-at);
+            for(std::size_t at=0;at<spec.size();){const auto end=(flags&1)?spec.find(u';',at):spec.npos;auto part=std::u16string_view(spec).substr(at,end==spec.npos?spec.size()-at:end-at);
                 if(!(flags&0x10000))while(!part.empty() && part.front()==u' ')part.remove_prefix(1);
                 if(path_pattern(file,part)){matched=true;break;}if(end==spec.npos)break;at=end+1;
             }
@@ -514,38 +558,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
                 }
             }
         }
-    }else if(service.symbol=="PathCchIsRoot"){
-        // BOOL：整個字串恰為根（"C:\\"、"\\\\server\\share"、"\\"）。
-        if(arg(0)){const auto path=read_utf16(memory,GuestAddress{arg(0)});const auto root=root_end(path);result=root && *root==path.size()?1U:0U;}
-    }else if(service.symbol.starts_with("PathCchRemoveBackslash") || service.symbol.starts_with("PathCchAddBackslash") ||
-             service.symbol=="PathCchRemoveFileSpec" || service.symbol=="PathCchStripToRoot" || service.symbol=="PathCchFindExtension"){
-        // 就地修改：cch 含結尾 NUL，上限 PATHCCH_MAX_CCH；S_OK 表示已變更、S_FALSE 表示不需變更。
-        const auto capacity=arg(1);const auto name=service.symbol;
-        if(!arg(0) || !capacity || capacity>32768)result=invalid;
-        else {
-            auto path=read_utf16(memory,GuestAddress{arg(0)});
+    }else if(service.symbol=="PathCchFindExtension"){
+        const auto capacity=arg(1);
+        if(!arg(0) || !capacity || capacity>32768 || !arg(2))result=invalid;
+        else{
+            const auto path=read_utf16(memory,GuestAddress{arg(0)});
             if(path.size()>=capacity)result=invalid;
-            else {
-                const auto root=root_end(path).value_or(0);bool changed=false;
-                if(name.starts_with("PathCchRemoveBackslash")){if(!path.empty() && path.back()==u'\\' && path.size()>root){path.pop_back();changed=true;}}
-                else if(name.starts_with("PathCchAddBackslash")){
-                    if(path.empty() || path.back()!=u'\\'){if(path.size()+2>capacity)result=too_small;else {path.push_back(u'\\');changed=true;}}
-                }else if(name=="PathCchRemoveFileSpec"){
-                    if(path.size()>root){const auto slash=path.find_last_of(u'\\');path.resize(slash==path.npos || slash<root?root:std::max<std::size_t>(slash,root));changed=true;}
-                }else if(name=="PathCchStripToRoot"){
-                    if(!root_end(path))result=invalid;else if(path.size()>root){path.resize(root);changed=true;}
-                }else {
-                    if(!arg(2))result=invalid;
-                    else memory.store(GuestAddress{arg(2)},x86_?32:64,arg(0)+extension_at(path)*2);
-                }
-                if(!result && name!="PathCchFindExtension"){
-                    if(changed)memory.write(GuestAddress{arg(0)},utf16_bytes(path));else result=1;
-                    if(name.ends_with("Ex")){
-                        if(arg(2))memory.store(GuestAddress{arg(2)},x86_?32:64,arg(0)+path.size()*2);
-                        if(arg(3))memory.store(GuestAddress{arg(3)},x86_?32:64,capacity-path.size());
-                    }
-                }
-            }
+            else memory.store(GuestAddress{arg(2)},x86_?32:64,arg(0)+extension_at(path)*2);
         }
     }else if(service.symbol=="PathCchAddExtension" || service.symbol=="PathCchRemoveExtension" || service.symbol=="PathCchRenameExtension" || service.symbol=="PathCchStripPrefix"){
         // 就地修改，cch 規則同上。Add：已有副檔名 S_FALSE、空副檔名 S_OK 不變；Remove／StripPrefix：沒有可移除者 S_FALSE；
@@ -575,20 +594,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
     }else if(service.symbol=="PathCchAppend" || service.symbol=="PathCchAppendEx"){
         // UNC 與 \\?\ 開頭的 pszMore 視為完整路徑並取代原路徑；其餘去掉開頭的反斜線後接在後面（中間補一個反斜線），再與 PathCchCombineEx 同樣正規化。
         const auto capacity=arg(1);const auto flags=service.symbol.ends_with("Ex")?static_cast<std::uint32_t>(arg(3)):0U;
-        if(!arg(0) || !arg(2) || !capacity || capacity>32768)result=invalid;
+        if(!arg(0) || !capacity || capacity>32768)result=invalid;
         else {
-            auto input=read_utf16(memory,GuestAddress{arg(0)});auto more=read_utf16(memory,GuestAddress{arg(2)});
-            if(more.starts_with(u"\\\\"))input=std::move(more);
-            else {
-                std::size_t skip=0;while(skip<more.size() && more[skip]==u'\\')++skip;more.erase(0,skip);
-                if(!more.empty()){if(!input.empty() && input.back()!=u'\\')input.push_back(u'\\');input+=more;}
-            }
-            std::u16string output;result=canonicalize(std::move(input),flags,static_cast<std::size_t>(capacity),output);
+            auto input=read_utf16(memory,GuestAddress{arg(0)});
+            auto more=arg(2)?read_utf16(memory,GuestAddress{arg(2)}):std::u16string{};
+            if(more.starts_with(u"\\") && !more.starts_with(u"\\\\"))more.erase(0,1);
+            std::u16string output;
+            result=canonicalize(combine_path(std::move(input),std::move(more)),flags,32768,output);
+            if(!result && output.size()>=capacity)result=too_small;
             if(!result)memory.write(GuestAddress{arg(0)},utf16_bytes(output));
         }
     }else if(service.symbol=="PathAllocCanonicalize" || service.symbol=="PathAllocCombine"){
         // 結果以 LocalAlloc 配置（呼叫端 LocalFree）；未指定 PATHCCH_ALLOW_LONG_PATHS 時以 MAX_PATH 為上限。失敗時輸出為 NULL。
         const bool combine=service.symbol=="PathAllocCombine";const auto flags=static_cast<std::uint32_t>(arg(combine?2:1));const auto out=arg(combine?3:2);
+        if(out && combine && !arg(0) && !arg(1))memory.store(GuestAddress{out},x86_?32:64,0);
         if(!out || (!combine && !arg(0)) || (combine && !arg(0) && !arg(1)))result=invalid;
         else {
             memory.store(GuestAddress{out},x86_?32:64,0);
@@ -600,18 +619,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
                 if(!block)result=0x8007000eU;else {memory.write(GuestAddress{block},bytes);memory.store(GuestAddress{out},x86_?32:64,block);}
             }
         }
-    }else if(service.symbol=="PathIsUNCEx"){
-        // BOOL：\\server\share 或 \\?\UNC\server\share；ppszServer 指向伺服器名稱起點。\\.\ 裝置路徑與其他 \\?\ 路徑不是 UNC。
-        if(arg(0)){
-            const auto path=read_utf16(memory,GuestAddress{arg(0)});std::size_t server=0;
-            if(prefix(path,u"\\\\?\\unc\\"))server=8;
-            else if(path.starts_with(u"\\\\") && !path.starts_with(u"\\\\?\\") && !path.starts_with(u"\\\\.\\"))server=2;
-            if(server){result=1;if(arg(1))memory.store(GuestAddress{arg(1)},x86_?32:64,arg(0)+server*2);}
-        }
-    }else if(service.symbol=="PathCchSkipRoot"){
-        if(!arg(0) || !arg(1))result=invalid;
-        else {const auto path=read_utf16(memory,GuestAddress{arg(0)});const auto root=root_end(path);
-            if(root)memory.store(GuestAddress{arg(1)},x86_?32:64,arg(0)+*root*2);else result=invalid;}
     }else {
         const auto capacity=arg(1);if(!arg(0) || !capacity || capacity>32768)result=invalid;
         else {
@@ -623,7 +630,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
                 input=combine_path(std::move(input),std::move(more));
             }
             // 先讀完所有來源，允許輸出與任一輸入使用相同緩衝區。
-            std::u16string output;result=canonicalize(std::move(input),flags,static_cast<std::size_t>(capacity),output);
+            std::u16string output;result=combine && !arg(2) && !arg(3)?invalid:canonicalize(std::move(input),flags,combine?32768:static_cast<std::size_t>(capacity),output);
+            if(!result && output.size()>=capacity)result=too_small;
             if(result)memory.store(GuestAddress{arg(0)},16,0);
             else memory.write(GuestAddress{arg(0)},utf16_bytes(output));
         }
@@ -641,9 +649,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
 std::span<const WindowsServiceDescriptor> path_extra_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
 #define X64ARM_PATH_PAIR(name,count) {"shlwapi.dll",name "A",count},{"shlwapi.dll",name "W",count}
-        X64ARM_PATH_PAIR("PathAddBackslash",1),X64ARM_PATH_PAIR("PathRemoveBackslash",1),X64ARM_PATH_PAIR("PathGetDriveNumber",1),
-        X64ARM_PATH_PAIR("PathIsRoot",1),X64ARM_PATH_PAIR("PathSkipRoot",1),X64ARM_PATH_PAIR("PathIsUNCServer",1),X64ARM_PATH_PAIR("PathIsUNCServerShare",1),
+        X64ARM_PATH_PAIR("PathGetDriveNumber",1),
+        {"pathcch.dll","PathIsUNCEx",2},X64ARM_PATH_PAIR("PathIsRelative",1),X64ARM_PATH_PAIR("PathIsUNC",1),
+        X64ARM_PATH_PAIR("PathIsUNCServer",1),X64ARM_PATH_PAIR("PathIsUNCServerShare",1),
         X64ARM_PATH_PAIR("PathIsPrefix",2),X64ARM_PATH_PAIR("PathCommonPrefix",3),X64ARM_PATH_PAIR("PathIsSameRoot",2),X64ARM_PATH_PAIR("PathIsFileSpec",1),
+        {"shell32.dll","SheRemoveQuotesA",1},{"shell32.dll","SheRemoveQuotesW",1},
+        X64ARM_PATH_PAIR("PathFindFileName",1),
         X64ARM_PATH_PAIR("PathStripPath",1),X64ARM_PATH_PAIR("PathRemoveBlanks",1),X64ARM_PATH_PAIR("PathQuoteSpaces",1),X64ARM_PATH_PAIR("PathGetArgs",1),
         X64ARM_PATH_PAIR("PathRemoveArgs",1),X64ARM_PATH_PAIR("PathIsURL",1),X64ARM_PATH_PAIR("PathFindSuffixArray",3),X64ARM_PATH_PAIR("PathRelativePathTo",5),
         X64ARM_PATH_PAIR("PathParseIconLocation",1),X64ARM_PATH_PAIR("PathIsNetworkPath",1),X64ARM_PATH_PAIR("PathIsLFNFileSpec",1),X64ARM_PATH_PAIR("PathMakePretty",1),
@@ -730,46 +741,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_path_extra(GuestState& stat
             write(arg(1),fallback);
             return done(exists(base+file)?0U:failure);
         }
-        if(name.starts_with("PathAddBackslash")){
-            // 結尾補一個反斜線並回傳 NUL 位置；空字串不變；結果會超過 MAX_PATH 時回 NULL。
-            if(!arg(0))return done(0);auto path=read(arg(0));
-            if(!path.empty() && path.back()!=u'\\'){if(path.size()+1>=260)return done(0);path.push_back(u'\\');write(arg(0),path);}
-            return done(arg(0)+path.size()*unit);
-        }
-        if(name.starts_with("PathRemoveBackslash")){
-            // 移除結尾反斜線（根除外）；回傳移除後 NUL 的位置，未移除時指向最後一個字元。
-            if(!arg(0))return done(0);auto path=read(arg(0));if(path.empty())return done(arg(0));
-            if(path.back()==u'\\' && root_end(path).value_or(0)!=path.size()){path.pop_back();write(arg(0),path);return done(arg(0)+path.size()*unit);}
-            return done(arg(0)+(path.size()-1)*unit);
-        }
         if(name.starts_with("PathBuildRoot")){
-            const auto drive_number=static_cast<std::int32_t>(static_cast<std::uint32_t>(arg(1)));if(!arg(0))return done(0);
-            if(drive_number<0 || drive_number>25){write(arg(0),u"");return done(arg(0));}
-            write(arg(0),std::u16string{static_cast<char16_t>(u'A'+drive_number),u':',u'\\'});return done(arg(0));
+            return done(shell_build_drive_root(&memory,arg(0),unit,static_cast<std::uint32_t>(arg(1)),
+                [](void* ctx,unsigned long long at,unsigned width,unsigned value){
+                    static_cast<GuestMemory*>(ctx)->store(GuestAddress{at},static_cast<std::uint8_t>(width*8),value);
+                }));
         }
         if(name.starts_with("PathGetDriveNumber")){
-            auto path=read(arg(0));if(path.starts_with(u"\\\\?\\"))path.erase(0,4);
-            return done(drive(path)?static_cast<std::uint32_t>(fold(path[0])-u'A'):UINT32_MAX);
+            const int number=shell_drive_number(&memory,arg(0),unit,
+                [](void* ctx,unsigned long long at,unsigned width)->unsigned{
+                    return static_cast<unsigned>(static_cast<GuestMemory*>(ctx)->load(GuestAddress{at},static_cast<std::uint8_t>(width*8)));
+                });
+            return done(static_cast<std::uint32_t>(number));
         }
-        if(name.starts_with("PathIsRoot") || name.starts_with("PathSkipRoot")){
-            const auto path=read(arg(0));const auto root=root_end(path);
-            if(name.starts_with("PathSkipRoot")){
-                if(!arg(0) || !root || (drive(path) && *root==2))return done(0);return done(arg(0)+*root*unit);
-            }
-            if(path==u"\\")return done(1);
-            if(drive(path))return done(path.size()==3 && path[2]==u'\\'?1U:0U);
-            if(path.starts_with(u"\\\\") && !path.starts_with(u"\\\\?\\")){
-                // \\server 與 \\server\share（結尾沒有反斜線）為根。
-                const auto rest=std::u16string_view(path).substr(2);const auto slashes=std::count(rest.begin(),rest.end(),u'\\');
-                return done(!rest.empty() && rest.back()!=u'\\' && slashes<=1?1U:0U);
-            }
-            return done(0);
-        }
-        if(name.starts_with("PathIsUNCServerShare") || name.starts_with("PathIsUNCServer")){
-            const auto path=read(arg(0));if(!path.starts_with(u"\\\\") || path.starts_with(u"\\\\?\\"))return done(0);
-            const auto rest=std::u16string_view(path).substr(2);const auto slash=rest.find(u'\\');
-            if(name.starts_with("PathIsUNCServerShare"))return done(slash!=rest.npos && slash && slash+1<rest.size() && rest.find(u'\\',slash+1)==rest.npos?1U:0U);
-            return done(slash==rest.npos?1U:0U);
+        if(name.starts_with("PathIsUNC") || name.starts_with("PathIsRelative")){
+            const auto query=name=="PathIsUNCEx"?ShellUNCServerAddress:name.starts_with("PathIsRelative")?ShellRelative:
+                name.starts_with("PathIsUNCServerShare")?ShellShare:name.starts_with("PathIsUNCServer")?ShellServer:ShellUNC;
+            const auto value=shell_unc_query(&memory,arg(0),name.ends_with('A')?1U:2U,query,
+                [](void* ctx,unsigned long long at,unsigned width)->unsigned{
+                    return static_cast<unsigned>(static_cast<GuestMemory*>(ctx)->load(GuestAddress{at},static_cast<std::uint8_t>(width*8)));
+                });
+            if(query==ShellUNCServerAddress && arg(1))memory.store(GuestAddress{arg(1)},bits,value);
+            return done(value!=0);
         }
         if(name.starts_with("PathCommonPrefix") || name.starts_with("PathIsPrefix")){
             const bool is_prefix=name.starts_with("PathIsPrefix");const auto a=read(arg(0)),b=read(arg(1));
@@ -783,26 +776,38 @@ std::optional<std::uint32_t> WindowsServices::invoke_path_extra(GuestState& stat
             return done(ra && rb && same_text(std::u16string_view(a).substr(0,*ra),std::u16string_view(b).substr(0,*rb))?1U:0U);
         }
         if(name.starts_with("PathIsFileSpec")){const auto path=read(arg(0));return done(path.find_first_of(u"\\:")==path.npos?1U:0U);}
-        if(name.starts_with("PathStripPath")){
-            auto path=read(arg(0));const auto slash=path.find_last_of(u"\\:");
-            if(slash!=path.npos && slash+1<path.size())write(arg(0),path.substr(slash+1));return done(0);
+        if(name.starts_with("PathFindFileName") || name.starts_with("PathStripPath")){
+            return done(shell_file_name(&memory,arg(0),unit,name.starts_with("PathStripPath"),
+                [](void* ctx,unsigned long long at,unsigned width)->unsigned{
+                    return static_cast<unsigned>(static_cast<GuestMemory*>(ctx)->load(GuestAddress{at},static_cast<std::uint8_t>(width*8)));
+                },
+                [](void* ctx,unsigned long long at,unsigned width,unsigned c){
+                    static_cast<GuestMemory*>(ctx)->store(GuestAddress{at},static_cast<std::uint8_t>(width*8),c);
+                }));
         }
-        if(name.starts_with("PathRemoveBlanks")){
-            auto path=read(arg(0));const auto first=path.find_first_not_of(u' ');
-            path=first==path.npos?std::u16string{}:path.substr(first);while(!path.empty() && path.back()==u' ')path.pop_back();
-            if(arg(0))write(arg(0),path);return done(0);
+        if(name.starts_with("PathRemoveBlanks") || name.starts_with("PathParseIconLocation")){
+            const auto load=[](void* ctx,ShellQuoteAddress at,unsigned width)->unsigned{
+                return static_cast<unsigned>(static_cast<GuestMemory*>(ctx)->load(GuestAddress{at},static_cast<std::uint8_t>(width*8)));
+            };
+            const auto store=[](void* ctx,ShellQuoteAddress at,unsigned width,unsigned value){
+                static_cast<GuestMemory*>(ctx)->store(GuestAddress{at},static_cast<std::uint8_t>(width*8),value);
+            };
+            if(name.starts_with("PathParseIconLocation"))return done(shell_parse_icon_location(&memory,arg(0),unit,load,store));
+            shell_remove_blanks(&memory,arg(0),unit,load,store);
+            return done(0);
         }
-        if(name.starts_with("PathQuoteSpaces")){
-            // 含空白時加上雙引號（結果須小於 MAX_PATH）；回傳是否已加上引號。
-            auto path=read(arg(0));if(!arg(0) || path.find(u' ')==path.npos || path.size()+3>260)return done(0);
-            write(arg(0),u"\""+path+u"\"");return done(1);
-        }
-        if(name.starts_with("PathGetArgs") || name.starts_with("PathRemoveArgs")){
-            // 引數從第一個不在引號內的空白之後開始。
-            const auto path=read(arg(0));bool quoted=false;std::size_t space=path.size();
-            for(std::size_t i=0;i<path.size();++i){if(path[i]==u'"')quoted=!quoted;else if(path[i]==u' ' && !quoted){space=i;break;}}
-            if(name.starts_with("PathGetArgs"))return done(arg(0)+(space<path.size()?space+1:path.size())*unit);
-            if(space<path.size())write(arg(0),path.substr(0,space));return done(0);
+        if(name.starts_with("SheRemoveQuotes") || name.starts_with("PathQuoteSpaces") || name.starts_with("PathUnquoteSpaces") ||
+           name.starts_with("PathGetArgs") || name.starts_with("PathRemoveArgs")){
+            const auto action=name.starts_with("PathGetArgs")?ShellFindArguments:name.starts_with("PathRemoveArgs")?ShellRemoveArguments:
+                              name.starts_with("SheRemoveQuotes")?ShellExtractQuoted:
+                              name.starts_with("PathUnquoteSpaces")?ShellUnquoteSpaces:ShellQuoteSpaces;
+            return done(shell_quote_text(&memory,arg(0),unit,action,
+                [](void* ctx,ShellQuoteAddress at,unsigned width)->unsigned{
+                    return static_cast<unsigned>(static_cast<GuestMemory*>(ctx)->load(GuestAddress{at},static_cast<std::uint8_t>(width*8)));
+                },
+                [](void* ctx,ShellQuoteAddress at,unsigned width,unsigned value){
+                    static_cast<GuestMemory*>(ctx)->store(GuestAddress{at},static_cast<std::uint8_t>(width*8),value);
+                }));
         }
         if(name.starts_with("PathIsURL")){
             const auto path=read(arg(0));const auto colon=path.find(u':');if(colon==path.npos || colon<2)return done(0);
@@ -835,15 +840,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_path_extra(GuestState& stat
             result=ups?result+rest:u"."+rest;if(result.size()>=260)return done(0);
             write(arg(0),result);return done(1);
         }
-        if(name.starts_with("PathParseIconLocation")){
-            // "檔案,索引"：截斷字串、移除引號並回傳索引（沒有逗號時為 0）。
-            auto path=read(arg(0));std::int32_t index=0;const auto comma=path.find_last_of(u',');
-            if(comma!=path.npos){bool negative=false;std::size_t at=comma+1;while(at<path.size() && path[at]==u' ')++at;
-                if(at<path.size() && path[at]==u'-'){negative=true;++at;}
-                for(;at<path.size() && path[at]>=u'0' && path[at]<=u'9';++at)index=index*10+(path[at]-u'0');if(negative)index=-index;path.resize(comma);}
-            if(path.size()>=2 && path.front()==u'"' && path.back()==u'"')path=path.substr(1,path.size()-2);
-            if(arg(0))write(arg(0),path);return done(static_cast<std::uint32_t>(index));
-        }
         if(name.starts_with("PathIsNetworkPath")){
             const auto path=read(arg(0));if(path.starts_with(u"\\\\"))return done(1);if(!drive(path))return done(0);
             GuestScratch temporary(*this,memory,state);const auto text=temporary.text(std::u16string{path[0],u':',u'\\'});if(!text)return done(0);
@@ -863,22 +859,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_path_extra(GuestState& stat
         }
 #include "windows_shell_path_search.inc"
         if(name.starts_with("PathIsDirectoryEmpty")){
-            GuestScratch temporary(*this,memory,state);
-            // 目錄中只有 . 與 .. 時為空；不是目錄時回 FALSE。
-            auto path=to_wide(read(arg(0)));if(path.empty())return done(0);if(path.back()!=u'\\')path.push_back(u'\\');
-            const auto pattern=temporary.text(path+u"*"),data=temporary.allocate(600);if(!pattern || !data)return done(0);
-            const auto attributes=static_cast<std::uint32_t>(host("GetFileAttributesW",{temporary.text(path)}));
-            if(attributes==UINT32_MAX || !(attributes&0x10U))return done(0);
-            // 沒有任何項目（包含檔案系統不列出 . 與 .. 的情況）即為空目錄。
-            auto handle=host("FindFirstFileW",{pattern,data});if(x86_)handle&=UINT32_MAX;if(handle==(x86_?UINT32_MAX:UINT64_MAX))return done(1);
-            bool empty=true;
-            do{const auto entry=read_utf16(memory,GuestAddress{data+44},260);if(entry!=u"." && entry!=u".."){empty=false;break;}}while(host("FindNextFileW",{handle,data}));
-            (void)host("FindClose",{handle});return done(empty?1U:0U);
-        }
-        if(name.starts_with("PathUnquoteSpaces")){
-            // 前後皆為雙引號時移除；回傳是否移除。
-            if(!arg(0))return done(0);const auto path=read(arg(0));if(path.size()<2 || path.front()!=u'"' || path.back()!=u'"')return done(0);
-            write(arg(0),path.substr(1,path.size()-2));return done(1);
+            if(!arg(0))return done(0);
+            const auto path=to_wide(read(arg(0)));
+            // 與 Shell 的 MAX_PATH 列舉契約一致，預留反斜線、*.* 及 NUL。
+            if(path.empty() || path.size()+(path.back()==u'\\'?0U:1U)>256)return done(0);
+            const auto info=query_native_file_attributes(state,memory,path,false);
+            if(info.error || !(info.metadata.attributes&0x10U))return done(0);
+            const auto listing=filesystem_.list(utf16_to_utf8(path));
+            if(listing.error){last_error_=listing.error;return done(0);}
+            return done(listing.entries.empty());
         }
         if(name.starts_with("PathUndecorate")){
             // 移除檔名中副檔名前的 "[數字]" 副本編號，例如 "a[2].txt" → "a.txt"；"[" 前必須還有主檔名。
@@ -935,22 +924,37 @@ std::optional<std::uint32_t> WindowsServices::invoke_path_extra(GuestState& stat
         }
         if(name.starts_with("PathSetDlgItemPath")){
             // 依控制項用戶區寬度與字型省略路徑後設定文字（NULL 路徑設為空字串）；WM_GETFONT 與 SetWindowText 可能回呼客體視窗程序，經 nested_continuation 續行。
-            std::u16string path;if(arg(2))path=to_wide(read(arg(2)));
-            return nested_continuation(state,memory,"PathSetDlgItemPath",[this,service,path](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
-                const WindowsCall call(s,m,service);auto text=path;
+            return nested_continuation(state,memory,"PathSetDlgItemPath",[this,service,wide](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall call(s,m,service);
+                const auto dialog=call(0),id=call(1),source=call(2);
                 const auto entry=[&](std::string_view dll,std::string_view target){const auto stub=host_service_stub(dll,target);return stub.value?stub.value:resolve(dll,target).value;};
                 const auto finish=[&]{call.return_to(s,std::uint64_t{0});return std::optional<std::uint32_t>{};};
                 const auto handle=[&](std::uint64_t value){return x86_?value&UINT32_MAX:value;};
-                const auto control=handle(co_await service_callback::call_value(entry("user32.dll","GetDlgItem"),{call(0),call(1)}));if(!control)co_return finish();
+                const auto control=handle(co_await service_callback::call_value(entry("user32.dll","GetDlgItem"),{dialog,id}));if(!control)co_return finish();
+                std::u16string text;
+                if(source && wide){
+                    for(unsigned i=0;i<260;++i){
+                        const auto c=static_cast<char16_t>(m.load(GuestAddress{source+i*2U},16));
+                        if(!c)break;
+                        text.push_back(c);
+                    }
+                }else if(source){
+                    text=utf8_to_utf16_lossy(read_ansi(m,source));
+                    if(text.size()>=260)text.resize(259);
+                }
                 GuestScratch temporary(*this,m,s);const auto rect=temporary.allocate(16);if(!rect)co_return finish();
                 (void)co_await service_callback::call(entry("user32.dll","GetClientRect"),{control,rect});
                 const auto width=static_cast<std::int32_t>(static_cast<std::uint32_t>(m.load(GuestAddress{rect+8},32)))-static_cast<std::int32_t>(static_cast<std::uint32_t>(m.load(GuestAddress{rect},32)));
-                const auto font=handle(co_await service_callback::call_value(entry("user32.dll","SendMessageW"),{control,0x31,0,0})); // WM_GETFONT
-                const auto dc=handle(co_await service_callback::call_value(entry("user32.dll","GetDC"),{control}));
-                if(dc){const auto previous=font?handle(co_await service_callback::call_value(entry("gdi32.dll","SelectObject"),{dc,font})):0;
-                    text=compact_path_for_dc(dc,text,width).first;
-                    if(previous)(void)co_await service_callback::call_value(entry("gdi32.dll","SelectObject"),{dc,previous});
-                    (void)co_await service_callback::call(entry("user32.dll","ReleaseDC"),{control,dc});}
+                const auto dc=handle(co_await service_callback::call_value(entry("user32.dll","GetDC"),{dialog}));
+                if(dc){
+                    const auto font=handle(co_await service_callback::call_value(entry("user32.dll","SendMessageW"),{control,0x31,0,0}));
+                    const auto previous=handle(co_await service_callback::call_value(entry("gdi32.dll","SelectObject"),{dc,font}));
+                    if(previous){
+                        text=compact_path_for_dc(dc,text,width).first;
+                        (void)co_await service_callback::call_value(entry("gdi32.dll","SelectObject"),{dc,previous});
+                    }
+                    (void)co_await service_callback::call(entry("user32.dll","ReleaseDC"),{dialog,dc});
+                }
                 const auto value=temporary.text(text);if(value)(void)co_await service_callback::call(entry("user32.dll","SetWindowTextW"),{control,value});co_return finish();
             });
         }

@@ -1,3 +1,4 @@
+#include "gui_cursor_bounds.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_geometry.hpp"
@@ -13,8 +14,9 @@
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> menu_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
+        {"shell32.dll","Shell_MergeMenus",6,0,0,0x3c},
         {"user32.dll","CreateMenu",0},{"user32.dll","CreatePopupMenu",0},
-        {"user32.dll","DestroyMenu",1},{"user32.dll","GetSystemMenu",2},{"user32.dll","IsMenu",1},
+        {"user32.dll","DestroyMenu",1},{"user32.dll","GetSystemMenu",2},{"user32.dll","SetSystemMenu",2},{"user32.dll","IsMenu",1},
         {"user32.dll","AppendMenuA",4},{"user32.dll","AppendMenuW",4},
         {"user32.dll","InsertMenuA",5},{"user32.dll","InsertMenuW",5},
         {"user32.dll","ModifyMenuA",5},{"user32.dll","ModifyMenuW",5},
@@ -24,10 +26,13 @@ std::span<const WindowsServiceDescriptor> menu_service_descriptors() {
         {"user32.dll","GetMenuState",3},{"user32.dll","GetMenuItemCount",1},
         {"user32.dll","GetMenuItemID",2},{"user32.dll","GetSubMenu",2},
         {"user32.dll","GetMenuBarInfo",4},{"user32.dll","GetMenuItemRect",4},{"user32.dll","MenuItemFromPoint",3,4},
+        {"win32u.dll","NtUserMenuItemFromPoint",4},
         {"user32.dll","GetMenuStringA",5},{"user32.dll","GetMenuStringW",5},
         {"user32.dll","GetMenuItemInfoA",4},{"user32.dll","GetMenuItemInfoW",4},
         {"user32.dll","SetMenuItemInfoA",4},{"user32.dll","SetMenuItemInfoW",4},
         {"user32.dll","InsertMenuItemA",4},{"user32.dll","InsertMenuItemW",4},
+        {"win32u.dll","NtUserCallTwoParam",3},{"win32u.dll","NtUserThunkedMenuInfo",2},
+        {"win32u.dll","NtUserThunkedMenuItemInfo",6},
         {"user32.dll","CheckMenuRadioItem",5},{"user32.dll","ChangeMenuA",5},{"user32.dll","ChangeMenuW",5},{"user32.dll","HiliteMenuItem",4},
         {"user32.dll","GetMenuInfo",2},{"user32.dll","SetMenuInfo",2},{"user32.dll","GetMenuDefaultItem",3},{"user32.dll","SetMenuDefaultItem",3},
         {"user32.dll","GetMenuContextHelpId",1},{"user32.dll","SetMenuContextHelpId",2},
@@ -42,17 +47,98 @@ constexpr std::size_t menu_limit = 8192, item_limit = 65536, depth_limit = 64;
 using Location = std::pair<std::uint64_t,std::size_t>;
 std::int32_t signed32(std::uint64_t value) { return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(value)); }
 
+// 先在獨立的選單集合建立子樹。來源與目的共用子選單或為同一選單時，
+// 所有讀取仍看到合併前的內容；超出既有選單容量時不留下未掛接的子選單。
+std::uint32_t merge_menus(GuiState& gui,std::uint64_t dst,std::uint64_t src,std::uint32_t insert,
+                          std::uint32_t adjust,std::uint32_t maximum,std::uint32_t flags) {
+    if(!gui.menus.contains(src) || !gui.menus.contains(dst))return adjust;
+    auto& dest=gui.menus.at(dst);
+    const auto position=std::min<std::size_t>(insert,dest.size());
+    std::map<std::uint64_t,std::vector<GuiMenuItem>> clones;
+    std::vector<GuiMenuItem> top;
+    std::vector<std::pair<std::uint64_t,std::uint64_t>> jobs{{src,dst}};
+    auto handle=gui.next_object;
+    auto next=adjust;
+    for(std::size_t index=0;index<jobs.size();++index){
+        const auto [source,target]=jobs[index];
+        auto& items=index?clones.at(target):top;
+        const bool keep_separators=!index && (flags&4);
+        const auto original=gui.menus.find(source);
+        if(original==gui.menus.end())continue;
+        for(auto item:original->second){
+            if(item.flags&separator){
+                const bool separated=items.empty()?(index || !position || (dest[position-1].flags&separator)):
+                                                   (items.back().flags&separator)!=0;
+                if(!keep_separators && separated)continue;
+            }else{
+                const bool child=(item.flags&popup)!=0;
+                if(!child || (flags&2)){
+                    const std::uint32_t id=(child?item.command:static_cast<std::uint32_t>(item.id))+adjust;
+                    if(id>maximum)continue;
+                    if(id>=next)next=id+1;
+                    item.command=id;
+                    if(!child)item.id=id;
+                }else item.command=0;
+                if(child){
+                    if(gui.menus.size()+clones.size()>=menu_limit)return adjust;
+                    jobs.emplace_back(item.id,handle);
+                    clones.try_emplace(handle);
+                    item.id=handle++;
+                }
+                item.mdi_owner=0;
+            }
+            items.push_back(std::move(item));
+        }
+        const bool right_separator=index || position==dest.size() || (dest[position].flags&separator);
+        if(!keep_separators && right_separator && !items.empty() && (items.back().flags&separator))items.pop_back();
+    }
+    if(top.empty())return adjust;
+    GuiMenuItem divider;
+    divider.flags=separator;
+    if(flags&1){
+        if(position && !(dest[position-1].flags&separator) && !(top.front().flags&separator))
+            top.insert(top.begin(),divider);
+        if(position<dest.size() && !(dest[position].flags&separator) && !(top.back().flags&separator))
+            top.push_back(divider);
+    }
+    if(top.size()>item_limit-dest.size())return adjust;
+    if(std::any_of(top.begin(),top.end(),[](const GuiMenuItem& item){return (item.flags&0x1000)!=0;})){
+        dest.reserve(dest.size()+top.size());
+        for(auto& item:dest)item.flags&=~0x1000U;
+    }
+    dest.insert(dest.begin()+static_cast<std::ptrdiff_t>(position),std::make_move_iterator(top.begin()),std::make_move_iterator(top.end()));
+    gui.menus.merge(clones);
+    gui.next_object=handle;
+    return next;
+}
+
 std::optional<Location> find_item(const GuiState& gui,std::uint64_t handle,std::uint32_t item,std::uint32_t flags) {
     const auto found=gui.menus.find(handle);
     if(found==gui.menus.end())return std::nullopt;
     if(flags&by_position)return item<found->second.size()?std::optional{Location{handle,item}}:std::nullopt;
-    std::set<std::uint64_t> visited;std::vector<std::uint64_t> pending{handle};
-    while(!pending.empty()){
-        const auto current=pending.back();pending.pop_back();
-        if(!visited.insert(current).second)continue;
-        const auto menu=gui.menus.find(current);if(menu==gui.menus.end())continue;
-        for(std::size_t i=0;i<menu->second.size();++i){const auto& entry=menu->second[i];if(((entry.flags&popup)?entry.command:static_cast<std::uint32_t>(entry.id))==item)return Location{current,i};}
-        for(auto it=menu->second.rbegin();it!=menu->second.rend();++it)if(it->flags&popup)pending.push_back(it->id);
+    struct Frame {
+        std::uint64_t menu;
+        std::size_t next;
+        std::optional<Location> fallback;
+    };
+    std::vector<Frame> stack{{handle,0,std::nullopt}};
+    std::set<std::uint64_t> visited{handle};
+    while(!stack.empty()){
+        auto& frame=stack.back();
+        const auto& items=gui.menus.at(frame.menu);
+        if(frame.next==items.size()){
+            if(frame.fallback)return frame.fallback;
+            stack.pop_back();
+            continue;
+        }
+        const auto index=frame.next++;
+        const auto& entry=items[index];
+        if(entry.flags&popup){
+            // 先搜尋此子樹；選單自身的命令 ID 留到同層項目都查完。
+            if(entry.command==item)frame.fallback=Location{frame.menu,index};
+            if(gui.menus.contains(entry.id) && visited.insert(entry.id).second)
+                stack.push_back({entry.id,0,std::nullopt});
+        }else if(static_cast<std::uint32_t>(entry.id)==item)return Location{frame.menu,index};
     }
     return std::nullopt;
 }
@@ -84,11 +170,16 @@ bool system_menu(const GuiState& gui,std::uint64_t owner,std::uint64_t menu) {
 
 // native 一次接收一棵 snapshot；callback 完成後才建立，避免把初始化前的文字與狀態顯示出來。
 bool menu_snapshot(const GuiState& gui,std::uint64_t root,std::vector<GuiPopupItem>& out,const std::function<GuiIcon(std::uint64_t)>& bitmap) {
-    const auto root_info=gui.menu_info.find(root);const auto style=root_info==gui.menu_info.end()?0:root_info->second.style;
+    const auto notify_style=[&](std::uint64_t menu){
+        const auto info=gui.menu_info.find(menu);
+        return info==gui.menu_info.end()?0U:info->second.style&0x08000000U;
+    };
+    const auto root_style=notify_style(root);
     std::set<std::uint64_t> path;std::size_t count=0;
     std::function<bool(std::uint64_t,std::vector<GuiPopupItem>&)> copy=[&](std::uint64_t handle,std::vector<GuiPopupItem>& items){
         if(path.size()>=depth_limit || !path.insert(handle).second)return false;
         const auto menu=gui.menus.find(handle);if(menu==gui.menus.end()){path.erase(handle);return true;}
+        const auto style=root_style|notify_style(handle);
         for(const auto& entry:menu->second){
             if(++count>item_limit)return false;
             GuiPopupItem item{entry.id,entry.flags|style,entry.text,{},handle,static_cast<std::uint32_t>(&entry-menu->second.data())};
@@ -130,7 +221,7 @@ bool WindowsServices::snapshot_gui_menu(GuestMemory& memory,std::uint64_t handle
 }
 void WindowsServices::present_gui_menu(GuestMemory& memory,std::uint64_t handle){
     if(!native_gui_)return;const auto found=gui_.windows.find(handle);if(found==gui_.windows.end())return;
-    std::vector<GuiPopupItem> items;if(found->second.menu && !snapshot_gui_menu(memory,found->second.menu,items))throw HostCallFault("視窗選單階層超出上限");
+    std::vector<GuiPopupItem> items;if(gui_.menus.contains(found->second.menu) && !snapshot_gui_menu(memory,found->second.menu,items))throw HostCallFault("視窗選單階層超出上限");
     native_gui_->set_menu(handle,items);
 }
 std::optional<std::uint32_t> WindowsServices::begin_gui_main_menu(GuestState& state,GuestMemory& memory,const GuiMessage& message){
@@ -149,18 +240,40 @@ std::optional<std::uint32_t> WindowsServices::begin_gui_main_menu(GuestState& st
     try{start_callbacks(state,memory,std::move(callbacks),Continuation::GuiMenuInit,token);}catch(...){gui_.menu_tracks.erase(token);throw;}
     return std::nullopt;
 }
+static std::uint64_t make_system_popup(GuiState& gui,const GuiWindow& window) {
+    const bool mdi=window.ex_style&0x40;
+    const auto style=window.style;
+    const auto menu=gui.next_object++;
+    auto& items=gui.menus[menu];
+    items={{0xf120,window.show_command==1?1U:0U,u"&Restore",0,9},{0xf010,0,u"&Move"},
+           {0xf000,(style&0x40000)?0U:1U,u"&Size"},{0xf020,(style&0x20000)?0U:1U,u"Mi&nimize",0,11},
+           {0xf030,(style&0x10000)?0U:1U,u"Ma&ximize",0,10},{0,separator,u""},
+           {0xf060,0x1000U,mdi?u"&Close\tCtrl+F4":u"&Close\tAlt+F4",0,8}};
+    if(mdi){items.push_back({0,separator,u""});items.push_back({0xf040,0,u"Nex&t\tCtrl+F6"});}
+    gui.menu_info[menu].style=0x04000000U; // MNS_CHECKORBMP
+    return menu;
+}
+
+static void apply_class_menu_style(GuiState& gui,const GuiClass* cls,std::uint64_t menu) {
+    if(!cls || !(cls->style&0x200U))return;
+    if(const auto close=find_item(gui,menu,0xf060,0)){
+        auto& items=gui.menus.at(close->first);
+        const auto entry=items[close->second];
+        items.erase(items.begin()+static_cast<std::ptrdiff_t>(close->second));
+        if(entry.flags&popup)destroy_menu(gui,entry.id);
+    }
+}
+
 std::uint64_t WindowsServices::gui_system_menu(std::uint64_t handle) {
     const auto window=gui_.windows.find(handle);
     if(window==gui_.windows.end()){last_error_=1400;return 0;}
-    if(!(window->second.style&0x80000))return 0;
     if(const auto found=gui_.system_menus.find(handle);found!=gui_.system_menus.end())return found->second;
+    if(!(window->second.style&0x80000))return 0;
     if(gui_.menus.size()>=menu_limit){last_error_=8;return 0;}
-    const auto result=gui_.next_object++;gui_.system_menus[handle]=result;
-    const auto style=window->second.style;
-    gui_.menus[result]={{0xf120,window->second.show_command==1?1U:0U,u"&Restore"},{0xf010,0,u"&Move"},
-        {0xf000,(style&0x40000)?0U:1U,u"&Size"},{0xf020,(style&0x20000)?0U:1U,u"Mi&nimize"},
-        {0xf030,(style&0x10000)?0U:1U,u"Ma&ximize"},{0,separator,u""},{0xf060,0,u"&Close"}};
-    return result;
+    const auto menu=make_system_popup(gui_,window->second);
+    apply_class_menu_style(gui_,gui_class_record(window->second.class_name),menu);
+    gui_.system_menus[handle]=menu;
+    return menu;
 }
 GuiPopupPlacement WindowsServices::gui_popup_placement(std::int32_t x,std::int32_t y,std::uint32_t flags) {
     const auto handle=gui_monitor_from_rect({x,y,x,y},2);
@@ -176,6 +289,54 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
     const auto read=[&](std::uint64_t address){return address?(wide?read_utf16(memory,GuestAddress{address}):utf8_to_utf16_lossy(read_ansi(memory,address))):std::u16string{};};
     std::uint64_t result=0;
     const auto fail=[&](std::uint32_t error,std::uint64_t value=0){last_error_=error;result=value;};
+    if(symbol=="NtUserCallTwoParam"){
+        switch(d(2)){
+        case 1:result=nested_service(state,memory,"user32.dll","GetMenuInfo",{arg(0),arg(1)});break;
+        case 2:result=nested_service(state,memory,"user32.dll","GetMonitorInfoW",{arg(0),arg(1)});break;
+        case 3:result=nested_service(state,memory,"user32.dll","GetSystemMetricsForDpi",{arg(0),arg(1)});break;
+        case 4:result=nested_service(state,memory,"user32.dll","MonitorFromRect",{arg(0),arg(1)});break;
+        case 8:{
+            // 沙盒各監視器的有效、角度與原生 DPI 都採用現有的 96 DPI 座標模型。
+            if(d(1)>2){fail(160);break;}
+            const auto rect=gui_virtual_screen_bounds(gui_monitors());
+            memory.check(GuestAddress{arg(0)},16,Access::Write);
+            for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(0)+4*i},32,static_cast<std::uint32_t>(rect[i]));
+            result=1;break;
+        }
+        default:fail(50);break;
+        }
+        arg.return_to(state,result);return std::nullopt;
+    }
+    if(symbol=="NtUserThunkedMenuInfo" && !arg(1)){
+        last_error_=998;arg.return_to(state,0);return std::nullopt;
+    }
+    if(symbol=="NtUserThunkedMenuItemInfo"){
+        const auto menu=arg(0),info=arg(4);
+        const auto pos=d(1),flags=d(2),method=d(3);
+        switch(method){
+        case 0:case 1:case 5:case 6:{
+            if(!info || memory.load(GuestAddress{info},32)!=(x86_?48U:80U)){fail(87);break;}
+            const auto op=method==0?"SetMenuItemInfoW":method==1?"InsertMenuItemW":method==5?"GetMenuItemInfoA":"GetMenuItemInfoW";
+            result=nested_service(state,memory,"user32.dll",op,{menu,pos,flags&by_position,info});
+            break;
+        }
+        case 2:
+            if(!info){fail(87);break;}
+            result=nested_service(state,memory,"user32.dll","CheckMenuRadioItem",{menu,pos,
+                memory.load(GuestAddress{info+(x86_?40U:64U)},32),memory.load(GuestAddress{info+4},32),flags});
+            break;
+        case 3:result=nested_service(state,memory,"user32.dll","GetMenuDefaultItem",{menu,pos,flags});break;
+        case 4:{
+            const auto where=find_item(gui_,menu,pos,flags);result=UINT32_MAX;
+            if(where){const auto& item=gui_.menus.at(where->first)[where->second];if(!(item.flags&popup))result=item.id;}
+            break;
+        }
+        case 7:result=nested_service(state,memory,"user32.dll","GetMenuState",{menu,pos,flags});break;
+        case 8:result=nested_service(state,memory,"user32.dll","GetSubMenu",{menu,pos});break;
+        default:break;
+        }
+        arg.return_to(state,static_cast<std::uint32_t>(result));return std::nullopt;
+    }
     if(symbol.starts_with("ChangeMenu")){
         // 舊版 ChangeMenu(hMenu, cmd, lpszNewItem, cmdInsert, flags)：依 MF_APPEND／MF_DELETE／MF_CHANGE／MF_REMOVE
         // 轉交同一選單模型的 Append／Delete／Modify／RemoveMenu，其餘為 InsertMenu；旗標本身不傳給目標函式。
@@ -196,8 +357,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
         else if(const auto where=find_item(gui_,arg(1),d(2),flags & by_position);!where)fail(1456);
         else {
             auto& item=gui_.menus.at(where->first)[where->second];
+            if(flags&0x80U)for(auto& other:gui_.menus.at(where->first))other.flags&=~0x80U;
             item.flags=(flags&0x80U)?(item.flags|0x80U):(item.flags&~0x80U);
-            if(gui_.windows.at(arg(0)).menu==arg(1))(void)nested_service(state,memory,"user32.dll","DrawMenuBar",{arg(0)});
             result=1;
         }
         arg.return_to(state,result);return std::nullopt;
@@ -221,13 +382,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
     }else if(symbol=="EndMenu"){
         // 遞迴追蹤只結束本執行緒最內層選單；不影響其他執行緒的選單。
         for(auto it=gui_.menu_tracks.rbegin();it!=gui_.menu_tracks.rend();++it)if(it->second.thread==threads_.current && it->second.active){it->second.cancel();result=1;break;}
-    }else if(symbol=="GetMenuBarInfo" || symbol=="GetMenuItemRect" || symbol=="MenuItemFromPoint"){
-        const bool bar=symbol=="GetMenuBarInfo",hit_test=symbol=="MenuItemFromPoint";
-        const auto owner=gui_.windows.find(arg(0));const auto invalid=hit_test?UINT64_MAX:0;
+    }else if(symbol=="GetMenuBarInfo" || symbol=="GetMenuItemRect" || symbol=="MenuItemFromPoint" || symbol=="NtUserMenuItemFromPoint"){
+        const bool bar=symbol=="GetMenuBarInfo",hit_test=symbol.ends_with("MenuItemFromPoint");
+        auto owner=gui_.windows.find(arg(0));const auto invalid=hit_test?UINT64_MAX:0;
         const auto object=signed32(arg(1));std::uint64_t menu=bar?(owner==gui_.windows.end()?0:object==-1?gui_system_menu(arg(0)):owner->second.menu):arg(1);
+        if(menu && (hit_test || (!bar && !arg(0)))){
+            // 命中測試使用選單本身的擁有者；查詢矩形時 NULL HWND 也採用此視窗。
+            owner=std::find_if(gui_.windows.begin(),gui_.windows.end(),[&](const auto& item){return item.second.menu==menu;});
+            if(owner==gui_.windows.end()){
+                for(const auto& [token,track]:gui_.menu_tracks){
+                    (void)token;
+                    if(track.active && (track.menu==menu || track.root_menu==menu)){owner=gui_.windows.find(track.owner);break;}
+                }
+            }
+        }
         const auto items=gui_.menus.find(menu);const auto index=static_cast<std::int64_t>(signed32(arg(2)))-(bar?1:0);
         const auto size=x86_?32U:48U;const auto output=hit_test?0:arg(3);
-        if(owner==gui_.windows.end())fail(1400,invalid);
+        if(!bar && items==gui_.menus.end())fail(1401,invalid);
+        else if(owner==gui_.windows.end())fail(1400,invalid);
+        else if(!hit_test && !output)fail(87);
         else if(bar && object!=-1 && object!=-3 && object!=-4)fail(87);
         else if(bar && (!output || memory.load(GuestAddress{output},32)!=size))fail(87);
         else if(items==gui_.menus.end())fail(1401,invalid);
@@ -251,7 +424,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
                 }
                 for(unsigned i=0;i<4;++i)r[i]=static_cast<std::int32_t>(std::clamp<std::int64_t>(static_cast<std::int64_t>(r[i])+origin[i%2],INT32_MIN,INT32_MAX));return r;
             };
-            if(hit_test){result=UINT64_MAX;const auto point=arg(2);const auto x=signed32(point),y=signed32(point>>32);
+            if(hit_test){result=UINT64_MAX;const auto point=arg(2);const auto x=signed32(point),y=symbol=="NtUserMenuItemFromPoint"?signed32(arg(3)):signed32(point>>32);
                 for(std::size_t i=0;i<items->second.size();++i){const auto r=rectangle(static_cast<std::int32_t>(i));if(x>=r[0] && x<r[2] && y>=r[1] && y<r[3]){result=i;break;}}
             }else {
                 const auto r=rectangle(static_cast<std::int32_t>(index));memory.check(GuestAddress{output},bar?size:16U,Access::Write);
@@ -264,18 +437,42 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
             }
         }
     }else if(symbol=="GetMenuCheckMarkDimensions")result=18U|(18U<<16);
+    else if(symbol=="Shell_MergeMenus")result=merge_menus(gui_,arg(0),arg(1),d(2),d(3),d(4),d(5));
     else if(symbol=="CreateMenu" || symbol=="CreatePopupMenu"){
         if(gui_.menus.size()>=menu_limit)fail(8);else {result=gui_.next_object++;gui_.menus[result]={};}
-    }else if(symbol=="IsMenu")result=gui_.menus.contains(arg(0));
-    else if(symbol=="GetSystemMenu"){
-        const auto window=gui_.windows.find(arg(0));
-        if(window==gui_.windows.end())fail(1400);
-        else if(d(1)){
-            const auto found=gui_.system_menus.find(arg(0));if(found!=gui_.system_menus.end())destroy_menu(gui_,found->second);
-        }else result=gui_system_menu(arg(0));
+    }else if(symbol=="IsMenu"){
+        if(gui_.menus.contains(arg(0)))result=1;else fail(1401);
+    }
+    else if(symbol=="GetSystemMenu" || symbol=="SetSystemMenu"){
+        const auto owner=arg(0);
+        const auto window=gui_.windows.find(owner);
+        if(window==gui_.windows.end() || owner==gui_.desktop)fail(1400);
+        else {
+            const bool set=symbol=="SetSystemMenu";
+            if(set || d(1)){
+                if(const auto old=gui_.system_menus.find(owner);old!=gui_.system_menus.end()){
+                    const auto previous=old->second;
+                    gui_.system_menus.erase(old);
+                    if(previous)destroy_menu(gui_,previous);
+                }
+            }
+            if(set){
+                auto menu=arg(1);
+                if(!menu && gui_.menus.size()>=menu_limit)fail(8);
+                else {
+                    if(!menu)menu=make_system_popup(gui_,window->second);
+                    apply_class_menu_style(gui_,gui_class_record(window->second.class_name),menu);
+                    gui_.system_menus[owner]=gui_.menus.contains(menu)?menu:0;
+                    result=1;
+                }
+            }else {
+                const auto menu=gui_system_menu(owner);
+                if(!d(1))result=menu;
+            }
+        }
     }else if(!gui_.menus.contains(arg(0))){
         const bool minus_one=symbol=="GetMenuDefaultItem" || symbol=="GetMenuState" || symbol=="GetMenuItemCount" || symbol=="GetMenuItemID" || symbol=="CheckMenuItem" || symbol=="EnableMenuItem";
-        fail(1401,minus_one?UINT32_MAX:0);
+        fail(symbol=="GetMenuInfo"?87:1401,minus_one?UINT32_MAX:0);
     }else if(symbol=="SetMenuItemBitmaps"){
         const auto where=find_item(gui_,arg(0),d(1),d(2));
         if(d(2)&~by_position)fail(87);
@@ -285,26 +482,45 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
     }else if(symbol=="DestroyMenu"){destroy_menu(gui_,arg(0));result=1;}
     else if(symbol=="GetMenuContextHelpId")result=gui_.menu_info[arg(0)].help_id;
     else if(symbol=="SetMenuContextHelpId"){gui_.menu_info[arg(0)].help_id=d(1);result=1;}
-    else if(symbol=="GetMenuInfo" || symbol=="SetMenuInfo"){
-        const bool get=symbol=="GetMenuInfo";const auto p=arg(1);const unsigned size=x86_?28:40,help=x86_?20:24,data=x86_?24:32;const std::uint8_t bits=x86_?32:64;
-        if(!p || memory.load(GuestAddress{p},32)!=size)fail(87);
-        else {memory.check(GuestAddress{p},size,get?Access::Write:Access::Read);const auto mask=static_cast<std::uint32_t>(memory.load(GuestAddress{p+4},32));
-            if(mask&~0x8000001fU)fail(87);
-            else if(get){const auto& info=gui_.menu_info[arg(0)];if(mask&1)memory.store(GuestAddress{p+12},32,0);if(mask&2)memory.store(GuestAddress{p+16},bits,0);if(mask&4)memory.store(GuestAddress{p+help},32,info.help_id);if(mask&8)memory.store(GuestAddress{p+data},bits,info.data);if(mask&16)memory.store(GuestAddress{p+8},32,info.style);result=1;}
-            else {const auto style=static_cast<std::uint32_t>(memory.load(GuestAddress{p+8},32));
-                if(((mask&16) && (style&~0x08000000U)) || ((mask&1) && memory.load(GuestAddress{p+12},32)) || ((mask&2) && memory.load(GuestAddress{p+16},bits)))fail(50);
-                else {std::vector<std::uint64_t> pending{arg(0)};std::set<std::uint64_t> visited;
-                    while(!pending.empty()){const auto h=pending.back();pending.pop_back();if(!visited.insert(h).second || !gui_.menus.contains(h))continue;auto& info=gui_.menu_info[h];
-                        if(mask&16)info.style=style;if(mask&4)info.help_id=static_cast<std::uint32_t>(memory.load(GuestAddress{p+help},32));if(mask&8)info.data=memory.load(GuestAddress{p+data},bits);
-                        if(mask&0x80000000U)for(const auto& item:gui_.menus.at(h))if(item.flags&popup)pending.push_back(item.id);
-                    }result=1;
+    else if(symbol=="GetMenuInfo" || symbol=="SetMenuInfo" || symbol=="NtUserThunkedMenuInfo"){
+        const bool get=symbol=="GetMenuInfo";const auto p=arg(1);
+        const unsigned size=x86_?28:40,help=x86_?20:24,data=x86_?24:32;
+        const std::uint8_t bits=x86_?32:64;
+        if(!p || (symbol!="NtUserThunkedMenuInfo" && memory.load(GuestAddress{p},32)!=size))fail(87);
+        else {
+            const auto mask=memory.load(GuestAddress{p+4},32);
+            memory.check(GuestAddress{p},size,get?Access::Write:Access::Read);
+            if(get){
+                const auto& info=gui_.menu_info[arg(0)];
+                if(mask&1)memory.store(GuestAddress{p+12},32,info.max_height);
+                if(mask&2)memory.store(GuestAddress{p+16},bits,info.background);
+                if(mask&4)memory.store(GuestAddress{p+help},32,info.help_id);
+                if(mask&8)memory.store(GuestAddress{p+data},bits,info.data);
+                if(mask&16)memory.store(GuestAddress{p+8},32,info.style);
+            }else {
+                std::vector<std::uint64_t> pending{arg(0)};std::set<std::uint64_t> visited;
+                while(!pending.empty()){
+                    const auto h=pending.back();pending.pop_back();
+                    if(!visited.insert(h).second || !gui_.menus.contains(h))continue;
+                    auto& info=gui_.menu_info[h];
+                    if(mask&1)info.max_height=static_cast<std::uint32_t>(memory.load(GuestAddress{p+12},32));
+                    if(mask&2)info.background=memory.load(GuestAddress{p+16},bits);
+                    if(mask&4)info.help_id=static_cast<std::uint32_t>(memory.load(GuestAddress{p+help},32));
+                    if(mask&8)info.data=memory.load(GuestAddress{p+data},bits);
+                    if(mask&16)info.style=static_cast<std::uint32_t>(memory.load(GuestAddress{p+8},32));
+                    if(mask&0x80000000U)for(const auto& item:gui_.menus.at(h))if(item.flags&popup)pending.push_back(item.id);
                 }
             }
+            result=1;
         }
     }else if(symbol=="SetMenuDefaultItem"){
-        auto& items=gui_.menus.at(arg(0));const auto where=d(1)==UINT32_MAX?std::optional<Location>{}:find_item(gui_,arg(0),d(1),d(2)?by_position:0);
-        if(d(1)!=UINT32_MAX && !where)fail(1456);
-        else {auto& entries=where?gui_.menus.at(where->first):items;for(auto& item:entries)item.flags&=~0x1000U;if(where)entries[where->second].flags|=0x1000;result=1;}
+        auto& items=gui_.menus.at(arg(0));const auto target=d(1);result=target==UINT32_MAX;
+        for(std::size_t i=0;i<items.size();++i){
+            auto& item=items[i];item.flags&=~0x1000U;
+            const auto id=(item.flags&popup)?item.command:static_cast<std::uint32_t>(item.id);
+            if(target!=UINT32_MAX && (d(2)?i: id)==target){item.flags|=0x1000U;result=1;}
+        }
+        if(!result)fail(1456);
     }else if(symbol=="GetMenuDefaultItem"){
         result=UINT32_MAX;
         if(d(2)&~3U)fail(87,UINT32_MAX);
@@ -324,10 +540,29 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
     }else if(symbol=="CheckMenuRadioItem"){
         if(d(4)&~by_position || d(1)>d(2))fail(87);
         else {
-            bool selected=false;auto& entries=gui_.menus.at(arg(0));
-            for(std::size_t index=0;index<entries.size();++index){auto& entry=entries[index];const auto id=(d(4)&by_position)?index:((entry.flags&popup)?entry.command:static_cast<std::uint32_t>(entry.id));
-                if(id<d(1) || id>d(2))continue;
-                if(id==d(3)){entry.flags|=0x208;selected=true;}else entry.flags&=~0x208U;
+            // 命令範圍可以很稀疏。依 find_item 的搜尋順序收集實際存在的 ID，
+            // 只修改範圍內最小 ID 所屬的選單，不逐一掃描整個 UINT 範圍。
+            std::map<std::uint32_t,Location> matches;
+            std::set<std::uint64_t> visited;std::vector<std::uint64_t> pending{arg(0)};
+            while(!pending.empty()){
+                const auto menu=pending.back();pending.pop_back();
+                if(!visited.insert(menu).second || !gui_.menus.contains(menu))continue;
+                const auto& entries=gui_.menus.at(menu);
+                for(std::size_t index=0;index<entries.size();++index){
+                    const auto& entry=entries[index];
+                    const auto id=(d(4)&by_position)?static_cast<std::uint32_t>(index):(entry.flags&popup)?entry.command:static_cast<std::uint32_t>(entry.id);
+                    if(id>=d(1) && id<=d(2)){
+                        auto [match,inserted]=matches.try_emplace(id,menu,index);
+                        if(!inserted)match->second=*find_item(gui_,arg(0),id,d(4));
+                    }
+                }
+                if(!(d(4)&by_position))for(auto it=entries.rbegin();it!=entries.rend();++it)if(it->flags&popup)pending.push_back(it->id);
+            }
+            bool selected=false;
+            for(const auto& [id,where]:matches){
+                if(where.first!=matches.begin()->second.first)continue;
+                auto& entry=gui_.menus.at(where.first)[where.second];if(entry.flags&separator)continue;
+                if(id==d(3)){entry.flags|=0x208;selected=true;}else entry.flags&=~8U;
             }
             result=selected;
         }
@@ -419,15 +654,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
         }
     }else if(symbol=="TrackPopupMenu" || symbol=="TrackPopupMenuEx"){
         const bool ex=symbol.ends_with("Ex");const auto owner=arg(ex?4:5);const auto flags=d(1);
-        if(!gui_.windows.contains(owner))fail(1400);
-        else if(!gui_.menus.contains(arg(0)))fail(1401);
-        else if((!ex && d(4)) || (flags&~0x1ffffU) || ((flags&12)==12) || ((flags&48)==48))fail(87);
-        else if(!(flags&1) && std::any_of(gui_.menu_tracks.begin(),gui_.menu_tracks.end(),[&](const auto& item){return item.second.active && item.second.thread==threads_.current;}))fail(1446);
+        if(!gui_.menus.contains(arg(0)))fail(1401);
+        else if(std::any_of(gui_.menu_tracks.begin(),gui_.menu_tracks.end(),[&](const auto& item){
+            const auto& active=item.second;
+            return active.active && (active.menu==arg(0) || (!(flags&1) && active.thread==threads_.current));
+        }))fail(1446);
+        else if(!gui_.windows.contains(owner))fail(1400);
         else if(gui_.menu_tracks.size()>=64)fail(8);
         else {
             GuiMenuTrack track;track.menu=arg(0);track.owner=owner;track.thread=threads_.current;track.flags=flags;track.x=signed32(arg(2));track.y=signed32(arg(3));
             if(ex && arg(5)){
-                if(memory.load(GuestAddress{arg(5)},32)!=20){fail(87);arg.return_to(state,result);return std::nullopt;}
+                // 參考實作讀取 rcExclude，保留傳統入口忽略 nReserved 與 lpRect 的契約。
                 for(unsigned i=0;i<4;++i)track.exclude[i]=signed32(memory.load(GuestAddress{arg(5)+4+4*i},32));
             }
             const auto token=gui_.next_object++;gui_.menu_tracks[token]=track;
@@ -496,7 +733,7 @@ std::optional<std::uint32_t> WindowsServices::resume_menu(GuestState& state,Gues
         if(track.selected && !(track.flags&0x180)){
             const bool system=system_menu(gui_,track.owner,track.menu);
             const auto coords=static_cast<std::uint16_t>(track.x)|(static_cast<std::uint32_t>(static_cast<std::uint16_t>(track.y))<<16);
-            const auto root=track.main_bar?track.root_menu:track.menu;const bool bypos=!system && (gui_.menu_info[root].style&0x08000000U);
+            const auto root=track.main_bar?track.root_menu:track.menu;const bool bypos=!system && ((gui_.menu_info[root].style|gui_.menu_info[track.selected_menu].style)&0x08000000U);
             enqueue_gui_message({track.owner,bypos?track.selected_position:system?track.selection:track.selection&0xffff,bypos?track.selected_menu:system?coords:0,bypos?0x126U:system?0x112U:0x111U});
         }
         gui_.menu_tracks.erase(found);complete_call(state,memory,result);return std::nullopt;
@@ -628,7 +865,7 @@ std::optional<std::uint32_t> WindowsServices::advance_menu_idle(GuestState& stat
         (message==gui_.queue.end() || it->queue_priority<message->queue_priority))message=it;
     if(message!=gui_.queue.end()){
         if(message->message==18){track.cancel();return std::nullopt;} // WM_QUIT 留給外層訊息迴圈。
-        const auto event=*message;consume_gui_input(event);consume_shell_message(event);remember_gui_message(event);gui_.queue.erase(message);track.idle_notified=false;
+        const auto event=*message;consume_gui_input(event);consume_shell_message(event);remember_gui_message(memory,event);gui_.queue.erase(message);track.idle_notified=false;
         if(std::any_of(gui_.hooks.begin(),gui_.hooks.end(),[&](const auto& entry){const auto& hook=entry.second;return (hook.type==-1 || hook.type==6) && (!hook.thread || hook.thread==threads_.current);})){
             std::vector<std::uint64_t> scratch;
             try{

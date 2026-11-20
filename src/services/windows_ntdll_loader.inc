@@ -309,12 +309,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_ntdll_loader(GuestState& st
             return finish(name=="RtlEncodeSystemPointer"?std::rotr(value^cookie,shift):std::rotl(value,shift)^cookie);
         }
         if(name=="RtlGetFullPathName_UEx"){
-            // (FileName, BufferLength 位元組, Buffer, FilePart*, RTL_PATH_TYPE*)：與 RtlGetFullPathName_U 同一流程，長度與錯誤改以 NTSTATUS 回報。
-            if(!call(0))return finish(0xc0000033U);
+            // 第五個參數接收位元組數；所需空間含結尾 NUL，成功複製的長度不含 NUL。
             const auto bytes=static_cast<std::uint32_t>(host("ntdll.dll","RtlGetFullPathName_U",{call(0),word(1),call(2),call(3)}));
-            if(call(4))memory.store(GuestAddress{call(4)},32,host("ntdll.dll","RtlDetermineDosPathNameType_U",{call(0)}));
-            if(!bytes)return finish(0xc0000033U);
-            return finish(bytes>word(1)?buffer_too_small:0U);
+            if(call(4))memory.store(GuestAddress{call(4)},32,bytes);
+            return finish(bytes?0U:0xc0000033U);
         }
         if(name=="RtlGetLongestNtPathLength")return finish(277); // "\??\UNC\" 的位元組數（16）＋ MAX_PATH（260）＋ 1
         if(name=="RtlDosPathNameToRelativeNtPathName_U" || name=="RtlDosPathNameToRelativeNtPathName_U_WithStatus"){

@@ -21,7 +21,21 @@ constexpr std::array<std::uint8_t,16> iid_persist_storage{0x0a,0x01,0,0,0,0,0,0,
 }
 std::span<const WindowsServiceDescriptor> ole_wrapper_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"ole32.dll","WdtpInterfacePointer_UserSize",5},
+        {"ole32.dll","WdtpInterfacePointer_UserMarshal",5},
+        {"ole32.dll","WdtpInterfacePointer_UserUnmarshal",4},
+        {"ole32.dll","WdtpInterfacePointer_UserFree",1},
+        {"combase.dll","WdtpInterfacePointer_UserSize",5},
+        {"combase.dll","WdtpInterfacePointer_UserMarshal",5},
+        {"combase.dll","WdtpInterfacePointer_UserUnmarshal",4},
+        {"combase.dll","WdtpInterfacePointer_UserFree",1},
+        {"combase.dll","WdtpInterfacePointer_UserSize64",5},
+        {"combase.dll","WdtpInterfacePointer_UserMarshal64",5},
+        {"combase.dll","WdtpInterfacePointer_UserUnmarshal64",4},
+        {"combase.dll","WdtpInterfacePointer_UserFree64",1},
         {"ole32.dll","CoCreateInstanceFromApp",6,0,0,0x14},{"ole32.dll","CoGetInstanceFromFile",8,0,0,0x58},{"ole32.dll","CoGetInstanceFromIStorage",7,0,0,0x28},
+        {"ole32.dll","ReadOleStg",6},{"ole32.dll","WriteOleStg",4,0,0,4},
+        {"ole32.dll","OpenOrCreateStream",3},{"ole32.dll","ReadStringStream",2},{"ole32.dll","WriteStringStream",2},
         {"ole32.dll","FreePropVariantArray",2,0,0,0x1},{"ole32.dll","BindMoniker",4,0,0,0x2},{"ole32.dll","OleNoteObjectVisible",2,0,0,0x2},
         {"ole32.dll","OleQueryCreateFromData",1},{"ole32.dll","OleQueryLinkFromData",1}};
     return table;
@@ -44,6 +58,64 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_wrappers(GuestState& st
         try{
             if(name=="CoCreateInstanceFromApp")
                 co_return finish(static_cast<std::uint32_t>(co_await api("ole32.dll","CoCreateInstanceEx",{call(0),call(1),call(2),0,call(4),call(5)})));
+#include "windows_propvariant_aggregate.inc"
+#include "windows_ole_record.inc"
+#include "windows_ole_interface_marshal.inc"
+            if(name=="OpenOrCreateStream"){
+                const auto storage=call(0),stream_name=call(1),out=call(2);
+                if(!out)co_return finish(e_pointer);
+                m.store(GuestAddress{out},bits,0);
+                if(!storage || !stream_name)co_return finish(e_invalidarg);
+                // STGM_READWRITE | STGM_SHARE_EXCLUSIVE；建立時保留已存在的內容。
+                constexpr unsigned mode=0x12;
+                auto hr=static_cast<std::uint32_t>(co_await com(storage,3,{stream_name,mode,0,0,out}));
+                if(hr==0x80030050U)
+                    hr=static_cast<std::uint32_t>(co_await com(storage,4,{stream_name,0,mode,0,out}));
+                co_return finish(hr);
+            }
+            if(name=="WriteStringStream" || name=="ReadStringStream"){
+                const bool writing=name=="WriteStringStream";
+                const auto stream=call(0),text=call(1);
+                if(!writing){
+                    if(!text)co_return finish(e_pointer);
+                    m.store(GuestAddress{text},bits,0);
+                }
+                if(!stream)co_return finish(e_invalidarg);
+                const auto header=scratch(8);
+                if(writing){
+                    std::uint32_t size=0;
+                    if(text){
+                        do{
+                            if(size>UINT32_MAX-2 || text>UINT64_MAX-size)co_return finish(e_invalidarg);
+                            size+=2;
+                        }while(m.load(GuestAddress{text+(size-2)},16));
+                    }
+                    m.store(GuestAddress{header},32,size);
+                    auto hr=static_cast<std::uint32_t>(co_await com(stream,4,{header,4,0}));
+                    if(!hr && size)hr=static_cast<std::uint32_t>(co_await com(stream,4,{text,size,0}));
+                    co_return finish(hr);
+                }
+                const auto read=[&](std::uint64_t dest,std::uint32_t count)->service_callback::Task<std::uint32_t>{
+                    m.store(GuestAddress{header+4},32,0);
+                    const auto hr=static_cast<std::uint32_t>(co_await com(stream,3,{dest,count,header+4}));
+                    co_return hr?hr:static_cast<std::uint32_t>(m.load(GuestAddress{header+4},32)!=count);
+                };
+                if(const auto hr=co_await read(header,4))co_return finish(hr);
+                const auto size=static_cast<std::uint32_t>(m.load(GuestAddress{header},32));
+                if(!size)co_return finish(0);
+                if(size>INT32_MAX)co_return finish(0x80004005U);
+                const auto data=co_await api("ole32.dll","CoTaskMemAlloc",{size});
+                if(!data)co_return finish(e_outofmemory);
+                std::uint32_t hr=0;
+                std::exception_ptr failure;
+                try{
+                    hr=co_await read(data,size);
+                    if(!hr)m.store(GuestAddress{text},bits,data);
+                }catch(...){failure=std::current_exception();}
+                if(hr || failure)(void)co_await api("ole32.dll","CoTaskMemFree",{data});
+                if(failure)std::rethrow_exception(failure);
+                co_return finish(hr);
+            }
             if(name=="FreePropVariantArray"){
                 const auto count=static_cast<std::uint32_t>(call(0));const auto items=call(1);if(count && !items)co_return finish(e_invalidarg);
                 const unsigned stride=x86_?16U:24U;std::uint32_t first=0;

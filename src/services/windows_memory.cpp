@@ -799,6 +799,8 @@ std::span<const WindowsServiceDescriptor> memory_service_descriptors() {
         {"kernel32.dll","InterlockedExchange",2},{"kernel32.dll","InterlockedIncrement",1},{"kernel32.dll","InterlockedDecrement",1},
         {"kernel32.dll","InterlockedExchangeAdd",2},{"kernel32.dll","InterlockedCompareExchange",3},
         {"kernel32.dll","InterlockedExchangePointer",2},{"kernel32.dll","InterlockedCompareExchangePointer",3},
+        {"internal-mapi-string-probe","IsBadBoundedStringPtr",2,0,0,2},
+        {"internal-mapi-string-probe","FBadRglpszA",2,0,0,2},{"internal-mapi-string-probe","FBadRglpszW",2,0,0,2},
         {"kernel32.dll","IsBadReadPtr",2},{"kernel32.dll","IsBadWritePtr",2},{"kernel32.dll","IsBadHugeReadPtr",2},{"kernel32.dll","IsBadHugeWritePtr",2},
         {"kernel32.dll","IsBadCodePtr",1},{"kernel32.dll","IsBadStringPtrA",2},{"kernel32.dll","IsBadStringPtrW",2},
         {"psapi.dll","QueryWorkingSetEx",3},{"kernel32.dll","K32QueryWorkingSetEx",3},
@@ -1123,16 +1125,35 @@ std::optional<std::uint32_t> WindowsServices::invoke_memory(GuestState& state,Gu
                 const auto counts=arg(0)+11*unit;memory.store(GuestAddress{counts},32,handles);memory.store(GuestAddress{counts+4},32,processes);memory.store(GuestAddress{counts+8},32,threads);result=1;
             }
         }
-    }else if(symbol.starts_with("IsBad")){
+    }else if(symbol.starts_with("IsBad") || service.family=="internal-mapi-string-probe"){
         try {
             const auto start=arg(0),limit=x86_?UINT64_C(0xffffffff):UINT64_MAX;
-            if(symbol.starts_with("IsBadStringPtr")){
-                const unsigned unit=symbol.ends_with('W')?2:1;auto address=start;
-                for(std::uint64_t i=0;i<arg(1);++i){
-                    if(address>limit-(unit-1)){result=1;break;}
-                    if(!memory.load(GuestAddress{address},static_cast<std::uint8_t>(unit*8)))break;
-                    if(i+1<arg(1) && address>limit-unit){result=1;break;}address+=unit;
+            const auto bad_string=[&](std::uint64_t address,std::uint64_t count,unsigned unit,bool require_nul){
+                if(!address)return true;
+                for(std::uint64_t i=0;i<count;++i){
+                    if(address>limit-(unit-1))return true;
+                    if(!memory.load(GuestAddress{address},static_cast<std::uint8_t>(unit*8)))return false;
+                    if(i+1<count && address>limit-unit)return true;
+                    address+=unit;
                 }
+                return require_nul;
+            };
+            if(symbol.starts_with("FBadRglpsz")){
+                const auto count=static_cast<std::uint32_t>(arg(1));
+                const auto bytes=std::uint64_t(count)*pointer_unit;
+                if(count && (!start || bytes-1>limit-start))result=1;
+                else if(count){
+                    memory.check(GuestAddress{start},bytes,Access::Read);
+                    const unsigned unit=symbol.ends_with('W')?2:1;
+                    for(std::uint32_t i=0;i<count && !result;++i){
+                        const auto str=memory.load(GuestAddress{start+std::uint64_t(i)*pointer_unit},pointer_bits);
+                        result=bad_string(str,limit,unit,true);
+                    }
+                }
+            }else if(symbol=="IsBadBoundedStringPtr"){
+                result=bad_string(start,static_cast<std::uint32_t>(arg(1)),1,true);
+            }else if(symbol.starts_with("IsBadStringPtr")){
+                result=bad_string(start,arg(1),symbol.ends_with('W')?2:1,false);
             }else {
                 const auto count=symbol=="IsBadCodePtr"?UINT64_C(1):arg(1);
                 if(count && (start>limit || count-1>limit-start))result=1;

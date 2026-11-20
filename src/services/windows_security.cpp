@@ -107,7 +107,7 @@ std::span<const WindowsServiceDescriptor> security_service_descriptors() {
         {"advapi32.dll","PrivilegedServiceAuditAlarmA",5,0,0,0x10},{"advapi32.dll","PrivilegedServiceAuditAlarmW",5,0,0,0x10},
         {"ntdll.dll","NtPrivilegedServiceAuditAlarm",5,0,0,0x10},{"ntdll.dll","ZwPrivilegedServiceAuditAlarm",5,0,0,0x10},
         {"advapi32.dll","MapGenericMask",2},{"advapi32.dll","AreAllAccessesGranted",2},{"advapi32.dll","AreAnyAccessesGranted",2},
-        {"advapi32.dll", "OpenProcessToken", 3},{"advapi32.dll","LogonUserA",6},{"advapi32.dll","LogonUserW",6},
+        {"advapi32.dll", "OpenProcessToken", 3},{"advapi32.dll","LogonUserA",6,0,0,0x18},{"advapi32.dll","LogonUserW",6,0,0,0x18},
         {"advapi32.dll", "GetKernelObjectSecurity", 5},{"advapi32.dll","SetKernelObjectSecurity",3},
         {"advapi32.dll","GetSecurityInfo",8},{"advapi32.dll","SetSecurityInfo",7},
         {"advapi32.dll", "LookupPrivilegeValueA", 3}, {"advapi32.dll", "LookupPrivilegeValueW", 3},
@@ -1038,6 +1038,13 @@ void WindowsServices::initialize_tokens(){
     token.default_dacl=security::encode_acl({encode_ace({0,0,0x10000000U,token.user.sid}),
         encode_ace({0,0,0x10000000U,sddl_sid("S-1-5-18")})});
     SecurityDescriptor sd;sd.control=4;sd.data[0]=token.owner;sd.data[1]=token.primary_group;sd.data[3]=token.default_dacl;
+    // 初始互動式工作階段與 TokenStatistics 使用相同的 AuthenticationId 及帳戶 SID。
+    const auto account=security::resolve_account(token.user.sid,token.user.sid);
+    if(account){
+        const auto user=utf8_to_utf16(account->name),domain=utf8_to_utf16(account->domain);
+        runtime_.lsa.sessions.emplace(token.authentication_id,LsaSession{token.authentication_id,runtime_.system_filetime(),
+            2,token.session,user,domain,user,token.user.sid});
+    }
     token.object_descriptor=relative_descriptor(sd);runtime_.process_security_descriptor=token.object_descriptor;runtime_.initial_thread_security_descriptor=token.object_descriptor;runtime_.token_objects.emplace(1,std::move(token));
 }
 void WindowsServices::refresh_file_security_context(){

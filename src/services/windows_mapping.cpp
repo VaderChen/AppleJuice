@@ -402,6 +402,17 @@ struct FileMappingState {
     std::map<std::u16string,Table> tables;
 #endif
 };
+bool same_readonly_module_store(const std::shared_ptr<FileMappingState>& left,
+                                const std::shared_ptr<FileMappingState>& right) noexcept {
+    if (!left || !right) return left == right;
+#if !defined(_WIN32)
+    // 比對分支可沿用同一個唯讀內建 PE 來源；命名空間、handle、view 與表仍具可變狀態。
+    return left == right && left->module_files && !left->name_space &&
+           left->handles.empty() && left->views.empty() && left->tables.empty();
+#else
+    return false;
+#endif
+}
 std::uint32_t WindowsServices::process_image_source(std::uint64_t handle,ProcessImageSource& source){
 #if !defined(_WIN32)
     if(!mappings_)return 6;
@@ -580,6 +591,17 @@ std::u16string WindowsServices::mapping_object_name(std::uint64_t handle) const 
         const auto& object=*mappings_->handles.at(handle).object;if(!object.named)return {};
         Header header{};if(::pread(object.descriptor,&header,sizeof(header),0)!=sizeof(header) || header.signature!=magic || header.characters>header.name.size())throw HostCallFault("Section 名稱儲存損壞");
         return {header.name.data(),header.characters};
+    }
+#else
+    (void)handle;
+#endif
+    return {};
+}
+std::shared_ptr<const void> WindowsServices::retain_mapping_object(std::uint64_t handle) const {
+#if !defined(_WIN32)
+    if(mappings_){
+        const auto found=mappings_->handles.find(handle);
+        if(found!=mappings_->handles.end())return found->second.object;
     }
 #else
     (void)handle;

@@ -19,6 +19,8 @@ std::span<const WindowsServiceDescriptor> serial_service_descriptors(){
         {"kernel32.dll","PurgeComm",2},{"kernel32.dll","SetupComm",3},
         {"kernel32.dll","CancelSynchronousIo",1},
         {"kernel32.dll","GetCommConfig",3},{"kernel32.dll","SetCommConfig",3},{"kernel32.dll","GetCommProperties",2},
+        {"serialui.dll","drvGetDefaultCommConfigA",3},{"serialui.dll","drvGetDefaultCommConfigW",3},
+        {"serialui.dll","drvSetDefaultCommConfigA",3},{"serialui.dll","drvSetDefaultCommConfigW",3},
         {"kernel32.dll","GetDefaultCommConfigA",3},{"kernel32.dll","GetDefaultCommConfigW",3},{"kernel32.dll","SetDefaultCommConfigA",3},{"kernel32.dll","SetDefaultCommConfigW",3}
     };return table;
 }
@@ -54,19 +56,51 @@ std::optional<std::uint32_t> WindowsServices::invoke_serial(GuestState& state,Gu
         std::array<std::uint8_t,52> config{};config[0]=52;config[4]=1;std::copy(dcb.begin(),dcb.end(),config.begin()+8);config[36]=1;
         memory.write(GuestAddress{pointer},config);memory.store(GuestAddress{size_pointer},32,52);return 0;};
     try{
-        if(name.starts_with("GetDefaultCommConfig") || name.starts_with("SetDefaultCommConfig")){
-            // 預設設定以埠名稱查詢；未設定時為 9600 bps、8N1、二進位模式並啟用 DTR／RTS。
-            const auto port_name=arg(0)?(name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},64):utf8_to_utf16(read_ansi(memory,arg(0),64))):std::u16string{};
-            const auto number=serial_port(port_name);scan_serial_ports();
-            if(!arg(0) || !arg(1))fail(87);
-            else if(!number || !serial_ports_.contains(*number))fail(2);
-            else if(name.starts_with("Get")){
+        if(name.find("DefaultCommConfig")!=std::string_view::npos){
+            const bool driver=service.family=="serialui.dll";
+            const bool setting=name.starts_with("Set") || name.starts_with("drvSet");
+            const auto operation=[&]()->std::uint32_t {
+                if(!arg(0) || !arg(1) || (!setting && !arg(2)))return 87;
+                if(setting && (d(2)<52 || memory.load(GuestAddress{arg(1)+8},32)!=28))return 87;
+                if(!setting && memory.load(GuestAddress{arg(2)},32)<52){
+                    memory.store(GuestAddress{arg(2)},32,52);return 122;
+                }
+                const auto port_name=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},64):utf8_to_utf16(read_ansi(memory,arg(0),64));
+                const auto number=serial_port(port_name);
+                if(!number)return driver?1010:2;
+                if(!driver){
+                    scan_serial_ports();
+                    if(!serial_ports_.contains(*number))return 2;
+                }
+                GuestScratch scratch(*this,memory,state);
+                const auto key=scratch.text(u"System\\CurrentControlSet\\Services\\Class\\Ports\\COM"+utf8_to_utf16(std::to_string(*number)));
+                const auto field=scratch.text(u"DCB");
+                constexpr auto machine=UINT64_C(0x80000002);
+                if(setting){
+                    memory.check(GuestAddress{arg(1)+8},28,Access::Read);
+                    return static_cast<std::uint32_t>(nested_service(state,memory,"advapi32.dll","RegSetKeyValueW",{machine,key,field,3,arg(1)+8,28}));
+                }
+                const auto data=scratch.allocate(28),size=scratch.allocate(4);
+                memory.store(GuestAddress{size},32,28);
+                const auto error=nested_service(state,memory,"advapi32.dll","RegGetValueW",{machine,key,field,8,0,data,size});
                 std::array<std::uint8_t,28> dcb{};
-                if(const auto found=runtime_.serial_defaults.find(*number);found!=runtime_.serial_defaults.end())dcb=found->second;
-                else {dcb[0]=28;dcb[4]=0x80;dcb[5]=0x25;dcb[8]=0x11;dcb[9]=0x10;dcb[14]=0x00;dcb[15]=0x08;dcb[16]=0x00;dcb[17]=0x02;dcb[18]=8;dcb[21]=0x11;dcb[22]=0x13;}
-                if(const auto e=write_config(arg(1),arg(2),dcb))fail(e);else result=1;
-            }else if(static_cast<std::uint32_t>(arg(2))<36 || memory.load(GuestAddress{arg(1)+8},32)!=28)fail(87);
-            else {std::array<std::uint8_t,28> dcb{};memory.read(GuestAddress{arg(1)+8},dcb);runtime_.serial_defaults[*number]=dcb;result=1;}
+                if(!error){
+                    if(memory.load(GuestAddress{size},32)!=28)return 13;
+                    memory.read(GuestAddress{data},dcb);
+                }else if(error==2 || error==3){
+                    // 未儲存時採 9600、8N1、二進位模式，開啟 DTR 與 RTS。
+                    dcb[0]=28;dcb[4]=0x80;dcb[5]=0x25;dcb[8]=0x11;dcb[9]=0x10;
+                    dcb[15]=8;dcb[17]=2;dcb[18]=8;dcb[21]=0x11;dcb[22]=0x13;
+                }else return static_cast<std::uint32_t>(error);
+                return write_config(arg(1),arg(2),dcb);
+            };
+            std::uint32_t error;
+            try{error=operation();}
+            catch(const MemoryFault&){error=87;}
+            catch(const std::bad_alloc&){error=8;}
+            if(driver && !setting)result=error;
+            else if(error)fail(error);
+            else result=1;
             frame.return_to(state,result);return std::nullopt;
         }
         if(name.starts_with("BuildCommDCB")){
@@ -75,10 +109,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_serial(GuestState& state,Gu
                 const auto definition=name.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)},4096)):read_ansi(memory,arg(0),4096);
                 std::array<std::uint8_t,28> settings{};memory.read(GuestAddress{arg(1)},settings);std::optional<bool> timeout;
                 if(!serial_definition(definition,settings,timeout))fail(87);
-                else if(name.starts_with("BuildCommDCBAndTimeouts") && timeout && !arg(2))fail(87);
                 else {
                     memory.check(GuestAddress{arg(1)},settings.size(),Access::Write);
-                    if(name.starts_with("BuildCommDCBAndTimeouts") && timeout){memory.check(GuestAddress{arg(2)},20,Access::Write);for(unsigned i=0;i<5;++i)memory.store(GuestAddress{arg(2)+4*i},32,i==4 && *timeout?60000:0);}
+                    if(name.starts_with("BuildCommDCBAndTimeouts") && timeout && arg(2)){memory.check(GuestAddress{arg(2)},20,Access::Write);for(unsigned i=0;i<5;++i)memory.store(GuestAddress{arg(2)+4*i},32,i==4 && *timeout?60000:0);}
                     memory.write(GuestAddress{arg(1)},settings);result=1;
                 }
             }

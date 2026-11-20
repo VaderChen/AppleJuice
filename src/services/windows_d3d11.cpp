@@ -1,3 +1,5 @@
+#include "service_callback_task.hpp"
+#include "x64arm/windows_paths.hpp"
 #include "d3d11on12_bridge.hpp"
 #include "parallel_mapping_lock.hpp"
 #include "x64arm/entry_runtime_profile.hpp"
@@ -14,6 +16,8 @@
 #include "graphics_frame_test_control.hpp"
 #include "x64arm/windows_services.hpp"
 #include <atomic>
+#include <deque>
+#include <mutex>
 #include "x64arm/d3dx_font_raster.hpp"
 #include "x64arm/d3dx_sprite_sort.hpp"
 #include "x64arm/media_surface.hpp"
@@ -128,6 +132,32 @@ struct D3D11DrawCache {
     std::uint64_t layout{},index{},depth{},blend{},depth_state{},raster{};
     std::uint64_t ticket{}; // 最後一次以參照交給後端的命令序號（同步後端恆為 0）。
 };
+// 延遲內容的繪製快照池：錄製時從池中取一份快取物件，就地增量更新後直接當作唯讀快照交給命令清單（不再每次配置並複製約 70 KB）；
+// 命令清單釋放最後一個引用時物件回到池尾。先進先出，下一幀第 i 次繪製多半拿到上一幀第 i 次用過的物件，增量最少。
+// 池中物件仍持有上次綁定的資源引用，所以設上限；超過時直接釋放。X64ARM_D3D11_DEFERRED_DRAW_POOL=0 回到每次複製。
+struct D3D11DeferredDrawPool {
+    static constexpr std::size_t limit=512;
+    std::mutex mutex;std::deque<std::unique_ptr<D3D11DrawCache>> free;
+    std::unique_ptr<D3D11DrawCache> acquire(){
+        {std::lock_guard lock(mutex);if(!free.empty()){auto cache=std::move(free.front());free.pop_front();return cache;}}
+        return std::make_unique<D3D11DrawCache>();
+    }
+    void release(std::unique_ptr<D3D11DrawCache> cache){
+        std::unique_lock lock(mutex);
+        if(free.size()<limit){free.push_back(std::move(cache));return;}
+        lock.unlock(); // 解構可能釋放資源，不在鎖內進行。
+    }
+};
+bool d3d11_deferred_draw_pool_enabled() noexcept {
+    static const bool value=[] {const auto* text=std::getenv("X64ARM_D3D11_DEFERRED_DRAW_POOL");return !text || std::string_view(text)!="0";}();
+    return value;
+}
+[[gnu::noinline]] RecordedGraphicsCommand recorded_draw_pooled(const std::shared_ptr<D3D11DeferredDrawPool>& pool,std::unique_ptr<D3D11DrawCache> cache){
+    auto* const raw=cache.release();
+    // 建構 shared_ptr 失敗時會以同一刪除器處理，物件照樣回到池中。
+    std::shared_ptr<const GraphicsDraw> snapshot(&raw->draw,[pool,raw](const GraphicsDraw*){pool->release(std::unique_ptr<D3D11DrawCache>(raw));});
+    return {[snapshot=std::move(snapshot)](NativeOpenGlContext& native){native.graphics_draw_shared(snapshot);},1,0};
+}
 // 固定名稱綁定的節點指標（8 個共用名稱＋6 stage 各 5 個名稱＋繪製狀態 5 個名稱，見 d3d11_setter_front_path.inc）。
 using D3D11FixedBindings=std::array<std::vector<std::uint64_t>*,43>;
 inline constexpr Guid on12_iid{0x73,0x1e,0x61,0x85,0xa9,0x70,0x0e,0x49,0x96,0x14,0xa9,0xe3,0x02,0x77,0x79,0x04};
@@ -186,6 +216,7 @@ struct Identity {
     // 多份輪流使用：Metal 命令執行緒可能仍以參照讀取先前繪製的那幾份（見 draw_state）。
     // 輪流使用的繪製狀態快取（實際份數見 d3d11_draw_cache_count，上限 32）。
     std::array<std::unique_ptr<D3D11DrawCache>,32> draw_caches;unsigned draw_slot{};
+    std::shared_ptr<D3D11DeferredDrawPool> deferred_draw_pool; // 延遲內容才建立。
     std::map<Guid,std::vector<std::uint8_t>> private_data;
     std::map<Guid,std::uint64_t> private_interfaces;
     std::vector<std::array<float,6>> viewports;
@@ -211,6 +242,9 @@ struct Identity {
     // staging 資源最後一次 GPU 存取（Copy*／UpdateSubresource／Unmap 上傳）的完成旗標，依序排在該命令之後。
     // Map 帶 D3D11_MAP_FLAG_DO_NOT_WAIT 時未完成即回 DXGI_ERROR_WAS_STILL_DRAWING；已完成的緩衝讀回不必等命令執行緒排空。
     std::shared_ptr<const std::atomic<bool>> gpu_fence;
+    // STAGING 資源建立時沒有初始資料，之後也沒被 Copy*／UpdateSubresource 寫入或寫入型 Map：內容未定義（D3D11），
+    // Map 直接回零填的區塊，不必等命令執行緒與 GPU 讀回。STAGING 不能綁到管線，GPU 寫入只來自複製目的。
+    bool pristine{};
     std::shared_ptr<const GraphicsTimestampFuture> query_timestamp;
     // 遮蔽查詢：End 只記錄 fence 與取樣序號，GetData 在 fence 完成後才讀回可見度緩衝區。
     std::uint64_t query_pending_sequence{};
@@ -413,7 +447,7 @@ struct D3D11State {
     // IDXGIOutput::TakeOwnership 的持有裝置（單一公開輸出）；ReleaseOwnership 或裝置釋放前保留。
     std::uint64_t output_owner{};bool output_owner_exclusive{};
     std::uint64_t linkage_draws{},linkage_cache_hits{},linkage_uploads{},linkage_readback_bytes{};
-    std::uint64_t destroyed_objects{},draw_cache_full{},draw_cache_incremental{};
+    std::uint64_t destroyed_objects{},draw_cache_full{},draw_cache_incremental{},draw_cache_refresh{};
     std::array<std::uint64_t,6> unmap_calls{},unmap_bytes{}; // 依 Map 類型累計上傳次數與位元組（診斷 X64ARM_TRACE_GRAPHICS_STATS）。
     // 診斷：狀態設定前置快路徑完成與交回完整路徑的次數（見 d3d11_setter_front_path.inc）。
     std::uint64_t setter_front_hits{},setter_front_fallbacks{};
@@ -538,7 +572,7 @@ std::string WindowsServices::video_diagnostics() const {
     std::ostringstream out;
     out<<"video_backend=VideoToolbox hardware_sessions="<<d3d11_->hardware_sessions<<" decoded_frames="<<d3d11_->decoded_frames<<" live_interfaces="<<d3d11_->objects.size()<<" peak_interfaces="<<d3d11_->peak_interfaces<<'\n';
     if(d3d11_->graphics_draws || d3d11_->graphics_dispatches || d3d11_->graphics_frames)out<<"d3d11_backend=Metal draws="<<d3d11_->graphics_draws<<" dispatches="<<d3d11_->graphics_dispatches<<" frames="<<d3d11_->graphics_frames<<'\n';
-    if(d3d11_->draw_cache_full || d3d11_->draw_cache_incremental)out<<"d3d11_draw_cache full="<<d3d11_->draw_cache_full<<" incremental="<<d3d11_->draw_cache_incremental<<" destroyed="<<d3d11_->destroyed_objects<<'\n';
+    if(d3d11_->draw_cache_full || d3d11_->draw_cache_incremental)out<<"d3d11_draw_cache full="<<d3d11_->draw_cache_full<<" incremental="<<d3d11_->draw_cache_incremental<<" refresh="<<d3d11_->draw_cache_refresh<<" destroyed="<<d3d11_->destroyed_objects<<'\n';
     if(d3d11_->setter_front_hits || d3d11_->setter_front_fallbacks)out<<"d3d11_setter_front hits="<<d3d11_->setter_front_hits<<" fallbacks="<<d3d11_->setter_front_fallbacks<<'\n';
     if(d3d11_->draw_front_hits || d3d11_->draw_front_fallbacks)out<<"d3d11_draw_front hits="<<d3d11_->draw_front_hits<<" fallbacks="<<d3d11_->draw_front_fallbacks<<'\n';
     if(d3d11_->linkage_draws)out<<"d3d11_linkage draws="<<d3d11_->linkage_draws<<" cache_hits="<<d3d11_->linkage_cache_hits<<" uploads="<<d3d11_->linkage_uploads<<" readback_bytes="<<d3d11_->linkage_readback_bytes<<'\n';
@@ -601,8 +635,8 @@ std::span<const WindowsServiceDescriptor> d3d11_service_descriptors() {
         {"d3dcompiler_47.dll","D3DCompile",11},{"d3dcompiler_43.dll","D3DCompile",11},
         {"d3dcompiler_47.dll","D3DCompile2",14},{"d3dcompiler_47.dll","D3DCreateBlob",2},{"d3dcompiler_43.dll","D3DCreateBlob",2},
         {"d3dcompiler_47.dll","D3DDisassemble",5},{"d3dcompiler_43.dll","D3DDisassemble",5},
-        {"d3dcompiler_47.dll","D3DPreprocess",7},{"d3dcompiler_43.dll","D3DPreprocess",7},{"d3dcompiler_47.dll","D3DGetBlobPart",5},{"d3dcompiler_43.dll","D3DGetBlobPart",5},
-        {"d3dcompiler_47.dll","D3DStripShader",4},{"d3dcompiler_43.dll","D3DStripShader",4},{"d3dcompiler_47.dll","D3DGetDebugInfo",3},{"d3dcompiler_43.dll","D3DGetDebugInfo",3},
+        {"d3dcompiler_47.dll","D3DPreprocess",7},{"d3dcompiler_43.dll","D3DPreprocess",7},{"d3dcompiler_47.dll","D3DSetBlobPart",7},{"d3dcompiler_47.dll","D3DGetBlobPart",5},{"d3dcompiler_43.dll","D3DGetBlobPart",5},
+        {"d3dcompiler_46.dll","D3DStripShader",4},{"d3dcompiler_47.dll","D3DStripShader",4},{"d3dcompiler_43.dll","D3DStripShader",4},{"d3dcompiler_47.dll","D3DGetDebugInfo",3},{"d3dcompiler_43.dll","D3DGetDebugInfo",3},
         {"d3dcompiler_47.dll","D3DReadFileToBlob",2},{"d3dcompiler_47.dll","D3DWriteBlobToFile",3},{"d3dcompiler_47.dll","D3DCompileFromFile",9},
         {"d3dcompiler_47.dll","D3DAssemble",8},{"d3dcompiler_43.dll","D3DAssemble",8},
         {"d3d10.dll","D3D10CompileShader",10},{"d3d10.dll","D3D10CompileEffectFromMemory",9},{"d3d10.dll","D3D10GetShaderDebugInfo",3},
@@ -795,6 +829,34 @@ GraphicsMutex& WindowsServices::graphics_mutex() noexcept {static GraphicsMutex 
 // 延後銷毀清單待處理、比對模式）一律交給完整路徑，例外與錯誤回報不變。X64ARM_D3D11_FRONT_PATH=0 關閉。
 // IA／*Set* 狀態設定同樣先走前置路徑（d3d11_setter_front_path.inc）；X64ARM_D3D11_SETTER_FRONT_PATH=0 只關閉這一段。
 std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    if(service.symbol=="D3DWriteBlobToFile"){
+        return nested_continuation(state,memory,"寫入著色器 Blob",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall arg(s,m,service);
+            const auto finish=[&](std::uint32_t hr){arg.return_to(s,hr);return std::optional<std::uint32_t>{};};
+            const auto object=arg(0);
+            if(!object || !arg(1))co_return finish(0x80070057U);
+            const auto file=nested_service(s,m,"kernel32.dll","CreateFileW",{arg(1),0x40000000U,1,0,arg(2)?2U:1U,0x80,0});
+            if(file==(x86_?std::uint64_t{UINT32_MAX}:UINT64_MAX))co_return finish(0x80070000U|last_error_);
+            const auto unit=x86_?4U:8U;
+            const auto bits=static_cast<std::uint8_t>(unit*8);
+            std::uint64_t written=0;
+            std::uint32_t hr=0;
+            try{
+                const auto table=m.load(GuestAddress{object},bits);
+                const auto word_mask=x86_?std::uint64_t{UINT32_MAX}:UINT64_MAX;
+                const auto size=(co_await service_callback::call_value(m.load(GuestAddress{table+4*unit},bits),{object}))&word_mask;
+                const auto data=(co_await service_callback::call_value(m.load(GuestAddress{table+3*unit},bits),{object}))&word_mask;
+                written=allocate_heap(m,4);
+                if(!written)hr=0x8007000eU;
+                else if(size>UINT32_MAX || !nested_service(s,m,"kernel32.dll","WriteFile",{file,data,size,written,0}) ||
+                        m.load(GuestAddress{written},32)!=size)hr=0x80004005U;
+            }catch(const MemoryFault&){hr=0x80070057U;}
+            catch(const std::bad_alloc&){hr=0x8007000eU;}
+            if(written)(void)free_heap(m,written,s);
+            (void)nested_service(s,m,"kernel32.dll","CloseHandle",{file});
+            co_return finish(hr);
+        });
+    }
     // 診斷：X64ARM_TRACE_D3D11_FULL=1 統計走完整路徑（非本地）的 D3D11 呼叫：服務、呼叫執行緒、是否串流擁有者、是否串流的立即內容、
     // 串流是否有擁有者、Map 類型；含排空的整體耗時，每 2 秒輸出一次。
     static const bool trace_full=std::getenv("X64ARM_TRACE_D3D11_FULL")!=nullptr;
