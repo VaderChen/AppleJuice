@@ -724,6 +724,11 @@ bool d3d11_worker_create_enabled() noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_WORKER_CREATE");return !value || std::string_view(value)!="0";}();
     return enabled;
 }
+// STAGING 資源寫入型對應的保留區塊（見 d3d11_graphics_handlers.inc 的 Map）。
+bool d3d11_staging_persistent_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_STAGING_PERSISTENT");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
 bool d3d11_map_block_reuse_enabled() noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_MAP_BLOCK_REUSE");return !value || std::string_view(value)!="0";}();
     return enabled;
@@ -757,6 +762,45 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
     }
     const WindowsCall arg(state,memory,service);
     const auto found=d3d11_->objects.find_fast(arg(0));if(found==d3d11_->objects.end())return false;
+    // 診斷：X64ARM_TRACE_D3D11_COORDINATED=1 統計到達協調者本地路徑的 Map／Unmap／CreateTexture2D 的資源型態與參數
+    //（worker 已拒絕的呼叫），每 2^16 次與程序結束時列出前 24 名，用來判斷哪一類資源值得移到 worker 完成。只讀取。
+    static const bool trace_coordinated=std::getenv("X64ARM_TRACE_D3D11_COORDINATED")!=nullptr;
+    if(trace_coordinated && coordinator && (symbol=="Map" || symbol=="Unmap" || symbol=="CreateTexture2D")){
+        struct Trace {
+            std::mutex mutex;std::map<std::string,std::uint64_t> counts;std::uint64_t total{};
+            ~Trace(){dump();}
+            void dump(){
+                std::vector<std::pair<std::string,std::uint64_t>> items(counts.begin(),counts.end());
+                std::sort(items.begin(),items.end(),[](const auto& a,const auto& b){return a.second>b.second;});
+                std::fprintf(stderr,"[d3d11_coordinated] total=%llu kinds=%zu\n",static_cast<unsigned long long>(total),items.size());
+                for(std::size_t i=0;i<items.size() && i<24;++i)std::fprintf(stderr,"[d3d11_coordinated]   %llu %s\n",static_cast<unsigned long long>(items[i].second),items[i].first.c_str());
+            }
+        };
+        static Trace trace;char text[224]{};
+        if(symbol=="CreateTexture2D"){
+            std::uint32_t d[11]{};
+            try{for(unsigned i=0;i<11;++i)d[i]=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)+4*i},32));}catch(...){}
+            std::snprintf(text,sizeof text,"CreateTexture2D %ux%u mips=%u array=%u fmt=%u usage=%u bind=0x%x cpu=0x%x misc=0x%x init=%d",
+                d[0],d[1],d[2],d[3],d[4],d[7],d[8],d[9],d[10],arg(2)?1:0);
+        }else{
+            const auto resource=d3d11_->objects.find_fast(arg(1));
+            const bool deferred=found->second.kind==Kind::Context && found->second.identity->context_type;
+            if(resource==d3d11_->objects.end() || !resource->second.identity->resource)std::snprintf(text,sizeof text,"%s 無資源",symbol=="Map"?"Map":"Unmap");
+            else{
+                const auto& id=*resource->second.identity;const auto& d=id.resource->desc;
+                const auto word=[&](std::size_t at){std::uint32_t value=0;if(id.desc.size()>=at+4)std::memcpy(&value,id.desc.data()+at,4);return value;};
+                const auto sub=static_cast<std::uint32_t>(arg(2));
+                // 緩衝描述：+4 Usage、+12 CPUAccess；Texture2D 描述：+28 Usage、+36 CPUAccess。
+                const auto usage=d.dimension==1?word(4):word(28),cpu=d.dimension==1?word(12):word(36);
+                std::snprintf(text,sizeof text,"%s %s dim=%u %ux%u fmt=%u usage=%u cpu=0x%x sub=%u type=%u flags=0x%x persistent=%d mapped=%d",
+                    symbol=="Map"?"Map":"Unmap",deferred?"deferred":"immediate",d.dimension,d.width,d.height,d.format,usage,cpu,sub,
+                    symbol=="Map"?static_cast<std::uint32_t>(arg(3)):0U,symbol=="Map"?static_cast<std::uint32_t>(arg(4)):0U,
+                    id.persistent_maps.contains(sub)?1:0,id.subresource_maps.contains(sub)?1:0);
+            }
+        }
+        const std::lock_guard lock(trace.mutex);++trace.counts[text];
+        if(!(++trace.total&0xffffU))trace.dump();
+    }
     // 著色器尚未編譯：交給背景編譯並回到完整服務路徑，由處理程式讓呼叫者等待後重試（見 d3d11_graphics_handlers.inc），
     // 不在持映射與圖形鎖的本地／worker 服務內轉譯（雙人成行走到新區域時每個約 106 ms，期間所有 D3D11 服務停住）。
     if(found->second.kind==Kind::Device && found->second.identity && found->second.identity->native && resident_context_key(state)!=present_thread_ &&
@@ -821,15 +865,38 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
                 static const bool discard=[] {const auto* value=std::getenv("X64ARM_GRAPHICS_DISCARD_RENAME");return !value || std::string_view(value)!="0";}();
                 const auto type=static_cast<std::uint32_t>(arg(3)),flags=static_cast<std::uint32_t>(arg(4));
                 const auto& d=id.resource->desc;
-                if(!persistent || !discard || type!=4 || (flags&~0x100000U) || subresource || id.offered || id.subresource_maps.contains(0) ||
-                   d.dimension!=1 || !d.width || id.desc.size()<16)return false;
-                const auto word=[&](std::size_t at){std::uint32_t value=0;std::memcpy(&value,id.desc.data()+at,4);return value;};
-                if(word(4)!=2 || !(word(12)&0x10000U))return false;
-                const auto blocks=d3d11_->map_blocks.find(d.width);
-                if(blocks==d3d11_->map_blocks.end() || blocks->second.empty())return false;
-                const auto block=blocks->second.back();
-                if(memory.is_copy_on_write(GuestAddress{block}) || memory.is_copy_on_write(GuestAddress{block+d.width-1}))return false;
-            }else if(symbol=="Map"){const auto type=static_cast<std::uint32_t>(arg(3));if(type!=4 && type!=5)return false;}
+                const auto word=[&](std::size_t at){std::uint32_t value=0;if(id.desc.size()>=at+4)std::memcpy(&value,id.desc.data()+at,4);return value;};
+                const std::size_t usage_at=d.dimension==1?4:d.dimension==2?16:d.dimension==4?20:28;
+                if(word(usage_at)==3){
+                    // 從未寫入的 STAGING 資源第一次寫入型對應：回零填的保留區塊（不讀回 GPU），區塊之後留作持久映射。
+                    if(!d3d11_staging_persistent_enabled() || !persistent || type!=2 || flags || !id.pristine || id.offered || id.subresource_maps.contains(subresource) ||
+                       !d.levels || subresource>=d.levels*d.layers || !(word(usage_at+8)&0x10000U))return false;
+                    const auto level=subresource%d.levels;
+                    const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>level),std::max(1U,d.height>>level));
+                    const auto size=std::uint64_t{pitch[0]}*pitch[1]*std::max(1U,d.depth>>level);
+                    if(!size || size>(std::uint64_t{4}<<20))return false;
+                    const auto blocks=d3d11_->map_blocks.find(static_cast<std::size_t>(size));
+                    if(blocks==d3d11_->map_blocks.end() || blocks->second.empty())return false;
+                    const auto block=blocks->second.back();
+                    if(memory.is_copy_on_write(GuestAddress{block}) || memory.is_copy_on_write(GuestAddress{block+size-1}))return false;
+                }else{
+                    if(!persistent || !discard || type!=4 || (flags&~0x100000U) || subresource || id.offered || id.subresource_maps.contains(0) ||
+                       d.dimension!=1 || !d.width || id.desc.size()<16)return false;
+                    if(word(4)!=2 || !(word(12)&0x10000U))return false;
+                    const auto blocks=d3d11_->map_blocks.find(d.width);
+                    if(blocks==d3d11_->map_blocks.end() || blocks->second.empty())return false;
+                    const auto block=blocks->second.back();
+                    if(memory.is_copy_on_write(GuestAddress{block}) || memory.is_copy_on_write(GuestAddress{block+d.width-1}))return false;
+                }
+            }else if(symbol=="Map"){
+                const auto type=static_cast<std::uint32_t>(arg(3));
+                if(type!=4 && type!=5){
+                    // 已保留區塊的 STAGING 寫入型對應（不帶旗標）；其餘型態交協調者。
+                    const auto& d=id.resource->desc;std::uint32_t usage=0;const std::size_t usage_at=d.dimension==1?4:d.dimension==2?16:d.dimension==4?20:28;
+                    if(id.desc.size()>=usage_at+4)std::memcpy(&usage,id.desc.data()+usage_at,4);
+                    if(type!=2 || usage!=3 || static_cast<std::uint32_t>(arg(4)) || !d3d11_staging_persistent_enabled() || id.offered || id.subresource_maps.contains(subresource))return false;
+                }
+            }
             else{const auto mapped=id.subresource_maps.find(subresource);if(mapped==id.subresource_maps.end() || mapped->second.pointer!=kept->second.pointer)return false;}
         }
     }

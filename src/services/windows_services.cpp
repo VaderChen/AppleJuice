@@ -1808,7 +1808,7 @@ bool WindowsServices::same_state(const WindowsServices& other) const {
     if(registry_notifications_!=other.registry_notifications_ || next_registry_notification_!=other.next_registry_notification_)return false;
     if(timer_workers_exhausted_!=other.timer_workers_exhausted_ || timer_queues_!=other.timer_queues_ || queue_timers_!=other.queue_timers_ || next_timer_queue_handle_!=other.next_timer_queue_handle_)return false;
     if(wait_completion_handles_!=other.wait_completion_handles_ || wait_completion_packets_!=other.wait_completion_packets_ || wait_completion_targets_!=other.wait_completion_targets_)return false;
-    if(registered_waits_!=other.registered_waits_ || wait_workers_!=other.wait_workers_ || next_registered_wait_!=other.next_registered_wait_)return false;
+    if(registered_waits_!=other.registered_waits_ || wait_workers_!=other.wait_workers_ || next_registered_wait_!=other.next_registered_wait_ || pending_work_items_!=other.pending_work_items_)return false;
     if (gui_ != other.gui_) return false;
     if(font_enumerations_!=other.font_enumerations_)return false;
     if (exceptions_ != other.exceptions_) return false;
@@ -2988,8 +2988,21 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
             // 共用（具名、跨程序）互斥鎖交回完整路徑。11-21 曾在這裡於命名空間鎖下 release_locked（FF XIII 每秒約 4400 次），但跨程序
             // 互斥鎖以 flock 實作、沒有釋放時交給等待者的公平交接，本地快速釋放後呼叫者立刻重取，Steam 端等待者搶不到，遊戲等 IPC 回覆
             // 停頓數秒（2 vCPU 卡住、4 vCPU 最長幀 3.2 秒）。要做需先補跨程序的交接公平性。
-            if(mutex.shared)return refuse_mutex(1);
-            {
+            // 11-22：共用狀態加了「最近有人探查而拿不到」的時戳（SharedMutex::wanted_recently，任何程序的等待預檢與鎖下探查都會更新）。
+            // 最近 20 ms 內沒有人要這把鎖、本程序也沒有等待者時，在命名空間鎖下本地釋放；有人在等就照舊走完整路徑把時間讓出來，
+            // 對方最慢在下一輪探查後取得。FINAL FANTASY XIII 的 Steam IPC 每秒約 6 千次釋放原本全走完整排程。
+            // X64ARM_LOCAL_SHARED_MUTEX_RELEASE=0 關閉。
+            if(mutex.shared){
+                static const bool shared_release=[] {const auto* value=std::getenv("X64ARM_LOCAL_SHARED_MUTEX_RELEASE");return !value || std::string_view(value)!="0";}();
+                if(!shared_release || mutex.shared->wanted_recently(UINT64_C(20'000'000)))return refuse_mutex(1);
+                if(mutex_has_waiters(found->second.mutex))return refuse_mutex(5);
+                {
+                    SharedEventLock lock(mutex.shared->lock_descriptor());
+                    if(mutex.shared->release_locked(key))return refuse_mutex(2);
+                }
+                value=1;
+                trace_event_operation('M',arg(0),key,memory.load(GuestAddress{state.reg(Gpr::Rsp)},pointer_bits));
+            }else{
                 if(mutex.owner!=key || !mutex.recursion)return refuse_mutex(2);
                 // 交接給等待者會改變 runnable 集合，協調者要重算期限：有等待者時交回完整路徑。
                 if(mutex.recursion==1 && mutex_has_waiters(found->second.mutex))return refuse_mutex(5);

@@ -46,7 +46,9 @@ void WindowsServices::release_registered_wait(std::uint64_t handle){
     }
 }
 void WindowsServices::poll_registered_waits(GuestMemory& memory){
-    (void)memory;
+    // 待執行的工作項目：執行中的項目若都阻塞在等待（不算可執行），這裡補啟動，避免排隊的項目永遠等不到完成事件。
+    if(!pending_work_items_.empty())if(const auto current=threads_.items.find(threads_.current);current!=threads_.items.end())
+        start_pending_work_items(current->second.context,memory);
     for(auto& [handle,wait]:registered_waits_){
         (void)handle;if(!wait.armed || wait.active || wait.ready || wait.closing)continue;
         auto& worker=threads_.items.at(wait.worker);bool signaled=false;
@@ -75,13 +77,35 @@ std::optional<std::uint32_t> WindowsServices::resume_registered_wait(GuestState&
     wait.callback_storage.clear();
     if(wait.device_owner)finish_device_notification(state,memory,wait.device_owner);
     if(wait.mib_owner)finish_mib_notification(state,memory,wait.mib_owner);
-    if(wait.closing)release_registered_wait(handle);
+    if(wait.closing){release_registered_wait(handle);start_pending_work_items(state,memory);}
     else {
         wait.armed=!(wait.flags&8U);
         wait.deadline=wait.armed?runtime_.clock_ticks+std::min(wait.interval_ticks,UINT64_MAX-runtime_.clock_ticks):UINT64_MAX;
         auto& worker=threads_.items.at(threads_.current);worker.status=ThreadStatus::Waiting;worker.wait={};worker.wait.kind=ThreadWaitKind::RegisteredWait;worker.wait.deadline=wait.deadline;
     }
     schedule(state,memory);return std::nullopt;
+}
+// 工作項目的併行上限（見 pending_work_items_）。X64ARM_POOL_WORK_QUEUE=0 恢復「每個工作項目立刻配一條執行緒、超過 64 個回失敗」。
+static bool pool_work_queue_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_POOL_WORK_QUEUE");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
+// 正在執行或等著上 vCPU 的工作項目數；阻塞在等待中的不算（Windows 的執行緒池在工作阻塞時會追加執行緒）。
+unsigned WindowsServices::pool_work_runnable() const {
+    unsigned count=0;
+    for(const auto& [handle,wait]:registered_waits_){
+        (void)handle;if(!wait.work_item)continue;
+        const auto thread=threads_.items.find(wait.worker);
+        if(thread!=threads_.items.end() && thread->second.status==ThreadStatus::Runnable)++count;
+    }
+    return count;
+}
+void WindowsServices::start_pending_work_items(const GuestState& state,GuestMemory& memory){
+    const auto limit=std::max(1U,runtime_.processor_count);
+    while(!pending_work_items_.empty() && registered_waits_.size()<64 && pool_work_runnable()<limit){
+        auto callback=std::move(pending_work_items_.front());pending_work_items_.pop_front();
+        if(queue_pool_callback(state,memory,callback)){pending_work_items_.push_front(std::move(callback));break;}
+    }
 }
 std::uint32_t WindowsServices::queue_pool_callback(const GuestState& state,GuestMemory& memory,GuestCallback callback){
     // 與 QueueUserWorkItem 相同的一次性工作項目；以 callback_batch 傳遞完整參數，完成後由 resume_registered_wait 釋放。
@@ -110,6 +134,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_registered_wait(GuestState&
         if(!arg(0))return finish(0,87);
         if(arg(2)&~UINT64_C(0x90))return finish(0,50); // 長工作／持續執行緒提示；不提供 impersonation 或 APC I/O worker。
         memory.check(GuestAddress{arg(0)},1,Access::Execute);
+        // 排入一律成功（與 Windows 相同）：可執行中的工作項目已達處理器數或 worker 表已滿時先排隊，否則立刻啟動。
+        // FINAL FANTASY XIII 每秒排入約 800 個工作項目；原本同時開 64 條執行緒在 2 個 vCPU 上以 Sleep(0) 互相讓出（15 分鐘 1.99 億次），
+        // 超過 64 個時 QueueUserWorkItem 還會失敗。
+        if(pool_work_queue_enabled()){
+            if(!pending_work_items_.empty() || registered_waits_.size()>=64 || pool_work_runnable()>=std::max(1U,runtime_.processor_count)){
+                pending_work_items_.push_back({arg(0),{arg(1)}});return finish(1);
+            }
+            if(const auto error=queue_pool_callback(state,memory,{arg(0),{arg(1)}})){
+                if(error!=8)return finish(0,error);
+                pending_work_items_.push_back({arg(0),{arg(1)}});
+            }
+            return finish(1);
+        }
         if(const auto error=queue_pool_callback(state,memory,{arg(0),{arg(1)}}))return finish(0,error);
         return finish(1);
     }

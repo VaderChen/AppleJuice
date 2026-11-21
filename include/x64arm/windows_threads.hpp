@@ -107,6 +107,8 @@ struct GuestThread {
     // 常駐平行 worker slot 的時間片期限（單調時鐘 100 ns）：期限內重新選取客體時保留原 slot，避免每次集合都輪替。
     std::uint64_t parallel_slice_deadline{};
     std::uint64_t null_wait_ticks{}; // 上次對 NULL handle 等待的單調時鐘（100 ns），判定是否在自旋。
+    std::uint64_t sleep_zero_ticks{}; // 上次 Sleep(0) 的單調時鐘（100 ns）與連續次數，判定是否與其他執行緒互相讓出（見 resident_block_service_impl）。
+    std::uint32_t sleep_zero_streak{};
     std::uint32_t dynamic_priority_boost{};
     bool priority_boost_disabled{};
     std::uint32_t power_control{}, power_state{};

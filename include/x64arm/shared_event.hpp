@@ -50,6 +50,8 @@ public:
     bool available_hint(std::uint64_t thread) noexcept;
     bool acquire_locked(std::uint64_t thread); // 回傳是否承接 abandoned ownership。
     std::uint32_t release_locked(std::uint64_t thread);
+    // 最近 window_ns 內是否有其他執行緒（任何程序）探查這把鎖而拿不到：擁有者據此決定釋放時要不要走完整排程把時間讓出來。
+    bool wanted_recently(std::uint64_t window_ns) const noexcept;
     SharedMutexState state_locked();
     void abandon(std::uint64_t thread);
     bool owned() const noexcept;

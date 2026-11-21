@@ -105,6 +105,6 @@
                 }
                 record_diagnostic("d3dx_normal_map_cpu");
             }
-            destination->pristine=false;
+            destination->pristine=false;drop_persistent(destination);
             if(destination->texture_desc[7]==3)destination->gpu_fence=native.graphics_fence_pending();
         }

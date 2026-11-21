@@ -1898,7 +1898,11 @@ void MetalGl::graphics_handoff(NativeGraphics& consumer,const GraphicsView& view
     [next->commands_ encodeWaitForEvent:handoff_event_ value:value];
 }}
 void MetalGl::graphics_present(const GraphicsView& v){@autoreleasepool{
-    if(auto* trace=metal_pass_trace())std::fprintf(trace,"P\n");
+    if(auto* trace=metal_pass_trace()){std::fprintf(trace,"P\n");std::fflush(trace);}
+    if(!metal_pass_trace_armed() && !(metal_pass_trace_frames()&63U)){
+        static const char* const trigger=std::getenv("X64ARM_METAL_PASS_TRACE_TRIGGER");
+        if(trigger && ::access(trigger,F_OK)==0)metal_pass_trace_armed()=true;
+    }
     ++metal_pass_trace_frames();
     auto texture=metal_texture(v);if(texture.width!=width_ || texture.height!=height_)throw std::invalid_argument("交換鏈尺寸與共用呈現表面不符");begin_commands(true,"present");
     // 呈現保留交換鏈已編碼的 sRGB 值；格式轉換取樣不可再次解碼成線性值。

@@ -266,8 +266,13 @@ struct MutexHeader {
     std::uint64_t signature{mutex_magic},references{},process{},thread{};
     std::uint32_t recursion{},abandoned{},characters{};
     std::array<char16_t,260> name{};
+    // 最近一次有人探查而拿不到的宿主單調時鐘（奈秒，跨程序可比）。放在名稱之後，不改變既有欄位位置；舊版引擎的程序不會寫入，視為沒有人在等。
+    std::uint64_t wanted{};
 };
 static_assert(sizeof(MutexHeader)<=detail::named_object_page_hint_offset);
+namespace {
+std::uint64_t mutex_wanted_now() noexcept {return ::clock_gettime_nsec_np(CLOCK_UPTIME_RAW);}
+}
 }
 struct SharedMutexStorage {
     int directory{-1},file{-1};MutexHeader* data{};std::string name;bool counted{},lease{};
@@ -295,10 +300,14 @@ void SharedMutex::detach_handles(){
 bool SharedMutex::available_hint(std::uint64_t thread) noexcept{
 #if !defined(_WIN32)
     auto& data=*storage_->data;
-    if(storage_->lease)return std::atomic_ref(data.thread).load(std::memory_order_acquire)==thread;
+    if(storage_->lease){
+        if(std::atomic_ref(data.thread).load(std::memory_order_acquire)==thread)return true;
+        std::atomic_ref(data.wanted).store(mutex_wanted_now(),std::memory_order_release);return false;
+    }
     if(!std::atomic_ref(data.process).load(std::memory_order_acquire))return true;
     // 其他擁有者：只探測 mutex 檔本身的 ownership lease（非阻塞，不碰命名空間鎖）；可取得表示擁有者已結束，交給鎖下流程處理放棄。
     if(::flock(storage_->file,LOCK_EX|LOCK_NB)==0){(void)::flock(storage_->file,LOCK_UN);return true;}
+    std::atomic_ref(data.wanted).store(mutex_wanted_now(),std::memory_order_release);
     return false;
 #else
     (void)thread;return true;
@@ -307,10 +316,10 @@ bool SharedMutex::available_hint(std::uint64_t thread) noexcept{
 bool SharedMutex::available_locked(std::uint64_t thread){
 #if !defined(_WIN32)
     auto& data=*storage_->data;
-    if(storage_->lease)return data.thread==thread;
+    if(storage_->lease){if(data.thread==thread)return true;std::atomic_ref(data.wanted).store(mutex_wanted_now(),std::memory_order_release);return false;}
     if(!data.process)return true;
     // ownership lease 由核心維護；程序退出或遭終止後自動釋放，不依賴 PID 存活猜測。
-    if(::flock(storage_->file,LOCK_EX|LOCK_NB)<0){if(errno==EWOULDBLOCK || errno==EAGAIN)return false;throw HostCallFault("無法探查共用 mutex ownership");}
+    if(::flock(storage_->file,LOCK_EX|LOCK_NB)<0){if(errno==EWOULDBLOCK || errno==EAGAIN){std::atomic_ref(data.wanted).store(mutex_wanted_now(),std::memory_order_release);return false;}throw HostCallFault("無法探查共用 mutex ownership");}
     (void)::flock(storage_->file,LOCK_UN);data.process=0;data.thread=0;data.recursion=0;data.abandoned=1;return true;
 #else
     (void)thread;return false;
@@ -332,6 +341,14 @@ std::uint32_t SharedMutex::release_locked(std::uint64_t thread){
     if(!--data.recursion){data.process=0;data.thread=0;storage_->lease=false;(void)::flock(storage_->file,LOCK_UN);if(storage_->wake)storage_->wake->notify();}return 0;
 #else
     (void)thread;return 50;
+#endif
+}
+bool SharedMutex::wanted_recently(std::uint64_t window_ns) const noexcept{
+#if !defined(_WIN32)
+    const auto wanted=std::atomic_ref(storage_->data->wanted).load(std::memory_order_acquire);
+    return wanted && mutex_wanted_now()-wanted<window_ns;
+#else
+    (void)window_ns;return true;
 #endif
 }
 SharedMutexState SharedMutex::state_locked(){

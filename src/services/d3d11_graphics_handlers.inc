@@ -320,7 +320,17 @@
                 }
                 // 回 WAS_STILL_DRAWING 時送出待提交的命令（不等待，與 Flush／GetData 相同），客體輪詢才會看到完成；驅動在這種情況同樣會自行提交。
                 if(still_drawing){result=0x887A000AU;if(arg(5))write_pointer(arg(5),0);context->native->graphics_flush(false);}else{
-                const bool persistent=persistent_maps_enabled && usage==2 && (type==4 || type==5) && !context->context_type;
+                // STAGING 資源的寫入型對應（D3D11_MAP_WRITE）同樣保留區塊：staging 的內容只會被 CPU 的 Map 或以它為目的的 Copy*／Update* 改寫，
+                // 後者會使區塊失效（drop_persistent），所以上次 Unmap 上傳的區塊就是目前內容。之後的 WRITE 對應直接回同一區塊，不讀回 GPU、
+                // 不配置 heap，Map／Unmap 都可在 worker 完成（見 d3d11_local_eligible）。Control 的紋理串流每輪約 26 萬次 staging
+                // Create→Map(WRITE)→Unmap，重複使用的 staging 緩衝每次 Map 還要同步讀回。X64ARM_D3D11_STAGING_PERSISTENT=0 關閉。
+                const bool staging_write=d3d11_staging_persistent_enabled() && persistent_maps_enabled && usage==3 && type==2 && !context->context_type;
+                // READ_WRITE 會經另一個區塊改寫內容：先讓保留的區塊失效。
+                if(usage==3 && type==3)if(const auto old=resource->persistent_maps.find(u32(2));old!=resource->persistent_maps.end()){
+                    if(!keep_block(old->second.pointer,old->second.size) && !free_heap(memory,old->second.pointer,state))throw HostCallFault("D3D11 持久映射記憶體已被客體破壞");
+                    std::erase(resource->allocations,old->second.pointer);resource->persistent_maps.erase(old);
+                }
+                const bool persistent=(persistent_maps_enabled && usage==2 && (type==4 || type==5) && !context->context_type) || staging_write;
                 const auto kept=persistent?resource->persistent_maps.find(u32(2)):resource->persistent_maps.end();
                 std::uint64_t pointer=0;std::size_t mapped_size=0;
                 if(kept!=resource->persistent_maps.end()){pointer=kept->second.pointer;mapped_size=kept->second.size;}
@@ -341,7 +351,13 @@
                         // 從未被寫入的 staging 資源：回零填區塊（內容未定義），不同步讀回 GPU。寫入型 Map 之後由 Unmap 上傳，內容不再未定義。
                         const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));
                         const auto size=std::uint64_t{pitch[0]}*pitch[1]*std::max(1U,d.depth>>view.level);require(size && size<=512U*1024U*1024U);
-                        mapped_size=static_cast<std::size_t>(size);pointer=allocate_heap(memory,mapped_size);if(!pointer)throw std::bad_alloc{};
+                        mapped_size=static_cast<std::size_t>(size);
+                        // 寫入型對應先取同大小的保留區塊（worker 只能從這裡取，d3d11_local_eligible 已核對）。
+                        if(const auto reuse=bridge.map_blocks.find(mapped_size);staging_write && d3d11_map_block_reuse_enabled() && reuse!=bridge.map_blocks.end() && !reuse->second.empty()){
+                            pointer=reuse->second.back();reuse->second.pop_back();bridge.map_block_bytes-=mapped_size;
+                        }else if(graphics_local())throw std::bad_alloc{};
+                        else pointer=allocate_heap(memory,mapped_size);
+                        if(!pointer)throw std::bad_alloc{};
                         resource->allocations.push_back(pointer);memory.fill(GuestAddress{pointer},0,mapped_size);
                         if(type!=1)resource->pristine=false;
                     }else{

@@ -253,6 +253,8 @@ struct D3D12State {
     std::map<std::uint64_t,CommandSignature> signatures;
     struct Fence {
         std::atomic<std::uint64_t> value{};
+        // 已由提交執行緒依序重播（提交給 GPU）的最大 Signal 值；GPU 尚未完成時 value 仍較小。Queue.Wait 以此放行（見 Queue.Wait）。
+        std::atomic<std::uint64_t> submitted{};
         std::vector<std::pair<std::uint64_t,std::uint64_t>> events;
         std::vector<std::pair<std::uint64_t,std::shared_ptr<std::atomic<bool>>>> waits;
     };
@@ -991,6 +993,10 @@ bool d3d12_bind_all(){static const bool value=[] {const auto* text=std::getenv("
 // D3D12 上傳與描述元鏡像直接寫入共享記憶體（X64ARM_D3D12_DIRECT_UPLOAD=0 恢復排在命令流中的 staging 複製）。
 bool d3d12_direct_uploads(){static const bool value=[] {const auto* text=std::getenv("X64ARM_D3D12_DIRECT_UPLOAD");return !text || std::string_view(text)!="0";}();return value;}
 // 需要先前提交已重播完成的方法：呈現與交換鏈緩衝變動、裝置與佇列最後釋放。
+bool d3d12_wait_submitted(){
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_D3D12_WAIT_SUBMITTED");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
 bool d3d12_drains(std::string_view symbol){
     return symbol=="Swap.ResizeBuffers" || symbol=="Swap.ResizeBuffers1" ||
         symbol=="Swap.SetFullscreenState" || symbol=="Swap.Release" || symbol=="Device.Release" || symbol=="Queue.Release";
@@ -1062,6 +1068,10 @@ void WindowsServices::d3d12_submit_loop(GuestMemory& memory,D3D12Submitter& subm
             (signal?stats.signals:present?stats.presents:stats.executes).fetch_add(1,std::memory_order_relaxed);
             stats.lists.fetch_add(job.programs.size(),std::memory_order_relaxed);
         }
+        // 診斷：X64ARM_D3D12_SUBMIT_DELAY_US=<微秒> 在每個重播工作（命令清單提交）前延遲，放大「ExecuteCommandLists 返回」到「實際重播」的時間差，
+        // 用來穩定重現只在重播較慢（著色器快取未熱）時出現的順序問題。只影響時序，不作成績。
+        {static const unsigned delay_us=[] {const auto* value=std::getenv("X64ARM_D3D12_SUBMIT_DELAY_US");return value?static_cast<unsigned>(std::strtoul(value,nullptr,10)):0U;}();
+            if(delay_us && !signal && !present)std::this_thread::sleep_for(std::chrono::microseconds(delay_us));}
         // 圖形鎖由 invoke_d3d12 入口取得（不在此外層持有），重播才能在命令清單之間讓給等待者。
         d3d12_submit_context()=&job;
         try{if(!job.dependency)(void)invoke_d3d12(idle,memory,*job.method);}
@@ -2816,8 +2826,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             if(d3d12_order_trace())std::fprintf(stderr,"d3d12_order Wait呼叫 佇列=%llx fence=%llx 值=%llu 目前=%llu\n",static_cast<unsigned long long>(self),static_cast<unsigned long long>(arg(1)),
                 static_cast<unsigned long long>(arg(2)),static_cast<unsigned long long>(fence->value.load(std::memory_order_acquire)));
             if(fence->value.load(std::memory_order_acquire)>=arg(2))return finish(ok);
+            // Queue.Wait 是 GPU 端的佇列間順序：之後提交到本佇列的工作要排在該 fence 值之後執行，不是要 CPU 等 GPU 做完。
+            // Metal 的命令佇列依提交順序執行，所以被等待的 Signal 一旦已依序重播（它之前的工作都已提交），本佇列後續工作接著提交
+            // 就滿足順序；不必等 GPU 完成。原本等到 GPU 完成才放行，每幀跨佇列 Wait 的程式無法讓編碼與 GPU 重疊
+            // （電馭叛客 720p：GPU 16 ms＋編碼約 20 ms 變成串行 36 ms，約 27 FPS；11-17 沒有這項等待時約 50）。
+            // 客體可見的完成值（GetCompletedValue／SetEventOnCompletion）仍以 GPU 完成為準。X64ARM_D3D12_WAIT_SUBMITTED=0 恢復等 GPU 完成。
+            if(d3d12_wait_submitted() && fence->submitted.load(std::memory_order_acquire)>=arg(2))return finish(ok);
             d3d12_start_submitter(memory);if(!d3d12_submitter_)return finish(no_memory);
-            auto ready=std::make_shared<std::atomic<bool>>(false);fence->waits.emplace_back(arg(2),ready);
+            auto ready=std::make_shared<std::atomic<bool>>(false);
+            {
+                const std::lock_guard wait_lock(d3d12_submitter_->mutex);
+                // 與提交執行緒的 Signal 重播在同一把鎖內核對，避免剛好錯過。
+                if(d3d12_wait_submitted() && fence->submitted.load(std::memory_order_acquire)>=arg(2))return finish(ok);
+                fence->waits.emplace_back(arg(2),ready);
+            }
             D3D12Submitter::Job job;job.arguments={self,arg(1),arg(2),0};job.method=&d3d12_wait_method;
             job.fence=std::move(fence);job.dependency=std::move(ready);
             d3d12_enqueue(*d3d12_submitter_,std::move(job),false);return finish(ok);
@@ -2830,6 +2852,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 static_cast<unsigned long long>(arg(1)),static_cast<unsigned long long>(arg(2)));
             trace_d3d12_fence(submit_job?"queue_signal_apply":"queue_signal_enqueue",arg(1),arg(2),
                 fence->value.load(std::memory_order_acquire),self);
+            // 重播到這個 Signal：它之前的工作都已依序提交，記錄已提交值並放行等這個值的 Queue.Wait（見 Queue.Wait 的說明）。
+            if(submit_job && d3d12_submitter_ && d3d12_wait_submitted()){
+                {
+                    const std::lock_guard wait_lock(d3d12_submitter_->mutex);
+                    if(fence->submitted.load(std::memory_order_relaxed)<arg(2))fence->submitted.store(arg(2),std::memory_order_release);
+                    for(const auto& item:fence->waits)if(item.first<=arg(2))item.second->store(true,std::memory_order_release);
+                }
+                d3d12_submitter_->wake.notify_one();d3d12_submitter_->idle.notify_all();
+            }
             // 非同步提交：排在前面的重播之後，由提交執行緒掛上完成旗標並只登記通知（由客體端輪詢套用、觸發事件）。
             if(!submit_job && d3d12_submitter_){
                 D3D12Submitter::Job job;job.arguments={self,arg(1),arg(2),0};job.method=&d3d12_signal_method;

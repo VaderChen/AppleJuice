@@ -459,6 +459,35 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
     if(!d3d9_)d3d9_=std::make_shared<D3D9State>();auto& bridge=*d3d9_;
 #include "d3d9_validator_handlers.inc"
     const WindowsCall arg(state,memory,service);auto symbol=service.symbol;const unsigned ps=x86_?4:8;const auto pb=static_cast<std::uint8_t>(ps*8);
+    // 狀態設定的前置路徑：與目前值完全相同的 SetRenderState／SetSamplerState／SetStreamSource／SetStreamSourceFreq 直接回 D3D_OK，
+    // 不進完整分派（數百個方法名稱比對的長鏈、延後銷毀清理與收尾掃描）。儲存的值先前已通過同一組檢查，重設相同的值沒有可觀察的副作用；
+    // 錄製狀態區塊中的裝置、找不到物件與任何不相同的值照舊走完整路徑。FINAL FANTASY XIII 戰鬥每幀約 2.4 萬次這四種呼叫、只有約 340 次繪製。
+    // X64ARM_D3D9_SETTER_FRONT=0 關閉。
+    {
+        static const bool setter_front=[] {const auto* value=std::getenv("X64ARM_D3D9_SETTER_FRONT");return !value || std::string_view(value)!="0";}();
+        if(setter_front && symbol.size()>=21 && symbol[0]=='D' && symbol[6]!='X'){
+            const auto dot=symbol.find('.');
+            const auto method=dot==std::string_view::npos?std::string_view{}:symbol.substr(dot+1);
+            const int kind=symbol.substr(0,dot==std::string_view::npos?0:dot).starts_with("Device")?
+                (method=="SetRenderState"?1:method=="SetSamplerState"?2:method=="SetStreamSourceFreq"?3:method=="SetStreamSource"?4:0):0;
+            if(kind)if(const auto found=bridge.objects.find(arg(0));found!=bridge.objects.end() && found->second && found->second->kind==Kind::Device && !found->second->recording){
+                const auto& device=*found->second;bool same=false;
+                const auto a1=static_cast<std::uint32_t>(arg(1)),a2=static_cast<std::uint32_t>(arg(2)),a3=static_cast<std::uint32_t>(arg(3));
+                switch(kind){
+                case 1:{const auto it=device.render.find(a1);same=it!=device.render.end() && it->second==a2;break;}
+                case 2:if(a1<16 || (a1>=257 && a1<=260)){const auto it=device.sampler.find(a2+(a1<16?a1:a1-241)*32);same=it!=device.sampler.end() && it->second==a3;}break;
+                case 3:same=a1<16 && device.stream_frequency[a1]==a2;break;
+                case 4:if(a1<16 && arg(2)){
+                    const auto a4=static_cast<std::uint32_t>(arg(4));
+                    if(a1)same=device.extra_streams[a1-1].buffer==arg(2) && device.extra_streams[a1-1].offset==a3 && device.extra_streams[a1-1].stride==a4;
+                    else same=device.vertex_buffer==arg(2) && device.stream_offset==a3 && device.stream_stride==a4;
+                }break;
+                default:break;
+                }
+                if(same){arg.return_to(state,0);return std::nullopt;}
+            }
+        }
+    }
     std::vector<GuestCallback> private_callbacks;
     const auto private_ref=[&](std::uint64_t pointer,unsigned slot){const auto table=memory.load(GuestAddress{pointer},pb);private_callbacks.push_back({memory.load(GuestAddress{table+slot*ps},pb),{pointer}});};
     const auto u=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};

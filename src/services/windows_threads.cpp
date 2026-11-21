@@ -1609,7 +1609,24 @@ bool WindowsServices::resident_block_service_impl(GuestState& state,GuestMemory&
     const auto null_now=null_wait?detail::monotonic_ticks():0;
     const bool null_park=null_wait && null_park_enabled && !x86_ && thread.null_wait_ticks && null_now-thread.null_wait_ticks<UINT64_C(20000);
     if(null_wait)thread.null_wait_ticks=null_now;
-    const bool yield=signal_handoff || (null_wait && !null_park) || symbol=="SwitchToThread" || ((symbol=="Sleep" || symbol=="SleepEx") && !static_cast<std::uint32_t>(arg(0)));
+    // Sleep(0) 乒乓停駐：兩條以上執行緒在 100 µs 內輪流以 Sleep(0) 讓出（各自在等別人做完事），每次讓出都要協調者選人換手，
+    // 協調者因此滿載、真正的工作排不上（FINAL FANTASY XIII 戰鬥中每秒約 8 萬次，worker 只有 1% 時間在跑客體碼）。
+    // 同一執行緒連續 16 次以上、且上一次讓出來自另一條執行緒時，這次改為停駐 X64ARM_PARALLEL_SLEEP0_PARK_US（預設 200 µs）：
+    // 對方沒有別人可讓時 Sleep(0) 直接在 worker 返回，不再經協調者。Windows 的 Sleep(0) 把剩餘時間片讓給同優先序的就緒執行緒，
+    // 何時再排到不保證。alertable 的 SleepEx 不適用。X64ARM_PARALLEL_SLEEP0_PARK=0 關閉。
+    static const bool sleep0_park_enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_SLEEP0_PARK");return !value || std::string_view(value)!="0";}();
+    static const std::uint64_t sleep0_park_ticks=[] {const auto* value=std::getenv("X64ARM_PARALLEL_SLEEP0_PARK_US");
+        return value && *value?std::max<std::uint64_t>(1,std::strtoull(value,nullptr,10))*10:UINT64_C(2000);}();
+    bool sleep0_park=false;
+    if((symbol=="Sleep" || (symbol=="SleepEx" && !static_cast<std::uint32_t>(arg(1)))) && !static_cast<std::uint32_t>(arg(0))){
+        const auto now=detail::monotonic_ticks();
+        thread.sleep_zero_streak=thread.sleep_zero_ticks && now-thread.sleep_zero_ticks<UINT64_C(2000)?std::min<std::uint32_t>(thread.sleep_zero_streak+1,1U<<20):0U;
+        thread.sleep_zero_ticks=now;
+        sleep0_park=sleep0_park_enabled && thread.sleep_zero_streak>=16 && sleep_zero_last_thread_ && sleep_zero_last_thread_!=key &&
+            now-sleep_zero_last_ticks_<UINT64_C(1000) && resident_block_parking() && resident_parkable(ThreadWaitKind::Sleep);
+        sleep_zero_last_ticks_=now;sleep_zero_last_thread_=key;
+    }
+    const bool yield=!sleep0_park && (signal_handoff || (null_wait && !null_park) || symbol=="SwitchToThread" || ((symbol=="Sleep" || symbol=="SleepEx") && !static_cast<std::uint32_t>(arg(0))));
     // x86 只開讓出（X64ARM_X86_RESIDENT_SLOT=yield）：事件交接、NULL 等待與各種阻塞仍交回全停。
     if(x86_ && !x86_resident_slot_enabled() && (!yield || signal_handoff || null_wait))return false;
     if(yield){
@@ -1631,6 +1648,17 @@ bool WindowsServices::resident_block_service_impl(GuestState& state,GuestMemory&
         if((signal_handoff || (sleep_by_priority && symbol!="SwitchToThread" && !null_wait)) && best &&
            best->effective_priority(runtime_.process_priority_class,runtime_.process_background)<
            thread.effective_priority(runtime_.process_priority_class,runtime_.process_background))best=nullptr;
+        // 連續 Sleep(0) 都選不到可換手的對象（候選停在服務入口、有待辦服務等，只有完整排程能讓它前進），但確實有可執行的執行緒
+        // 沒排上 vCPU：原地續跑會讓呼叫者以每秒數十萬次經協調者空轉，而那些執行緒永遠等不到排程點（FINAL FANTASY XIII 的間歇性
+        // 長停頓：畫面停住、Sleep 每秒約 22 萬次）。尚未改動任何狀態，交回完整路徑由 schedule 重新分配。X64ARM_PARALLEL_SLEEP0_STARVE=0 關閉。
+        static const bool sleep0_starve=[] {const auto* value=std::getenv("X64ARM_PARALLEL_SLEEP0_STARVE");return !value || std::string_view(value)!="0";}();
+        if(sleep0_starve && !best && !signal_handoff && !null_wait && symbol!="SwitchToThread" && thread.sleep_zero_streak>=16){
+            for(const auto& [id,other]:threads_.items){
+                if(id==key || id==threads_.current || other.status!=ThreadStatus::Runnable || other.suspended)continue;
+                if(std::find(active.begin(),active.end(),&other.context)!=active.end())continue;
+                thread.sleep_zero_streak=0;return false;
+            }
+        }
         if(null_wait){memory.store(GuestAddress{x86_?state.fs_base+0x34:state.gs_base+0x68},32,6);if(current)last_error_=6;}
         arg.return_to(state,null_wait?0xffffffffU:signal_handoff?1U:symbol=="SwitchToThread"?(best?1U:0U):0U);
         ++state.tsc;state.rep_compare={};
@@ -1674,6 +1702,8 @@ bool WindowsServices::resident_block_service_impl(GuestState& state,GuestMemory&
         // 結果已確定：LastError 先寫好，等待完成時回 WAIT_FAILED（見 resolve_thread_waits 的 null_wait）。
         wait.kind=ThreadWaitKind::Sleep;wait.null_wait=true;wait.deadline=runtime_.clock_ticks+null_park_ticks;
         memory.store(GuestAddress{state.gs_base+0x68},32,6);if(current)last_error_=6;
+    }else if(sleep0_park){
+        wait.kind=ThreadWaitKind::Sleep;wait.deadline=runtime_.clock_ticks+sleep0_park_ticks;
     }else if(condition_service){
         // 與完整路徑相同：釋放 SRW（共用模式減一個持有者、獨占清 bit0）後登記 Condition 等待，喚醒時由等待解析重新取得。
         // 旗標非法、逾時 0、未持有或記憶體不可寫，交回完整路徑。

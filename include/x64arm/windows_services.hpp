@@ -1946,6 +1946,13 @@ private:
     std::map<std::uint64_t,RegisteredWait> registered_waits_;
     std::map<std::uint64_t,std::uint64_t> wait_workers_;
     std::uint64_t next_registered_wait_{0xc0000};
+    // QueueUserWorkItem 的待執行佇列：Windows 的執行緒池不限排入數量，以接近處理器數的執行緒依序執行（執行緒阻塞時才追加）。
+    // 同時處於可執行狀態的工作項目達處理器數（或 worker 表已滿）時先排在這裡，由完成的工作項目與等待輪詢接手啟動。
+    std::deque<GuestCallback> pending_work_items_;
+    // 最近一次經協調者讓出的 Sleep(0)：時鐘與執行緒，用來辨認多條執行緒互相讓出的乒乓（啟發式，不屬客體可見狀態）。
+    std::uint64_t sleep_zero_last_ticks_{},sleep_zero_last_thread_{};
+    unsigned pool_work_runnable() const;
+    void start_pending_work_items(const GuestState&,GuestMemory&);
     struct TimerQueue {
         std::uint64_t completion_event{};bool closing{};
         bool operator==(const TimerQueue&) const = default;

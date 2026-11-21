@@ -25,7 +25,16 @@ public:
     D3D9ConstantState& operator=(D3D9ConstantState&&)=default;
     void bind(GuestMemory& memory,std::uint64_t address){memory_=&memory;address_=address;}
     void read_into(unsigned stage,unsigned kind,unsigned first,std::span<std::uint8_t> result)const{
-        if(memory_)memory_->read(GuestAddress{address_+d9_constant_offset(stage,kind)+first},result);
+        if(memory_){
+            // 多執行緒裝置的客體常式在寫入前後各遞增序號（奇數＝寫入中，見 guest_d3d9_constants.c）：序號前後相同且為偶數才是一致的快照。
+            // 寫入者可能正停在全體靜止點，重試有上限，超過就照現況讀取（與單執行緒裝置相同，不阻塞）。其他裝置的序號恆為 0。
+            const GuestAddress sequence{address_-D9_CONSTANT_DATA+D9_CONSTANT_SEQUENCE};
+            for(unsigned attempt=0;;++attempt){
+                const auto before=memory_->load(sequence,32);
+                memory_->read(GuestAddress{address_+d9_constant_offset(stage,kind)+first},result);
+                if(attempt>=64 || (!(before&1U) && memory_->load(sequence,32)==before))break;
+            }
+        }
         else if(const auto& saved=saved_[stage][kind];!saved.empty())std::copy_n(saved.begin()+first,result.size(),result.begin());
         else std::fill(result.begin(),result.end(),0);
     }

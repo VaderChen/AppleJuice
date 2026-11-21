@@ -12,8 +12,10 @@ struct __attribute__((packed,may_alias)) UnalignedWord {Word value;};
 typedef Word (CALL *Host)(void*,Word,void*,Word);
 static Word constants(void* self,Word first,void* data,Word count,unsigned stage,unsigned kind,unsigned write){
     unsigned char* object=self;
-    /* stateblock 記錄、多執行緒裝置與診斷保留共用宿主服務。 */
-    if(*(Word*)(object+D9_CONSTANT_FLAGS)){
+    /* stateblock 記錄與診斷保留共用宿主服務。多執行緒裝置（位元 2）留在客體：寫入者以鎖互斥並遞增序號，宿主讀取依序號取一致快照；
+       原本每次都回宿主服務（FINAL FANTASY XIII 戰鬥每幀約 1.2 萬次）。 */
+    const Word flags=*(Word*)(object+D9_CONSTANT_FLAGS);
+    if(flags&~4U){
         const unsigned method=stage*6+kind*2+(write?0:1);
         return ((Host)*(Pointer*)(object+D9_CONSTANT_HOST+method*8))(self,first,data,count);
     }
@@ -25,9 +27,19 @@ static Word constants(void* self,Word first,void* data,Word count,unsigned stage
     struct UnalignedWord* values=data;
     const unsigned length=count*words;
     /* 先讀完來源，存取例外不會留下部分更新的裝置狀態。 */
-    for(unsigned i=0;i<length;++i)temporary[i]=write?values[i].value:state[i];
+    Word* lock=(Word*)(object+D9_CONSTANT_LOCK);
+    Word* sequence=(Word*)(object+D9_CONSTANT_SEQUENCE);
+    if(write){for(unsigned i=0;i<length;++i)temporary[i]=values[i].value;}
+    if(flags){while(__atomic_exchange_n(lock,1U,__ATOMIC_ACQUIRE))__asm__ __volatile__("pause");}
+    if(!write){for(unsigned i=0;i<length;++i)temporary[i]=state[i];}
     __asm__ __volatile__("" ::: "memory");
-    if(write){for(unsigned i=0;i<length;++i)state[i]=temporary[i];}
+    if(write){
+        if(flags)__atomic_fetch_add(sequence,1U,__ATOMIC_RELEASE);
+        for(unsigned i=0;i<length;++i)state[i]=temporary[i];
+        if(flags)__atomic_fetch_add(sequence,1U,__ATOMIC_RELEASE);
+    }
+    if(flags)__atomic_store_n(lock,0U,__ATOMIC_RELEASE);
+    if(write){}
     else{
         /* 先探測整份輸出；跨頁存取例外保留呼叫端原內容。 */
         volatile struct UnalignedWord* probe=data;

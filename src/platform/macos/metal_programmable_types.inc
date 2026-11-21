@@ -334,13 +334,15 @@ inline bool metal_labels() noexcept {static const bool enabled=std::getenv("X64A
 // 診斷 X64ARM_METAL_GPU_PROFILE=<檔案>（須同時設 X64ARM_METAL_LABELS=1）：每個 encoder 一個命令緩衝，依標籤累計 GPU 時間，每 5 秒附加一份累計表到檔案。
 // 診斷 X64ARM_METAL_PASS_TRACE=<檔案>：依序記錄 encoder（X 換 pass 細項、R 繪製、C 運算、E 結束原因、P 呈現），用來分析哪些 pass 能合併。
 // X64ARM_METAL_PASS_TRACE_FROM=<第幾次呈現> 之後才記錄，上限約 40 萬行。
+// X64ARM_METAL_PASS_TRACE_TRIGGER=<檔案>：該檔案出現後才開始記錄（每 64 次呈現檢查一次），用於幀號不固定的場景（例如內建 Benchmark）。
 inline unsigned& metal_pass_trace_frames() noexcept {static unsigned value=0;return value;}
+inline bool& metal_pass_trace_armed() noexcept {static bool value=std::getenv("X64ARM_METAL_PASS_TRACE_TRIGGER")==nullptr;return value;}
 inline std::FILE* metal_pass_trace() noexcept {
     static std::FILE* const file=[]()->std::FILE* {const auto* path=std::getenv("X64ARM_METAL_PASS_TRACE");return path?std::fopen(path,"w"):nullptr;}();
     if(!file)return nullptr;
     static const unsigned from=[] {const auto* text=std::getenv("X64ARM_METAL_PASS_TRACE_FROM");return text?static_cast<unsigned>(std::strtoul(text,nullptr,10)):0U;}();
     static unsigned lines=0;
-    return metal_pass_trace_frames()>=from && ++lines<400000?file:nullptr;
+    return metal_pass_trace_armed() && metal_pass_trace_frames()>=from && ++lines<400000?file:nullptr;
 }
 inline const char* metal_gpu_profile_path() noexcept {static const char* path=std::getenv("X64ARM_METAL_GPU_PROFILE");return path;}
 inline bool metal_gpu_profile() noexcept {return metal_gpu_profile_path()!=nullptr && metal_labels();}
