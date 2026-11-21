@@ -20,6 +20,10 @@ std::string json_string(std::string_view value) {
 void resolution(std::ostream& out, const WindowsServices& services, std::string dll, std::string_view symbol) {
     for(auto& c:dll)if(c>='A' && c<='Z')c=static_cast<char>(c+32);
     out << ",\"builtin_module\":" << (services.builtin_module(dll)?"true":"false");
+    if(services.builtin_pe_export(dll,symbol)){
+        out << ",\"registered\":true,\"resolved_name\":" << json_string(symbol);
+        return;
+    }
     try {
         const auto address=services.resolve(dll,symbol);
         const auto name=services.name(address);

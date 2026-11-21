@@ -132,30 +132,12 @@
             const auto disc=b*b-4*a*c;bool hit=false;
             if(c<=0)hit=true;else if(a!=0 && disc>=0){const auto root=std::sqrt(disc);hit=(-b-root)/(2*a)>=0 || (-b+root)/(2*a)>=0;}
             bool_result(hit);
-        }else if(symbol=="D3DXSHMultiply2" || symbol=="D3DXSHMultiply3" || symbol=="D3DXSHMultiply4"){
+        }else if(symbol.starts_with("D3DXSHMultiply") && symbol.size()==sizeof("D3DXSHMultiply2")-1 && symbol.back()>='2' && symbol.back()<='6'){
             const unsigned order=static_cast<unsigned>(symbol.back()-'0'),count=order*order;std::array<float,36> a{},b{},out{};
             for(unsigned i=0;i<count;++i){a[i]=load(arg(1)+4*i,1)[0];b[i]=load(arg(2)+4*i,1)[0];}
             (void)sh_multiply(out.data(),order,a.data(),b.data());store(arg(0),out,count);
-        }else if(symbol=="D3DXSHRotateZ"){
-            // (pOut, Order, Angle, pIn)：繞 Z 軸旋轉，與 D3DXSHRotate 共用 SH 基底。
-            const auto order=static_cast<unsigned>(arg(1));
-            if(order>=2 && order<=6){std::array<float,36> in{},out{};for(unsigned i=0;i<order*order;++i)in[i]=load(arg(3)+4*i,1)[0];sh_rotate_z(out.data(),order,f(2),in.data());store(arg(0),out,order*order);}
-        }else if(symbol=="D3DXSHEvalDirectionalLight" || symbol=="D3DXSHEvalSphericalLight" || symbol=="D3DXSHEvalHemisphereLight"){
-            // 方向光 (Order, pDir, R, G, B, pR, pG, pB)；球形光 (Order, pPos, Radius, R, G, B, pR, pG, pB)；
-            // 半球光 (Order, pDir, Top, Bottom（D3DXCOLOR 以值傳遞）, pR, pG, pB)。pG／pB 可為 NULL。
-            const auto order=static_cast<unsigned>(arg(0));const bool spherical=symbol.find("Spherical")!=symbol.npos,hemisphere=symbol.find("Hemisphere")!=symbol.npos;
-            const unsigned first=hemisphere?4U:spherical?6U:5U;std::array<float,36> r{},g{},b{};
-            if(!arg(1) || !arg(first) || order<2 || order>6)result=0x8876086cU;
-            else{
-                const auto vector=load(arg(1),3);bool ok=false;
-                if(hemisphere){const auto top=load(arg(2),4),bottom=load(arg(3),4);ok=sh_hemisphere(order,vector.data(),top.data(),bottom.data(),r.data(),arg(5)?g.data():nullptr,arg(6)?b.data():nullptr);}
-                else {const Vector color{f(spherical?3:2),f(spherical?4:3),f(spherical?5:4),0};
-                    ok=spherical?sh_spherical(order,vector.data(),f(2),color.data(),r.data(),arg(7)?g.data():nullptr,arg(8)?b.data():nullptr):
-                                 sh_directional(order,vector.data(),color.data(),r.data(),arg(6)?g.data():nullptr,arg(7)?b.data():nullptr);}
-                const auto count=order*order;
-                if(!ok)result=0x8876086cU;
-                else {store(arg(first),r,count);if(arg(first+1))store(arg(first+1),g,count);if(arg(first+2))store(arg(first+2),b,count);result=0;}
-            }
+        }else if(symbol=="D3DXSHRotate" || symbol=="D3DXSHRotateZ"){
+#include "d3dx_sh_rotation.inc"
         }else if(symbol=="D3DXCheckVersion"){
             // 所有 d3dx9_24～43 共用同一實作：接受 D3D_SDK_VERSION 31／32 與該範圍內的 D3DX_SDK_VERSION。
             const auto d3d=static_cast<std::uint32_t>(arg(0)),d3dx=static_cast<std::uint32_t>(arg(1));bool_result((d3d==31 || d3d==32) && d3dx>=24 && d3dx<=43);

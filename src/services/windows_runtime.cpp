@@ -1,8 +1,10 @@
 #include "x64arm/windows_services.hpp"
+#include "crt_program_data.hpp"
 #include "x64arm/windows_version.hpp"
 #include "x64arm/interpreter.hpp"
 #include "service_callback_task.hpp"
 #include "guest_crt_state.h"
+#include "crt_mbcs.hpp"
 #include "crt_format_contract.h"
 #include "message_insert.hpp"
 #include "crt_nonfinite_format.hpp"
@@ -23,6 +25,7 @@ namespace x64arm::detail {const WindowsServiceDescriptor* runtime_stub_descripto
 #include "x64arm/windows_pointer.hpp"
 #include "x64arm/windows_icon.hpp"
 #include "x64arm/windows_default_environment.hpp"
+#include "x64arm/windows_paths.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/network_registry.hpp"
 #include "x64arm/windows_unwind.hpp"
@@ -44,6 +47,12 @@ namespace x64arm::detail {const WindowsServiceDescriptor* runtime_stub_descripto
 #include <limits>
 #include <random>
 #include <sstream>
+
+namespace x64arm {
+std::span<const WindowsServiceDescriptor> icu_charset_detection_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_region_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_idna_service_descriptors();
+}
 
 namespace x64arm {
 namespace detail {void fls_trace_record(std::uint64_t,std::size_t,std::uint64_t) noexcept;}
@@ -177,7 +186,10 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
         {"crt","_vscwprintf",2},
         {"crt","__stdio_common_vswprintf",6,1},{"crt","__stdio_common_vswprintf_s",6,1},
         {"crt","__stdio_common_vsprintf_p",6,1},{"crt","__stdio_common_vswprintf_p",6,1},{"crt","__stdio_common_vfprintf_p",5,1},{"crt","__stdio_common_vfwprintf_p",5,1},
-        {"crt", "signal", 2}, {"crt", "__getmainargs", 5}, {"crt", "__wgetmainargs", 5}, 
+        {"crt", "signal", 2}, {"crt", "__getmainargs", 5}, {"crt", "__wgetmainargs", 5},
+        {"crtdll.dll","__GetMainArgs",4,0,0,0,true},
+        {"msvcrt20.dll","__getmainargs",5,0,0,0,true},{"msvcrt20.dll","__wgetmainargs",5,0,0,0,true},
+        {"msvcrtd.dll","__getmainargs",5,0,0,0,true},{"msvcrtd.dll","__wgetmainargs",5,0,0,0,true},
         
         
         
@@ -296,6 +308,7 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {file_link_service_descriptors(), true, "file_link_service_descriptors", &WindowsServices::invoke_file_links},
             {power_scheme_service_descriptors(), true, "power_scheme_service_descriptors", &WindowsServices::invoke_power_schemes},
             {ole_picture_service_descriptors(), true, "ole_picture_service_descriptors", &WindowsServices::invoke_ole_picture},
+            {dxdiag_service_descriptors(), true, "dxdiag_service_descriptors", &WindowsServices::invoke_dxdiag},
             {shell_icon_service_descriptors(), false, "shell_icon_service_descriptors", &WindowsServices::invoke_shell_icons},
             {ole_misc_service_descriptors(), false, "ole_misc_service_descriptors", &WindowsServices::invoke_ole_misc},
             {ntdll_table_service_descriptors(), false, "ntdll_table_service_descriptors", &WindowsServices::invoke_ntdll_tables},
@@ -416,6 +429,27 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {credential_ui_service_descriptors(), true, "credential_ui_service_descriptors", &WindowsServices::invoke_credential_ui},
             {certificate_ui_service_descriptors(), true, "certificate_ui_service_descriptors", &WindowsServices::invoke_certificate_ui},
             {winusb_service_descriptors(), true, "winusb_service_descriptors", &WindowsServices::invoke_winusb},
+            {icu_character_service_descriptors(), true, "icu_character_service_descriptors", &WindowsServices::invoke_icu_character},
+            {icu_set_service_descriptors(), true, "icu_set_service_descriptors", &WindowsServices::invoke_icu_set},
+            {icu_trie_service_descriptors(), true, "icu_trie_service_descriptors", &WindowsServices::invoke_icu_trie},
+            {icu_string_service_descriptors(), true, "icu_string_service_descriptors", &WindowsServices::invoke_icu_guest_text},
+            {icu_text_service_descriptors(), true, "icu_text_service_descriptors", &WindowsServices::invoke_icu_guest_text},
+            {icu_break_service_descriptors(), true, "icu_break_service_descriptors", &WindowsServices::invoke_icu_break},
+            {icu_case_service_descriptors(), true, "icu_case_service_descriptors", &WindowsServices::invoke_icu_case},
+            {icu_normalization_service_descriptors(), true, "icu_normalization_service_descriptors", &WindowsServices::invoke_icu_normalization},
+            {icu_enumeration_service_descriptors(), true, "icu_enumeration_service_descriptors", &WindowsServices::invoke_icu_guest_text},
+            {icu_locale_service_descriptors(), true, "icu_locale_service_descriptors", &WindowsServices::invoke_icu_locale},
+            {icu_currency_service_descriptors(), true, "icu_currency_service_descriptors", &WindowsServices::invoke_icu_currency},
+            {icu_calendar_service_descriptors(), true, "icu_calendar_service_descriptors", &WindowsServices::invoke_icu_calendar},
+            {icu_date_pattern_service_descriptors(), true, "icu_date_pattern_service_descriptors", &WindowsServices::invoke_icu_date_pattern},
+            {icu_number_service_descriptors(), true, "icu_number_service_descriptors", &WindowsServices::invoke_icu_number},
+            {icu_date_format_service_descriptors(), true, "icu_date_format_service_descriptors", &WindowsServices::invoke_icu_date_format},
+            {icu_formatted_service_descriptors(), true, "icu_formatted_service_descriptors", &WindowsServices::invoke_icu_formatted},
+            {icu_bidi_service_descriptors(), true, "icu_bidi_service_descriptors", &WindowsServices::invoke_icu_guest_text},
+            {icu_modern_number_service_descriptors(), true, "icu_modern_number_service_descriptors", &WindowsServices::invoke_icu_modern_number},
+            {icu_charset_detection_service_descriptors(), true, "icu_charset_detection_service_descriptors", &WindowsServices::invoke_icu_charset_detection},
+            {icu_region_service_descriptors(), true, "icu_region_service_descriptors", &WindowsServices::invoke_icu_region},
+            {icu_idna_service_descriptors(), true, "icu_idna_service_descriptors", &WindowsServices::invoke_icu_idna},
             {wlan_service_descriptors(), true, "wlan_service_descriptors", &WindowsServices::invoke_wlan},
             {font_package_service_descriptors(), true, "font_package_service_descriptors", &WindowsServices::invoke_font_package},
             {mci_service_descriptors(), false, "mci_service_descriptors", &WindowsServices::invoke_mci},
@@ -877,10 +911,13 @@ void WindowsServices::configure_runtime_arguments(GuestMemory& memory,std::u16st
     const auto wargv = runtime_allocate(memory, {}, (wide_pointers.size() + 1) * unit);
     for (std::size_t i = 0; i < wide_pointers.size(); ++i) memory.store(GuestAddress{wargv + i * unit}, bits, wide_pointers[i]);
     memory.store(GuestAddress{runtime_.wargv_cell}, bits, wargv);
+    runtime_.initial_argc=static_cast<std::uint32_t>(pointers.size());
+    runtime_.initial_argv={argv,wargv};
     memory.store(GuestAddress{runtime_base_.value + 48}, bits, runtime_.command_ansi);
     // CRT 資料匯出保存指標，而非字串本身；與 GetCommandLineW 共用程序文字。
     memory.store(GuestAddress{runtime_base_.value + 104}, bits, command_line_address_.value);
 }
+#include "crt_startup_arguments.inc"
 void WindowsServices::initialize_runtime(GuestMemory& memory, std::u16string_view command_line) {
     startup_profile::Scope phase("services","initialize_runtime",true);
     runtime_.filetime_base = UINT64_C(116444736000000000) + static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::duration<std::int64_t,std::ratio<1,10000000>>>(std::chrono::system_clock::now().time_since_epoch()).count());
@@ -917,7 +954,9 @@ void WindowsServices::initialize_runtime(GuestMemory& memory, std::u16string_vie
     // _dstbias 的 CRT 初始值（夏令與標準時間差 -3600 秒）；__dstbias 回傳此格。
     memory.store(GuestAddress{runtime_base_.value+160},32,static_cast<std::uint32_t>(-3600));
     initialize_crt_wctype(memory);
+    initialize_crt_multibyte(memory,runtime_base_.value,runtime_.crt_multibyte_codepage);
     initialize_crt_lowio(memory);
+    initialize_crt_error_data(memory);
     configure_runtime_arguments(memory,command_line,command_line_address_.value);
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     memory.store(GuestAddress{runtime_.environ_cell}, bits, runtime_allocate(memory, {}, unit));
@@ -946,6 +985,11 @@ void WindowsServices::configure_image(GuestState& state, GuestMemory& memory, Ru
 }
 void WindowsServices::configure_image_after_unwind_validation(GuestState& state, GuestMemory& memory, RuntimeImage image,bool initial_thread) {
     runtime_.image = std::move(image);
+    const auto program_ansi=runtime_allocate(memory,bytes_of(utf16_to_utf8(runtime_.image.path)));
+    const auto program_wide=runtime_allocate(memory,utf16_bytes(runtime_.image.path));
+    const auto program_bits=static_cast<std::uint8_t>(x86_?32:64);
+    memory.store(GuestAddress{runtime_base_.value+detail::crt_pgmptr_offset},program_bits,program_ansi);
+    memory.store(GuestAddress{runtime_base_.value+detail::crt_wpgmptr_offset},program_bits,program_wide);
     std::vector<std::uint64_t> builtins;const auto native=load_module(memory,u"ntdll.dll",0,builtins);runtime_.main_dependencies.insert(native);
     install_guard(memory,runtime_.image);
     if(initial_thread)memory.map(teb_base_, x86_?0x4000:GUEST_CRT_TEB_SIZE, read_write);
@@ -2546,7 +2590,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
     else if (symbol == "__p__commode") result = runtime_.commode_cell;
     else if (symbol == "__p__adjust_fdiv") result = runtime_base_.value+72;
     else if (symbol == "_errno") result = runtime_.errno_cell;
-    else if (symbol == "_configure_narrow_argv" || symbol == "_configure_wide_argv") { if (static_cast<std::uint32_t>(arg(0)) != 1) throw HostCallFault("目前 CRT argv 使用不展開萬用字元的模式"); }
+    else if (symbol == "_configure_narrow_argv" || symbol == "_configure_wide_argv") {
+        const auto mode=static_cast<std::uint32_t>(arg(0));
+        if(mode>2){
+            memory.store(GuestAddress{runtime_.errno_cell},32,22);
+            if(const auto callback=current_invalid_parameter_handler()){
+                start_callbacks(state,memory,{{callback,{0,0,0,0,0}}},Continuation::Return,22);
+                return std::nullopt;
+            }
+            return UINT32_C(0xc0000409);
+        }
+        if(mode)result=configure_crt_argv(state,memory,symbol=="_configure_wide_argv",mode==2);
+        if(result)memory.store(GuestAddress{runtime_.errno_cell},32,result);
+    }
     else if (symbol == "_initialize_narrow_environment" || symbol == "_initialize_wide_environment" || symbol == "_get_initial_narrow_environment" || symbol == "_get_initial_wide_environment") {
         if(symbol=="_get_initial_narrow_environment")result=memory.load(GuestAddress{runtime_base_.value+112},x86_?32:64);
         else if(symbol=="_get_initial_wide_environment")result=memory.load(GuestAddress{runtime_base_.value+120},x86_?32:64);
@@ -2935,12 +2991,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
             else {const auto callback=signal_callback;signal_callback=0;start_callbacks(state,memory,{{callback,signal==8?std::vector<std::uint64_t>{signal,0x8c}:std::vector<std::uint64_t>{signal}}},Continuation::Return,0);return std::nullopt;}
         }
     }
-    else if (symbol == "__getmainargs" || symbol == "__wgetmainargs") {
+    else if (symbol == "__getmainargs" || symbol == "__wgetmainargs" || symbol=="__GetMainArgs") {
         const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);const bool wide=symbol=="__wgetmainargs";
         memory.check(GuestAddress{arg(0)}, 4, Access::Write); memory.check(GuestAddress{arg(1)}, unit, Access::Write); memory.check(GuestAddress{arg(2)}, unit, Access::Write);
+        if(configure_crt_argv(state,memory,wide,static_cast<std::uint32_t>(arg(3))!=0))
+            (void)configure_crt_argv(state,memory,wide,false);
         memory.store(GuestAddress{arg(0)}, 32, memory.load(GuestAddress{runtime_.argc_cell}, 32));
         memory.store(GuestAddress{arg(1)}, bits, memory.load(GuestAddress{wide?runtime_.wargv_cell:runtime_.argv_cell}, bits));
         memory.store(GuestAddress{arg(2)}, bits, memory.load(GuestAddress{wide?runtime_.wenviron_cell:runtime_.environ_cell}, bits));
+        // CRTDLL 固定傳入 new mode 0，MSVCRT20 則直接傳 int。後續版本才接收可省略的 int 指標。
+        std::optional<std::uint32_t> mode;
+        if(symbol=="__GetMainArgs")mode=0;
+        else if(service.family=="msvcrt20.dll")mode=static_cast<std::uint32_t>(arg(4));
+        else if(arg(4))mode=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(4)},32));
+        if(mode){
+            if(*mode>1){
+                memory.store(GuestAddress{runtime_.errno_cell},32,22);
+                if(const auto callback=current_invalid_parameter_handler()){
+                    start_callbacks(state,memory,{{callback,{0,0,0,0,0}}},Continuation::Return,0);
+                    return std::nullopt;
+                }
+                return UINT32_C(0xc0000409);
+            }
+            runtime_.new_mode=static_cast<int>(*mode);
+        }
     } else throw HostCallFault("尚未實作此執行階段服務：" + std::string(symbol));
     arg.return_to(state, result); return std::nullopt;
 }

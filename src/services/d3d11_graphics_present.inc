@@ -1,12 +1,14 @@
             graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);if(!d3d11_on_stream_thread)present_thread_=threads_.current;
             require(u32(1)<=4 && !(u32(2)&~0x21bU));
+            const bool target_available=swap->remote_window || gui_.windows.contains(swap->window);
+            if(!target_available)result=0x887a0001U; // 本程序已經銷毀交換鏈綁定的 HWND。
             // 顯示緩衝都在途時，呈現會在 nextDrawable 等到下一次垂直同步；Present 在全體靜止的服務邊界執行，等待期間
             // 所有客體執行緒一起停（DQ3 讀取畫面每幀約 12 ms，讀取執行緒近四成時間被凍結）。改讓呼叫端進入重試等待、
             // 交出 vCPU，緩衝釋出或約兩幀的保底期限到時重新執行整個 Present（見 resolve_thread_waits）。只用於常駐 AOT 多 vCPU：
             // 協調者每 0.25 ms 輪詢等待者；單 vCPU 與依指令預算切時間片的執行要到時間片結束才重新檢查，維持原本的阻塞呈現。
             // X64ARM_PRESENT_WAIT=0 關閉。
             static const bool present_wait=[] {const auto* value=std::getenv("X64ARM_PRESENT_WAIT");return !value || std::string_view(value)!="0";}();
-            if(!d3d11_on_stream_thread && present_wait && !(u32(2)&1) && resident_execution_depth_>0 && runtime_.processor_count>1 && threads_.items.size()>1 &&
+            if(target_available && !d3d11_on_stream_thread && present_wait && !(u32(2)&1) && resident_execution_depth_>0 && runtime_.processor_count>1 && threads_.items.size()>1 &&
                gui_.windows.contains(swap->window) && !swap->native->graphics_present_ready()){
                 std::erase_if(present_waits_,[&](const auto& entry){const auto waiter=threads_.items.find(entry.first);
                     return waiter==threads_.items.end() || waiter->second.status!=ThreadStatus::Waiting || waiter->second.wait.kind!=ThreadWaitKind::PresentRetry;});
@@ -14,7 +16,7 @@
                 thread.wait.deadline=runtime_.clock_ticks+340000;present_waits_[threads_.current]=swap->native;record_diagnostic("d3d11_present_wait");
                 schedule(state,memory);return std::nullopt;
             }
-            if(!(u32(2)&1)){
+            if(target_available && !(u32(2)&1)){
                 auto view=view_of(swap->bindings.at("Backbuffers")[0]);const auto shared_view=view;
                 const auto width=view.resource->desc.width,height=view.resource->desc.height;
                 using Rect=std::array<std::int64_t,4>;

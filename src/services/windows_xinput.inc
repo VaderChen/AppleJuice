@@ -3,15 +3,34 @@ const auto xinput_result=[&]() -> std::uint32_t {
     // 入口家族：GetState／SetState／GetCapabilities／Enable／GetBatteryInformation／GetKeystroke／
     // GetAudioDeviceIds（1_4）／GetDSoundAudioDeviceGuids（1_3）／#100 GetStateEx／#108 GetCapabilitiesEx（1_4）。
     if(name=="DllMain")return 1U;
+    const auto apply_vibration=[&](const input::Guid& device,const std::array<std::uint16_t,2>& speeds){
+        const auto error=bridge.backend->rumble(device,speeds[0],speeds[1]);
+        if(!error){
+            auto& applied=bridge.gamepad_vibrations[device];
+            applied[0]=speeds[0]/65535.0;
+            applied[1]=speeds[1]/65535.0;
+        }
+        return error;
+    };
+    if(name=="XInputEnable"){
+        const bool enabled=arg(0)!=0;
+        if(bridge.xinput_enabled!=enabled){
+            bridge.xinput_enabled=enabled;
+            for(const auto& slot:bridge.gamepad_slots)
+                if(slot.device && slot.vibration)
+                    (void)apply_vibration(*slot.device,enabled?*slot.vibration:std::array<std::uint16_t,2>{});
+        }
+        return 0U;
+    }
     const bool capabilities_ex=name=="#108";
     const auto index=static_cast<std::uint32_t>(arg(capabilities_ex?1:0));
     const unsigned output_index=name=="XInputGetCapabilities"?2:name=="XInputGetBatteryInformation" || name=="XInputGetKeystroke"?2:capabilities_ex?3:1;
-    const auto output=name=="XInputEnable" || name=="XInputGetAudioDeviceIds"?0:arg(output_index);
-    if(name=="XInputEnable"){bridge.xinput_enabled=arg(0)!=0;return 0U;}
+    const auto output=name=="XInputGetAudioDeviceIds"?0:arg(output_index);
     const bool any_index=name=="XInputGetKeystroke" && index==0xffU;
     if((index>=bridge.gamepad_slots.size() && !any_index) || (!output && name!="XInputGetAudioDeviceIds") ||
        (name=="XInputGetCapabilities" && arg(1)>1) || (capabilities_ex && (arg(0)!=1 || arg(2)>1)) ||
-       (name=="XInputGetBatteryInformation" && arg(1)>1))return 87U;
+       (name=="XInputGetBatteryInformation" && arg(1)>1) ||
+       (name=="XInputGetDSoundAudioDeviceGuids" && !arg(2)))return 87U;
     poll_dinput();
     const auto pads=bridge.backend->gamepads();
     for(auto& slot:bridge.gamepad_slots)if(slot.device && std::none_of(pads.begin(),pads.end(),[&](const auto& pad){return pad.device==*slot.device;}))slot={};
@@ -59,10 +78,10 @@ const auto xinput_result=[&]() -> std::uint32_t {
     const auto pad=std::find_if(pads.begin(),pads.end(),[&](const auto& item){return item.device==*slot.device;});
     if(name=="XInputSetState"){
         memory.check(GuestAddress{output},4,Access::Read);
-        if(!bridge.xinput_enabled)return 0U;
-        const auto left=static_cast<std::uint16_t>(memory.load(GuestAddress{output},16)),right=static_cast<std::uint16_t>(memory.load(GuestAddress{output+2},16));
-        const auto error=bridge.backend->rumble(*slot.device,left,right);
-        if(!error){auto& vibration=bridge.gamepad_vibrations[*slot.device];vibration[0]=left/65535.0;vibration[1]=right/65535.0;}
+        const std::array speeds{static_cast<std::uint16_t>(memory.load(GuestAddress{output},16)),
+            static_cast<std::uint16_t>(memory.load(GuestAddress{output+2},16))};
+        const auto error=bridge.xinput_enabled?apply_vibration(*slot.device,speeds):0U;
+        if(!error)slot.vibration=speeds;
         return error;
     }
     if(name=="XInputGetState" || name=="#100"){
@@ -100,8 +119,11 @@ const auto xinput_result=[&]() -> std::uint32_t {
         return 0U;
     }
     if(name=="XInputGetDSoundAudioDeviceGuids"){
-        memory.check(GuestAddress{output},16,Access::Write);memory.write(GuestAddress{output},std::array<std::uint8_t,16>{});
-        if(arg(2)){memory.check(GuestAddress{arg(2)},16,Access::Write);memory.write(GuestAddress{arg(2)},std::array<std::uint8_t,16>{});}
+        const auto capture=arg(2);
+        memory.check(GuestAddress{output},16,Access::Write);
+        memory.check(GuestAddress{capture},16,Access::Write);
+        memory.write(GuestAddress{output},std::array<std::uint8_t,16>{});
+        memory.write(GuestAddress{capture},std::array<std::uint8_t,16>{});
         return 0U;
     }
     return 87U;

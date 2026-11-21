@@ -3,6 +3,39 @@
             const auto at=allocate_heap(memory,text.size()+1);if(!at)throw std::bad_alloc{};owner->allocations.push_back(at);memory.write(GuestAddress{at},std::span(reinterpret_cast<const std::uint8_t*>(text.c_str()),text.size()+1));owner->effect_handles[key]=at;return at;
         };
         const auto fx_owner=[&](const std::shared_ptr<Identity>& id){return id->effect_owner?object(id->effect_owner).identity:id;};
+        const auto fx_pool=[&](const std::shared_ptr<Identity>& owner){
+            return owner->effect_pool?object(owner->effect_pool).identity:std::shared_ptr<Identity>{};
+        };
+        struct FxLocation {
+            std::shared_ptr<Identity> scope;
+            unsigned index{UINT32_MAX};
+            explicit operator bool() const {return bool(scope);}
+        };
+        const auto fx_index=[&](const std::shared_ptr<Identity>& owner,unsigned index,bool buffer){
+            for(const auto& scope:std::array{owner,fx_pool(owner)})if(scope){
+                const auto count=static_cast<unsigned>(buffer?scope->effect->buffers.size():scope->effect->variables.size());
+                if(index<count)return FxLocation{scope,index};
+                index-=count;
+            }
+            return FxLocation{};
+        };
+        const auto fx_named=[&](const std::shared_ptr<Identity>& owner,std::string_view name,bool buffer,bool semantic=false){
+            const auto fold=[](char c){return c>='A' && c<='Z'?static_cast<char>(c-'A'+'a'):c;};
+            if(!name.empty())for(const auto& scope:std::array{owner,fx_pool(owner)})if(scope){
+                const auto& program=*scope->effect;
+                if(buffer){
+                    for(unsigned i=0;i<program.buffers.size();++i)
+                        if(program.buffers[i].name==name)return FxLocation{scope,i};
+                }else{
+                    for(unsigned i=0;i<program.variables.size();++i){
+                        const auto& v=program.variables[i];
+                        if(semantic?std::ranges::equal(v.semantic,name,[&](char a,char b){return fold(a)==fold(b);}):v.name==name)
+                            return FxLocation{scope,i};
+                    }
+                }
+            }
+            return FxLocation{};
+        };
         const auto fx_handle=[&](const std::shared_ptr<Identity>& owner,Kind kind,const std::string& key){
             if(owner->effect_handles.contains(key))return object(owner->effect_handles.at(key)).identity;
             auto id=create(kind);id->effect=owner->effect;id->effect_owner=owner->root;owner->bindings["EffectHandles"].push_back(id->root);owner->effect_handles[key]=id->root;return id;
@@ -11,15 +44,62 @@
             auto id=fx_handle(owner,Kind::EffectVariable10,"variable:"+std::to_string(index));id->effect_variable=index;id->effect_valid=index<owner->effect->variables.size();
             if(id->effect_valid){const auto& v=owner->effect->variables[index];id->effect_type=v.type;id->effect_buffer=v.buffer;id->effect_offset=v.offset;}return id;
         };
-        const auto fx_find_variable=[&](const std::shared_ptr<Identity>& owner,const std::string& name){const auto& vars=owner->effect->variables;const auto found=std::find_if(vars.begin(),vars.end(),[&](const auto& v){return v.name==name;});return found==vars.end()?UINT32_MAX:static_cast<unsigned>(found-vars.begin());};
+        const auto fx_buffer=[&](const std::shared_ptr<Identity>& owner,unsigned index){
+            const auto& buffers=owner->effect->buffers;
+            auto value=fx_handle(owner,Kind::EffectBuffer10,"buffer:"+std::to_string(index));
+            value->effect_buffer=index;
+            value->effect_valid=index<buffers.size();
+            if(value->effect_valid && !value->effect_type){
+                value->effect_type=std::make_shared<fx10::Type>();
+                auto& type=*value->effect_type;
+                type.name=buffers[index].name;
+                type.kind=2;
+                type.detail=18;
+                type.size=static_cast<std::uint32_t>(buffers[index].bytes.size());
+            }
+            return value;
+        };
+        const auto fx_subscript=[&](const std::shared_ptr<Identity>& owner,std::string_view name){
+            const auto location=fx_named(owner,name,false);
+            require(bool(location));
+            const auto& program=*location.scope->effect;
+            const auto& variable=program.variables[location.index];
+            require(variable.buffer<program.buffers.size());
+            return word(program.buffers[variable.buffer].bytes,variable.offset);
+        };
         const auto fx_shader=[&](const std::shared_ptr<Identity>& owner,unsigned stage,const std::vector<std::uint8_t>& bytes,const std::string& key,std::string_view so={}){
             if(owner->effect_handles.contains(key))return owner->effect_handles.at(key);if(bytes.empty())return std::uint64_t{};
             auto device=object(owner->device).identity;auto reflected=std::make_shared<dxbc::Reflection>(bytes);const auto native_stage=stage==2 && (reflected->version>>16)==1?0U:stage;auto shader=so.empty()?device->native->graphics_shader(native_stage,bytes):device->native->graphics_shader_private(native_stage,bytes);if(!so.empty())stream_output::parse(*shader,*reflected,so);
-            auto id=create(stage==0?Kind::VertexShader:stage==1?Kind::PixelShader:Kind::GeometryShader,owner->device);id->shader=std::move(shader);id->reflection=std::move(reflected);id->desc=bytes;owner->bindings["EffectShaders"].push_back(id->root);owner->effect_handles[key]=id->root;return id->root;
+            auto id=create(stage==0?Kind::VertexShader:stage==1?Kind::PixelShader:Kind::GeometryShader,owner->device);id->effect_owner=owner->root;id->shader=std::move(shader);id->reflection=std::move(reflected);id->desc=bytes;owner->bindings["EffectShaders"].push_back(id->root);owner->effect_handles[key]=id->root;return id->root;
         };
-        const auto fx_create=[&](std::uint64_t device_pointer,std::span<const std::uint8_t> bytes){
-            auto device=typed(device_pointer,Kind::Device);require(device->api10);auto program=std::make_shared<fx10::Program>(bytes);auto owner=create(Kind::Effect10,device_pointer);owner->effect=std::move(program);
+        const auto fx_create=[&](std::uint64_t device_pointer,std::span<const std::uint8_t> bytes,
+            unsigned flags,bool make_pool,std::uint64_t pool_pointer){
+            require(device_pointer!=0 && !(flags&~0xbU) && bool(flags&1)==bool(pool_pointer) && (!make_pool || !pool_pointer));
+            const auto device=typed(device_pointer,Kind::Device);
+            require(device->api10);
+            std::shared_ptr<Identity> pool;
+            if(pool_pointer){
+                const auto found=bridge.objects.find_fast(pool_pointer);
+                require(found!=bridge.objects.end() && found->second.kind==Kind::EffectPool10);
+                pool=found->second.identity;
+                require(pool->device==device->root && pool->effect_is_pool && bool(pool->effect));
+            }
+            std::optional<std::vector<std::uint8_t>> section;
+            if(bytes.size()>=4 && word(bytes,0)==0x43425844){
+                section=graphics_dxbc_section(bytes,0x30315846);
+                require(bool(section));
+                bytes=*section;
+            }
+            auto program=std::make_shared<fx10::Program>(bytes,pool?pool->effect.get():nullptr);
+            if(make_pool)for(auto& variable:program->variables)variable.flags|=1;
+            auto owner=create(Kind::Effect10,device->root);
+            owner->effect=std::move(program);
+            owner->effect_is_pool=make_pool;
             try{
+                if(pool){
+                    bind_one(owner,"EffectPool",pool->root);
+                    owner->effect_pool=pool->root;
+                }
                 for(unsigned i=0;i<owner->effect->buffers.size();++i){const auto& b=owner->effect->buffers[i];GraphicsResourceDesc desc;desc.width=static_cast<std::uint32_t>((b.bytes.size()+15)&~std::size_t{15});desc.bind=(b.flags&1)?8U:4U;if(!desc.width)desc.width=16;
                     auto resource=device->native->graphics_resource(desc);auto id=create(Kind::BufferObject,device_pointer);id->resource=std::move(resource);id->desc.resize(24);put_word(id->desc,0,desc.width);put_word(id->desc,8,desc.bind);owner->bindings["EffectBuffer:"+std::to_string(i)]={id->root};
                     if(b.flags&1){auto view=create(Kind::ShaderResource,device_pointer);view->texture=id->root;hold(id->root);view->graphics_view={id->resource,2,0,1,0,1};view->graphics_view.count=desc.width;view->graphics_view.dimension=1;view->desc.resize(24);put_word(view->desc,0,2);put_word(view->desc,4,1);put_word(view->desc,12,desc.width/16);owner->bindings["EffectBufferView:"+std::to_string(i)]={view->root};}
@@ -27,12 +107,21 @@
                 for(unsigned i=0;i<owner->effect->variables.size();++i){const auto& v=owner->effect->variables[i];if(v.type->kind!=2)continue;auto& objects=owner->bindings["EffectObject:"+std::to_string(i)];objects.resize(v.type->count());
                     if(v.type->detail>=5 && v.type->detail<=8)for(unsigned j=0;j<v.objects.size();++j){const auto shader=fx_shader(owner,v.type->detail==6?0U:v.type->detail==5?1U:2U,owner->effect->blob(v.objects[j].data),"shader:"+std::to_string(i)+":"+std::to_string(j),owner->effect->string(v.objects[j].stream_output));if(shader)hold(shader);objects[j]=shader;}
                 }
-            }catch(...){release(owner->root);throw;}return owner;
+                return make_pool?interface(owner,Kind::EffectPool10):owner->root;
+            }catch(...){release(owner->root);throw;}
         };
         const auto fx_numeric=[&](const std::shared_ptr<Identity>& owner,const fx10::Assignment& a){
             std::vector<std::pair<unsigned,std::uint32_t>> values;
             if(a.kind==1){const auto count=fx10::Program::bounded(owner->effect->get(a.offset));for(unsigned i=0;i<count;++i)values.emplace_back(owner->effect->get(a.offset+4+i*8),owner->effect->get(a.offset+8+i*8));}
-            else if(a.kind==2){const auto index=fx_find_variable(owner,owner->effect->string(a.offset));require(index!=UINT32_MAX);const auto& v=owner->effect->variables[index];require(v.type->kind==1 && v.buffer<owner->effect->buffers.size());const auto& bytes=owner->effect->buffers[v.buffer].bytes;for(unsigned i=0;i<v.type->columns();++i)values.emplace_back(v.type->scalar(),word(bytes,v.offset+i*4));}
+            else if(a.kind==2){
+                const auto location=fx_named(owner,owner->effect->string(a.offset),false);
+                require(bool(location));
+                const auto& program=*location.scope->effect;
+                const auto& v=program.variables[location.index];
+                require(v.type->kind==1 && v.buffer<program.buffers.size());
+                const auto& bytes=program.buffers[v.buffer].bytes;
+                for(unsigned i=0;i<v.type->columns();++i)values.emplace_back(v.type->scalar(),word(bytes,v.offset+i*4));
+            }
             else throw std::invalid_argument("FX4 數值 assignment 尚需 expression 解碼");return values;
         };
         const auto fx_integer=[&](const std::pair<unsigned,std::uint32_t>& value){return value.first==1?static_cast<std::uint32_t>(static_cast<std::int32_t>(std::bit_cast<float>(value.second))):value.second;};
@@ -64,9 +153,13 @@
             unsigned index=0;std::string name;
             if(a.kind==2)name=program.string(a.offset);
             else if(a.kind==3){name=program.string(program.get(a.offset));index=program.get(a.offset+4);}
-            else if(a.kind==4){name=program.string(program.get(a.offset));const auto selector=fx_find_variable(owner,program.string(program.get(a.offset+4)));require(selector!=UINT32_MAX);const auto& v=program.variables[selector];require(v.buffer<program.buffers.size());index=word(program.buffers[v.buffer].bytes,v.offset);}
+            else if(a.kind==4){name=program.string(program.get(a.offset));index=fx_subscript(owner,program.string(program.get(a.offset+4)));}
             else throw std::invalid_argument("FX4 物件 expression 尚未解碼");
-            const auto variable=fx_find_variable(owner,name);require(variable!=UINT32_MAX);const auto& v=program.variables[variable];require(index<v.type->count());
-            if(v.type->detail==2 || v.type->detail==3 || v.type->detail==4 || v.type->detail==21)return fx_state(owner,variable,index);
-            return owner->bindings.at("EffectObject:"+std::to_string(variable)).at(index);
+            const auto variable=fx_named(owner,name,false);
+            require(bool(variable));
+            const auto& v=variable.scope->effect->variables[variable.index];
+            require(index<v.type->count());
+            if(v.type->detail==2 || v.type->detail==3 || v.type->detail==4 || v.type->detail==21)
+                return fx_state(variable.scope,variable.index,index);
+            return variable.scope->bindings.at("EffectObject:"+std::to_string(variable.index)).at(index);
         };

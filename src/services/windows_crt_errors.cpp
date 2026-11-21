@@ -42,6 +42,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_error(GuestState& state
         if(number!=3)runtime_.crt_error_mode=number;arg.return_to(state,static_cast<std::uint32_t>(previous));return std::nullopt;
     }
     const bool assertion=service.symbol=="_assert" || service.symbol=="_wassert";
+    const bool legacy=service.family=="crtdll.dll";
+    const auto exit_callback=legacy?memory.load(builtin_constant_address("crtdll.dll","_aexit_rtn_dll"),32):0;
     std::string message;
     if(assertion){
         const auto read=[&](std::uint64_t pointer){return service.symbol=="_wassert"?read_utf16(memory,GuestAddress{pointer}):cp1252_to_utf16(read_ansi(memory,pointer));};
@@ -54,10 +56,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_error(GuestState& state
         try{
             memory.write(GuestAddress{base},text);memory.write(GuestAddress{base+text.size()},caption);
             // 共用原生／headless 模態對話框；保留呼叫端堆疊，Ignore 可正常返回。
-            start_callbacks(state,memory,{{resolve("user32.dll","MessageBoxW").value,{0,base,base+text.size(),assertion?0x12U:0x10U}}},assertion?Continuation::CrtAssertion:Continuation::CrtFatalDialog,base);
+            const GuestCallback dialog{resolve("user32.dll","MessageBoxW").value,
+                {0,base,base+text.size(),assertion?0x12U:0x10U}};
+            if(legacy)start_callbacks(state,memory,{dialog,{exit_callback,{255}}},Continuation::ReturnZeroFreeHeap,base);
+            else start_callbacks(state,memory,{dialog},assertion?Continuation::CrtAssertion:Continuation::CrtFatalDialog,base);
         }catch(...){(void)free_heap(memory,base,state);throw;}
         return std::nullopt;
     }
-    (void)write_standard_output(2,{reinterpret_cast<const std::uint8_t*>(message.data()),message.size()});return assertion?3U:255U;
+    (void)write_standard_output(2,{reinterpret_cast<const std::uint8_t*>(message.data()),message.size()});
+    if(legacy){
+        start_callbacks(state,memory,{{exit_callback,{255}}},Continuation::Return,0);
+        return std::nullopt;
+    }
+    return assertion?3U:255U;
 }
 }

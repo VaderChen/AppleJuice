@@ -3,19 +3,23 @@
 #include "x64arm/unicode.hpp"
 #include "pcm_wave_format.hpp"
 #include "wave_device_message.hpp"
+#include "wave_mapper_abi.hpp"
+#include "wave_acm_stream.hpp"
 #include <algorithm>
 
 namespace x64arm {
 struct WinmmWaveInput {
     std::shared_ptr<audio::Buffer> buffer;
     std::unique_ptr<audio::Input> input;
-    std::uint64_t callback{},target{},instance{},read_frames{};
+    std::unique_ptr<wave::AcmStream> codec;
+    std::uint64_t callback{},target{},instance{},read_frames{},client_handle{};
     std::uint32_t callback_type{};
     bool started{};
     struct Header {std::uint64_t data{};std::uint32_t capacity{},size{},used{};bool queued{};};
     std::map<std::uint64_t,Header> headers;
     std::deque<std::uint64_t> queue;
     void notify(std::deque<GuestCallback>& callbacks,std::uint64_t handle,unsigned message,std::uint64_t header=0) const {
+        if(client_handle)handle=client_handle;
         if(callback_type==0x30000)callbacks.push_back({target,{handle,message,instance,header,0}});
         else if(callback_type==0x10000 || callback_type==0x20000)callbacks.push_back({target,{callback,message,handle,header}});
         else if(callback_type==0x50000 && message==0x3c0)callbacks.push_back({target,{callback}});
@@ -28,15 +32,32 @@ struct WinmmWaveInput {
         header.queued=false;queue.pop_front();notify(callbacks,handle,0x3c0,address);
     }
     // 呼叫端持有 buffer.mutex；原生 callback 只寫宿主 PCM ring，不存取客體指標。
-    void drain(GuestMemory& memory,unsigned unit,std::deque<GuestCallback>& callbacks,std::uint64_t handle){
+    void drain(GuestMemory& memory,unsigned unit,std::deque<GuestCallback>& callbacks,std::uint64_t handle,
+               bool flush_partial=false){
         const auto frame_bytes=buffer->frame_bytes();const auto ring_frames=buffer->pcm.size()/frame_bytes;
         const auto total=buffer->captured_frames;
         if(total-read_frames>ring_frames)read_frames=total-ring_frames;
         while(read_frames<total && !queue.empty()){
             auto& header=headers.at(queue.front());const auto at=static_cast<std::size_t>(read_frames%ring_frames)*frame_bytes;
-            const auto bytes=std::min<std::uint64_t>({header.size-header.used,(total-read_frames)*frame_bytes,buffer->pcm.size()-at});
-            memory.write(GuestAddress{header.data+header.used},std::span(buffer->pcm).subspan(at,static_cast<std::size_t>(bytes)));
-            header.used+=static_cast<std::uint32_t>(bytes);read_frames+=bytes/frame_bytes;
+            const auto ring=std::span<const std::uint8_t>(buffer->pcm);
+            if(codec){
+                const auto packet=codec->packet_frames();
+                const auto frames=static_cast<unsigned>(std::min<std::uint64_t>(packet,total-read_frames));
+                if(frames<packet && !flush_partial)break;
+                std::vector<std::uint8_t> pcm(std::size_t{frames}*frame_bytes);
+                const auto prefix=std::min(pcm.size(),ring.size()-at);
+                std::copy_n(ring.begin()+static_cast<std::ptrdiff_t>(at),prefix,pcm.begin());
+                std::copy_n(ring.begin(),pcm.size()-prefix,pcm.begin()+static_cast<std::ptrdiff_t>(prefix));
+                const auto encoded=codec->convert(pcm,header.size-header.used,frames<packet);
+                memory.write(GuestAddress{header.data+header.used},encoded);
+                header.used+=static_cast<std::uint32_t>(encoded.size());
+                read_frames+=frames;
+            }else{
+                const auto bytes=std::min<std::uint64_t>({header.size-header.used,(total-read_frames)*frame_bytes,ring.size()-at});
+                memory.write(GuestAddress{header.data+header.used},ring.subspan(at,static_cast<std::size_t>(bytes)));
+                header.used+=static_cast<std::uint32_t>(bytes);
+                read_frames+=bytes/frame_bytes;
+            }
             if(header.used==header.size)complete(memory,unit,callbacks,handle);
         }
         // Windows 在應用程式沒有提供緩衝區時丟棄輸入；後來排入的 buffer 不接收舊資料。
@@ -58,11 +79,15 @@ void WindowsServices::poll_wave_input(GuestMemory& memory){
     }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_wave_input(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    const WindowsCall arg(state,memory,service);const auto name=service.symbol;const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
+    wave::MapperCall arg(state,memory,service);auto name=service.symbol;const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
     const std::uint8_t bits=x86_?32:64;const unsigned unit=bits/8,header_size=x86_?32:48,flags_offset=x86_?16:24;
     const auto available=[&](){return audio_input_backend_?audio_input_backend_->available():audio::input_available();};
     std::uint32_t result=0;
     try {
+        if(const auto translated=arg.translate(memory,name,true,bits)){
+            arg.return_to(state,*translated);
+            return {};
+        }
         poll_wave_input(memory);poll_wave_output(memory);
         if(name=="waveInMessage")result=wave::device_message(memory,arg(0),d(1),arg(2),arg(3),true,available(),wave_inputs_.contains(arg(0)),x86_);
         else if(name=="waveInGetNumDevs")result=available()?1:0;
@@ -83,7 +108,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_wave_input(GuestState& stat
             if(!arg(2) || (!query && !arg(0)))result=11;
             else {
                 if(arg(0)){memory.check(GuestAddress{arg(0)},unit,Access::Write);memory.store(GuestAddress{arg(0)},bits,0);}
-                const auto format=read_pcm_wave_format(memory,arg(2),true,true,8000,192000);
+                auto format=read_pcm_wave_format(memory,arg(2),true,true,8000,192000);
+                std::unique_ptr<wave::AcmStream> codec;
+                if(!format && !(flags&8U) && (arg.parameters || d(1)==UINT32_MAX)){
+                    codec=wave::AcmStream::open(memory,arg(2),true,acm_.get());
+                    if(codec){
+                        const auto pcm=codec->pcm_format();
+                        if(pcm.rate>=8000 && pcm.rate<=192000)format=pcm;
+                        else codec.reset();
+                    }
+                }
                 if(d(1)!=0 && d(1)!=UINT32_MAX && !wave_inputs_.contains(arg(1)))result=2;
                 else if((flags&~0x7000fU) || (kind!=0 && kind!=0x10000 && kind!=0x20000 && kind!=0x30000 && kind!=0x50000))result=10;
                 else if(!format)result=32;
@@ -99,11 +133,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_wave_input(GuestState& stat
                     if(!runtime_.network.external_io)throw HostCallFault("原生 PCM 輸入不支援 deterministic compare");
                     auto input=std::make_shared<WinmmWaveInput>();input->buffer=std::make_shared<audio::Buffer>();auto& buffer=*input->buffer;
                     buffer.channels=format->channels;buffer.bits=format->bits;buffer.floating=format->floating;buffer.rate=buffer.frequency=format->rate;
-                    buffer.pcm.resize(static_cast<std::size_t>(std::max(format->rate,4096U))*format->align);buffer.looping=true;
+                    const auto frames=std::max({format->rate,4096U,codec?2*codec->packet_frames():0U});
+                    buffer.pcm.resize(std::size_t{frames}*format->align);
+                    buffer.looping=true;
+                    input->codec=std::move(codec);
                     try {input->input=audio_input_backend_?audio_input_backend_->open(input->buffer):audio::open_input(input->buffer);}catch(const std::runtime_error&){result=3;}
                     if(!input->input)result=3;
                     else {
-                        input->callback_type=kind;input->callback=arg(3);input->instance=arg(4);
+                        input->callback_type=kind;input->callback=arg(3);input->instance=arg(4);input->client_handle=arg.client_handle;
                         input->target=kind==0x30000?arg(3):kind==0x10000?resolve("user32.dll","PostMessageW").value:kind==0x20000?resolve("user32.dll","PostThreadMessageW").value:resolve("kernel32.dll","SetEvent").value;
                         const auto handle=runtime_.allocate_wait_handle();wave_inputs_.emplace(handle,input);memory.store(GuestAddress{arg(0)},bits,handle);input->notify(wave_callbacks_,handle,0x3be);
                     }
@@ -115,10 +152,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_wave_input(GuestState& stat
             else {
                 // input 的生命週期涵蓋 lock；CoreAudio 停止／釋放必須在解除 buffer.mutex 後。
                 const auto input=found->second;auto& buffer=*input->buffer;std::lock_guard lock(buffer.mutex);
-                input->drain(memory,unit,wave_callbacks_,arg(0));
+                input->drain(memory,unit,wave_callbacks_,arg(0),name=="waveInStop" || name=="waveInReset");
                 if(name=="waveInClose"){
                     if(!input->queue.empty())result=33;
                     else {input->started=false;buffer.playing=false;input->notify(wave_callbacks_,arg(0),0x3bf);wave_inputs_.erase(found);}
+                }else if(name=="waveInMapperStatus"){
+                    if(!arg(2))result=11;
+                    else if(d(1)==2)wave::write_pcm_format(memory,arg(2),buffer.channels,buffer.rate,buffer.bits,buffer.floating);
+                    else memory.store(GuestAddress{arg(2)},32,d(1)==1 && bool(input->codec));
                 }else if(name=="waveInGetID"){if(!arg(1))result=11;else memory.store(GuestAddress{arg(1)},32,0);}
                 else if(name=="waveInStart"){
                     if(buffer.capture_failed)result=3;
@@ -126,6 +167,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wave_input(GuestState& stat
                 }else if(name=="waveInStop" || name=="waveInReset"){
                     buffer.playing=false;
                     if(name=="waveInReset"){
+                        if(input->codec)input->codec->reset();
                         while(!input->queue.empty())input->complete(memory,unit,wave_callbacks_,arg(0));
                         buffer.captured_frames=0;buffer.cursor=0;buffer.capture_fraction=0;input->read_frames=0;
                     }else if(input->started && !input->queue.empty())input->complete(memory,unit,wave_callbacks_,arg(0));
@@ -134,7 +176,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_wave_input(GuestState& stat
                     if(!arg(1) || d(2)<12)result=11;
                     else {memory.check(GuestAddress{arg(1)},12,Access::Write);auto type=memory.load(GuestAddress{arg(1)},32);if(type!=1 && type!=2 && type!=4)type=4;
                         const auto frames=buffer.captured_frames;memory.store(GuestAddress{arg(1)},32,type);
-                        memory.store(GuestAddress{arg(1)+4},32,type==1?frames*1000/buffer.rate:type==2?frames:frames*buffer.frame_bytes());}
+                        const auto bytes=input->codec?input->codec->wire_bytes(frames):frames*buffer.frame_bytes();
+                        memory.store(GuestAddress{arg(1)+4},32,type==1?frames*1000/buffer.rate:type==2?frames:bytes);}
                 }else {
                     const auto header=arg(1);
                     if(!header || d(2)<header_size)result=11;
@@ -158,7 +201,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_wave_input(GuestState& stat
                             else if(wave_callbacks_.size()>=4096)result=7;
                             else {
                                 const auto data=memory.load(GuestAddress{header},bits);const auto size=static_cast<std::uint32_t>(memory.load(GuestAddress{header+unit},32));
-                                if(data!=prepared->second.data || !size || size>prepared->second.capacity || size%buffer.frame_bytes())result=11;
+                                const auto alignment=input->codec?input->codec->wire_alignment():buffer.frame_bytes();
+                                if(data!=prepared->second.data || !size || size>prepared->second.capacity || size%alignment)result=11;
                                 else {memory.check(GuestAddress{data},size,Access::Write);input->queue.push_back(header);auto& h=prepared->second;h.size=size;h.used=0;h.queued=true;
                                     memory.store(GuestAddress{header+unit+4},32,0);memory.store(GuestAddress{header+flags_offset},32,(flags&~1U)|0x10U);}
                             }
@@ -168,6 +212,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wave_input(GuestState& stat
             }
         }
     }catch(const MemoryFault&){result=11;}catch(const std::bad_alloc&){result=7;}
+    catch(const std::length_error&){result=7;}catch(const std::invalid_argument&){result=11;}
     arg.return_to(state,result);return std::nullopt;
 }
 }

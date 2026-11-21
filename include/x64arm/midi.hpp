@@ -32,12 +32,17 @@ struct Sequence {
     std::vector<Event> events;
     std::vector<Tempo> tempos{{0,0,120}};
     std::vector<TimeSignature> signatures{{0,4,4,4}};
+    std::string title,copyright;
+    std::uint16_t division{};
+    std::uint32_t smpte_offset{};
     std::uint64_t frames{};std::uint32_t music_length{};
     std::uint64_t frame_at(std::uint32_t music) const;
     std::uint32_t music_at(std::uint64_t frame) const;
+    double tempo_at(double frame) const;
 };
-// 標準 MIDI 0／1 與 RIFF DirectMusic 樂段；共用 48 kHz 時間軸。
+// SMF 0／1、RMID 與 DirectMusic 樂段共用 48 kHz 時間軸。
 Sequence parse(std::span<const std::uint8_t> bytes);
+Sequence parse_midi_file(std::span<const std::uint8_t> bytes);
 std::vector<Event> chase(const Sequence&,std::uint64_t frame);
 struct Stream;
 struct Playback {
@@ -56,7 +61,7 @@ struct Playback {
     std::shared_ptr<Stream> stream;
     struct Voice {
         std::shared_ptr<const Sequence> sequence;
-        std::uint64_t start{},stop{UINT64_MAX},loop_start{},loop_end{},id{},loops{};
+        std::uint64_t start{},stop{UINT64_MAX},end_frame{UINT64_MAX},loop_start{},loop_end{},id{},loops{};
         double position{};
         std::size_t next{};
         std::uint32_t repeats{};

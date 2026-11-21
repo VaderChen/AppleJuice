@@ -556,7 +556,8 @@ FileInformation WindowsServices::publish_font_file(std::span<const std::uint8_t>
     return {{},{},50};
 #endif
 }
-std::uint32_t WindowsServices::publish_module_file(std::u16string_view guest_path,std::span<const std::uint8_t> bytes) {
+std::uint32_t WindowsServices::publish_module_file(std::u16string_view guest_path,std::span<const std::uint8_t> bytes,
+                                                   std::filesystem::path* source) {
 #if !defined(_WIN32)
     if(bytes.empty())return 87;
     if(!mappings_)mappings_=std::make_shared<FileMappingState>();
@@ -565,9 +566,11 @@ std::uint32_t WindowsServices::publish_module_file(std::u16string_view guest_pat
     if(!mappings_->module_files){mappings_->module_files=session();reclaim_stale_sessions(mappings_->module_files->path);}
     const auto [path,error]=publish_immutable_resource(*mappings_->module_files,"modules",".dll",bytes);
     if(error)return error;
-    filesystem_.mount_readonly_file(utf16_to_utf8(guest_path),path);return 0;
+    filesystem_.mount_readonly_file(utf16_to_utf8(guest_path),path);
+    if(source)*source=path;
+    return 0;
 #else
-    (void)guest_path;(void)bytes;return 50;
+    (void)guest_path;(void)bytes;(void)source;return 50;
 #endif
 }
 

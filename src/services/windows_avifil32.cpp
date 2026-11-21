@@ -50,6 +50,30 @@ std::span<const WindowsServiceDescriptor> avifil32_service_descriptors(){
         {"avifil32.dll","AVIBuildFilter",3},{"avifil32.dll","AVIBuildFilterA",3},{"avifil32.dll","AVIBuildFilterW",3},
         {"avifil32.dll","DllRegisterServer",0},{"avifil32.dll","DllUnregisterServer",0},
         {"avifil32.dll","DllGetClassObject",3},{"avifil32.dll","DllCanUnloadNow",0},
+        {"msrle32.dll","DriverProc",5,0,0,4},{"msvidc32.dll","DriverProc",5,0,0,4},
+        {"msvfw32.dll","VideoForWindowsVersion",0},{"msvfw32.dll","#2",0},
+        {"msvfw32.dll","ICOpen",3,0,0,7},{"msvfw32.dll","ICOpenFunction",4,0,0,7},
+        {"msvfw32.dll","ICLocate",5,0,0,0x13},{"msvfw32.dll","ICClose",1},
+        {"msvfw32.dll","ICSendMessage",4,0,0,2},{"msvfw32.dll","ICGetInfo",3,0,0,4},
+        {"msvfw32.dll","ICInfo",3,0,0,3},{"msvfw32.dll","ICInstall",5,0,0,0x13},
+        {"msvfw32.dll","ICRemove",3,0,0,7},{"msvfw32.dll","ICDecompress",6,0,0,2,true},
+        {"msvfw32.dll","ICGetDisplayFormat",6,0,0,0x38},{"msvfw32.dll","ICImageDecompress",5,0,0,2},
+        {"msvfw32.dll","ICDraw",6,0,0,0x32,true},{"msvfw32.dll","ICDrawBegin",16,0,0,0xfde2,true},
+        {"msvfw32.dll","ICCompress",13,0,0,0x702,true},{"msvfw32.dll","ICImageCompress",7,0,0,0x22},
+        {"msvfw32.dll","ICSeqCompressFrameStart",2},{"msvfw32.dll","ICSeqCompressFrame",5,0,0,2},
+        {"msvfw32.dll","ICSeqCompressFrameEnd",1},{"msvfw32.dll","ICCompressorFree",1},
+        {"msvfw32.dll","ICCompressorChoose",6,0,0,2},{"internal-avi-vfw-choice","DialogProc",4},
+        {"msvfw32.dll","MCIWndRegisterClass",0,0,0,0,true},
+        {"msvfw32.dll","MCIWndCreate",4,0,0,4,true},{"msvfw32.dll","MCIWndCreateA",4,0,0,4,true},
+        {"msvfw32.dll","MCIWndCreateW",4,0,0,4,true},{"internal-avi-mciwnd","WindowProc",4,0,0,2},
+        {"msvfw32.dll","DrawDibOpen",0},{"msvfw32.dll","DrawDibClose",1},
+        {"msvfw32.dll","DrawDibBegin",8,0,0,0xec},{"msvfw32.dll","DrawDibEnd",1},
+        {"msvfw32.dll","DrawDibDraw",13,0,0,0x1f3c},{"msvfw32.dll","DrawDibGetBuffer",4,0,0,0xc},
+        {"msvfw32.dll","DrawDibGetPalette",1},{"msvfw32.dll","DrawDibSetPalette",2},
+        {"msvfw32.dll","DrawDibChangePalette",4,0,0,6},{"msvfw32.dll","DrawDibRealize",3,0,0,4},
+        {"msvfw32.dll","DrawDibStart",2,0,0,2},{"msvfw32.dll","DrawDibStop",1},
+        {"msvfw32.dll","DrawDibTime",2},{"msvfw32.dll","DrawDibProfileDisplay",1},
+        {"msvfw32.dll","StretchDIB",12,0,0,0xf3c},
 #include "avi_disk_vtables.inc"
         {"avifil32.dll","AVIClearClipboard",0},{"avifil32.dll","AVIGetFromClipboard",1},
         {"avifil32.dll","AVIMakeStreamFromClipboard",3},{"avifil32.dll","AVIPutFileOnClipboard",1},
@@ -89,6 +113,8 @@ std::span<const WindowsServiceDescriptor> avifil32_service_descriptors(){
 
 std::optional<std::uint32_t> WindowsServices::invoke_avifil32(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const auto name=service.symbol;
+    if(service.family=="msvfw32.dll" || service.family=="msrle32.dll" || service.family=="msvidc32.dll")
+        return invoke_avi_disk(state,memory,service);
 #include "windows_avi_registration.inc"
 #include "windows_avi_options_proc.inc"
     if(name.ends_with("Clipboard") || service.family.starts_with("internal-avi-") || name=="CreateEditableStream" || name.starts_with("EditStream") || name=="AVIMakeFileFromStreams" || name=="AVIStreamGetFrameOpen" || name=="DllGetClassObject" || name=="DllCanUnloadNow")return invoke_avi_disk(state,memory,service);

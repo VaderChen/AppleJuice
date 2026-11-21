@@ -93,7 +93,14 @@ struct DirectInputState {
     std::uint32_t sequence{},locks{};std::uint64_t joystick_format{};
     std::vector<std::pair<input::Event,std::uint32_t>> injected_events;
     std::array<std::optional<input::Guid>,16> legacy_joystick_slots;
-    struct GamepadSlot {std::optional<input::Guid> device;std::array<std::uint8_t,12> state{};std::uint32_t packet{};std::uint16_t keystroke_buttons{};bool sampled{};};
+    struct GamepadSlot {
+        std::optional<input::Guid> device;
+        std::optional<std::array<std::uint16_t,2>> vibration;
+        std::array<std::uint8_t,12> state{};
+        std::uint32_t packet{};
+        std::uint16_t keystroke_buttons{};
+        bool sampled{};
+    };
     std::array<GamepadSlot,4> gamepad_slots;
     std::map<input::Guid,std::array<double,4>> gamepad_vibrations;
     bool xinput_enabled{true}; // XInputEnable(FALSE) 後 GetState 回中性狀態、SetState 不震動。

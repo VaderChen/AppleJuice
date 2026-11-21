@@ -14,6 +14,7 @@ void metal_timestamp_relay(NativeOpenGlContext&,const std::shared_ptr<GraphicsTi
 // 只讀資源描述的資格判斷（定義於 metal_programmable.inc／metal_unordered_clear.inc）：代理據此在呼叫端回傳結果並非同步排入。
 bool metal_copy_buffer_texture_eligible(const GraphicsView&,const GraphicsView&,std::uint64_t,std::uint32_t,std::uint32_t,const std::array<std::uint32_t,6>&);
 bool metal_unordered_clear_pattern(const GraphicsView&,const std::array<std::uint32_t,4>&,bool,std::array<std::uint8_t,16>&,unsigned&);
+bool metal_indirect_count_shapes(std::span<const GraphicsIndirectCountMask>,const GraphicsResource*);
 class MetalCommandThread final:public NativeOpenGlContext {
 public:
     explicit MetalCommandThread(std::shared_ptr<NativeOpenGlContext> inner,std::function<void(const std::string&)> on_error={}):
@@ -93,6 +94,13 @@ public:
     }
     void graphics_dispatch_indirect(const GraphicsStage& stage,const std::shared_ptr<GraphicsResource>& arguments,std::uint32_t offset) override {
         auto copy=std::make_shared<const GraphicsStage>(stage);post([this,copy,arguments,offset]{inner_->graphics_dispatch_indirect(*copy,arguments,offset);});
+    }
+    // 形狀只看資源描述，在呼叫端核對後才排入；內層同一核對必定成立，之後的間接繪製一定讀到遮罩結果。
+    bool graphics_indirect_count_masks(std::span<const GraphicsIndirectCountMask> masks,const std::shared_ptr<GraphicsResource>& target) override {
+        if(!metal_indirect_count_shapes(masks,target.get()))return false;
+        post([this,copy=std::vector<GraphicsIndirectCountMask>(masks.begin(),masks.end()),target]{
+            if(!inner_->graphics_indirect_count_masks(copy,target))throw std::invalid_argument("間接計數遮罩形狀不一致");});
+        return true;
     }
     // 其餘方法：先等佇列清空，再同步轉交。
     bool fixed_vertex_supported()const noexcept override {return inner_->fixed_vertex_supported();}

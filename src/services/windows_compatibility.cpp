@@ -104,6 +104,8 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"wldap32.dll","#79",1,0,0,0,true},
 #include "ldap_extended_descriptors.inc"
 
+        {"x3daudio1_0.dll","X3DAudioInitialize",3},
+        {"x3daudio1_0.dll","X3DAudioCalculate",5},
         {"x3daudio1_7.dll","X3DAudioInitialize",3,0,0,0,true},
         {"x3daudio1_7.dll","X3DAudioCalculate",5,0,0,0,true},
         {"bthprops.cpl","BluetoothSdpGetElementData",3},
@@ -275,7 +277,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"crt", "rand_s", 1}, {"crt", "rand", 0}, {"crt", "srand", 1},
         {"crt", "qsort", 4}, {"crt", "bsearch", 5}, {"crt","qsort_s",5},{"crt","bsearch_s",6},{"crt","_lfind",5},{"crt","_lfind_s",6},{"crt","_lsearch",5},
         {"crt", "setlocale", 2}, {"crt", "_wsetlocale", 2}, {"crt", "localeconv", 0}, {"crt", "___lc_codepage_func", 0}, {"crt", "___lc_collate_cp_func", 0},
-        {"crt", "___mb_cur_max_func", 0}, {"crt", "__mb_cur_max_func", 0}, {"crt","_ismbblead",1},{"crt","_ismbbtrail",1}, {"crt", "_lock", 1}, {"crt", "_unlock", 1},
+        {"crt", "___mb_cur_max_func", 0}, {"crt", "__mb_cur_max_func", 0}, {"crt", "_lock", 1}, {"crt", "_unlock", 1},
         {"crt", "__lconv_init", 0},
         {"crt", "wcrtomb", 3}, {"crt", "wctomb", 2},
         {"crt", "___lc_locale_name_func", 0}, {"crt", "__pctype_func", 0}, {"crt", "___lc_handle_func", 0}, {"crt", "___setlc_active_func", 0}, {"crt", "___unguarded_readlc_active_add_func", 0}, 
@@ -419,7 +421,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     // 沒有 Windows 錯誤回報（Dr. Watson）服務：回報 frrvErrNoDW，呼叫端照常走自己的崩潰處理。
     if(service.symbol=="ReportFault"){WindowsCall(state,memory,service).return_to(state,4);return std::nullopt;}
     const auto module_api=service.symbol;
-    if(service.family=="x3daudio1_7.dll"){const WindowsCall call(state,memory,service);const auto result=x3daudio::invoke(memory,call,state,module_api=="X3DAudioInitialize",x86_);call.return_to(state,result);return std::nullopt;}
+    if(service.family=="x3daudio1_0.dll" || service.family=="x3daudio1_7.dll"){
+        const WindowsCall call(state,memory,service);
+        call.return_to(state,x3daudio::invoke(memory,call,state,module_api=="X3DAudioInitialize",x86_));
+        return std::nullopt;
+    }
     if(module_api.starts_with("BluetoothSdp")){const WindowsCall call(state,memory,service);call.return_to(state,bluetooth_sdp::invoke(memory,call,module_api,x86_));return std::nullopt;}
     if(module_api.starts_with("Bluetooth"))return invoke_bluetooth(state,memory,service);
     if(module_api=="GetFirmwareType"){
@@ -1410,7 +1416,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
               symbol=="mbrtowc" || symbol=="mbrlen" || symbol=="mbtowc" || symbol=="mblen" || symbol=="mbsinit") {
         return invoke_locale(state,memory,service);
     }
-    else if(symbol=="_ismbblead" || symbol=="_ismbbtrail")return invoke_locale(state,memory,service);
     else if(symbol=="___mb_cur_max_func" || symbol=="__mb_cur_max_func" || symbol=="setlocale" || symbol=="_wsetlocale" || symbol=="localeconv" || symbol=="___lc_codepage_func" || symbol=="___lc_collate_cp_func" || symbol=="__lconv_init") {
         return invoke_locale(state,memory,service);
     } else if (symbol == "rand_s") {

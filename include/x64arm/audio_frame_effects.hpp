@@ -1,5 +1,8 @@
 #pragma once
+#include <algorithm>
 #include <atomic>
+#include <deque>
+#include <span>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -23,6 +26,28 @@ public:
     unsigned rate()const {return rate_;}
 protected:
     unsigned rate_{48000},input_{1},output_{1};
+};
+
+// 應用程式自寫的 XAPO（客體程式碼）與語音圖之間的區塊橋接：混音鎖內逐幀交出效果輸入、取回輸出。
+// 服務層每個量子結束時把累積的輸入交給客體 IXAPO::Process，結果在下一個量子依序播出（這條路徑延遲一個量子）；
+// 輸出尚未就緒時補靜音。輸出最多保留 4 個量子，消費落後時丟棄最舊的部分。
+class GuestBlock {
+public:
+    GuestBlock(unsigned input,unsigned output,unsigned quantum_frames):input_channels(input),output_channels(output),quantum_(quantum_frames){}
+    const unsigned input_channels,output_channels;
+    void exchange(float* frame){
+        std::lock_guard lock(mutex_);input_.insert(input_.end(),frame,frame+input_channels);
+        if(output_.size()>=output_channels){for(unsigned c=0;c<output_channels;++c){frame[c]=output_.front();output_.pop_front();}}
+        else std::fill(frame,frame+output_channels,0.F);
+    }
+    std::vector<float> take_input(){std::lock_guard lock(mutex_);std::vector<float> result;result.swap(input_);return result;}
+    void append_output(std::span<const float> samples){
+        std::lock_guard lock(mutex_);output_.insert(output_.end(),samples.begin(),samples.end());
+        const std::size_t limit=std::size_t{quantum_}*4*output_channels;
+        if(output_.size()>limit){const auto drop=(output_.size()-limit)/output_channels*output_channels;output_.erase(output_.begin(),output_.begin()+static_cast<std::ptrdiff_t>(drop));}
+    }
+private:
+    std::mutex mutex_;std::vector<float> input_;std::deque<float> output_;unsigned quantum_;
 };
 
 // XAUDIO2FX_REVERB_PARAMETERS；預設值與範圍依 xaudio2fx.h。時間與頻率都以 48 kHz 為基準。

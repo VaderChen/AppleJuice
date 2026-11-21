@@ -45,7 +45,7 @@ static inline unsigned shell_parse_icon_location(void *ctx, ShellQuoteAddress pa
         }
         if (negative) index = 0u - index;
     }
-    /* 參考實作先去除成對引號，再刪除路徑前後的 ASCII 空格。 */
+    /* 參考實作 先去除成對引號，再刪除路徑前後的 ASCII 空格。 */
     shell_quote_text(ctx, path, unit, ShellUnquoteSpaces, read_unit, write_unit);
     shell_remove_blanks(ctx, path, unit, read_unit, write_unit);
     return index;

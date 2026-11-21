@@ -2,6 +2,7 @@
 #include "x64arm/midi.hpp"
 #include "x64arm/unicode.hpp"
 #include "directmusic_interfaces.hpp"
+#include "directx_audio_registration.hpp"
 #include <functional>
 #include <map>
 #include <set>
@@ -101,7 +102,19 @@ void clock_change(MusicObject& o,std::int64_t reference,double bpm){const auto m
 }
 struct DirectMusicState {std::map<std::uint64_t,std::shared_ptr<MusicObject>> objects;std::map<char,std::uint64_t> tables;std::uint32_t locks{};std::map<std::u16string,std::weak_ptr<const midi::SoundBank>> banks;std::map<std::string,std::array<std::uint64_t,2>> trace_calls;};
 std::span<const WindowsServiceDescriptor> directmusic_service_descriptors(){
-    static const auto table=[] {std::vector<WindowsServiceDescriptor> result;for(const auto kind:{'L','P','S','T','A','O','F','C','B','R','K','D','I','U'})for(const auto& method:methods(kind))result.push_back(method);for(auto dll:{"dmusic.dll","dmime.dll","dmloader.dll"}){result.push_back({dll,"DllGetClassObject",3});result.push_back({dll,"DllCanUnloadNow",0});}return result;}();return table;
+    static const auto table=[] {
+        std::vector<WindowsServiceDescriptor> result;
+        for(const auto kind:{'L','P','S','T','A','O','F','C','B','R','K','D','I','U'})
+            for(const auto& method:methods(kind))result.push_back(method);
+        for(auto dll:{"dmusic.dll","dmime.dll","dmloader.dll"}){
+            result.push_back({dll,"DllGetClassObject",3});
+            result.push_back({dll,"DllCanUnloadNow",0});
+            result.push_back({dll,"DllRegisterServer",0});
+            result.push_back({dll,"DllUnregisterServer",0});
+        }
+        return result;
+    }();
+    return table;
 }
 void WindowsServices::poll_directmusic(){
     if(!dmusic_)return;
@@ -330,7 +343,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_directmusic(GuestState& sta
     for(auto& perf:performances)for(auto it=perf->runs.begin();it!=perf->runs.end();){const auto run=object(*it);bool finished=false;if(auto pb=run->voice_playback.lock()){std::lock_guard lock(pb->mutex);finished=run->voice->finished && run->observed_end;}for(const auto& extra:run->extra_voices)if(auto pb=extra.playback.lock()){std::lock_guard lock(pb->mutex);finished=finished && extra.voice->finished;}if(!finished){++it;continue;}const auto address=*it;it=perf->runs.erase(it);if(perf->active_state==address)perf->active_state=0;release(address);}
     std::uint64_t result=0;std::string failure;
     try {
-        if(service.symbol=="DllCanUnloadNow")result=bridge.objects.empty() && !bridge.locks?0:1;
+        if(service.symbol=="DllRegisterServer" || service.symbol=="DllUnregisterServer"){
+            const auto update=com_registry::update(runtime_.registry,registry_file_,registry_store_cache_,
+                registry_view(0,x86_),directx_audio_registration::music_classes(service.family),
+                utf8_to_utf16(service.family),service.symbol=="DllUnregisterServer",runtime_.system_filetime());
+            result=update.error;
+            if(!result)for(const auto& path:update.changed)poll_registry_notifications(true,path,5);
+        }else if(service.symbol=="DllCanUnloadNow")result=bridge.objects.empty() && !bridge.locks?0:1;
         else if(activation){
             const bool factory=service.symbol!="CoCreateInstance",dll=service.symbol=="DllGetClassObject";const auto out=arg(dll?2:4);check(out,unit);put(out,0,bits);const auto cls=read_guid(memory,arg(0));const auto iid=read_guid(memory,arg(dll?1:3));
             const char kind=factory?'F':class_kind(cls);

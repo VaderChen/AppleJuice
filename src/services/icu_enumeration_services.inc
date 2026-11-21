@@ -1,0 +1,7 @@
+ICU_ENUM_API(uenum_close,1)
+ICU_ENUM_API(uenum_count,2)
+ICU_ENUM_API(uenum_next,3)
+ICU_ENUM_API(uenum_openCharStringsEnumeration,3)
+ICU_ENUM_API(uenum_openUCharStringsEnumeration,3)
+ICU_ENUM_API(uenum_reset,2)
+ICU_ENUM_API(uenum_unext,3)

@@ -8,6 +8,7 @@
 #include "crt_time_storage.hpp"
 #include "monotonic_clock.hpp"
 #include "windows_math_environment.hpp"
+#include "service_callback_task.hpp"
 #include <algorithm>
 #include <bit>
 #include "x64arm/x87_fp.hpp"
@@ -44,16 +45,27 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
         {"msacm32.dll","acmGetVersion",0},{"msacm32.dll","acmMetrics",3},
         {"msacm32.dll","acmDriverEnum",3},{"msacm32.dll","acmDriverDetailsA",3},{"msacm32.dll","acmDriverDetailsW",3},{"msacm32.dll","acmDriverOpen",3},
         {"msacm32.dll","acmDriverClose",2},{"msacm32.dll","acmDriverID",3},{"msacm32.dll","acmDriverMessage",4},{"msacm32.dll","acmDriverPriority",3},
+        {"msacm32.dll","acmDriverAddA",5,0,0,0x18},{"msacm32.dll","acmDriverAddW",5,0,0,0x18},
+        {"msacm32.dll","acmDriverRemove",2,0,0,2},
         {"msacm32.dll","acmFormatTagDetailsA",3},{"msacm32.dll","acmFormatTagDetailsW",3},{"msacm32.dll","acmFormatDetailsA",3},{"msacm32.dll","acmFormatDetailsW",3},
         {"msacm32.dll","acmFormatTagEnumA",5},{"msacm32.dll","acmFormatTagEnumW",5},{"msacm32.dll","acmFormatEnumA",5},{"msacm32.dll","acmFormatEnumW",5},
         {"msacm32.dll","acmFilterTagDetailsA",3},{"msacm32.dll","acmFilterTagDetailsW",3},{"msacm32.dll","acmFilterDetailsA",3},{"msacm32.dll","acmFilterDetailsW",3},
         {"msacm32.dll","acmFilterTagEnumA",5},{"msacm32.dll","acmFilterTagEnumW",5},{"msacm32.dll","acmFilterEnumA",5},{"msacm32.dll","acmFilterEnumW",5},
+        {"msacm32.dll","acmFormatChooseA",1},{"msacm32.dll","acmFormatChooseW",1},
+        {"msacm32.dll","acmFilterChooseA",1},{"msacm32.dll","acmFilterChooseW",1},
+        {"msacm32.dll","DriverProc",5,0,0,4},{"msadp32.acm","DriverProc",5,0,0,4},
+        {"l3codeca.acm","DriverProc",5,0,0,4},{"msg711.acm","DriverProc",5,0,0,4},
+        {"imaadp32.acm","DriverProc",5,0,0,4},{"msgsm32.acm","DriverProc",5,0,0,4},
+        {"msacm32.drv","DriverProc",5,0,0,4},{"msacm32.drv","widMessage",5,0,0,3},{"msacm32.drv","wodMessage",5,0,0,3},
+        {"midimap.dll","DriverProc",5,0,0,4},{"midimap.dll","modMessage",5,0,0,3},
+        {"internal-acm-choice","DialogProc",4,0,0,2},
+        {"internal-acm-builtin","acmStreamOpen",8},{"internal-acm-builtin","acmFormatSuggest",5},
         {"crt","_gmtime64",1},{"crt","_localtime64",1},{"crt","_gmtime64_s",2},{"crt","_localtime64_s",2},
         {"crt","_mkgmtime64",1},{"crt","_mktime64",1},{"crt","_time64",1},{"crt","_difftime64",2,3},
         {"crt","time",1},{"crt","_time32",1},{"crt","gmtime",1},{"crt","localtime",1},
         {"crt","gmtime_s",2},{"crt","localtime_s",2},{"crt","_gmtime32",1},{"crt","_localtime32",1},
         {"crt","_gmtime32_s",2},{"crt","_localtime32_s",2},{"crt","mktime",1},{"crt","_mkgmtime",1},
-        {"crt","_mktime32",1},{"crt","_mkgmtime32",1},{"crt","difftime",2,3},{"crt","_difftime32",2},
+        {"crt","_mktime32",1},{"crt","_mkgmtime32",1},{"crt","_getsystime",1},{"crt","_setsystime",2},{"crt","difftime",2,3},{"crt","_difftime32",2},
         {"crt","strftime",4},{"crt","_tzset",0},{"crt","__timezone",0},{"crt","__daylight",0},{"crt","__tzname",0},{"crt","_get_tzname",4},{"crt","_get_timezone",1},{"crt","_get_daylight",1},{"crt","_get_dstbias",1},
         {"crt","wcsftime",4},{"crt","_Strftime",5},{"crt","_Wcsftime",5},
         {"crt","_strftime_l",5},{"crt","_wcsftime_l",5},{"crt","_Strftime_l",6},{"crt","_Wcsftime_l",6},
@@ -128,6 +140,11 @@ std::tm read_tm(const GuestMemory& memory,std::uint64_t address) {
 void write_tm(GuestMemory& memory,std::uint64_t address,const std::tm& value) {
     memory.check(GuestAddress{address},36,Access::Write);
     for (std::size_t i=0;i<fields.size();++i) memory.store(GuestAddress{address+i*4},32,static_cast<std::uint32_t>(value.*fields[i]));
+}
+std::optional<std::int64_t> normalize_crt_tm(std::tm& value,std::int64_t maximum){
+    const auto seconds=::timegm(&value);
+    if(seconds<0 || seconds>maximum)return {};
+    return static_cast<std::int64_t>(seconds);
 }
 std::int64_t read_time_value(const GuestMemory& memory,std::uint64_t address,bool narrow){
     if(!address)return -1;
@@ -227,9 +244,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
         else result=static_cast<std::uint32_t>(runtime_.clock_ticks/10000);
         call.return_to(state,result);return std::nullopt;
     }
-    if((service.symbol=="SetSystemTime" || service.symbol=="SetLocalTime") || service.symbol=="GetSystemTimeAdjustment" || service.symbol=="SetSystemTimeAdjustment"){
+    const bool crt_system_time=service.symbol=="_setsystime";
+    if(crt_system_time || service.symbol=="SetSystemTime" || service.symbol=="SetLocalTime" ||
+       service.symbol=="GetSystemTimeAdjustment" || service.symbol=="SetSystemTimeAdjustment"){
         const WindowsCall call(state,memory,service);
-        const auto finish=[&](unsigned value,unsigned error=0){if(error)last_error_=error;call.return_to(state,value);return std::optional<std::uint32_t>{};};
+        const auto finish=[&](unsigned value,unsigned error=0){
+            if(error)last_error_=error;
+            call.return_to(state,crt_system_time?error:value);
+            return std::optional<std::uint32_t>{};
+        };
         try{
         if(service.symbol=="GetSystemTimeAdjustment"){
             for(unsigned i=0;i<3;++i)if(!call(i))return finish(0,87);
@@ -238,14 +261,34 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
             memory.store(GuestAddress{call(1)},32,time.increment);
             memory.store(GuestAddress{call(2)},32,time.disabled);return finish(1);
         }
+        SystemTime legacy_fields{};
+        if(crt_system_time){
+            if(!call(0))return finish(0,87);
+            const auto original=read_tm(memory,call(0));
+            auto local=original;
+            if(!normalize_crt_tm(local,INT32_MAX)){
+                memory.store(GuestAddress{runtime_.errno_cell},32,22);
+                local=original;
+            }else write_tm(memory,call(0),local);
+            const auto word=[](std::int64_t value){return static_cast<std::uint16_t>(value);};
+            legacy_fields={word(static_cast<std::int64_t>(local.tm_year)+1900),
+                           word(static_cast<std::int64_t>(local.tm_mon)+1),
+                           word(local.tm_wday),word(local.tm_mday),word(local.tm_hour),
+                           word(local.tm_min),word(local.tm_sec),static_cast<std::uint16_t>(call(1))};
+        }
         refresh_file_security_context();
         const auto& token=runtime_.token_objects.at(effective_token_id());
-        const bool setting=(service.symbol=="SetSystemTime" || service.symbol=="SetLocalTime");
+        const bool setting=crt_system_time || service.symbol=="SetSystemTime" || service.symbol=="SetLocalTime";
         if(!token.has_privilege(12,!setting))return finish(0,1314);
         auto now=runtime_.system_filetime();
         if(setting){
-            if(!call(0))return finish(0,87);memory.check(GuestAddress{call(0)},16,Access::Read);
-            const auto time_fields=system_time(memory,call(0));const auto seconds=system_seconds(time_fields);
+            auto time_fields=legacy_fields;
+            if(!crt_system_time){
+                if(!call(0))return finish(0,87);
+                memory.check(GuestAddress{call(0)},16,Access::Read);
+                time_fields=system_time(memory,call(0));
+            }
+            const auto seconds=system_seconds(time_fields);
             if(!seconds || *seconds < -INT64_C(11644473600))return finish(0,87);
             const auto value=static_cast<std::uint64_t>(*seconds+INT64_C(11644473600));
             if(value>INT64_MAX/10000000U)return finish(0,87);
@@ -271,7 +314,34 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
         const auto elapsed=runtime_.clock_ticks>=origin?(runtime_.clock_ticks-origin)/10000:0;
         arg.return_to(state,elapsed>INT32_MAX?UINT32_MAX:elapsed);return std::nullopt;
     }
-    if(service.family=="msacm32.dll")return invoke_acm(state,memory,service);
+    if(service.family=="msacm32.dll" || service.family=="msadp32.acm" ||
+       service.family=="l3codeca.acm" || service.family=="msg711.acm" ||
+       service.family=="imaadp32.acm" || service.family=="msgsm32.acm" ||
+       service.family=="internal-acm-choice" || service.family=="internal-acm-builtin")
+        return invoke_acm(state,memory,service);
+    if(service.family=="msacm32.drv" || service.family=="midimap.dll"){
+        if(service.symbol=="widMessage")return invoke_wave_input(state,memory,service);
+        if(service.symbol=="wodMessage")return invoke_wave_output(state,memory,service);
+        if(service.symbol=="modMessage")return invoke_winmm_midi(state,memory,service);
+        const WindowsCall call(state,memory,service);
+        const auto message=static_cast<unsigned>(call(2));
+        if(message==7){
+            return nested_continuation(state,memory,"多媒體對應器驅動程式說明",
+                [this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                    const WindowsCall current(s,m,service);
+                    GuestScratch scratch(*this,m,s);
+                    const bool midi=service.family=="midimap.dll";
+                    const auto title=scratch.text(midi?u"MIDI 對應器":u"音訊裝置對應器");
+                    const auto text=scratch.text(midi?u"MIDI 播放使用目前的 DLS 合成器與音訊裝置。":u"播放與錄音使用目前的音訊裝置與相容格式。");
+                    const auto shown=title && text?co_await service_callback::call_value(
+                        resolve("user32.dll","MessageBoxW").value,{current(3),text,title,0x40}):0;
+                    current.return_to(s,shown?1:0);
+                    co_return std::optional<std::uint32_t>{};
+                });
+        }
+        call.return_to(state,(message==9 || message==10)?2U:(message>=1 && message<=6) || message==8?1U:0U);
+        return {};
+    }
     if(service.symbol=="timeSetEvent" || service.symbol=="timeKillEvent")return invoke_timer_queue(state,memory,service);
     if(service.family=="winmm.dll" && service.symbol.find("GetErrorText")!=service.symbol.npos) {
         const WindowsCall arg(state,memory,service);const auto code=static_cast<std::uint32_t>(arg(0)),capacity=static_cast<std::uint32_t>(arg(2));
@@ -584,14 +654,32 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
             else for (unsigned offset : {4U,88U}) {bytes[offset]='U';bytes[offset+2]='T';bytes[offset+4]='C';}
             memory.write(GuestAddress{arg(2)},bytes);result=1;
         }
-    } else if (symbol=="GetSystemTime" || symbol=="GetLocalTime") {
-        // 客體時區為 UTC；使用與 FILETIME／CRT 相同的虛擬時鐘。
-        const auto ticks=runtime_.system_filetime();
-        const auto stamp=static_cast<std::time_t>(static_cast<std::int64_t>(ticks/10000000)-INT64_C(11644473600));std::tm value{};
-        if(!::gmtime_r(&stamp,&value))throw HostCallFault("SYSTEMTIME 超出宿主可表示的日期");
-        const std::array<unsigned,8> fields_out{static_cast<unsigned>(value.tm_year+1900),static_cast<unsigned>(value.tm_mon+1),static_cast<unsigned>(value.tm_wday),static_cast<unsigned>(value.tm_mday),static_cast<unsigned>(value.tm_hour),static_cast<unsigned>(value.tm_min),static_cast<unsigned>(value.tm_sec),static_cast<unsigned>((ticks/10000)%1000)};
-        memory.check(GuestAddress{arg(0)},16,Access::Write);
-        for(unsigned i=0;i<fields_out.size();++i)memory.store(GuestAddress{arg(0)+i*2},16,fields_out[i]);
+    } else if(symbol=="GetSystemTime" || symbol=="GetLocalTime" || symbol=="_getsystime"){
+        const bool legacy=symbol=="_getsystime";
+        if(legacy && !arg(0)){error(0);invalid_parameter=true;}
+        else {
+            // 客體時區維持 UTC，Win32 SYSTEMTIME 與 CRT 表示共用同一個虛擬時刻。
+            const auto ticks=runtime_.system_filetime();
+            const auto milliseconds=static_cast<unsigned>((ticks/10000)%1000);
+            const auto stamp=static_cast<std::time_t>(static_cast<std::int64_t>(ticks/10000000)-INT64_C(11644473600));
+            std::tm value{};
+            if(!::gmtime_r(&stamp,&value))throw HostCallFault("系統時間超出宿主可表示的日期");
+            if(legacy){
+                if(stamp<0 || stamp>INT32_MAX){
+                    value.tm_yday=read_tm(memory,arg(0)).tm_yday;
+                    value.tm_isdst=-1;
+                    memory.store(GuestAddress{runtime_.errno_cell},32,22);
+                }
+                write_tm(memory,arg(0),value);
+                result=milliseconds;
+            }else{
+                const SystemTime out{static_cast<unsigned>(value.tm_year+1900),static_cast<unsigned>(value.tm_mon+1),
+                    static_cast<unsigned>(value.tm_wday),static_cast<unsigned>(value.tm_mday),static_cast<unsigned>(value.tm_hour),
+                    static_cast<unsigned>(value.tm_min),static_cast<unsigned>(value.tm_sec),milliseconds};
+                memory.check(GuestAddress{arg(0)},16,Access::Write);
+                for(unsigned i=0;i<out.size();++i)memory.store(GuestAddress{arg(0)+i*2},16,out[i]);
+            }
+        }
     } else if (symbol=="_time64" || symbol=="_time32" || symbol=="time") {
         const auto ticks=runtime_.system_filetime();
         if(ticks<UINT64_C(116444736000000000))error(UINT64_MAX);
@@ -610,9 +698,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
         if(!arg(0)){error(UINT64_MAX);invalid_parameter=true;}
         else {
             auto value=read_tm(memory,arg(0));memory.check(GuestAddress{arg(0)},36,Access::Write);
-            const auto seconds=::timegm(&value); // 客體預設時區 UTC，與宿主 TZ 無關。
-            if(seconds<0 || seconds>maximum)error(UINT64_MAX);
-            else {write_tm(memory,arg(0),value);result=static_cast<std::uint64_t>(seconds);}
+            const auto seconds=normalize_crt_tm(value,maximum);
+            if(!seconds)error(UINT64_MAX);
+            else {write_tm(memory,arg(0),value);result=static_cast<std::uint64_t>(*seconds);}
         }
     } else if (symbol=="strftime" || symbol=="wcsftime" || symbol=="_Strftime" || symbol=="_Wcsftime" || symbol=="_strftime_l" || symbol=="_wcsftime_l" || symbol=="_Strftime_l" || symbol=="_Wcsftime_l") {
         const bool wide=symbol.find("wcsftime")!=symbol.npos || symbol.find("Wcsftime")!=symbol.npos;

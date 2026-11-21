@@ -15,6 +15,12 @@
 // _l 版本以最後一個參數的 locale 物件選擇 mbcinfo，其餘共用同一實作。
 namespace x64arm {
 namespace {
+struct ByteClass {std::string_view name;unsigned ctype,type;};
+constexpr ByteClass byte_classes[]{
+#define CRT_MBC_BYTE(name,ctype,type) {#name,ctype,type},
+#include "crt_mbc_byte_operations.inc"
+#undef CRT_MBC_BYTE
+};
 constexpr std::uint32_t einval=22,erange=34,eilseq=42,struncate=80,nlscmperror=0x7fffffffU;
 // cp932 半形片假名 0xA1～0xDF（U+FF61～U+FF9F）的全形對應：Unicode 半形／全形相容對應，濁音與半濁音符號採獨立全形符號。
 constexpr std::array<char16_t,63> fullwidth_kana{
@@ -36,17 +42,51 @@ const std::array<std::uint32_t,256>& japanese_fullwidth_table(){
     static const auto table=[]{std::array<std::uint32_t,256> out{};for(unsigned c=0;c<256;++c)out[c]=japanese_fullwidth(c);return out;}();
     return table;
 }
+std::optional<std::uint32_t> invoke_crtdll_text(
+        GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    const WindowsCall call(state,memory,service);
+    const auto name=service.symbol;
+    const auto finish=[&](std::uint32_t value){
+        call.return_to(state,value);
+        return std::optional<std::uint32_t>{};
+    };
+    const auto read=[&](std::uint32_t address){return memory.load(GuestAddress{address},8);};
+    const auto first=static_cast<std::uint32_t>(call(0));
+    if(name=="_strinc")return finish(first+1);
+    if(name=="_strdec")return finish(static_cast<std::uint32_t>(call(1))-1);
+    if(name=="_strnextc")return finish(static_cast<std::uint32_t>(read(first)));
+    const auto second=static_cast<std::uint32_t>(call(1));
+    if(name=="_strninc")return finish(first+second);
+    if(name=="_strncnt"){
+        std::uint32_t count=0;
+        while(count<second && read(first+count))++count;
+        return finish(count);
+    }
+    if(name=="_strspnp"){
+        for(auto current=first;const auto value=read(current);++current){
+            auto candidate=second;
+            auto accepted=read(candidate);
+            while(accepted && accepted!=value)accepted=read(++candidate);
+            if(!accepted)return finish(current);
+        }
+        return finish(0);
+    }
+    throw HostCallFault("CRTDLL 窄字元服務未登錄");
+}
 }
 std::span<const WindowsServiceDescriptor> crt_mbcs_service_descriptors(){
     static const auto table=[]{
         std::vector<WindowsServiceDescriptor> out;
         // {名稱, 參數數, 是否有 _l 版本}
         static constexpr std::tuple<std::string_view,std::string_view,unsigned> entries[]{
-            {"_ismbbkana","_ismbbkana_l",1},{"_ismbcalnum","_ismbcalnum_l",1},{"_ismbcalpha","_ismbcalpha_l",1},{"_ismbcdigit","_ismbcdigit_l",1},
+            {"_ismbcblank","_ismbcblank_l",1},{"_ismbcalnum","_ismbcalnum_l",1},{"_ismbcalpha","_ismbcalpha_l",1},{"_ismbcdigit","_ismbcdigit_l",1},
             {"_ismbcgraph","_ismbcgraph_l",1},{"_ismbchira","_ismbchira_l",1},{"_ismbckata","_ismbckata_l",1},{"_ismbcl0","_ismbcl0_l",1},
             {"_ismbcl1","_ismbcl1_l",1},{"_ismbcl2","_ismbcl2_l",1},{"_ismbclegal","_ismbclegal_l",1},{"_ismbclower","_ismbclower_l",1},
             {"_ismbcprint","_ismbcprint_l",1},{"_ismbcpunct","_ismbcpunct_l",1},{"_ismbcspace","_ismbcspace_l",1},{"_ismbcsymbol","_ismbcsymbol_l",1},
             {"_ismbcupper","_ismbcupper_l",1},{"_ismbslead","_ismbslead_l",2},{"_ismbstrail","_ismbstrail_l",2},
+            {"_mbscoll","_mbscoll_l",2},{"_mbsicoll","_mbsicoll_l",2},
+            {"_mbsnbcoll","_mbsnbcoll_l",3},{"_mbsnbicoll","_mbsnbicoll_l",3},
+            {"_mbsncoll","_mbsncoll_l",3},{"_mbsnicoll","_mbsnicoll_l",3},
             {"_mbbtombc","_mbbtombc_l",1},{"_mbbtype","_mbbtype_l",2},{"_mbccpy","_mbccpy_l",2},{"_mbccpy_s","_mbccpy_s_l",4},
             {"_mbcjistojms","_mbcjistojms_l",1},{"_mbcjmstojis","_mbcjmstojis_l",1},{"_mbclen","_mbclen_l",1},{"_mbctohira","_mbctohira_l",1},
             {"_mbctokata","_mbctokata_l",1},{"_mbctolower","_mbctolower_l",1},{"_mbctombb","_mbctombb_l",1},{"_mbctoupper","_mbctoupper_l",1},
@@ -56,12 +96,21 @@ std::span<const WindowsServiceDescriptor> crt_mbcs_service_descriptors(){
             {"_mbsnicmp","_mbsnicmp_l",3},{"_mbsninc","",2},{"_mbsnlen","_mbsnlen_l",2},{"_mbsnset","_mbsnset_l",3},{"_mbsrev","_mbsrev_l",1},
             {"_mbsset","_mbsset_l",2},{"_mbsstr","",2},{"_mbstok","_mbstok_l",2},{"_mbstok_s","_mbstok_s_l",3},{"_mbsupr","_mbsupr_l",1},{"_mbsupr_s","_mbsupr_s_l",2},
         };
+#define CRTDLL_TEXT(name,count) out.push_back({"crtdll.dll",#name,count,0,0,0,true});
+#include "crtdll_text_services.inc"
+#undef CRTDLL_TEXT
+        out.push_back({"crt","__p__mbctype",0});
+        out.push_back({"crt","__p__mbcasemap",0});
+#define CRT_MBC_BYTE(name,ctype,type) out.push_back({"crt",#name,1});out.push_back({"crt",#name "_l",2});
+#include "crt_mbc_byte_operations.inc"
+#undef CRT_MBC_BYTE
         for(const auto& [plain,localized,count]:entries){out.push_back({"crt",plain,count});if(!localized.empty())out.push_back({"crt",localized,count+1});}
         return out;
     }();
     return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.family=="crtdll.dll")return invoke_crtdll_text(state,memory,service);
     const WindowsCall arg(state,memory,service);auto name=service.symbol;
     const bool localized=name.ends_with("_l");if(localized)name.remove_suffix(2);
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
@@ -72,13 +121,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
         if(const auto handler=current_invalid_parameter_handler()){start_callbacks(state,memory,{{handler,{0,0,0,0,0}}},Continuation::Return,result);return std::nullopt;}
         return done(result);
     };
+    const bool collation=name.starts_with("_mbs") && name.ends_with("coll");
     const CrtLocaleObject* chosen=&current_crt_locale(state,memory);
     if(localized && arg(service.arguments-1)){
-        const auto found=runtime_.crt_locales.find(arg(service.arguments-1));if(found==runtime_.crt_locales.end())return invalid(0);chosen=&found->second;
+        const auto found=runtime_.crt_locales.find(arg(service.arguments-1));if(found==runtime_.crt_locales.end())return invalid(collation?nlscmperror:0);chosen=&found->second;
     }
     const auto mbc=crt_mbc_address(memory,*chosen,x86_);
+    if(name=="__p__mbctype")return done(mbc+CRT_MBC_TYPES_OFFSET);
+    if(name=="__p__mbcasemap")return done(mbc+CRT_MBC_CASE_OFFSET);
     const auto codepage=static_cast<std::uint32_t>(memory.load(GuestAddress{mbc+4},32));const bool multibyte=memory.load(GuestAddress{mbc+8},32)!=0;
-    std::array<std::uint8_t,256> types{};memory.read(GuestAddress{mbc+29},types);
+    std::array<std::uint8_t,256> types{};
+    memory.read(GuestAddress{mbc+CRT_MBC_TYPES_OFFSET+1},types);
+    const auto& ctype=windows_crt_character_table(chosen->categories[2]);
+    const auto test_byte=[&](unsigned value,const ByteClass& classification){
+        return value<256 && crt_mbc_test_byte(value,ctype.masks[value+1],types[value],classification.ctype,classification.type);
+    };
+    if(const auto found=std::ranges::find(byte_classes,name,&ByteClass::name);found!=std::end(byte_classes))
+        return done(test_byte(static_cast<std::uint32_t>(arg(0)),*found));
     const auto page=windows_crt_codepage(codepage);if(!page)return invalid(0);
     const auto& table=windows_crt_character_table(*page);const bool japanese=multibyte && codepage==932;
     const auto lead=[&](unsigned b){return multibyte && (types[b&0xffU]&4U);};
@@ -127,9 +186,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
     const auto length=[&](std::uint64_t text,std::uint64_t limit=UINT64_MAX){std::uint64_t n=0;while(n<limit && byte(text+n))++n;return n;};
     try{
         // ---- 字元分類 ----
-        if(name.starts_with("_ismbc") || name=="_ismbbkana"){
+        if(name.starts_with("_ismbc")){
             const auto c=u32(0);
-            if(name=="_ismbbkana")return done(japanese && c>=0xa1 && c<=0xdf);
+            if(c<256){
+                const auto found=std::ranges::find_if(byte_classes,[&](const auto& operation){
+                    return operation.name.substr(6)==name.substr(6);
+                });
+                if(found!=std::end(byte_classes))return done(test_byte(c,*found));
+            }
+            if(name=="_ismbcblank")return done(c<256?test_byte(c,{"",0x40,0}):classify(c,0x40));
             if(name=="_ismbclegal")return done(c>255 && lead(c>>8) && trail(c&0xffU));
             if(name=="_ismbchira")return done(japanese && c>=0x829f && c<=0x82f1);
             if(name=="_ismbckata")return done(japanese && c>=0x8340 && c<=0x8396 && c!=0x837f);
@@ -224,6 +289,58 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
             return done(limit);
         }
         // ---- 比較 ----
+        if(collation){
+            if(!arg(0) || !arg(1))return invalid(nlscmperror);
+            const bool bytes=name.starts_with("_mbsnb");
+            const bool bounded=bytes || name.starts_with("_mbsn");
+            const bool fold=name.ends_with("icoll");
+            const auto count=bounded?arg(2):UINT64_MAX;
+            const auto& order_locale=chosen->categories[1];
+            const bool classic=!multibyte && !order_locale.codepage;
+            constexpr std::uint64_t max_input=1048576;
+            const auto read=[&](std::uint64_t source)->std::optional<std::string>{
+                std::string output;
+                for(std::uint64_t offset=0,characters=0;offset<max_input;){
+                    if((bytes?offset:characters)==count)return output;
+                    const auto first=byte(source+offset);
+                    if(!first)return output;
+                    if(!lead(first)){
+                        output.push_back(static_cast<char>(first));++offset;
+                    }else{
+                        if(bytes && count-offset<2)return output;
+                        if(offset+1>=max_input)return {};
+                        const auto second=byte(source+offset+1);
+                        if(!second)return output;
+                        output.push_back(static_cast<char>(first));
+                        output.push_back(static_cast<char>(second));
+                        offset+=2;
+                    }
+                    ++characters;
+                    if((bytes?offset:characters)==count)return output;
+                }
+                return {};
+            };
+            const auto first=read(arg(0)),second=read(arg(1));
+            if(!first || !second)return invalid(nlscmperror);
+            if(classic){
+                const auto key=[&](char value){
+                    const auto c=static_cast<unsigned char>(value);
+                    return fold && c>='A' && c<='Z'?static_cast<unsigned>(c)+32U:c;
+                };
+                const auto pair=std::mismatch(first->begin(),first->end(),second->begin(),second->end(),
+                    [&](auto left,auto right){return key(left)==key(right);});
+                const auto left=pair.first==first->end()?0U:key(*pair.first);
+                const auto right=pair.second==second->end()?0U:key(*pair.second);
+                return done(left<right?UINT32_MAX:left>right?1U:0U);
+            }
+            const auto collation_page=multibyte?codepage:order_locale.codepage;
+            const auto mbc_locale=static_cast<std::uint32_t>(memory.load(GuestAddress{mbc+12},32));
+            const auto locale=multibyte?(mbc_locale?mbc_locale:windows_crt_collation_lcid(collation_page)):order_locale.lcid;
+            const auto left=windows_nls_decode(*first,collation_page,true),right=windows_nls_decode(*second,collation_page,true);
+            if(!left || !right)return invalid(nlscmperror);
+            const auto result=windows_nls_compare(*left,*right,locale,fold?1U:0U);
+            return result?done(static_cast<std::uint32_t>(*result)):invalid(nlscmperror);
+        }
         if(name=="_mbsicmp" || name=="_mbsnbicmp" || name=="_mbsnicmp" || name=="_mbsncmp"){
             const bool fold=name!="_mbsncmp",bytes=name=="_mbsnbicmp",bounded=name!="_mbsicmp";
             if(bounded && !arg(2))return done(0);

@@ -46,6 +46,8 @@ class SharedMutex {
 public:
     explicit SharedMutex(std::shared_ptr<SharedMutexStorage> storage):storage_(std::move(storage)){}
     bool available_locked(std::uint64_t thread);
+    // 不取命名空間鎖的可用性提示（等待預檢用）：正面結果仍須在鎖下以 available_locked 重查並取得。
+    bool available_hint(std::uint64_t thread) noexcept;
     bool acquire_locked(std::uint64_t thread); // 回傳是否承接 abandoned ownership。
     std::uint32_t release_locked(std::uint64_t thread);
     SharedMutexState state_locked();

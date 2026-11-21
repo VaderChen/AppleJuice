@@ -5,6 +5,7 @@
 #include "x64arm/windows_fonts.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
+#include "avi_preview.hpp"
 #include <algorithm>
 #include <bit>
 #include <charconv>
@@ -18,6 +19,9 @@ std::span<const WindowsServiceDescriptor> common_dialog_service_descriptors() {
         {"comdlg32.dll","ChooseColorA",1},{"comdlg32.dll","ChooseColorW",1},
         {"comdlg32.dll","GetOpenFileNameA",1},{"comdlg32.dll","GetOpenFileNameW",1},
         {"comdlg32.dll","GetSaveFileNameA",1},{"comdlg32.dll","GetSaveFileNameW",1},
+        {"msvfw32.dll","GetOpenFileNamePreview",1},{"msvfw32.dll","GetOpenFileNamePreviewA",1},
+        {"msvfw32.dll","GetOpenFileNamePreviewW",1},{"msvfw32.dll","GetSaveFileNamePreviewA",1},
+        {"msvfw32.dll","GetSaveFileNamePreviewW",1},
         {"comdlg32.dll","CommDlgExtendedError",0},
         {"comdlg32.dll","FindTextA",1},{"comdlg32.dll","FindTextW",1},{"comdlg32.dll","ReplaceTextA",1},{"comdlg32.dll","ReplaceTextW",1},{"internal-find-replace","DialogProc",4},
         {"comdlg32.dll","DllGetClassObject",3},{"internal-file-dialog-factory","QueryInterface",3},{"internal-file-dialog-factory","AddRef",1},{"internal-file-dialog-factory","Release",1},{"internal-file-dialog-factory","CreateInstance",4},{"internal-file-dialog-factory","LockServer",2},
@@ -34,6 +38,7 @@ std::span<const WindowsServiceDescriptor> common_dialog_service_descriptors() {
 }
 namespace {
 using Kind=GuiCommonDialog::Kind;
+constexpr unsigned file_name_edit=411,preview_button=418,preview_screen=419;
 struct CommonDialogAbi {
     unsigned size,legacy_size,owner,flags,font,point_size,font_type,min_size,max_size,color,custom_colors;
     unsigned filter,filter_index,file,file_capacity,file_title,title_capacity,directory,title,extension,file_offset,extension_offset,hook,font_color,style;
@@ -55,6 +60,10 @@ std::optional<std::int32_t> integer(const std::u16string& text){
 std::u16string slash(std::u16string s){std::replace(s.begin(),s.end(),u'/',u'\\');return s;}
 std::u16string parent_path(const std::u16string& path){const auto n=path.find_last_of(u'\\');return n==std::u16string::npos?u".":n==2 && path[1]==u':'?path.substr(0,3):path.substr(0,n);}
 std::u16string join_path(const std::u16string& dir,const std::u16string& name){return dir.empty() || dir==u"."?name:dir+(dir.back()==u'\\'?u"":u"\\")+name;}
+std::u16string file_dialog_path(const std::u16string& directory,const std::u16string& name,std::u16string_view cwd){
+    const bool absolute=name.starts_with(u"\\") || (name.size()>1 && name[1]==u':');
+    return normalized_windows_path(absolute?name:join_path(directory,name),cwd);
+}
 bool match_filter(std::u16string_view name,std::u16string_view pattern){
     const auto lower=[](char16_t c){return c>=u'A' && c<=u'Z'?static_cast<char16_t>(c+32):c;};
     std::size_t n=0,p=0,star=std::u16string_view::npos,retry=0;
@@ -226,6 +235,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_common_dialog(GuestState& s
     if(service.symbol.starts_with("ChooseFont"))data.kind=Kind::Font;else if(service.symbol.starts_with("ChooseColor"))data.kind=Kind::Colour;
     else data.kind=service.symbol.starts_with("GetSave")?Kind::SaveFile:Kind::OpenFile;
     const bool file=data.kind==Kind::SaveFile || data.kind==Kind::OpenFile;
+    const bool preview=file && service.family=="msvfw32.dll";
     const CommonDialogAbi abi(data.kind,x86_);
     if(size!=abi.size && !(file && size==abi.legacy_size)){fail(1);return std::nullopt;}
     memory.check(GuestAddress{p},size,Access::Write);
@@ -252,6 +262,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_common_dialog(GuestState& s
     // Headless 回傳使用者取消；原生模式才建立可操作的共用對話框。
     if(!native_gui_ && !data.hook){arg.return_to(state,0);return std::nullopt;}
     GuiWindow dialog;dialog.dpi_context=effective_dpi_context();dialog.thread=threads_.current;dialog.class_name=u"#32770";dialog.dialog=true;dialog.modal=true;dialog.builtin=true;dialog.visible=true;dialog.owner=load(abi.owner);dialog.width=600;dialog.height=file?480:data.kind==Kind::Font && (data.flags&0x100U)?400:data.kind==Kind::Colour?460:300;
+    if(preview){dialog.width=878;dialog.style|=0x10000000U;data.preview_timer=gui_.next_object++;}
     dialog.procedure=resolve("comdlg32.dll",wide?"__CommonDialogProcW":"__CommonDialogProcA").value;
     dialog.unicode=wide;
     dialog.title=file?(read(load(abi.title)).empty()?(data.kind==Kind::SaveFile?u"Save file":u"Open file"):read(load(abi.title))):data.kind==Kind::Font?u"Font":u"Colour";
@@ -283,6 +294,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_common_dialog(GuestState& s
         add(0,u"static",u"檔案類型",20,355,130,26);const auto filter=add(413,u"combobox",{},160,355,410,28,3);auto& filters=gui_.windows.at(filter);
         auto at=load(abi.filter);for(unsigned i=0;at && i<128;++i){const auto label=read(at);if(label.empty())break;at+=(wide?label.size():utf16_to_utf8(label).size())*(wide?2:1)+(wide?2:1);const auto pattern=read(at);at+=(wide?pattern.size():utf16_to_utf8(pattern).size())*(wide?2:1)+(wide?2:1);data.filters.push_back(pattern);filters.items.push_back({gui_.next_item++,0,0,label,0});}
         if(filters.items.empty()){data.filters.push_back(u"*");filters.items.push_back({gui_.next_item++,0,0,u"所有檔案",0});}const auto filter_index=load(abi.filter_index,32);filters.selection=filter_index>=1 && filter_index<=filters.items.size()?static_cast<int>(filter_index-1):0;filters.title=filters.items[static_cast<std::size_t>(filters.selection)].text;present_gui(filter);
+        if(preview){
+            add(preview_screen,u"static",u"",600,92,250,190,0x50800000);
+            add(preview_button,u"button",u"預覽",600,295,250,28,0x50010000);
+        }
     }
     const auto footer=static_cast<int>(dialog.height)-55;if(data.kind==Kind::Font && (data.flags&0x200U))add(1026,u"button",u"套用",20,footer,90,28);add(499,u"static",u"",20,footer-38,550,32);add(1,u"button",u"OK",370,footer,90,28,1);add(2,u"button",u"Cancel",480,footer,90,28);
     gui_.common_dialogs[h]=std::move(data);if(file)common_dialog_refresh(h);
@@ -296,6 +311,9 @@ bool WindowsServices::common_dialog_message(GuestMemory& memory,const GuiMessage
     if(found->second.hook && !from_hook)return false;
     auto& data=found->second;auto& dialog=gui_.windows.at(msg.window);const auto p=data.request;const bool wide=data.wide;const CommonDialogAbi abi(data.kind,x86_);
     if(msg.message==0x10){dialog.ended=true;dialog.dialog_result=0;return true;}
+    if(data.preview_timer){
+#include "windows_vfw_file_preview.inc"
+    }
     const bool query_font=data.kind==Kind::Font && msg.message==0x401;
     if(msg.message!=0x111 && !query_font && !(data.kind==Kind::Font && msg.message==0x465))return false;
     const auto id=query_font?1U:msg.wparam&65535,notice=query_font?0U:msg.wparam>>16;
@@ -352,8 +370,8 @@ bool WindowsServices::common_dialog_message(GuestMemory& memory,const GuiMessage
     }else{
         auto name=slash(control(411).title);if(name.empty()){status(u"請選擇或輸入檔案名稱。 ");return true;}
         if(name==u".."){data.directory=parent_path(data.directory);common_dialog_refresh(msg.window);return true;}
-        auto path=name.starts_with(u"\\") || (name.size()>1 && name[1]==u':')?name:join_path(data.directory,name);
-        try{path=normalized_windows_path(std::move(path),runtime_.current_directory);}catch(const std::invalid_argument&){status(u"請輸入有效的已映射路徑。 ");return true;}
+        std::u16string path;
+        try{path=file_dialog_path(data.directory,name,runtime_.current_directory);}catch(const std::invalid_argument&){status(u"請輸入有效的已映射路徑。 ");return true;}
         auto info=filesystem_.information(utf16_to_utf8(path));if(!info.error && (info.metadata.attributes&16)){data.directory=path;control(411).title.clear();present_gui(gui_child(msg.window,411));common_dialog_refresh(msg.window);return true;}
         const auto leaf=name.substr(name.find_last_of(u'\\')==name.npos?0:name.find_last_of(u'\\')+1);
         if(leaf.find(u'.')==leaf.npos && !data.extension.empty()){path+=u"."+data.extension;info=filesystem_.information(utf16_to_utf8(path));}

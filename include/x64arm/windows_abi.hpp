@@ -51,6 +51,12 @@ public:
         if (offset > UINT64_MAX - sp) throw MemoryFault(GuestAddress{sp}, Access::Read, 8, "Windows 參數地址溢位");
         return scalar(memory_.load(GuestAddress{sp + offset}, 64));
     }
+    // return_to 返回時堆疊指標前進的位元組數（返回位址＋Win32 callee cleanup 參數槽）；供不再讀客體堆疊的返回路徑使用。
+    std::uint32_t return_pop() const noexcept {
+        if (!x86_) return 8;
+        const auto slots=arguments_+static_cast<unsigned>(std::popcount(wide_arguments_))+3U*static_cast<unsigned>(std::popcount(aggregate_arguments_));
+        return 4 + (callee_cleanup_ ? slots * 4U : 0);
+    }
     void return_to(GuestState& state, std::uint64_t value, bool wide_result = false) const {
         if (x86_) {
             const auto target = memory_.load(GuestAddress{state_.reg(Gpr::Rsp)}, 32);
@@ -155,6 +161,24 @@ std::span<const WindowsServiceDescriptor> network_diagnostic_service_descriptors
 std::span<const WindowsServiceDescriptor> credential_ui_service_descriptors();
 std::span<const WindowsServiceDescriptor> certificate_ui_service_descriptors();
 std::span<const WindowsServiceDescriptor> winusb_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_character_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_set_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_trie_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_string_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_text_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_break_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_case_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_normalization_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_enumeration_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_locale_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_currency_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_calendar_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_date_pattern_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_number_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_date_format_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_formatted_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_bidi_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_modern_number_service_descriptors();
 std::span<const WindowsServiceDescriptor> wlan_service_descriptors();
 std::span<const WindowsServiceDescriptor> font_package_service_descriptors();
 std::span<const WindowsServiceDescriptor> mci_service_descriptors();
@@ -202,6 +226,7 @@ std::span<const WindowsServiceDescriptor> ole_wrapper_service_descriptors();
 std::span<const WindowsServiceDescriptor> file_link_service_descriptors();
 std::span<const WindowsServiceDescriptor> power_scheme_service_descriptors();
 std::span<const WindowsServiceDescriptor> ole_picture_service_descriptors();
+std::span<const WindowsServiceDescriptor> dxdiag_service_descriptors();
 std::span<const WindowsServiceDescriptor> crt_console_read_service_descriptors();
 std::span<const WindowsServiceDescriptor> com_moniker_service_descriptors();
 std::span<const WindowsServiceDescriptor> ole_advise_service_descriptors();

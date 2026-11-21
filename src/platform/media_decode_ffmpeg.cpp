@@ -1,5 +1,5 @@
-// Windows Media 內容的軟體解碼後端：只連結 FFmpeg 的 libavcodec／libavutil 解碼器（cmake/FFmpeg.cmake），
-// 不使用容器、縮放、重取樣與編碼器。解多工、色彩配置與 PCM 轉換由引擎既有的 MF 流程負責。
+// Windows Media 解碼與 Video 1 編解碼使用內建 FFmpeg libavcodec／libavutil。
+// 容器、色彩配置及 PCM 轉換由既有 MF 與 AVI 流程負責。
 #include "x64arm/media_decode.hpp"
 
 extern "C" {
@@ -48,6 +48,9 @@ AVCodecID video_codec(std::uint32_t fourcc) {
     case make_fourcc('W', 'M', 'V', '3'): return AV_CODEC_ID_WMV3;
     case make_fourcc('W', 'M', 'V', '2'): return AV_CODEC_ID_WMV2;
     case make_fourcc('W', 'M', 'V', '1'): return AV_CODEC_ID_WMV1;
+    case make_fourcc('H', '2', '6', '4'): return AV_CODEC_ID_H264;
+    case make_fourcc('M', 'P', 'G', '1'): return AV_CODEC_ID_MPEG1VIDEO;
+    case make_fourcc('M', 'P', 'G', '2'): return AV_CODEC_ID_MPEG2VIDEO;
     default: return AV_CODEC_ID_NONE;
     }
 }
@@ -58,6 +61,8 @@ AVCodecID audio_codec(std::uint16_t tag) {
     case 0x0162: return AV_CODEC_ID_WMAPRO;
     case 0x0163: return AV_CODEC_ID_WMALOSSLESS;
     case 0x000a: return AV_CODEC_ID_WMAVOICE;
+    case 0x0050: return AV_CODEC_ID_MP2;
+    case 0x0055: return AV_CODEC_ID_MP3;
     default: return AV_CODEC_ID_NONE;
     }
 }
@@ -224,6 +229,131 @@ bool video_decoder_available(std::uint32_t fourcc) {
 bool audio_decoder_available(std::uint16_t format_tag) {
     const auto id = audio_codec(format_tag);
     return id != AV_CODEC_ID_NONE && avcodec_find_decoder(id);
+}
+bool video1_fourcc(std::uint32_t fourcc){
+    switch(upper_fourcc(fourcc)){
+    case make_fourcc('M','S','V','C'):
+    case make_fourcc('C','R','A','M'):
+    case make_fourcc('W','H','A','M'):
+        return true;
+    default:return false;
+    }
+}
+
+namespace {
+void validate_video1_size(unsigned width,unsigned height){
+    if(width<4 || height<4 || width>16384 || height>16384 || (width&3) || (height&3) ||
+       std::uint64_t{width}*height>32U*1024*1024)
+        throw std::invalid_argument("Video 1 的畫面尺寸無效");
+}
+bool complete_video1_blocks(std::span<const std::uint8_t> packet,unsigned blocks,bool indexed){
+    std::size_t at=0;
+    while(blocks){
+        if(packet.size()-at<2)return false;
+        const unsigned low=packet[at++],high=packet[at++];
+        if((high&0xfc)==0x84){
+            const auto skipped=low+((high&3)<<8);
+            if(!skipped || skipped>blocks)return false;
+            blocks-=skipped;
+            continue;
+        }
+        unsigned colors=0;
+        if(high<0x80){
+            if(indexed)colors=2;
+            else{
+                if(packet.size()-at<2)return false;
+                colors=packet[at+1]&0x80?16:4;
+            }
+        }else if(indexed && high>=0x90)colors=8;
+        if(packet.size()-at<colors)return false;
+        at+=colors;
+        --blocks;
+    }
+    return true;
+}
+}
+
+struct Video1Decoder::State : Codec {using Codec::Codec;};
+Video1Decoder::Video1Decoder(unsigned width,unsigned height,unsigned depth,std::span<const std::uint8_t> palette){
+    validate_video1_size(width,height);
+    if((depth!=8 && depth!=16) || palette.size()>AVPALETTE_SIZE || palette.size()%4)
+        throw std::invalid_argument("Video 1 的像素格式無效");
+    std::vector<std::uint8_t> color_table(depth==8?AVPALETTE_SIZE:0);
+    if(depth==8)std::copy(palette.begin(),palette.end(),color_table.begin());
+    state_=std::make_unique<State>(AV_CODEC_ID_MSVIDEO1,color_table,[=](AVCodecContext& context){
+        context.width=context.coded_width=static_cast<int>(width);
+        context.height=context.coded_height=static_cast<int>(height);
+        context.bits_per_coded_sample=static_cast<int>(depth);
+    });
+}
+Video1Decoder::~Video1Decoder()=default;
+
+std::vector<std::uint8_t> Video1Decoder::decode(std::span<const std::uint8_t> packet,bool key){
+    std::vector<std::uint8_t> output;
+    const auto& format=*state_->context;
+    const auto blocks=static_cast<unsigned>(format.width/4)*static_cast<unsigned>(format.height/4);
+    if(!complete_video1_blocks(packet,blocks,format.bits_per_coded_sample==8))return output;
+    state_->send(packet,INT64_MIN,key,[&](const AVFrame& frame){
+        if(frame.width!=format.width || frame.height!=format.height ||
+           (frame.format!=AV_PIX_FMT_RGB555 && frame.format!=AV_PIX_FMT_PAL8))return;
+        const auto row=static_cast<std::size_t>(frame.width)*(frame.format==AV_PIX_FMT_PAL8?1U:2U);
+        output.resize(row*static_cast<std::size_t>(frame.height));
+        for(int y=0;y<frame.height;++y)
+            std::memcpy(output.data()+row*static_cast<std::size_t>(frame.height-1-y),
+                        frame.data[0]+std::ptrdiff_t{y}*frame.linesize[0],row);
+    });
+    return output;
+}
+
+struct Video1Encoder::State {
+    std::unique_ptr<AVCodecContext,ContextDeleter> context;
+    std::unique_ptr<AVFrame,FrameDeleter> frame{av_frame_alloc()};
+    std::unique_ptr<AVPacket,PacketDeleter> packet{av_packet_alloc()};
+    std::int64_t frame_number{};
+};
+Video1Encoder::Video1Encoder(unsigned width,unsigned height){
+    validate_video1_size(width,height);
+    quiet_logging();
+    const auto* codec=avcodec_find_encoder(AV_CODEC_ID_MSVIDEO1);
+    if(!codec)throw std::runtime_error("內建 FFmpeg 缺少 Video 1 編碼器");
+    state_=std::make_unique<State>();
+    state_->context.reset(avcodec_alloc_context3(codec));
+    if(!state_->context || !state_->frame || !state_->packet)throw std::bad_alloc{};
+    auto& format=*state_->context;
+    format.width=static_cast<int>(width);
+    format.height=static_cast<int>(height);
+    format.time_base={1,25};
+    format.pix_fmt=AV_PIX_FMT_RGB555;
+    format.keyint_min=static_cast<int>(video1_default_key_rate);
+    if(const auto status=avcodec_open2(&format,codec,nullptr);status<0)
+        throw std::runtime_error("無法開啟 Video 1 編碼器："+error_text(status));
+    auto& frame=*state_->frame;
+    frame.width=format.width;
+    frame.height=format.height;
+    frame.format=format.pix_fmt;
+    if(av_frame_get_buffer(&frame,0)<0)throw std::bad_alloc{};
+}
+Video1Encoder::~Video1Encoder()=default;
+
+Video1Encoder::Packet Video1Encoder::encode(std::span<const std::uint8_t> rgb555,bool key){
+    auto& state=*state_;
+    auto& frame=*state.frame;
+    const auto row=static_cast<std::size_t>(frame.width)*2;
+    if(rgb555.size()!=row*static_cast<std::size_t>(frame.height))
+        throw std::invalid_argument("Video 1 的 RGB555 資料長度無效");
+    if(av_frame_make_writable(&frame)<0)throw std::bad_alloc{};
+    for(int y=0;y<frame.height;++y)
+        std::memcpy(frame.data[0]+std::ptrdiff_t{y}*frame.linesize[0],
+                    rgb555.data()+row*static_cast<std::size_t>(frame.height-1-y),row);
+    frame.pts=state.frame_number;
+    state.context->keyint_min=key || !state.frame_number?0:static_cast<int>(video1_default_key_rate);
+    if(const auto status=avcodec_send_frame(state.context.get(),&frame);status<0)
+        throw std::runtime_error("無法送入 Video 1 影格："+error_text(status));
+    ++state.frame_number;
+    av_packet_unref(state.packet.get());
+    if(const auto status=avcodec_receive_packet(state.context.get(),state.packet.get());status<0)
+        throw std::runtime_error("無法取得 Video 1 封包："+error_text(status));
+    return {{state.packet->data,state.packet->data+state.packet->size},bool(state.packet->flags&AV_PKT_FLAG_KEY)};
 }
 
 struct VideoDecoder::State : Codec {

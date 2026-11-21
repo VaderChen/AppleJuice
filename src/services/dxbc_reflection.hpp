@@ -58,6 +58,7 @@ struct Reflection {
     std::uint64_t requires_flags{};
     std::string creator;
     std::uint32_t version{},flags{},interface_slots{};
+    bool level9{};
     std::vector<Buffer> buffers;
     std::vector<Binding> bindings;
     std::array<std::vector<Signature>,3> signatures;
@@ -80,6 +81,7 @@ struct Reflection {
             else if(tag==0x47534350 || tag==0x31475350)read_signature(chunk,2,tag==0x31475350?2U:0U);
             else if(tag==0x30494653){requires_flags=chunk.u32(0)|(std::uint64_t{chunk.u32(4)}<<32);}
             else if(tag==0x45434649){interface_slots=chunk.u32(12);}
+            else if(tag==0x396e6f41)level9=true; // Aon9：以 D3D9 bytecode 執行的 feature-level 9 路徑
             else if(tag==0x58454853 || tag==0x52444853){
                 version=chunk.u32(0);const auto words=chunk.u32(4);
                 if(words<2 || std::uint64_t{words}*4!=size)throw std::invalid_argument("DXBC reflection shader 長度不合法");

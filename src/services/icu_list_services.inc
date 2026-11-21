@@ -1,0 +1,8 @@
+ICU_FMT_API(ulistfmt_close,1,0,icuuc)
+ICU_FMT_API(ulistfmt_closeResult,1,0,icu)
+ICU_FMT_API(ulistfmt_format,7,0,icuuc)
+ICU_FMT_API(ulistfmt_formatStringsToResult,6,0,icu)
+ICU_FMT_API(ulistfmt_open,2,0,icuuc)
+ICU_FMT_API(ulistfmt_openForType,4,0,icu)
+ICU_FMT_API(ulistfmt_openResult,1,0,icu)
+ICU_FMT_API(ulistfmt_resultAsValue,2,0,icu)

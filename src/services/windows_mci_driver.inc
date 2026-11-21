@@ -8,7 +8,7 @@
 //   驗證格式後配發表格編號；格式錯誤或找不到資源回傳 MCI_NO_COMMAND_TABLE。
 if(name=="mciGetDriverData" || name=="mciSetDriverData" || name=="mciGetCreatorTask" || name=="mciDriverNotify" || name=="mciDriverYield" ||
    name=="mciSetYieldProc" || name=="mciGetYieldProc" || name.starts_with("mciGetDeviceIDFromElementID") || name=="mciLoadCommandResource" || name=="mciFreeCommandResource"){
-    const auto device_at=[&](unsigned index)->mci::Wave*{const auto found=bridge.devices.find(static_cast<std::uint32_t>(arg(index)));return found==bridge.devices.end()?nullptr:found->second.get();};
+    const auto device_at=[&](unsigned index){return mci_control(bridge,static_cast<std::uint32_t>(arg(index)));};
     if(name=="mciGetDriverData"){const auto device=device_at(0);return finish(device?device->driver_data:0);}
     if(name=="mciSetDriverData"){const auto device=device_at(0);if(!device)return finish(0);device->driver_data=arg(1);return finish(1);}
     if(name=="mciGetCreatorTask"){const auto device=device_at(0);return finish(device?thread_identifier(device->creator):0);}

@@ -4,6 +4,7 @@
 #include "x64arm/windows_unwind.hpp"
 #include "windows_memory_diagnostics.hpp"
 #include "windows_exception_diagnostics.hpp"
+#include "windows_image_dump.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -561,6 +562,7 @@ std::optional<std::uint32_t> WindowsServices::advance_exception(GuestState& stat
         state = dispatch.consolidate_record?dispatch.consolidate_origin:dispatch.original;
         if(state.reg(Gpr::Rsp)<256){
             trace_fault_memory(state,memory,process_id(),threads_.current,true);
+            detail::dump_main_image(memory,runtime_.image.base,runtime_.image.size);
             if(std::getenv("X64ARM_TRACE_FAULT_MEMORY"))std::cerr<<"[exception_stack_failure] code=0x"<<std::hex<<dispatch.code<<" handler=0x"<<handler<<" context=0x"<<dispatch.context<<" record=0x"<<dispatch.record<<std::dec<<" stage="<<static_cast<unsigned>(dispatch.stage)<<'\n';
         }
         start_callbacks(state, memory, {{handler, std::move(arguments)}}, Continuation::Exception);
@@ -656,6 +658,7 @@ std::optional<std::uint32_t> WindowsServices::advance_exception(GuestState& stat
         exceptions_.stack.pop_back();sync_msvc_uncaught(memory);
         if(disposition==debugger::handled)return std::nullopt;
         trace_fault_memory(state,memory,process_id(),threads_.current,true);
+        detail::dump_main_image(memory,runtime_.image.base,runtime_.image.size);
         (void)emit_debug_event(state,memory,debugger::ExitProcess{code==0xe06d7363U?3U:code});return code==0xe06d7363U?3U:code;
     }
     throw HostCallFault("例外派送狀態不合法");

@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "texture_load.hpp"
 #include "gdiplus_codecs.hpp"
+#include "gdiplus_metafile.hpp"
 #include "gdiplus_brush.hpp"
 #include "gdiplus_pixels.hpp"
 #include "gdiplus_image_attributes.hpp"
@@ -65,6 +66,7 @@ struct GdiplusState {
     struct Bitmap {std::uint32_t width{},height{},format{};std::int64_t stride{};std::uint64_t scan0{};bool owned{};std::optional<Lock> lock{};
         std::vector<std::uint32_t> palette{};std::uint32_t palette_flags{};double dpi_x{96},dpi_y{96};std::uint8_t raw{0xaa};std::uint32_t image_flags{};std::vector<Property> properties{};};
     std::map<std::uint64_t,Bitmap> bitmaps;
+    std::map<std::uint64_t,gdiplus_meta::Image> metafiles;
     // ImageAttributes 與 CachedBitmap（建立時複製成 32bppPARGB 的自有點陣圖）。
     std::map<std::uint64_t,GdiplusImageAttributes> attributes;std::map<std::uint64_t,Bitmap> cached;
     // GDI+ 1.1 影像效果：種類、已檢查的參數（RedEye 另存區域複本）與是否已設定。
@@ -88,7 +90,7 @@ struct GdiplusState {
     std::uint64_t next_token{1};
     unsigned startups{};
     // GdipLoadImageFromStream：以 IStream::Read 分段讀入，完成後由共用影像解碼器轉成 32bppARGB。
-    struct StreamLoad {std::uint64_t stream{},output{},buffer{};std::vector<std::uint8_t> bytes;bool saving{};std::size_t offset{};std::uint32_t sent{};};
+    struct StreamLoad {std::uint64_t stream{},output{},buffer{};std::vector<std::uint8_t> bytes;bool saving{};std::size_t offset{};std::uint32_t sent{};std::string_view operation{};bool seeking{};};
     std::map<std::uint64_t,StreamLoad> loads;std::uint64_t next_load{1};
 };
 namespace {
@@ -145,6 +147,13 @@ std::span<const WindowsServiceDescriptor> gdiplus_service_descriptors(){
         {"gdiplus.dll","GdipGetImageDecodersSize",2},{"gdiplus.dll","GdipGetImageDecoders",3},
         {"gdiplus.dll","GdipGetEncoderParameterListSize",3},{"gdiplus.dll","GdipGetEncoderParameterList",4},
         {"gdiplus.dll","GdipSaveImageToFile",4},{"gdiplus.dll","GdipSaveImageToStream",4},
+        {"gdiplus.dll","GdipGetMetafileHeaderFromEmf",2},{"gdiplus.dll","GdipGetMetafileHeaderFromWmf",3},
+        {"gdiplus.dll","GdipGetMetafileHeaderFromFile",2},{"gdiplus.dll","GdipGetMetafileHeaderFromStream",2},
+        {"gdiplus.dll","GdipGetMetafileHeaderFromMetafile",2},{"gdiplus.dll","GdipGetHemfFromMetafile",2},
+        {"gdiplus.dll","GdipCreateMetafileFromEmf",3},{"gdiplus.dll","GdipCreateMetafileFromWmf",4},
+        {"gdiplus.dll","GdipCreateMetafileFromFile",2},{"gdiplus.dll","GdipCreateMetafileFromWmfFile",3},
+        {"gdiplus.dll","GdipCreateMetafileFromStream",2},
+        {"gdiplus.dll","GdipCreateStreamOnFile",3},
         {"gdiplus.dll","GdipLoadImageFromFile",2},{"gdiplus.dll","GdipLoadImageFromFileICM",2},
         {"gdiplus.dll","GdipCreateBitmapFromFile",2},{"gdiplus.dll","GdipCreateBitmapFromFileICM",2},
         {"gdiplus.dll","GdipBitmapLockBits",5},{"gdiplus.dll","GdipBitmapUnlockBits",2},
@@ -183,9 +192,10 @@ std::span<const WindowsServiceDescriptor> gdiplus_service_descriptors(){
         // 文字家族（gdiplus_text_handlers.inc）。
         {"gdiplus.dll","GdipNewInstalledFontCollection",1},{"gdiplus.dll","GdipNewPrivateFontCollection",1},{"gdiplus.dll","GdipDeletePrivateFontCollection",1},{"gdiplus.dll","GdipPrivateAddFontFile",2},{"gdiplus.dll","GdipPrivateAddMemoryFont",3},{"gdiplus.dll","GdipGetFontCollectionFamilyCount",2},{"gdiplus.dll","GdipGetFontCollectionFamilyList",4},{"gdiplus.dll","GdipCreateFontFamilyFromName",3},{"gdiplus.dll","GdipGetGenericFontFamilySansSerif",1},{"gdiplus.dll","GdipGetGenericFontFamilySerif",1},{"gdiplus.dll","GdipGetGenericFontFamilyMonospace",1},{"gdiplus.dll","GdipCloneFontFamily",2},{"gdiplus.dll","GdipDeleteFontFamily",1},{"gdiplus.dll","GdipGetFamilyName",3},{"gdiplus.dll","GdipIsStyleAvailable",3},{"gdiplus.dll","GdipGetEmHeight",3},{"gdiplus.dll","GdipGetCellAscent",3},{"gdiplus.dll","GdipGetCellDescent",3},{"gdiplus.dll","GdipGetLineSpacing",3},{"gdiplus.dll","GdipCreateFont",5},{"gdiplus.dll","GdipCreateFontFromLogfontW",3},{"gdiplus.dll","GdipCreateFontFromLogfontA",3},{"gdiplus.dll","GdipCreateFontFromDC",2},{"gdiplus.dll","GdipCloneFont",2},{"gdiplus.dll","GdipDeleteFont",1},{"gdiplus.dll","GdipGetFamily",2},{"gdiplus.dll","GdipGetFontSize",2},{"gdiplus.dll","GdipGetFontStyle",2},{"gdiplus.dll","GdipGetFontUnit",2},{"gdiplus.dll","GdipGetFontHeight",3},{"gdiplus.dll","GdipGetFontHeightGivenDPI",3},{"gdiplus.dll","GdipGetLogFontW",3},{"gdiplus.dll","GdipGetLogFontA",3},{"gdiplus.dll","GdipCreateStringFormat",3},{"gdiplus.dll","GdipStringFormatGetGenericDefault",1},{"gdiplus.dll","GdipStringFormatGetGenericTypographic",1},{"gdiplus.dll","GdipCloneStringFormat",2},{"gdiplus.dll","GdipDeleteStringFormat",1},{"gdiplus.dll","GdipSetStringFormatAlign",2},{"gdiplus.dll","GdipGetStringFormatAlign",2},{"gdiplus.dll","GdipSetStringFormatLineAlign",2},{"gdiplus.dll","GdipGetStringFormatLineAlign",2},{"gdiplus.dll","GdipSetStringFormatTrimming",2},{"gdiplus.dll","GdipGetStringFormatTrimming",2},{"gdiplus.dll","GdipSetStringFormatHotkeyPrefix",2},{"gdiplus.dll","GdipGetStringFormatHotkeyPrefix",2},{"gdiplus.dll","GdipSetStringFormatFlags",2},{"gdiplus.dll","GdipGetStringFormatFlags",2},{"gdiplus.dll","GdipSetStringFormatTabStops",4},{"gdiplus.dll","GdipGetStringFormatTabStopCount",2},{"gdiplus.dll","GdipGetStringFormatTabStops",4},{"gdiplus.dll","GdipSetStringFormatDigitSubstitution",3},{"gdiplus.dll","GdipGetStringFormatDigitSubstitution",3},{"gdiplus.dll","GdipSetStringFormatMeasurableCharacterRanges",3},{"gdiplus.dll","GdipGetStringFormatMeasurableCharacterRangeCount",2},{"gdiplus.dll","GdipDrawString",7},{"gdiplus.dll","GdipMeasureString",9},{"gdiplus.dll","GdipMeasureCharacterRanges",8},{"gdiplus.dll","GdipDrawDriverString",8},{"gdiplus.dll","GdipMeasureDriverString",8},{"gdiplus.dll","GdipAddPathString",8},{"gdiplus.dll","GdipAddPathStringI",8},
         // 畫筆進階、線端、路徑迭代器與容器（gdiplus_pen_path_handlers.inc）。
-        {"gdiplus.dll","GdipSetPenDashArray",3},{"gdiplus.dll","GdipGetPenDashArray",3},{"gdiplus.dll","GdipGetPenDashCount",2},{"gdiplus.dll","GdipGetPenDashOffset",2},{"gdiplus.dll","GdipSetPenDashOffset",2},{"gdiplus.dll","GdipSetPenCompoundArray",3},{"gdiplus.dll","GdipGetPenCompoundArray",3},{"gdiplus.dll","GdipGetPenCompoundCount",2},{"gdiplus.dll","GdipSetPenTransform",2},{"gdiplus.dll","GdipGetPenTransform",2},{"gdiplus.dll","GdipResetPenTransform",1},{"gdiplus.dll","GdipMultiplyPenTransform",3},{"gdiplus.dll","GdipTranslatePenTransform",4},{"gdiplus.dll","GdipScalePenTransform",4},{"gdiplus.dll","GdipRotatePenTransform",3},{"gdiplus.dll","GdipGetPenMode",2},{"gdiplus.dll","GdipSetPenMode",2},{"gdiplus.dll","GdipSetPenCustomStartCap",2},{"gdiplus.dll","GdipGetPenCustomStartCap",2},{"gdiplus.dll","GdipSetPenCustomEndCap",2},{"gdiplus.dll","GdipGetPenCustomEndCap",2},{"gdiplus.dll","GdipCreateCustomLineCap",5},{"gdiplus.dll","GdipCloneCustomLineCap",2},{"gdiplus.dll","GdipDeleteCustomLineCap",1},{"gdiplus.dll","GdipGetCustomLineCapBaseCap",2},{"gdiplus.dll","GdipSetCustomLineCapBaseCap",2},{"gdiplus.dll","GdipGetCustomLineCapBaseInset",2},{"gdiplus.dll","GdipSetCustomLineCapBaseInset",2},{"gdiplus.dll","GdipGetCustomLineCapStrokeJoin",2},{"gdiplus.dll","GdipSetCustomLineCapStrokeJoin",2},{"gdiplus.dll","GdipSetCustomLineCapStrokeCaps",3},{"gdiplus.dll","GdipGetCustomLineCapType",2},{"gdiplus.dll","GdipGetCustomLineCapWidthScale",2},{"gdiplus.dll","GdipSetCustomLineCapWidthScale",2},{"gdiplus.dll","GdipCreateAdjustableArrowCap",4},{"gdiplus.dll","GdipGetAdjustableArrowCapHeight",2},{"gdiplus.dll","GdipSetAdjustableArrowCapHeight",2},{"gdiplus.dll","GdipGetAdjustableArrowCapWidth",2},{"gdiplus.dll","GdipSetAdjustableArrowCapWidth",2},{"gdiplus.dll","GdipGetAdjustableArrowCapMiddleInset",2},{"gdiplus.dll","GdipSetAdjustableArrowCapMiddleInset",2},{"gdiplus.dll","GdipGetAdjustableArrowCapFillState",2},{"gdiplus.dll","GdipSetAdjustableArrowCapFillState",2},{"gdiplus.dll","GdipCreatePathIter",2},{"gdiplus.dll","GdipDeletePathIter",1},{"gdiplus.dll","GdipPathIterCopyData",6},{"gdiplus.dll","GdipPathIterEnumerate",5},{"gdiplus.dll","GdipPathIterGetCount",2},{"gdiplus.dll","GdipPathIterGetSubpathCount",2},{"gdiplus.dll","GdipPathIterHasCurve",2},{"gdiplus.dll","GdipPathIterIsValid",2},{"gdiplus.dll","GdipPathIterNextMarker",4},{"gdiplus.dll","GdipPathIterNextMarkerPath",3},{"gdiplus.dll","GdipPathIterNextPathType",5},{"gdiplus.dll","GdipPathIterNextSubpath",5},{"gdiplus.dll","GdipPathIterNextSubpathPath",4},{"gdiplus.dll","GdipPathIterRewind",1},{"gdiplus.dll","GdipGetPathData",2},{"gdiplus.dll","GdipSetPathMarker",1},{"gdiplus.dll","GdipClearPathMarkers",1},{"gdiplus.dll","GdipIsOutlineVisiblePathPoint",6},{"gdiplus.dll","GdipIsOutlineVisiblePathPointI",6},{"gdiplus.dll","GdipWidenPath",4},{"gdiplus.dll","GdipWarpPath",10},{"gdiplus.dll","GdipWindingModeOutline",3},{"gdiplus.dll","GdipBeginContainer",5},{"gdiplus.dll","GdipBeginContainer2",2},{"gdiplus.dll","GdipBeginContainerI",5},{"gdiplus.dll","GdipEndContainer",2},{"gdiplus.dll","GdipResetPageTransform",1},
+        {"gdiplus.dll","GdipSetPenDashArray",3},{"gdiplus.dll","GdipGetPenDashArray",3},{"gdiplus.dll","GdipGetPenDashCount",2},{"gdiplus.dll","GdipGetPenDashOffset",2},{"gdiplus.dll","GdipSetPenDashOffset",2},{"gdiplus.dll","GdipSetPenCompoundArray",3},{"gdiplus.dll","GdipGetPenCompoundArray",3},{"gdiplus.dll","GdipGetPenCompoundCount",2},{"gdiplus.dll","GdipSetPenTransform",2},{"gdiplus.dll","GdipGetPenTransform",2},{"gdiplus.dll","GdipResetPenTransform",1},{"gdiplus.dll","GdipMultiplyPenTransform",3},{"gdiplus.dll","GdipTranslatePenTransform",4},{"gdiplus.dll","GdipScalePenTransform",4},{"gdiplus.dll","GdipRotatePenTransform",3},{"gdiplus.dll","GdipGetPenMode",2},{"gdiplus.dll","GdipSetPenMode",2},{"gdiplus.dll","GdipSetPenCustomStartCap",2},{"gdiplus.dll","GdipGetPenCustomStartCap",2},{"gdiplus.dll","GdipSetPenCustomEndCap",2},{"gdiplus.dll","GdipGetPenCustomEndCap",2},{"gdiplus.dll","GdipCreateCustomLineCap",5},{"gdiplus.dll","GdipCloneCustomLineCap",2},{"gdiplus.dll","GdipDeleteCustomLineCap",1},{"gdiplus.dll","GdipGetCustomLineCapBaseCap",2},{"gdiplus.dll","GdipSetCustomLineCapBaseCap",2},{"gdiplus.dll","GdipGetCustomLineCapBaseInset",2},{"gdiplus.dll","GdipSetCustomLineCapBaseInset",2},{"gdiplus.dll","GdipGetCustomLineCapStrokeJoin",2},{"gdiplus.dll","GdipSetCustomLineCapStrokeJoin",2},{"gdiplus.dll","GdipGetCustomLineCapStrokeCaps",3},{"gdiplus.dll","GdipSetCustomLineCapStrokeCaps",3},{"gdiplus.dll","GdipGetCustomLineCapType",2},{"gdiplus.dll","GdipGetCustomLineCapWidthScale",2},{"gdiplus.dll","GdipSetCustomLineCapWidthScale",2},{"gdiplus.dll","GdipCreateAdjustableArrowCap",4},{"gdiplus.dll","GdipGetAdjustableArrowCapHeight",2},{"gdiplus.dll","GdipSetAdjustableArrowCapHeight",2},{"gdiplus.dll","GdipGetAdjustableArrowCapWidth",2},{"gdiplus.dll","GdipSetAdjustableArrowCapWidth",2},{"gdiplus.dll","GdipGetAdjustableArrowCapMiddleInset",2},{"gdiplus.dll","GdipSetAdjustableArrowCapMiddleInset",2},{"gdiplus.dll","GdipGetAdjustableArrowCapFillState",2},{"gdiplus.dll","GdipSetAdjustableArrowCapFillState",2},{"gdiplus.dll","GdipCreatePathIter",2},{"gdiplus.dll","GdipDeletePathIter",1},{"gdiplus.dll","GdipPathIterCopyData",6},{"gdiplus.dll","GdipPathIterEnumerate",5},{"gdiplus.dll","GdipPathIterGetCount",2},{"gdiplus.dll","GdipPathIterGetSubpathCount",2},{"gdiplus.dll","GdipPathIterHasCurve",2},{"gdiplus.dll","GdipPathIterIsValid",2},{"gdiplus.dll","GdipPathIterNextMarker",4},{"gdiplus.dll","GdipPathIterNextMarkerPath",3},{"gdiplus.dll","GdipPathIterNextPathType",5},{"gdiplus.dll","GdipPathIterNextSubpath",5},{"gdiplus.dll","GdipPathIterNextSubpathPath",4},{"gdiplus.dll","GdipPathIterRewind",1},{"gdiplus.dll","GdipGetPathData",2},{"gdiplus.dll","GdipSetPathMarker",1},{"gdiplus.dll","GdipClearPathMarkers",1},{"gdiplus.dll","GdipIsOutlineVisiblePathPoint",6},{"gdiplus.dll","GdipIsOutlineVisiblePathPointI",6},{"gdiplus.dll","GdipWidenPath",4},{"gdiplus.dll","GdipWarpPath",10},{"gdiplus.dll","GdipWindingModeOutline",3},{"gdiplus.dll","GdipBeginContainer",5},{"gdiplus.dll","GdipBeginContainer2",2},{"gdiplus.dll","GdipBeginContainerI",5},{"gdiplus.dll","GdipEndContainer",2},{"gdiplus.dll","GdipResetPageTransform",1},
     };return table;
 }
+#include "gdiplus_metafile_read.inc"
 std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
     if(!gdiplus_)gdiplus_=std::make_shared<GdiplusState>();
@@ -223,6 +233,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
             if(symbol.starts_with("GdipDraw") || symbol.starts_with("GdipFill") || symbol=="GdipGraphicsClear")target->second.dirty=true;
             else if(symbol=="GdipGetDC")target->second.held=true;else if(symbol=="GdipReleaseDC"){target->second.held=false;target->second.dirty=true;}
         }
+#include "gdiplus_metafile_handlers.inc"
 #include "gdiplus_vector_handlers.inc"
 #include "gdiplus_geometry_handlers.inc"
 #include "gdiplus_pen_path_handlers.inc"
@@ -238,25 +249,61 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
             const auto bytes=gdiplus_codec::information(x86_,arg(2));if(u32(1)!=bytes.size())return finish(invalid_parameter);
             memory.write(GuestAddress{arg(2)},bytes);return finish(ok);
         }
-        if(symbol=="GdipLoadImageFromFile" || symbol=="GdipLoadImageFromFileICM" || symbol=="GdipCreateBitmapFromFile" || symbol=="GdipCreateBitmapFromFileICM"){
-            if(!arg(0) || !arg(1))return finish(invalid_parameter);memory.store(GuestAddress{arg(1)},pointer_bits,0);
+        if(symbol=="GdipCreateStreamOnFile"){
+            const bool write=(u32(1)&0x40000000U)!=0, read=(u32(1)&0x80000000U)!=0;
+            if(!arg(0) || !arg(2) || (!read && !write))return finish(invalid_parameter);
+            // 寫入優先，建立或截短；兩種模式都拒絕其他寫入者。
+            const unsigned mode=write?0x1021U:0x20U;
+            const auto hr=nested_service(state,memory,"shlwapi.dll","SHCreateStreamOnFileW",{arg(0),mode,arg(2)});
+            if(!hr)return finish(ok);
+            if(hr==0x8007000eU)return finish(out_of_memory);
+            return finish(hr==0x80070057U?invalid_parameter:generic_error);
+        }
+        if(symbol=="GdipGetMetafileHeaderFromEmf" || symbol=="GdipGetMetafileHeaderFromWmf" ||
+           symbol=="GdipCreateMetafileFromEmf" || symbol=="GdipCreateMetafileFromWmf"){
+            const bool header=symbol.starts_with("GdipGet"),wmf=symbol.ends_with("Wmf");
+            const auto output=arg(service.arguments-1);
+            if(!arg(0) || !output)return finish(invalid_parameter);
+            if(!header)memory.store(GuestAddress{output},pointer_bits,0);
+            std::span<const std::uint8_t> bytes;
+            if(wmf){
+                const auto found=gui_.windows_metafiles.find(arg(0));if(found==gui_.windows_metafiles.end())return finish(generic_error);
+                bytes=found->second;
+            }else{
+                const auto found=gui_.metafiles.find(arg(0));if(found==gui_.metafiles.end())return finish(generic_error);
+                bytes=found->second.bytes;
+            }
+            return finish(read_gdiplus_image(state,memory,bytes,output,symbol,arg(0),!header && u32(1),wmf?arg(header?1:2):0));
+        }
+        if(symbol=="GdipLoadImageFromFile" || symbol=="GdipLoadImageFromFileICM" || symbol=="GdipCreateBitmapFromFile" ||
+           symbol=="GdipCreateBitmapFromFileICM" || symbol=="GdipGetMetafileHeaderFromFile" ||
+           symbol=="GdipCreateMetafileFromFile" || symbol=="GdipCreateMetafileFromWmfFile"){
+            const auto output=arg(service.arguments-1);
+            if(!arg(0) || !output)return finish(invalid_parameter);
+            if(!symbol.starts_with("GdipGet"))memory.store(GuestAddress{output},pointer_bits,0);
             const auto path=read_utf16(memory,GuestAddress{arg(0)});if(path.empty())return finish(invalid_parameter);
             const auto opened=filesystem_.open_reader(utf16_to_utf8(normalized_windows_path(path,runtime_.current_directory)));
-            if(opened.error)return finish(opened.error==2 || opened.error==3?10:opened.error==5?12:7);
+            if(opened.error)return finish(symbol.find("Metafile")!=symbol.npos?generic_error:opened.error==2 || opened.error==3?10:opened.error==5?12:7);
             const auto info=opened.file->information();if(info.error)return finish(7);if(info.metadata.size>stream_limit)return finish(out_of_memory);
             std::vector<std::uint8_t> bytes(info.metadata.size);const auto io=opened.file->read(bytes,0);
             if(io.error || io.bytes!=bytes.size())return finish(7);
-            return finish(decode_bitmap(g,memory,bytes,arg(1),pointer_bits,[&](auto size){return allocate_heap(memory,size);},release_handle));
+            return finish(read_gdiplus_image(state,memory,bytes,output,symbol,0,false,symbol.ends_with("WmfFile")?arg(1):0));
         }
-        // 解碼後的影像固定是點陣圖；CreateBitmapFromStream 與 LoadImageFromStream 共用同一 IStream 讀取流程。
-        if(symbol=="GdipLoadImageFromStream" || symbol=="GdipLoadImageFromStreamICM" || symbol=="GdipCreateBitmapFromStream" || symbol=="GdipCreateBitmapFromStreamICM"){
+        if(symbol=="GdipLoadImageFromStream" || symbol=="GdipLoadImageFromStreamICM" || symbol=="GdipCreateBitmapFromStream" ||
+           symbol=="GdipCreateBitmapFromStreamICM" || symbol=="GdipGetMetafileHeaderFromStream" || symbol=="GdipCreateMetafileFromStream"){
             if(!arg(0) || !arg(1))return finish(invalid_parameter);
-            memory.store(GuestAddress{arg(1)},pointer_bits,0);
+            if(!symbol.starts_with("GdipGet"))memory.store(GuestAddress{arg(1)},pointer_bits,0);
+            const auto table=memory.load(GuestAddress{arg(0)},pointer_bits);
+            const auto seek=memory.load(GuestAddress{table+5*(pointer_bits/8U)},pointer_bits);
+            if(!seek)return finish(generic_error);
             const auto buffer=allocate_heap(memory,stream_chunk+8);if(!buffer)return finish(out_of_memory);
-            const auto id=g.next_load++;g.loads.emplace(id,GdiplusState::StreamLoad{arg(0),arg(1),buffer,{}});
-            const auto table=memory.load(GuestAddress{arg(0)},pointer_bits),read=memory.load(GuestAddress{table+(x86_?12U:24U)},pointer_bits);
-            memory.store(GuestAddress{buffer+stream_chunk},32,0);
-            start_callbacks(state,memory,{{read,{arg(0),buffer,stream_chunk,buffer+stream_chunk}}},Continuation::GdiplusStream,id);return std::nullopt;
+            const auto id=g.next_load++;
+            auto& load=g.loads.emplace(id,GdiplusState::StreamLoad{arg(0),arg(1),buffer,{}}).first->second;
+            load.operation=symbol;load.seeking=true;
+            // IStream::Seek 的 LARGE_INTEGER 在 x86 佔兩個堆疊欄位。
+            GuestCallback rewind{seek,{arg(0),0,0,0}};
+            rewind.wide_arguments=1U<<1;
+            start_callbacks(state,memory,{std::move(rewind)},Continuation::GdiplusStream,id);return std::nullopt;
         }
         if(symbol=="GdipCreateBitmapFromScan0"){
             const auto width=s32(0),height=s32(1),stride=s32(2);const auto format=u32(3);const auto scan0=arg(4);
@@ -505,7 +552,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gdiplus_stream(GuestState& 
     const auto finish=[&](std::uint32_t status){(void)free_heap(memory,load.buffer,state);g.loads.erase(found);complete_call(state,memory,status);return std::optional<std::uint32_t>{};};
     try{
         const auto status=static_cast<std::uint32_t>(value);if(status&0x80000000U)return finish(generic_error);
-        const auto count=static_cast<std::uint32_t>(memory.load(GuestAddress{load.buffer+stream_chunk},32));
+        const auto count=load.seeking?0U:static_cast<std::uint32_t>(memory.load(GuestAddress{load.buffer+stream_chunk},32));
         if(load.saving){
             if(count!=load.sent)return finish(generic_error);load.offset+=count;if(load.offset==load.bytes.size())return finish(ok);
             load.sent=static_cast<std::uint32_t>(std::min<std::size_t>(stream_chunk,load.bytes.size()-load.offset));
@@ -515,13 +562,13 @@ std::optional<std::uint32_t> WindowsServices::resume_gdiplus_stream(GuestState& 
         }
         if(count>stream_chunk || load.bytes.size()+count>stream_limit)return finish(count>stream_chunk?generic_error:out_of_memory);
         if(count){const auto at=load.bytes.size();load.bytes.resize(at+count);memory.read(GuestAddress{load.buffer},std::span(load.bytes).subspan(at));}
-        if(count && status==0){
-            // 尚未到資料結尾，繼續讀下一段。
+        if(load.seeking || (count && status==0)){
+            load.seeking=false;
             const auto table=memory.load(GuestAddress{load.stream},pointer_bits),read=memory.load(GuestAddress{table+(x86_?12U:24U)},pointer_bits);
             memory.store(GuestAddress{load.buffer+stream_chunk},32,0);
             start_callbacks(state,memory,{{read,{load.stream,load.buffer,stream_chunk,load.buffer+stream_chunk}}},Continuation::GdiplusStream,id);return std::nullopt;
         }
-        return finish(decode_bitmap(g,memory,load.bytes,load.output,pointer_bits,[&](auto size){return allocate_heap(memory,size);},[&](auto at){(void)free_heap(memory,at,state);}));
+        return finish(read_gdiplus_image(state,memory,load.bytes,load.output,load.operation));
     }catch(const MemoryFault&){return finish(invalid_parameter);}catch(const std::bad_alloc&){return finish(out_of_memory);}
 }
 void WindowsServices::discard_gdiplus_stream(GuestState& state,GuestMemory& memory,std::uint64_t id){

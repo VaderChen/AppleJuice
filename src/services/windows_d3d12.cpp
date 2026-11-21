@@ -137,6 +137,7 @@ struct D3D12DrawPool {
         target.instances=source.instances;target.start_instance=source.start_instance;target.base_vertex=source.base_vertex;
         target.alpha_function=source.alpha_function;target.alpha_reference=source.alpha_reference;target.indexed=source.indexed;
         share(target.visibility,source.visibility);target.visibility_offset=source.visibility_offset;share(target.indirect,source.indirect);target.indirect_offset=source.indirect_offset;
+        target.indirect_count=source.indirect_count;target.indirect_stride=source.indirect_stride;
         target.pipeline_serial=source.pipeline_serial;target.explicit_uav_order=source.explicit_uav_order;
         return slot;
     }
@@ -407,6 +408,9 @@ struct D3D12Submitter {
         }
         return jobs.end();
     }
+    // 呼叫端持 mutex。佇列中只剩被相依擋住的工作（等客體之後才會發出的 fence）、且沒有工作正在重播：提交端要等客體推進才會動。
+    // 協調者此時若繼續等提交端（清空佇列、在途 Present 上限、等工作票），客體就發不出那個 fence，雙方互等（電馭叛客啟動卡死）。
+    bool stalled(){return !jobs.empty() && queued-finished==jobs.size() && runnable()==jobs.end();}
     // 已排入、尚未完成的 Present（在 mutex 內增減）：超過 DXGI 預設的最大幀延遲 3 時，客體 Present 先等。
     unsigned presents{};
     // Queue.Signal 從排入到發布 gpu_signals_ 都算待處理，涵蓋等待端已停駐而提交執行緒尚未登記通知的區間。
@@ -1015,9 +1019,9 @@ std::uint64_t d3d12_enqueue(D3D12Submitter& submitter,D3D12Submitter::Job job,bo
 }
 // 等提交執行緒完成到指定排入序號（呼叫端不得持圖形鎖：重播需要它）。
 void d3d12_wait_ticket(D3D12Submitter& submitter,std::uint64_t ticket){
-    std::unique_lock lock(submitter.mutex);if(submitter.ticket_complete(ticket))return;
+    std::unique_lock lock(submitter.mutex);if(submitter.ticket_complete(ticket) || submitter.stalled())return;
     const auto start=D3D12Submitter::timed()?D3D12Submitter::now_ns():0;
-    submitter.idle.wait(lock,[&]{return submitter.ticket_complete(ticket);});
+    submitter.idle.wait(lock,[&]{return submitter.ticket_complete(ticket) || submitter.stalled();});
     if(start)submitter.stats.drain_wait.fetch_add(D3D12Submitter::now_ns()-start,std::memory_order_relaxed);
     D3D12Submitter::stall("guest_wait_ticket",start);
 }
@@ -1164,9 +1168,12 @@ void WindowsServices::d3d12_submit_loop(GuestMemory& memory,D3D12Submitter& subm
 void WindowsServices::d3d12_drain(){
     if(!d3d12_submitter_)return;auto& submitter=*d3d12_submitter_;
     std::unique_lock lock(submitter.mutex);const auto target=submitter.queued;
-    if(submitter.done>=target)return;
+    // 佇列中只剩被相依擋住的工作（等客體之後才會發出的 fence）、且沒有工作正在重播時不再等：呼叫端（協調者）停在這裡，
+    // 客體就永遠發不出那個 fence（電馭叛客在 ResizeBuffers／Release 前卡死，主執行緒與提交執行緒互等）。
+    const auto settled=[&]{return submitter.done>=target || submitter.stalled();};
+    if(settled())return;
     const auto start=D3D12Submitter::timed()?D3D12Submitter::now_ns():0;
-    submitter.idle.wait(lock,[&]{return submitter.done>=target;});
+    submitter.idle.wait(lock,settled);
     if(start)submitter.stats.drain_wait.fetch_add(D3D12Submitter::now_ns()-start,std::memory_order_relaxed);
     D3D12Submitter::stall("guest_drain",start);
 }
@@ -1781,9 +1788,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 if(graphics_guard.owns_lock())graphics_guard.unlock(); // 等在途 Present 時提交執行緒需要圖形鎖。
                 {
                     std::unique_lock lock(submitter.mutex);
-                    if(submitter.presents>=inflight_limit){
+                    if(submitter.presents>=inflight_limit && !submitter.stalled()){
                         const auto start=D3D12Submitter::timed()?D3D12Submitter::now_ns():0;
-                        submitter.idle.wait(lock,[&]{return submitter.presents<inflight_limit;});
+                        submitter.idle.wait(lock,[&]{return submitter.presents<inflight_limit || submitter.stalled();});
                         if(start)submitter.stats.present_wait.fetch_add(D3D12Submitter::now_ns()-start,std::memory_order_relaxed);
                         D3D12Submitter::stall("guest_present_inflight",start);
                     }
@@ -1795,7 +1802,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         if(swap.inflight.size()>=inflight_limit){
                             const auto start=D3D12Submitter::timed()?D3D12Submitter::now_ns():0;
                             // GPU 完成旗標沒有通知：以 0.25 ms 間隔重查（與 GPU 完成通知的輪詢間隔相同）；編碼完成時提交執行緒會喚醒。
-                            while(retire(),swap.inflight.size()>=inflight_limit)submitter.idle.wait_for(lock,std::chrono::microseconds(250));
+                            while(retire(),swap.inflight.size()>=inflight_limit && !submitter.stalled())submitter.idle.wait_for(lock,std::chrono::microseconds(250));
                             if(start)submitter.stats.present_wait.fetch_add(D3D12Submitter::now_ns()-start,std::memory_order_relaxed);
                             D3D12Submitter::stall("guest_present_gpu_frames",start);
                         }
@@ -3288,9 +3295,41 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         lock_graphics(graphics_guard);
                         resource_slots.fill({});recent_ranges.fill({});uploaded.clear();
                     };
+                    // ExecuteIndirect 計數遮罩批次：D3D12 規定參數與計數緩衝在 GPU 寫入後須經 barrier 轉為 INDIRECT_ARGUMENT 才可使用，
+                    // 所以同一個 barrier（或清單開頭）之後、下一個 barrier 之前的計數型 ExecuteIndirect 可在段落開頭一次遮罩：
+                    // 一個暫存緩衝、一個 compute 段落，避免每次 ExecuteIndirect 都打斷 render pass。形狀不符或批次失敗時逐筆處理。
+                    static const std::uint32_t indirect_batch_limit=[] {const auto* text=std::getenv("X64ARM_D3D12_INDIRECT_COUNT_LIMIT");
+                        return text?static_cast<std::uint32_t>(std::min<unsigned long long>(std::strtoull(text,nullptr,10),65536ULL)):1024U;}();
+                    std::map<std::size_t,std::vector<std::size_t>> mask_groups;std::unordered_map<std::size_t,std::pair<std::shared_ptr<GraphicsResource>,std::uint32_t>> masked_indirect;
+                    if(indirect_batch_limit && (program->type==0 || program->type==2)){
+                        std::size_t boundary=0;
+                        for(std::size_t i=0;i<recorded.size();++i){
+                            const auto& rc=recorded[i];if(rc.op=="ResourceBarrier"sv){boundary=i+1;continue;}
+                            if(rc.op!="ExecuteIndirect"sv || rc.values.size()<6 || !rc.values[4])continue;
+                            const auto& rv=rc.values;const auto sig=bridge.signatures.find(rv[0]);const auto argument_entry=bridge.resources.find(rv[2]),count_entry=bridge.resources.find(rv[4]);
+                            if(sig==bridge.signatures.end() || argument_entry==bridge.resources.end() || count_entry==bridge.resources.end() || sig->second.arguments.size()!=1)continue;
+                            const auto type=sig->second.arguments.front().type;const auto maximum=static_cast<std::uint32_t>(rv[1]);
+                            if(type>2 || (program->type==2)!=(type==2) || argument_entry->second.cpu || count_entry->second.cpu || argument_entry->second.dimension!=1 || count_entry->second.dimension!=1 ||
+                               !maximum || maximum>indirect_batch_limit || (rv[3]&3) || (rv[5]&3) || rv[5]>UINT32_MAX-4 || rv[3]+std::uint64_t{maximum}*sig->second.stride>UINT32_MAX)continue;
+                            mask_groups[boundary].push_back(i);
+                        }
+                    }
+                    const auto encode_mask_group=[&](const std::vector<std::size_t>& group){
+                        std::vector<GraphicsIndirectCountMask> jobs;jobs.reserve(group.size());std::uint64_t total=0;
+                        for(const auto index:group){
+                            const auto& rv=recorded[index].values;const auto& sig=bridge.signatures.at(rv[0]);const auto type=sig.arguments.front().type;
+                            const auto words=type==2?3U:type==1?5U:4U;const auto maximum=static_cast<std::uint32_t>(rv[1]);
+                            jobs.push_back({gpu_resource(rv[2]),static_cast<std::uint32_t>(rv[3]),sig.stride,words,maximum,gpu_resource(rv[4]),static_cast<std::uint32_t>(rv[5]),static_cast<std::uint32_t>(total),type==2});
+                            total+=std::uint64_t{maximum}*words*4;if(total>UINT32_MAX)return;
+                        }
+                        GraphicsResourceDesc d;d.dimension=1;d.width=static_cast<std::uint32_t>(total);d.bind=0x88;d.misc=0x10;d.initialized=d.width;auto scratch=native.graphics_resource(d);
+                        if(!native.graphics_indirect_count_masks(jobs,scratch))return;
+                        for(std::size_t k=0;k<group.size();++k)masked_indirect.insert_or_assign(group[k],std::make_pair(scratch,jobs[k].target_offset));
+                    };
                     while(!pending.empty() || cursor<recorded.size()){
                         yield_graphics();
                         const D3D12State::Command* current=&held;
+                        if(pending.empty() && !mask_groups.empty())if(const auto group=mask_groups.find(cursor);group!=mask_groups.end()){encode_mask_group(group->second);mask_groups.erase(group);}
                         if(!pending.empty()){held=std::move(pending.front());pending.pop_front();}else current=&recorded[cursor++];
                         const auto& c=*current;if(trace_d3d12)failed_op=std::string(c.op);
                         const auto& v=c.values;const bool graphics=c.op.find("Graphics")!=std::string::npos;auto& roots=graphics?graphics_roots:compute_roots;
@@ -3336,18 +3375,55 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                             if((v[3]&3) || (v[5]&3))throw std::invalid_argument("ExecuteIndirect 位移未對齊");
                             const auto& argument_resource=bridge.resources.at(v[2]);
                             if(argument_resource.dimension!=1 || v[3]>argument_resource.width || std::uint64_t{static_cast<std::uint32_t>(v[1])}*signature.stride>argument_resource.width-v[3])throw std::invalid_argument("ExecuteIndirect 最大命令範圍無效");
-                            if(const auto& only=signature.arguments.front();!v[4] && signature.arguments.size()==1 && only.type<=2 && !argument_resource.cpu &&
+                            const auto& only=signature.arguments.front();const auto maximum=static_cast<std::uint32_t>(v[1]);
+                            const bool gpu_shape=signature.arguments.size()==1 && only.type<=2 && !argument_resource.cpu &&
                                (only.type==2 || !bridge.pipelines.contains(pipeline) || !bridge.pipelines.at(pipeline).geometry ||
                                 bridge.pipelines.at(pipeline).geometry->stream_output.empty()) &&
-                               v[3]+std::uint64_t{static_cast<std::uint32_t>(v[1])}*signature.stride<=UINT32_MAX){
+                               v[3]+std::uint64_t{maximum}*signature.stride<=UINT32_MAX;
+                            const char* gpu_op=only.type==2?"DispatchIndirectGpu":only.type==1?"DrawIndexedIndirectGpu":"DrawIndirectGpu";
+                            // 沒有幾何／曲面細分與遮蔽查詢的繪製：全部筆數合成一筆多記錄間接繪製，狀態只繫結一次（後端逐筆間接繪製）。
+                            // X64ARM_D3D12_INDIRECT_MULTI=0 改回逐筆展開作對照。
+                            static const bool indirect_multi=[] {const auto* text=std::getenv("X64ARM_D3D12_INDIRECT_MULTI");return !text || std::string_view(text)!="0";}();
+                            const bool multi_draw=indirect_multi && only.type<=1 && maximum>1 && !occlusion_heap && [&]{
+                                const auto state=bridge.pipelines.find(pipeline);return state!=bridge.pipelines.end() && !state->second.compute && !state->second.geometry && !state->second.hull && !state->second.domain;}();
+                            if(gpu_shape && !v[4] && multi_draw){pending.push_front({gpu_op,{v[2],v[3],maximum,signature.stride},{},{}});continue;}
+                            if(gpu_shape && !v[4]){
                                 // 參數留在 GPU：簽章只有一個 Draw／DrawIndexed／Dispatch 且沒有計數緩衝時，D3D12 與 Metal 的間接參數排列相同，
                                 // 直接展開成 GPU 間接命令，不必等前面的 GPU 工作完成再讀回（否則每次 ExecuteIndirect 都讓 CPU 與 GPU 互等）。
-                                const char* op=only.type==2?"DispatchIndirectGpu":only.type==1?"DrawIndexedIndirectGpu":"DrawIndirectGpu";
-                                for(auto i=static_cast<std::uint32_t>(v[1]);i-->0;)pending.push_front({op,{v[2],v[3]+std::uint64_t{i}*signature.stride},{},{}});
+                                for(auto i=maximum;i-->0;)pending.push_front({gpu_op,{v[2],v[3]+std::uint64_t{i}*signature.stride},{},{}});
                                 continue;
                             }
+                            // 計數也在 GPU：先由 GPU 依計數遮罩參數到暫存緩衝（超出計數的筆數實例數／群組數歸零），再展開 maximum 筆 GPU 間接命令，
+                            // 同樣不回讀。筆數上限內才採用，避免大量空命令；後端不支援的形狀退回回讀。X64ARM_D3D12_INDIRECT_COUNT_LIMIT=0 關閉。
+                            static const std::uint32_t indirect_count_limit=[] {const auto* text=std::getenv("X64ARM_D3D12_INDIRECT_COUNT_LIMIT");
+                                return text?static_cast<std::uint32_t>(std::min<unsigned long long>(std::strtoull(text,nullptr,10),65536ULL)):1024U;}();
+                            if(gpu_shape && v[4] && maximum && maximum<=indirect_count_limit && v[5]<=UINT32_MAX-4 && !bridge.resources.at(v[4]).cpu){
+                                const auto words=only.type==2?3U:only.type==1?5U:4U;
+                                // 同一 barrier 段落已在段落開頭一次遮罩（見 mask_groups）；否則單獨遮罩這一筆。
+                                std::shared_ptr<GraphicsResource> scratch;std::uint32_t base=0;
+                                if(current!=&held)if(const auto prepared=masked_indirect.find(cursor-1);prepared!=masked_indirect.end())scratch=prepared->second.first,base=prepared->second.second;
+                                if(!scratch){
+                                    GraphicsResourceDesc d;d.dimension=1;d.width=maximum*words*4;d.bind=0x88;d.misc=0x10;d.initialized=d.width;auto created=native.graphics_resource(d);
+                                    const GraphicsIndirectCountMask job{gpu_resource(v[2]),static_cast<std::uint32_t>(v[3]),signature.stride,words,maximum,gpu_resource(v[4]),static_cast<std::uint32_t>(v[5]),0,only.type==2};
+                                    if(native.graphics_indirect_count_masks(std::span<const GraphicsIndirectCountMask>(&job,1),created))scratch=std::move(created);
+                                }
+                                if(scratch){
+                                    // 診斷（預設關閉、會改變結果）：X64ARM_DEBUG_INDIRECT_COUNT_EXPAND=<N> 每次只展開前 N 筆，量測空命令的成本。
+                                    static const std::uint32_t debug_expand=[] {const auto* text=std::getenv("X64ARM_DEBUG_INDIRECT_COUNT_EXPAND");return text?static_cast<std::uint32_t>(std::strtoul(text,nullptr,10)):0U;}();
+                                    const auto records=debug_expand?std::min(maximum,debug_expand):maximum;
+                                    if(multi_draw && records>1){pending.push_front({gpu_op,{0,base,records,words*4},{},{GraphicsView{scratch}}});continue;}
+                                    for(auto i=records;i-->0;)pending.push_front({gpu_op,{0,base+std::uint64_t{i}*words*4},{},{GraphicsView{scratch}}});
+                                    continue;
+                                }
+                            }
                             auto count=static_cast<std::uint32_t>(v[1]);
+                            // 診斷（X64ARM_TRACE_GRAPHICS_STATS）：走回讀的簽章形狀（參數型別、計數緩衝、參數所在）與最大／實際筆數。
+                            static const bool trace_indirect_shape=std::getenv("X64ARM_TRACE_GRAPHICS_STATS")!=nullptr;
+                            std::string indirect_shape;
+                            if(trace_indirect_shape){indirect_shape="ei:";for(const auto& a:signature.arguments)indirect_shape+=std::to_string(a.type)+".";
+                                indirect_shape+=std::string(v[4]?"count":"nocount")+(argument_resource.cpu?"/cpu":"/gpu")+"/op"+std::to_string(signature.operation);++sync_reads[indirect_shape];sync_reads[indirect_shape+"/max"]+=static_cast<std::uint32_t>(v[1]);}
                             if(v[4]){const auto data=read_buffer(v[4],v[5],4);std::uint32_t limit;std::memcpy(&limit,data.data(),4);count=std::min(count,limit);}
+                            if(trace_indirect_shape)sync_reads[indirect_shape+"/n"]+=count;
                             const auto data=read_buffer(v[2],v[3],std::uint64_t{count}*signature.stride);
                             if(trace_d3d12 && count && !signature.arguments.empty()){
                                 // 只在同一參數位置的值改變時輸出，避免每幀重複的固定參數占滿上限。
@@ -3460,9 +3536,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                             if(p->second.domain){d.stages[4].shader=p->second.domain;bind(d.stages[4],graphics_roots,signature,3,&draw_extents[4]);}
                             const auto t2=timing?D3D12Submitter::now_ns():0;
                             if(draw_pipeline!=pipeline){d.layout=p->second.layout;d.blend=p->second.blend;d.depth_state=p->second.depth;d.raster=p->second.raster;d.sample_mask=p->second.sample_mask;d.pipeline_serial=p->second.serial;draw_pipeline=pipeline;}
-                            d.indirect.reset();d.indirect_offset=0;d.count=0;d.instances=1;d.start=0;d.base_vertex=0;d.start_instance=0;d.visibility.reset();d.visibility_offset=0;
+                            d.indirect.reset();d.indirect_offset=0;d.indirect_count=1;d.indirect_stride=0;d.count=0;d.instances=1;d.start=0;d.base_vertex=0;d.start_instance=0;d.visibility.reset();d.visibility_offset=0;
                             const bool indexed=c.op=="DrawIndexedInstanced"sv || c.op=="DrawIndexedIndirectGpu"sv;d.indexed=indexed;
-                            if(c.op.ends_with("IndirectGpu")){d.indirect=gpu_resource(v[0]);d.indirect_offset=static_cast<std::uint32_t>(v[1]);}
+                            if(c.op.ends_with("IndirectGpu")){d.indirect=!c.views.empty() && c.views[0].resource?c.views[0].resource:gpu_resource(v[0]);d.indirect_offset=static_cast<std::uint32_t>(v[1]);
+                                if(v.size()>=4){d.indirect_count=static_cast<std::uint32_t>(v[2]);d.indirect_stride=static_cast<std::uint32_t>(v[3]);}}
                             else {
                                 d.count=static_cast<std::uint32_t>(v[0]);d.instances=static_cast<std::uint32_t>(v[1]);d.start=static_cast<std::uint32_t>(v[2]);
                                 if(indexed){d.base_vertex=static_cast<std::int32_t>(static_cast<std::uint32_t>(v[3]));d.start_instance=static_cast<std::uint32_t>(v[4]);}else d.start_instance=static_cast<std::uint32_t>(v[3]);
@@ -3594,7 +3671,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                     static_cast<unsigned long long>(p->second.root),static_cast<unsigned long long>(compute_roots.tables[0]),static_cast<unsigned long long>(compute_roots.tables[1]),
                                     static_cast<unsigned long long>(v[0]),static_cast<unsigned long long>(v[1]),static_cast<unsigned long long>(v.size()>2?v[2]:0));
                             GraphicsStage stage;stage.shader=p->second.shader;bind(stage,compute_roots,signature_of(compute_roots),0);
-                            if(c.op=="DispatchIndirectGpu"sv)native.graphics_dispatch_indirect(stage,gpu_resource(v[0]),static_cast<std::uint32_t>(v[1]));
+                            if(c.op=="DispatchIndirectGpu"sv)native.graphics_dispatch_indirect(stage,!c.views.empty() && c.views[0].resource?c.views[0].resource:gpu_resource(v[0]),static_cast<std::uint32_t>(v[1]));
                             else native.graphics_dispatch(stage,{static_cast<std::uint32_t>(v[0]),static_cast<std::uint32_t>(v[1]),static_cast<std::uint32_t>(v[2])});
                         }
                         else if(c.op=="WriteBufferImmediate"sv){

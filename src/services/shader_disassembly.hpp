@@ -10,12 +10,19 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <locale.h>
 #if defined(__APPLE__)
 #include <xlocale.h>
 #endif
 
 namespace x64arm::shader_disassembly {
+struct InstructionRange { std::size_t begin,end; };
+struct DisassembledRegion { std::string text; std::uint64_t finish; };
+DisassembledRegion region(std::span<const std::uint8_t> bytecode,std::uint32_t flags,
+    std::string_view comments,std::uint64_t start,std::uint64_t count);
+std::vector<std::uint64_t> trace_offsets(std::span<const std::uint8_t> bytecode,bool include_declarations);
+
 inline std::string hex(std::uint64_t value,unsigned width){
     constexpr char digits[]="0123456789abcdef";std::string result(width+2,'0');result[1]='x';
     for(unsigned i=0;i<width;++i){result[width+1-i]=digits[value&15U];value>>=4;}return result;
@@ -25,6 +32,7 @@ inline std::optional<unsigned> sm1_length(std::uint32_t opcode,std::uint32_t ver
     static constexpr std::array<unsigned,25> arithmetic{1,3,4,4,5,4,3,3,4,4,4,4,4,4,3,3,3,4,5,3,4,4,4,4,4};
     if(opcode<arithmetic.size())return arithmetic[opcode];
     if(opcode==0xfffdU)return 1;
+    if(opcode==31U)return 3; // dcl：宣告 token 與目的暫存器
     if(opcode==64 || opcode==66)return (version&255U)>=4?3U:2U;
     if(opcode==65 || opcode==87)return 2;
     if((opcode>=67 && opcode<=75) || opcode==77 || opcode==78 || opcode==79 || (opcode>=82 && opcode<=86))return 3;
@@ -79,16 +87,30 @@ inline std::string html(std::string_view text){
         result+="</span>\n";if(end==text.npos)break;at=end+1;
     }result+="</pre></body></html>";return result;
 }
-inline std::string format(std::string_view assembly,std::uint32_t flags,std::string_view comments,std::string_view header,std::span<const std::uint64_t> offsets){
+inline std::string format(std::string_view assembly,std::uint32_t flags,std::string_view comments,
+    std::string_view header,std::span<const std::uint64_t> offsets,std::optional<InstructionRange> range={}){
     std::string result;if(!(flags&0x40U)){result+=header;
         for(std::size_t at=0;at<comments.size();){const auto end=comments.find('\n',at);result+="// ";result+=comments.substr(at,end==comments.npos?comments.size()-at:end-at);result+='\n';if(end==comments.npos)break;at=end+1;}
     }
-    std::size_t instruction=0;bool profile=true;unsigned block_depth=0;
+    std::size_t instruction=0;bool profile=true,selected_block=false;unsigned block_depth=0;
     for(std::size_t at=0;at<assembly.size();){const auto end=assembly.find('\n',at);const auto line=assembly.substr(at,end==assembly.npos?assembly.size()-at:end-at);const auto content=trim(line);
         const bool directive=content.empty() || content.starts_with("//") || content.starts_with('.') || content.starts_with('{') || content.starts_with('}') || content.starts_with('(');
-        const bool executable=!directive && !profile && !block_depth;if(!directive && profile)profile=false;
-        if(executable){if(flags&4U)result+="/* "+std::to_string(instruction)+" */ ";if((flags&0x20U) && instruction<offsets.size())result+="/* "+hex(offsets[instruction],8)+" */ ";++instruction;}
-        if(!(flags&0x40U) || !content.starts_with("//")){result+=flags&0x80U?hex_literals(line):std::string(line);result+='\n';}
+        const bool first=!directive && profile;
+        const bool opcode=!directive && !profile && !block_depth;
+        bool selected=!range || first || (block_depth && selected_block);
+        if(first)profile=false;
+        if(opcode){
+            selected=!range || (instruction>=range->begin && instruction<range->end);
+            selected_block=selected;
+            if(selected){
+                if(flags&4U)result+="/* "+std::to_string(instruction)+" */ ";
+                if((flags&0x20U) && instruction<offsets.size())result+="/* "+hex(offsets[instruction],8)+" */ ";
+            }
+            ++instruction;
+        }
+        if(selected && (!(flags&0x40U) || !content.starts_with("//"))){
+            result+=flags&0x80U?hex_literals(line):std::string(line);result+='\n';
+        }
         if(!content.starts_with("//"))for(const auto c:content){if(c=='{')++block_depth;else if(c=='}' && block_depth)--block_depth;}
         if(end==assembly.npos)break;at=end+1;
     }

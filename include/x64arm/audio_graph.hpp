@@ -5,6 +5,7 @@
 
 namespace x64arm::audio {
 class FrameEffect;
+class GuestBlock;
 // XAudio2 音源／子混音需要的宿主圖。裝置、PCM 解碼與 DSP 沿用 audio 後台。
 // 所有控制方法與 render 共用一把鎖；客體回呼由服務層在 take_events 後派送。
 class VoiceGraph final:public RenderSource {
@@ -15,7 +16,7 @@ public:
     struct Packet {
         std::vector<std::uint8_t> pcm;
         unsigned play_begin{},play_length{},loop_begin{},loop_length{},loop_count{};
-        std::uint64_t context{};bool end_stream{};
+        std::uint64_t context{};bool end_stream{},legacy_loop_count{};
     };
     struct Filter {unsigned type{};float frequency{1},one_over_q{1};};
     struct Send {Voice destination{};std::vector<float> matrix;bool use_filter{};};
@@ -35,7 +36,8 @@ public:
     };
     // 效果鏈的一格。Effect 是立體聲 DSP，每兩聲道一個（奇數的最後一個聲道單獨處理），數量須為 (聲道數+1)/2。
     // frame 非空時改以整個音框處理，可改變後續聲道數（XAudio2 內建 reverb、volume meter）；此時 pairs 須為空。
-    struct EffectSlot {std::vector<std::shared_ptr<Effect>> pairs;bool enabled{true};std::shared_ptr<FrameEffect> frame{};};
+    // guest 非空時是應用程式自寫的 XAPO：逐幀交換到區塊橋接（延遲一個量子），pairs 與 frame 須為空；啟用狀態由客體 Process 處理。
+    struct EffectSlot {std::vector<std::shared_ptr<Effect>> pairs;bool enabled{true};std::shared_ptr<FrameEffect> frame{};std::shared_ptr<GuestBlock> guest{};};
     VoiceGraph();
     ~VoiceGraph() override;
     Voice create(Kind,Format,unsigned flags=0,unsigned stage=0,float maximum_ratio=2);

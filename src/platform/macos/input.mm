@@ -68,7 +68,8 @@ std::uint32_t physical_descriptor_error(NSError* error){
     default:return 31;
     }
 }
-std::uint32_t read_physical_descriptor(const PhysicalDescriptorSource& source,std::span<std::uint8_t> bytes,std::uint32_t& transferred){
+std::uint32_t read_usb_hid_descriptor(const PhysicalDescriptorSource& source,std::span<std::uint8_t> bytes,
+                                      std::uint32_t& transferred,bool genre=false){
     transferred=0;if(bytes.empty())return 87;if(source.error)return source.error;
     @autoreleasepool {
         const auto matching=IORegistryEntryIDMatching(source.registry_id);
@@ -78,11 +79,27 @@ std::uint32_t read_physical_descriptor(const PhysicalDescriptorSource& source,st
         IOUSBHostDevice* device=[[IOUSBHostDevice alloc] initWithIOService:service options:IOUSBHostObjectInitOptionsNone queue:nil error:&failure interestHandler:nil];
         IOObjectRelease(service);if(!device)return physical_descriptor_error(failure);
         const auto capacity=std::min<std::size_t>(bytes.size(),UINT16_MAX);
+        // HID 1.11 §7.1.1：介面 GET_DESCRIPTOR、physical type 0x23、預設 set 0。
+        IOUSBDeviceRequest request{0x81,6,0x2300,static_cast<std::uint16_t>(source.interface),static_cast<std::uint16_t>(capacity)};
+        if(genre){
+            // 先核對裝置的 MSFT100 字串，再使用韌體宣告的讀取請求碼。
+            const IOUSBDeviceRequest query{0x80,6,0x03ee,0,18};
+            NSMutableData* string=[NSMutableData dataWithLength:18];
+            if(!string){[device destroy];return 8;}
+            NSUInteger length=0;
+            if(![device sendDeviceRequest:query data:string bytesTransferred:&length completionTimeout:2.0 error:&failure]){
+                [device destroy];return physical_descriptor_error(failure);
+            }
+            constexpr std::array<std::uint8_t,16> signature{18,3,'M',0,'S',0,'F',0,'T',0,'1',0,'0',0,'0',0};
+            const auto* descriptor=static_cast<const std::uint8_t*>(string.bytes);
+            if(length!=18 || string.length<18 || !std::equal(signature.begin(),signature.end(),descriptor) || !descriptor[16]){
+                [device destroy];return 50;
+            }
+            request={0xc0,descriptor[16],0,1,static_cast<std::uint16_t>(capacity)};
+        }
         NSMutableData* data=[NSMutableData dataWithLength:capacity];
         if(!data){[device destroy];return 8;}
-        // HID 1.11 §7.1.1：介面 GET_DESCRIPTOR、physical type 0x23、預設 set 0。
-        // 不 capture／seize，不卸載宿主 HID 驅動；每次讀取至多等待兩秒。
-        const IOUSBDeviceRequest request{0x81,6,0x2300,static_cast<std::uint16_t>(source.interface),static_cast<std::uint16_t>(capacity)};
+        // 保留宿主 HID 驅動，每筆唯讀 USB 傳輸上限兩秒。
         NSUInteger count=0;const bool ok=[device sendDeviceRequest:request data:data bytesTransferred:&count completionTimeout:2.0 error:&failure];
         [device destroy];if(!ok)return physical_descriptor_error(failure);
         if(count>capacity || count>data.length)return 31;
@@ -310,7 +327,10 @@ public:
         return {0,0,1167};
     }
     std::uint32_t get_physical_descriptor(const Guid& id,std::span<std::uint8_t> bytes,std::uint32_t& transferred)override{
-        return read_physical_descriptor(physical_descriptor_source(id),bytes,transferred);
+        return read_usb_hid_descriptor(physical_descriptor_source(id),bytes,transferred);
+    }
+    std::uint32_t get_genre_descriptor(const Guid& id,std::span<std::uint8_t> bytes,std::uint32_t& transferred)override{
+        return read_usb_hid_descriptor(physical_descriptor_source(id),bytes,transferred,true);
     }
     bool available(const Guid& id)override{if(id==keyboard_.instance || id==mouse_.instance)return true;for(auto& [ref,h]:hid_){(void)ref;if(h.device.instance==id)return h.device.attached;}return false;}
     void mouse_wheel(std::int32_t delta)override{if(!tap_)change(mouse_,2,delta);}

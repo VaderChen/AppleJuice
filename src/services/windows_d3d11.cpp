@@ -37,14 +37,19 @@
 #include <unordered_map>
 #include "d3d11_guids.hpp"
 #include "d3d10_guids.hpp"
+#include "d3dx10_version.h"
 #include "d3d10_effect.hpp"
+#include "d3d10_effect_disassembly.hpp"
 #include "d3d10_sprite.hpp"
 #include "d3d10_mesh.hpp"
+#include "d3dx_sh_project.hpp"
 #include "x64arm/raster_surface.hpp"
 #include "x64arm/windows_fonts.hpp"
 #include "x64arm/native_font_data.hpp"
 #include "texture_image.hpp"
 #include "texture_load.hpp"
+#include "d3dx_texture_entry.hpp"
+#include "d3dx_shader_entry.hpp"
 #include "texture_transform.hpp"
 #include "hlsl_include.hpp"
 #include "dxbc_reflection.hpp"
@@ -58,9 +63,18 @@
 namespace x64arm {
 namespace {
 using namespace d3d11_guid;
+// 舊版編譯器以 DLL 版號決定可取得的反射介面；既有 43／47 呼叫者沿用原有相容範圍。
+constexpr bool supports_shader_reflection(std::uint64_t abi,const Guid& iid){
+    if(abi<40)return iid==d3d10_guid::IID_ID3D10ShaderReflection ||
+        (abi>=33 && iid==d3d10_guid::IID_ID3D10ShaderReflection1);
+    if(abi<=42)return iid==IID_ID3D11ShaderReflection;
+    if(abi==46)return iid==IID_ID3D11ShaderReflection47;
+    return iid==IID_ID3D11ShaderReflection || iid==IID_ID3D11ShaderReflection47 ||
+        iid==IID_ID3D11ShaderReflection43 || iid==IID_ID3D12ShaderReflection;
+}
 constexpr std::uint32_t invalid=0x80070057U, no_interface=0x80004002U, not_supported=0x887a0004U,
     not_found=0x887a0002U, out_of_memory=0x8007000eU, failure=0x80004005U;
-enum class Kind { Mesh10, MeshBuffer10, Sprite10, Font10, Effect10, EffectType10, EffectVariable10, EffectScalar10, EffectVector10, EffectMatrix10, EffectString10, EffectResource10, EffectRenderTarget10, EffectDepthView10, EffectBuffer10, EffectShader10, EffectBlend10, EffectDepth10, EffectRaster10, EffectSampler10, EffectTechnique10, EffectPass10, StateBlock10, ClassLinkage, ClassInstance, Reflection, ReflectionBuffer, ReflectionVariable, ReflectionType, Device, Context, VideoDevice, VideoContext, Multithread, Texture, Decoder, View, Factory, Adapter, BufferObject, Texture1D, Texture3D, ShaderResource, Unordered, RenderTarget, DepthView, VertexShader, PixelShader, ComputeShader, GeometryShader, HullShader, DomainShader, Layout, Blend, DepthState, Raster, Sampler, Query, Predicate, CommandList, DxgiDevice, SwapChain, Output, Blob, DxgiResource, Fence, Annotation, DataLoader, On12Device };
+enum class Kind { Mesh10, MeshBuffer10, Sprite10, Font10, Effect10, EffectPool10, EffectType10, EffectVariable10, EffectScalar10, EffectVector10, EffectMatrix10, EffectString10, EffectResource10, EffectRenderTarget10, EffectDepthView10, EffectBuffer10, EffectShader10, EffectBlend10, EffectDepth10, EffectRaster10, EffectSampler10, EffectTechnique10, EffectPass10, StateBlock10, ClassLinkage, ClassInstance, Reflection, Reflection10_1, ReflectionBuffer, ReflectionVariable, ReflectionType, Device, Context, VideoDevice, VideoContext, Multithread, Texture, Decoder, View, Factory, Adapter, BufferObject, Texture1D, Texture3D, ShaderResource, Unordered, RenderTarget, DepthView, VertexShader, PixelShader, ComputeShader, GeometryShader, HullShader, DomainShader, Layout, Blend, DepthState, Raster, Sampler, Query, Predicate, CommandList, DxgiDevice, SwapChain, Output, Blob, DxgiResource, Fence, Annotation, DataLoader, DataProcessor, On12Device };
 struct Buffer { std::uint64_t address{}; std::uint32_t capacity{}; bool acquired{}; std::vector<std::uint8_t> submitted; };
 struct ReferenceSurface {
     std::array<std::int32_t,2> poc;
@@ -187,7 +201,8 @@ struct Identity {
     std::vector<std::uint8_t> effect_annotation_data;
     std::uint64_t effect_owner{};
     std::uint32_t effect_variable{UINT32_MAX},effect_buffer{UINT32_MAX},effect_technique{UINT32_MAX},effect_pass{UINT32_MAX},effect_element{},effect_offset{};
-    bool effect_valid{true},effect_optimized{},effect_anonymous{};
+    bool effect_valid{true},effect_optimized{},effect_anonymous{},effect_is_pool{};
+    std::uint64_t effect_pool{};
     std::uint64_t effect_inline_shader{};
     std::map<std::string,std::uint64_t> effect_handles;
 
@@ -206,6 +221,8 @@ struct Identity {
     // 最後一次 Present 的 QPC 時間（10 MHz）、IDXGISwapChain1 背景色（DXGI_RGBA）與旋轉。
     std::uint64_t present_ticks{};std::array<std::uint8_t,16> background_color{};std::uint32_t rotation{1};
     std::shared_ptr<GraphicsShader> shader;
+    std::shared_ptr<GraphicsShader> normal_map_shader;
+    ShCubeShaders sh_cube_shaders;
     std::shared_ptr<GraphicsSampler> sampler;
     GraphicsView graphics_view;
     std::vector<GraphicsElement> layout;
@@ -233,6 +250,7 @@ struct Identity {
     std::vector<std::uint64_t> pipeline_queries;
     std::uint32_t topology{},index_format{42},index_offset{},sample_mask{UINT32_MAX},stencil_reference{},priority{},query_size{},context_type{};
     std::uint64_t window{},factory{},adapter{},frames{},draws{},dispatches{};
+    bool remote_window{};
     std::vector<RecordedGraphicsCommand> commands;
     std::map<std::pair<std::uint64_t,std::uint32_t>,DeferredGraphicsMap> deferred_maps;
     bool offered{};
@@ -280,6 +298,7 @@ struct Identity {
     // 內部持有者只在 graphics_mutex 下修改；外部計數仍共用 resident AOT 的原子格位。
     std::uint32_t internal_references{};
     bool internal_texture{};
+    std::uint64_t dxgi_layer{},dxgi_layer_storage{};
     std::uint32_t slice{}, creation_flags{}, feature_level{0xb000}, exception_mode{};
     struct SubresourceMap { std::uint64_t pointer{};std::size_t size{};std::uint32_t type{}; };
     // 每個 mip／array slice 的 CPU 映射獨立，不把整個資源當成單一鎖。
@@ -303,6 +322,14 @@ struct Identity {
     std::uint64_t sequence{};
     // ID3DX10／ID3DX11DataLoader：來源（1 檔案、2 記憶體、3 資源）、檔案路徑，以及 Decompress 回傳的資料位址與長度（檔案載入器的資料在 allocations 內）。
     struct DataLoader { std::uint32_t source{};std::string path;std::uint64_t data{},size{};bool loaded{},d3d10{}; } data_loader;
+    struct DataProcessor {
+        bool info_only{},view{};
+        std::uint64_t info_pointer{};
+        std::vector<std::uint8_t> options;
+        D3dxPreparedTexture prepared;
+        std::optional<texture_image::Decoded> decoded;
+    };
+    std::unique_ptr<DataProcessor> data_processor;
 };
 struct Object { Kind kind; std::shared_ptr<Identity> identity; };
 // COM 引用計數存放在客體記憶體：每個身分一格 32 位元（建立根介面時配置、初值 1），各介面物件 [this+指標寬] 指向它。
@@ -381,7 +408,7 @@ struct D3DCompileOperation {
     std::vector<D3DCompileInclude> includes;
     std::optional<D3DCompileInclude> pending;
     std::optional<GraphicsCompilation> result;
-    bool closing{},closed{};
+    bool closing{},closed{},assembly_started{};
 };
 
 // COM 介面指標 → 物件。UE 每幀查表約 9 萬次（每次繪製十多次、每次狀態設定數次）；unordered_map 要取餘數再追指標，
@@ -431,8 +458,12 @@ private:
     mutable std::shared_mutex structure_;
 };
 struct D3D11SharedResource {std::weak_ptr<GraphicsResource> resource;std::weak_ptr<NativeOpenGlContext> producer;std::vector<std::uint8_t> desc;};
+struct DxgiDeviceLayer {std::uint64_t initialize{},size{},create{};};
+constexpr std::uint32_t dxgi_primary_layer=UINT32_MAX;
 struct D3D11State {
     std::map<std::uint32_t,D3D11SharedResource> shared_resources;
+    std::map<std::uint32_t,DxgiDeviceLayer> device_layers;
+    std::atomic<bool> guest_device_layer{};
     std::uint32_t next_shared_resource{0xa6000000};
     std::map<std::uint64_t,D3DCompileOperation> compilations;
     // D3D10Get*ShaderProfile 回傳的常駐字串（每個程序配置一次）。
@@ -590,6 +621,8 @@ std::span<const WindowsServiceDescriptor> d3d11_service_descriptors() {
         {"d3d11.dll","D3D11CreateDeviceAndSwapChain",12},{"dxgi.dll","CreateDXGIFactory2",3},{"dxgi.dll","DXGIGetDebugInterface1",3},
         {"d3dx11_42.dll","D3DX11LoadTextureFromTexture",4},{"d3dx11_43.dll","D3DX11LoadTextureFromTexture",4},
         {"d3dx11_42.dll","D3DX11FilterTexture",4},{"d3dx11_43.dll","D3DX11FilterTexture",4},
+        {"d3dx11_42.dll","D3DX11ComputeNormalMap",6},{"d3dx11_43.dll","D3DX11ComputeNormalMap",6},
+        {"d3dx11_42.dll","D3DX11SHProjectCubeMap",6},{"d3dx11_43.dll","D3DX11SHProjectCubeMap",6},
         {"d3dx11_42.dll","D3DX11SaveTextureToFileA",4},{"d3dx11_42.dll","D3DX11SaveTextureToFileW",4},{"d3dx11_42.dll","D3DX11SaveTextureToMemory",5},
         {"d3dx11_43.dll","D3DX11SaveTextureToFileA",4},{"d3dx11_43.dll","D3DX11SaveTextureToFileW",4},{"d3dx11_43.dll","D3DX11SaveTextureToMemory",5},
         {"d3dx11_42.dll","D3DX11CompileFromFileA",11},
@@ -635,6 +668,8 @@ std::span<const WindowsServiceDescriptor> d3d11_service_descriptors() {
         {"d3dcompiler_47.dll","D3DCompile",11},{"d3dcompiler_43.dll","D3DCompile",11},
         {"d3dcompiler_47.dll","D3DCompile2",14},{"d3dcompiler_47.dll","D3DCreateBlob",2},{"d3dcompiler_43.dll","D3DCreateBlob",2},
         {"d3dcompiler_47.dll","D3DDisassemble",5},{"d3dcompiler_43.dll","D3DDisassemble",5},
+        {"d3dcompiler_46.dll","D3DDisassembleRegion",8},{"d3dcompiler_47.dll","D3DDisassembleRegion",8},
+        {"d3dcompiler_46.dll","D3DGetTraceInstructionOffsets",7},{"d3dcompiler_47.dll","D3DGetTraceInstructionOffsets",7},
         {"d3dcompiler_47.dll","D3DPreprocess",7},{"d3dcompiler_43.dll","D3DPreprocess",7},{"d3dcompiler_47.dll","D3DSetBlobPart",7},{"d3dcompiler_47.dll","D3DGetBlobPart",5},{"d3dcompiler_43.dll","D3DGetBlobPart",5},
         {"d3dcompiler_46.dll","D3DStripShader",4},{"d3dcompiler_47.dll","D3DStripShader",4},{"d3dcompiler_43.dll","D3DStripShader",4},{"d3dcompiler_47.dll","D3DGetDebugInfo",3},{"d3dcompiler_43.dll","D3DGetDebugInfo",3},
         {"d3dcompiler_47.dll","D3DReadFileToBlob",2},{"d3dcompiler_47.dll","D3DWriteBlobToFile",3},{"d3dcompiler_47.dll","D3DCompileFromFile",9},
@@ -643,11 +678,18 @@ std::span<const WindowsServiceDescriptor> d3d11_service_descriptors() {
         {"d3d10.dll","D3D10GetVertexShaderProfile",1},{"d3d10.dll","D3D10GetPixelShaderProfile",1},{"d3d10.dll","D3D10GetGeometryShaderProfile",1},
         {"internal-d3d11","BlobPointer",1},{"internal-d3d11","BlobSize",1},
         {"internal-d3d11","DataLoaderLoad",1},{"internal-d3d11","DataLoaderDecompress",3},{"internal-d3d11","DataLoaderDestroy",1},
+        {"internal-d3d11","DataProcessorProcess",3},{"internal-d3d11","DataProcessorCreateDeviceObject",2},{"internal-d3d11","DataProcessorDestroy",1},
 #include "d3d11_graphics_descriptors.inc"
 #include "d3d11_reflection_descriptors.inc"
         {"d3d11.dll","D3D11On12CreateDevice",10},{"internal-d3d11","CreateWrappedResource",7},
         {"internal-d3d11","AcquireWrappedResources",3},{"internal-d3d11","ReleaseWrappedResources",3},
         {"d3d11.dll","D3D11CreateDevice",10},{"dxgi.dll","CreateDXGIFactory",2},{"dxgi.dll","CreateDXGIFactory1",2},
+        {"dxgi.dll","DXGID3D10CreateDevice",7},{"dxgi.dll","DXGID3D10RegisterLayers",2},
+        {"d3d10core.dll","D3D10CoreCreateDevice",5},{"d3d10core.dll","D3D10CoreRegisterLayers",0},
+        {"d3d11.dll","D3D11CoreCreateDevice",6},{"d3d11.dll","D3D11CoreRegisterLayers",0},
+        {"d3d10.dll","D3D10RegisterLayers",0},{"d3d10_1.dll","D3D10RegisterLayers",0},
+        {"internal-dxgi-layers","DxgiCreateLayerBase",7},{"internal-dxgi-layers","DxgiAttachLayer",3},
+        {"internal-dxgi-layers","DxgiFinishLayerRelease",2},{"internal-dxgi-layers","DxgiCoreDevice",1},
         {"internal-d3d11","Unsupported",1},{"internal-d3d11","QueryInterface",3},{"internal-d3d11","AddRef",1},{"internal-d3d11","Release",1},
         {"internal-d3d11","GetDevice",2},{"internal-d3d11","CreateTexture2D",4},{"internal-d3d11","CheckFormatSupport",3},
         {"internal-d3d11","GetFeatureLevel",1},{"internal-d3d11","GetCreationFlags",1},{"internal-d3d11","GetDeviceRemovedReason",1},
@@ -822,6 +864,9 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
     d3d11_local_refusal=nullptr;return true;
 }catch(const MemoryFault&){d3d11_local_refusal="fault";return false;}catch(const HostCallFault&){d3d11_local_refusal="fault";return false;}
 GraphicsMutex& WindowsServices::graphics_mutex() noexcept {static GraphicsMutex value;return value;}
+bool WindowsServices::dxgi_guest_layers() const noexcept {
+    return d3d11_ && d3d11_->guest_device_layer.load(std::memory_order_relaxed);
+}
 // 前置快速路徑：完整分派函式內聯了上百個方法與數十個繪製狀態暫存物件，堆疊框架很大，每次呼叫都要逐頁探測
 // 堆疊與初始化；遊戲內 D3D11 呼叫約八成是 COM AddRef／Release 與 GetDesc（DQ3 每秒十餘萬次），在進入完整函式前
 // 以相同語義完成：AddRef 與非最後一次 Release 只改引用計數；GetDesc 只把建立時保存的描述寫回客體，並遵守
@@ -829,6 +874,26 @@ GraphicsMutex& WindowsServices::graphics_mutex() noexcept {static GraphicsMutex 
 // 延後銷毀清單待處理、比對模式）一律交給完整路徑，例外與錯誤回報不變。X64ARM_D3D11_FRONT_PATH=0 關閉。
 // IA／*Set* 狀態設定同樣先走前置路徑（d3d11_setter_front_path.inc）；X64ARM_D3D11_SETTER_FRONT_PATH=0 只關閉這一段。
 std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    if(dxgi_guest_layers() &&
+       service_callback::completed(this,threads_.current,"DXGI 聚合物件",state))
+        return nested_continuation(state,memory,"DXGI 聚合物件",[](GuestState&,GuestMemory&)
+            ->service_callback::Task<std::optional<std::uint32_t>>{throw HostCallFault("DXGI 聚合續行重播時應取回結果");});
+    {
+        const auto create_source_loader=[this](GuestState& s,GuestMemory& m,const WindowsServiceDescriptor& api,
+            bool file,bool resource,std::uint64_t source,std::uint64_t second,std::uint64_t destination){
+            const std::string version=api.symbol.starts_with("D3DX10")?"D3DX10":"D3DX11";
+            const bool wide=api.symbol.ends_with('W');
+            const std::string name=version+(file?(wide?"CreateAsyncFileLoaderW":"CreateAsyncFileLoaderA"):
+                resource?(wide?"CreateAsyncResourceLoaderW":"CreateAsyncResourceLoaderA"):"CreateAsyncMemoryLoader");
+            return static_cast<std::uint32_t>(file?
+                nested_service(s,m,api.family,name,{source,destination}):
+                nested_service(s,m,api.family,name,{source,second,destination}));
+        };
+        {
+#include "d3dx_texture_pump_dispatch.inc"
+        }
+#include "d3dx_shader_pump_dispatch.inc"
+    }
     if(service.symbol=="D3DWriteBlobToFile"){
         return nested_continuation(state,memory,"寫入著色器 Blob",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
             const WindowsCall arg(s,m,service);
@@ -903,13 +968,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
         full_trace.key=std::move(key);full_trace.start=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     }
     // 全停中交給協調者的擁有者呼叫：能排入命令環的由協調者代為排入（見 d3d11_stream_full_enqueue），不排空佇列。
-    if(d3d11_stream_ && !graphics_local() && !graphics_coordinator_local() && d3d11_stream_full_enqueue(state,memory,service))return std::nullopt;
+    if(d3d11_stream_ && !graphics_local() && !graphics_coordinator_local() &&
+       !dxgi_guest_layers() && d3d11_stream_full_enqueue(state,memory,service))return std::nullopt;
     // 完整服務要看到佇列裡所有命令的結果（worker、協調者本地與串流執行緒自己都是本地路徑，各有處理）；擁有者自己的 Map／Unmap 只等同一資源。
     if(d3d11_stream_ && !graphics_local() && !d3d11_stream_owner_resource_sync(state,memory,service))d3d11_stream_full_service_sync(service);
     static const bool front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_FRONT_PATH");return !value || std::string_view(value)!="0";}();
     static const bool setter_front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_SETTER_FRONT_PATH");return front_path && (!value || std::string_view(value)!="0");}();
     static const bool draw_front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_DRAW_FRONT_PATH");return front_path && (!value || std::string_view(value)!="0");}();
     const auto symbol=service.symbol;
+#include "d3d_layer_creation.inc"
     if(const auto setter=setter_front_path?d3d11_setter_method(service):D3D11SetterMethod{};setter.kind!=D3D11Setter::None && d3d11_ && service.family=="internal-d3d11"){
         std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         auto& bridge=*d3d11_;
@@ -982,7 +1049,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
     const auto arg=[&](unsigned i){return i<20 && (adapted_mask&(1U<<i))?adapted_arguments[i]:original_arg(i);};
     const auto adapt=[&](unsigned i,std::uint64_t value){adapted_arguments.at(i)=value;adapted_mask|=1U<<i;};
     std::vector<std::uint64_t> temporary_arguments;std::function<void()> finish_adapter;
-    bool effect_compile=false;std::uint64_t effect_code_slot=0;
+    bool effect_compile=false,effect_compile_pool=false;
+    unsigned effect_device_arg=0,effect_output_arg=0;
+    std::uint64_t effect_code_slot=0,compile_status=0;
     struct TemporaryCleanup {
         WindowsServices& self;GuestMemory& memory;const GuestState& state;const std::vector<std::uint64_t>& pointers;
         ~TemporaryCleanup(){for(auto pointer:pointers)(void)self.free_heap(memory,pointer,state);}
@@ -1027,6 +1096,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         nested.reg(Gpr::Rcx)=address;
         invoke_d3d12(nested,memory,WindowsServiceDescriptor{"internal-d3d12",retain?"Interop.AddRef":"Interop.Release",1});
     };
+    struct LayerRelease {std::uint64_t outer,inner,storage;bool internal;};
+    std::vector<LayerRelease> layer_releases;
+    std::optional<GuestCallback> layer_query;
     const auto release_object=[&](const auto& self,std::uint64_t address,bool internal=false)->void {
         auto id=object(address).identity;const auto references=reference_count(memory,*id);
         if(!(internal?id->internal_references:references))throw HostCallFault("D3D11 物件引用計數已為零");
@@ -1034,6 +1106,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         if(graphics_local() && last){bridge.deferred_releases.emplace_back(address,internal);return;}
         if(last && id->fullscreen && !restore_fullscreen(id))throw WindowPresentationFault("無法恢復 DXGI 全螢幕視窗");
         if(last && id->lock_address && runtime_.critical_sections.at(id->lock_address).owner)throw HostCallFault("不可釋放仍鎖定的 D3D11 裝置");
+        if(last && id->dxgi_layer){
+            // 聚合的內層先執行自己的 Release，外層及工作儲存維持到回呼完成。
+            layer_releases.push_back({address,id->dxgi_layer,id->dxgi_layer_storage,internal});
+            id->dxgi_layer=id->dxgi_layer_storage=0;
+            return;
+        }
         if(internal)--id->internal_references;
         else if(!adjust_references(memory,*id,false))throw HostCallFault("D3D11 COM 物件引用計數已為零");
         if(id->internal_references || reference_count(memory,*id))return;
@@ -1110,6 +1188,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         case Kind::Blob:count=5;methods.insert({{3,"BlobPointer"},{4,"BlobSize"}});break;
         // ID3DX10／ID3DX11DataLoader 不是 COM 介面：只有 Load、Decompress、Destroy 三個方法。
         case Kind::DataLoader:count=3;methods={{0,"DataLoaderLoad"},{1,"DataLoaderDecompress"},{2,"DataLoaderDestroy"}};break;
+        case Kind::DataProcessor:count=3;methods={{0,"DataProcessorProcess"},{1,"DataProcessorCreateDeviceObject"},{2,"DataProcessorDestroy"}};break;
 #include "d3d11_graphics_vtables.inc"
 #include "d3d10_effect_vtables.inc"
 #include "d3d10_sprite_vtables.inc"
@@ -1194,6 +1273,41 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
             }
         }catch(...){release(id->root);throw;}
         return id;
+    };
+    const auto make_hardware_device=[&](bool api10,std::uint32_t flags,std::uint32_t level,
+                                        std::uint64_t adapter,std::uint64_t factory=0) {
+        if(factory) (void)typed(factory,Kind::Factory);
+        if(adapter){
+            const auto supplied=typed(adapter,Kind::Adapter);
+            if(factory && supplied->device!=factory)throw std::invalid_argument("DXGI 介面卡所屬的工廠不符");
+        }
+        auto device=create(Kind::Device,0,api10);
+        device->feature_level=level;
+        device->creation_flags=flags;
+        try {
+            if(adapter){hold(adapter);device->adapter=adapter;}
+            else if(factory){
+                auto selected=create(Kind::Adapter,factory);
+                selected->native=device->native;
+                device->adapter=selected->root;
+            }
+            if(api10){
+                auto context=create(Kind::Context,device->root);
+                context->weak_bindings=true;
+                device->context10=context->root;
+                // 私有 immediate context 歸裝置所有，共用資源後端與狀態。
+                release(device->root);
+            }
+        } catch(...) {release(device->root);throw;}
+        return device;
+    };
+    const auto feature_level=[&](std::uint64_t address,std::uint32_t count,bool api10){
+        if(!address || !count || count>16)return 0U;
+        for(std::uint32_t i=0;i<count;++i){
+            const auto level=static_cast<std::uint32_t>(memory.load(GuestAddress{address+4*i},32));
+            if(level==0xa000 || level==0xa100 || (!api10 && level==0xb000))return level;
+        }
+        return 0U;
     };
     std::uint64_t result=0;
     // 成功進入獨占全螢幕的視窗：Windows 的獨占全螢幕視窗必為前景，方法完成後尚未啟用時補上啟用通知。
@@ -1310,6 +1424,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         }
         bool graphics_handled=false;
 #include "d3d11_graphics_handlers.inc"
+#include "d3d_device_layers.inc"
 #include "d3d10_handlers.inc"
 #include "d3d10_stateblock.inc"
 #include "d3d10_effect_helpers.inc"
@@ -1318,8 +1433,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
 #include "d3d10_sprite_handlers.inc"
 #include "d3d10_mesh_handlers.inc"
 #include "d3dx11_save_handlers.inc"
+#include "d3dx_texture_helpers.inc"
 #include "d3dx11_load_handlers.inc"
+#include "d3dx_texture_processor_handlers.inc"
 #include "d3dx11_transfer_handlers.inc"
+#include "d3dx_normal_map_handlers.inc"
+#include "d3dx_sh_project_handlers.inc"
 #include "d3dx_data_loader_handlers.inc"
         if(graphics_handled){}
         // 影片資源與圖形資源共用同一 COM 物件表及裝置生命週期。
@@ -1334,13 +1453,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
             if(with_swap && arg(8)){output(8);write_pointer(arg(8),0);}
             if(arg(od))output(od);if(arg(oc))output(oc);if(arg(ol))memory.check(GuestAddress{arg(ol)},4,Access::Write);
             if(arg(od))memory.store(GuestAddress{arg(od)},pointer_bits,0);if(arg(oc))memory.store(GuestAddress{arg(oc)},pointer_bits,0);
-            std::uint32_t level=0xb000;
-            bool levels_valid=!arg(4) && !u32(5);
-            if(arg(4) && u32(5)>0 && u32(5)<=16){levels_valid=false;for(unsigned i=0;i<u32(5);++i){const auto requested=memory.load(GuestAddress{arg(4)+4*i},32);if(requested==0xb000 || requested==0xa100 || requested==0xa000){level=static_cast<std::uint32_t>(requested);levels_valid=true;break;}}}
-            if(arg(2) || u32(6)!=7 || (u32(3)&~0x8e3U) || !levels_valid || (arg(0)?u32(1)!=0:u32(1)!=1))result=invalid;
+            const auto level=!arg(4) && !u32(5)?0xb000U:feature_level(arg(4),u32(5),false);
+            if(arg(2) || u32(6)!=7 || (u32(3)&~0x8e3U) || !level || (arg(0)?u32(1)!=0:u32(1)!=1))result=invalid;
             else {
-                if(arg(0))(void)typed(arg(0),Kind::Adapter);
-                auto device=create(Kind::Device);device->creation_flags=u32(3);device->feature_level=level;if(arg(0)){hold(arg(0));device->adapter=arg(0);}
+                auto device=make_hardware_device(false,u32(3),level,arg(0));
                 std::uint64_t context=0;
                 try {if(arg(oc))context=create(Kind::Context,device->root)->root;}
                 catch(...) {release(device->root);throw;}
@@ -1353,7 +1469,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         } else if(symbol=="QueryInterface") {
             const auto value=object(arg(0));const auto id=value.identity;const auto guid=read_guid(memory,arg(1));output(2);memory.store(GuestAddress{arg(2)},pointer_bits,0);
             Kind target=value.kind;bool supported=false;
-            if(guid==IID_IUnknown){target=id->kind;supported=true;}
+            if(id->effect_is_pool){target=Kind::EffectPool10;supported=guid==IID_IUnknown || guid==d3d10_guid::IID_ID3D10EffectPool;}
+            else if(guid==IID_IUnknown){target=id->kind;supported=true;}
             else if(id->api10){
                 switch(id->kind){
                 case Kind::Mesh10:supported=guid==d3d10_guid::IID_ID3DX10Mesh;break;
@@ -1403,13 +1520,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
             else if(id->kind==Kind::Fence)supported=guid==IID_ID3D11Fence || guid==IID_ID3D11DeviceChild;
             else if(id->kind==Kind::Decoder)supported=guid==IID_ID3D11VideoDecoder || guid==IID_ID3D11DeviceChild;
             else if(id->kind==Kind::View)supported=guid==IID_ID3D11VideoDecoderOutputView || guid==IID_ID3D11View || guid==IID_ID3D11DeviceChild;
-            else if(id->kind==Kind::Reflection)supported=id->sequence==10?guid==d3d10_guid::IID_ID3D10ShaderReflection:(guid==IID_ID3D11ShaderReflection || guid==IID_ID3D11ShaderReflection47 || guid==IID_ID3D11ShaderReflection43 || guid==IID_ID3D12ShaderReflection);
+            else if(id->kind==Kind::Reflection){
+                supported=supports_shader_reflection(id->sequence,guid);
+                target=guid==d3d10_guid::IID_ID3D10ShaderReflection1?Kind::Reflection10_1:Kind::Reflection;
+            }
             else if(id->kind==Kind::Blob)supported=guid==IID_ID3D10Blob;
             else if(id->kind==Kind::Factory)supported=dxgi_factory_guid(guid) || guid==IID_IDXGIObject;
             else if(id->kind==Kind::Adapter)supported=dxgi_adapter_guid(guid) || guid==IID_IDXGIObject;
 #include "d3d11_graphics_query.inc"
             if(resource_kind(id->kind) && (guid==IID_IDXGIResource || guid==IID_IDXGIDeviceSubObject || guid==IID_IDXGIObject)){target=Kind::DxgiResource;supported=true;}
-            if(!supported)result=no_interface;
+            if(!supported){
+                result=no_interface;
+                if(id->dxgi_layer){
+                    const auto table=memory.load(GuestAddress{id->dxgi_layer},pointer_bits);
+                    const auto callback=memory.load(GuestAddress{table},pointer_bits);
+                    memory.check(GuestAddress{callback},1,Access::Execute);
+                    layer_query=GuestCallback{callback,{id->dxgi_layer,arg(1),arg(2)}};
+                }
+            }
             else {const auto pointer=interface(id,target);hold(pointer);memory.store(GuestAddress{arg(2)},pointer_bits,pointer);}
         } else if(symbol=="AddRef")result=hold(arg(0));
         else if(symbol=="Release"){result=reference_count(memory,*object(arg(0)).identity)-1;release(arg(0));}
@@ -1704,8 +1832,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
       catch(const texture_image::Error& error){result=error.hresult;bridge.last_error=error.what();}
       catch(const video::VideoCodecError& error){result=failure;bridge.last_error=error.what();}
       catch(const video::DxvaH264Error& error){result=not_supported;bridge.last_error=error.what();}
-      // 呈現目標視窗已關閉或不可見（例如 Chromium 的 GPU 程序對剛關閉的對話框送出最後一張畫面）：Windows 的 Present 不把它當成呼叫錯誤，
-      // 回 DXGI_STATUS_OCCLUDED（成功、畫面未顯示）。回 DXGI_ERROR_INVALID_CALL 會讓 Chromium 的合成器停止，整個 Steam 介面不再更新。
+      // 遠端目標在交付期間消失或暫時不可見時回 DXGI_STATUS_OCCLUDED，允許 Chromium 合成器繼續呈現後續視窗。
+      // 本程序明確銷毀的 HWND 已於 Present 入口拒絕，保留 DXGI_ERROR_INVALID_CALL。
       catch(const WindowPresentationFault& error){result=symbol=="Present" || symbol=="Present1"?0x087a0001U:0x887a0001U;bridge.last_error=error.what();record_diagnostic("d3d11_present_fault");set_diagnostic("d3d11_present_fault_last",error.what());if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d11] %.*s: %s\n",static_cast<int>(symbol.size()),symbol.data(),error.what());}
       catch(const std::invalid_argument& error){bridge.last_error=error.what();if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d11] %.*s: %s\n",static_cast<int>(symbol.size()),symbol.data(),error.what());if(void_methods.contains(symbol)){
             // 診斷：X64ARM_TRACE_SHADER_FAILURE_DIR=<目錄> 時把繪製／分派的著色器編譯失敗寫成檔案並略過這次呼叫，一輪收集所有失敗的著色器；正常執行仍視為內部錯誤。
@@ -1716,12 +1844,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
             if(auto* out=std::fopen((std::string(failure_dir)+name).c_str(),"wb")){std::fwrite(bridge.last_error.data(),1,bridge.last_error.size(),out);std::fclose(out);}
         }
         result=invalid;}
-    if(effect_compile){const auto hresult=original_arg(service.symbol.find("FromFile")!=std::string_view::npos?11:13);if(hresult)memory.store(GuestAddress{hresult},32,result);}
-    if(symbol.starts_with("D3DX11GetImageInfoFrom") || symbol.starts_with("D3DX11CreateTextureFrom") || symbol.starts_with("D3DX11CreateShaderResourceViewFrom")){
-        const bool info=symbol.starts_with("D3DX11GetImageInfo"),file=symbol.find("FromFile")!=std::string_view::npos;
-        const unsigned pump=(info?0U:2U)+(file?1U:2U);
-        if(!arg(pump) && arg(pump+2))memory.store(GuestAddress{arg(pump+2)},32,result);
-    }
+    if(compile_status)memory.store(GuestAddress{compile_status},32,result);
+    if(const D3dxTextureEntry entry(symbol);entry.valid && !arg(entry.pump_arg) && arg(entry.status_arg))
+        memory.store(GuestAddress{arg(entry.status_arg)},32,result);
     if(symbol.starts_with("D3DX11") && (result&0x80000000U) && std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))
         std::fprintf(stderr,"[d3dx11] %.*s HRESULT=%08x %s\n",static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned>(result),bridge.last_error.c_str());
     if((result&0x80000000U) && std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS") && symbol=="CreateTexture2D" && arg(1)){
@@ -1758,6 +1883,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         }
     }
     if(finish_adapter && !(result&0x80000000U))finish_adapter();
+    if(!layer_releases.empty() || layer_query){
+        graphics_lock.unlock();
+        return nested_continuation(state,memory,"DXGI 聚合物件",
+            [this,service,result,releases=std::move(layer_releases),query=std::move(layer_query),pointer_bits,pointer_size]
+            (GuestState& guest,GuestMemory& data)->service_callback::Task<std::optional<std::uint32_t>>{
+                auto value=result;
+                for(const auto& item:releases){
+                    const auto table=data.load(GuestAddress{item.inner},pointer_bits);
+                    const auto release_inner=data.load(GuestAddress{table+2*pointer_size},pointer_bits);
+                    (void)co_await service_callback::call(release_inner,{item.inner});
+                    (void)free_heap(data,item.storage,guest);
+                    (void)co_await service_callback::call(resolve("internal-dxgi-layers","DxgiFinishLayerRelease").value,
+                        {item.outer,item.internal?1U:0U});
+                }
+                if(query)value=co_await service_callback::call(query->target,std::move(query->arguments));
+                WindowsCall(guest,data,service).return_to(guest,value);
+                co_return std::nullopt;
+            });
+    }
     if(fullscreen_activation && !(result&0x80000000U) && gui_.active!=fullscreen_activation){
         // 與 SetForegroundWindow 相同的啟用流程（WM_NCACTIVATE／WM_ACTIVATE 回呼）；只限位於輸入桌面的頂層視窗。
         // 呼叫者通常是渲染執行緒而非視窗執行緒，不套用 SetActiveWindow 的同輸入佇列限制。

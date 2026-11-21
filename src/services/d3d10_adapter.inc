@@ -57,16 +57,43 @@
             }
         }
 
-        if(service.family=="d3dx10_43.dll" && symbol.starts_with("D3DX10CreateEffectFrom")){
-            effect_compile=true;const bool file=symbol.find("FromFile")!=symbol.npos;const unsigned delta=file?0U:2U;
-            if(original_arg(7+delta) || original_arg(8+delta))throw std::invalid_argument("FX4 pool 或非同步 pump 需要對應實作");
-            memory.store(GuestAddress{original_arg(9+delta)},pointer_bits,0);effect_code_slot=temporary(std::vector<std::uint8_t>(pointer_size));
-            adapted_symbol="D3DX11Compile"+std::string(symbol.substr(std::string_view("D3DX10CreateEffect").size()));symbol=adapted_symbol;
-            adapt(3+delta,0);adapt(4+delta,original_arg(3+delta));adapt(5+delta,original_arg(4+delta));adapt(6+delta,original_arg(5+delta));adapt(7+delta,0);adapt(8+delta,effect_code_slot);adapt(9+delta,original_arg(10+delta));adapt(10+delta,original_arg(11+delta));
+        if(service.family=="d3dx10_43.dll" &&
+            (symbol.starts_with("D3DX10CreateEffectFrom") || symbol.starts_with("D3DX10CreateEffectPoolFrom"))){
+            effect_compile=true;
+            effect_compile_pool=symbol.starts_with("D3DX10CreateEffectPoolFrom");
+            const unsigned delta=symbol.find("FromFile")!=symbol.npos?0U:2U;
+            effect_device_arg=6+delta;
+            effect_output_arg=effect_device_arg+(effect_compile_pool?2U:3U);
+            const auto destination=original_arg(effect_output_arg);
+            if(!destination)throw std::invalid_argument("FX4 缺少輸出指標");
+            memory.store(GuestAddress{destination},pointer_bits,0);
+            if(const auto errors=original_arg(effect_output_arg+1))
+                memory.store(GuestAddress{errors},pointer_bits,0);
+            if(const auto status=original_arg(effect_output_arg+2)){
+                memory.check(GuestAddress{status},4,Access::Write);
+                compile_status=status;
+            }
+            const auto fx_flags=static_cast<std::uint32_t>(original_arg(effect_device_arg-1));
+            if((fx_flags&~0xbU) || (effect_compile_pool && (fx_flags&1)))
+                throw std::invalid_argument("FX4 建立旗標無效");
+            if(original_arg(effect_output_arg-1))
+                throw std::invalid_argument("FX4 此編譯路徑僅處理同步請求");
+            effect_code_slot=temporary(std::vector<std::uint8_t>(pointer_size));
+            adapted_symbol="D3DX11Compile"+std::string(symbol.substr(symbol.find("From")));
+            symbol=adapted_symbol;
+            adapt(3+delta,0);
+            adapt(4+delta,original_arg(3+delta));
+            adapt(5+delta,original_arg(4+delta));
+            adapt(6+delta,fx_flags&3U);
+            adapt(7+delta,0);
+            adapt(8+delta,effect_code_slot);
+            adapt(9+delta,original_arg(effect_output_arg+1));
+            adapt(10+delta,compile_status);
         }else if(service.family=="d3dx10_43.dll" && symbol.starts_with("D3DX10") && !symbol.starts_with("D3DX10CreateFont") && symbol!="D3DX10CreateSprite" && symbol!="D3DX10CreateMesh" &&
                  // D3DX10 自己的裝置與版本輔助函式沒有對應的 D3DX11 版本，不改寫名稱。
                  symbol!="D3DX10CheckVersion" && symbol!="D3DX10CreateDevice" && symbol!="D3DX10CreateDeviceAndSwapChain" && symbol!="D3DX10GetFeatureLevel1" &&
-                 symbol!="D3DX10UnsetAllDeviceObjects" && symbol!="D3DX10PreprocessShaderFromMemory"){
+                 symbol!="D3DX10UnsetAllDeviceObjects" && symbol!="D3DX10ComputeNormalMap" &&
+                 symbol!="D3DX10SHProjectCubeMap" && !symbol.starts_with("D3DX10PreprocessShaderFrom")){
             // D3DX10/11 的圖片資訊及載入設定具有相同 ABI。
             adapted_symbol="D3DX11"+std::string(symbol.substr(6));symbol=adapted_symbol;
             if(symbol.starts_with("D3DX11SaveTexture") || symbol=="D3DX11LoadTextureFromTexture" || symbol=="D3DX11FilterTexture"){

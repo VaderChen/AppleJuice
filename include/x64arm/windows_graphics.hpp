@@ -28,6 +28,8 @@ struct GraphicsResource:GraphicsObject {
     GraphicsResourceDesc desc;
     std::uint64_t stream_cursor{},stream_vertices{};
 };
+struct GraphicsIndirectCountMask {std::shared_ptr<GraphicsResource> arguments;std::uint32_t offset{},stride{},words{},maximum{};
+    std::shared_ptr<GraphicsResource> count;std::uint32_t count_offset{},target_offset{};bool dispatch{};};
 struct GraphicsStreamElement {std::string semantic;std::uint32_t index{},first{},count{},slot{},stream{};};
 struct GraphicsStreamStatistics {std::uint64_t written{},needed{};};
 // D3D11_QUERY_DATA_PIPELINE_STATISTICS 的 11 個計數（順序與欄位相同）。由後端在命令執行緒依提交順序累加；
@@ -126,6 +128,9 @@ struct GraphicsDraw {
     // Draw*InstancedIndirect：count／instances／start／base_vertex／start_instance 改由此 buffer 的 offset 處取得
     // （D3D11 與 Metal 的間接參數佈局相同）；GPU 寫入的參數不經 CPU 讀回。
     std::shared_ptr<GraphicsResource> indirect;std::uint32_t indirect_offset{};
+    // 連續 indirect_count 筆間接參數（每筆相隔 indirect_stride 位元組）共用同一組狀態依序繪製，例如 ExecuteIndirect 遮罩後的參數陣列；
+    // 只用於沒有幾何／曲面細分與遮蔽查詢的繪製。
+    std::uint32_t indirect_count{1},indirect_stride{};
     // 非零時，值相同的繪製其著色器、輸入佈局、混色／深度／光柵狀態與 sample mask 皆相同（D3D12 PSO 建立後不變），
     // 後端可據此快取管線；0 表示不保證（D3D11 等逐次比對）。
     std::uint64_t pipeline_serial{};
@@ -213,6 +218,10 @@ public:
     virtual void graphics_draw(const GraphicsDraw&){throw std::runtime_error("後端缺少繪製操作");}
     virtual void graphics_dispatch(const GraphicsStage&,std::array<std::uint32_t,3>){throw std::runtime_error("後端缺少運算操作");}
     virtual void graphics_dispatch_indirect(const GraphicsStage&,const std::shared_ptr<GraphicsResource>&,std::uint32_t){throw std::runtime_error("後端缺少間接運算操作");}
+    // ExecuteIndirect 計數緩衝（依命令順序、不經 CPU）：每項把 arguments 自 offset 起每 stride 位元組一筆、每筆 words 個 32 位元字的參數，
+    // 依 count 資源 count_offset 處的計數遮罩後緊密寫入 target 的 target_offset——第 i≥min(計數, maximum) 筆的實例數（繪製）或三個群組數（dispatch）歸零。
+    // 一批共用一個 compute 段落；任一項形狀不支援就回傳 false 且不排入任何命令，呼叫端改回讀計數。
+    virtual bool graphics_indirect_count_masks(std::span<const GraphicsIndirectCountMask>,const std::shared_ptr<GraphicsResource>&){return false;}
     virtual void graphics_mips(const GraphicsView&){throw std::runtime_error("後端缺少 mipmap 操作");}
     // 呼叫期間由呼叫端持有跨程序鎖；返回前 GPU 已完成寫入。
     virtual void graphics_export_frame(const GraphicsView&,void*,std::size_t,std::uint32_t,std::shared_ptr<void> = {}){throw std::runtime_error("後端缺少共用影格匯出");}

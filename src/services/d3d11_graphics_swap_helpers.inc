@@ -23,7 +23,7 @@
             const auto fs=fullscreen_desc?read_bytes(memory,fullscreen_desc,20):std::vector<std::uint8_t>{};
             const bool fullscreen=desc1?(!fs.empty() && !word(fs,16)):!word(desc,x86_?48:56);
             if(!factory)factory=object(device_adapter(device)).identity->device;
-            auto swap=create(Kind::SwapChain,display_only?0:device->root);swap->window=window;swap->factory=factory;if(factory)hold(factory);
+            auto swap=create(Kind::SwapChain,display_only?0:device->root);swap->window=window;swap->remote_window=remote.has_value();swap->factory=factory;if(factory)hold(factory);
             // device 的繪製 queue 共用；HWND／尺寸／drawable 則由各交換鏈獨立持有。
             try{if(!display_only){swap->native=make_metal_opengl(nullptr,1,1);swap_buffers(swap,width,height,format,count,word(desc,desc1?24:36),samples);}swap->desc.resize(x86_?60:72);if(!desc1)std::copy_n(desc.begin(),28,swap->desc.begin());else if(!fs.empty()){std::copy_n(fs.begin(),8,swap->desc.begin()+8);put_word(swap->desc,20,word(fs,8));put_word(swap->desc,24,word(fs,12));}put_word(swap->desc,0,width);put_word(swap->desc,4,height);put_word(swap->desc,16,format);put_word(swap->desc,28,samples);put_word(swap->desc,36,word(desc,desc1?24:36));put_word(swap->desc,40,count);std::memcpy(swap->desc.data()+(x86_?44:48),&window,pointer_size);put_word(swap->desc,x86_?48:56,1);put_word(swap->desc,x86_?52:60,word(desc,desc1?36:x86_?52:60));put_word(swap->desc,x86_?56:64,word(desc,desc1?44:x86_?56:64));
                 swap->target_mode.assign(swap->desc.begin(),swap->desc.begin()+28);if(restricted){hold(restricted);swap->bindings["RestrictOutput"]={restricted};}

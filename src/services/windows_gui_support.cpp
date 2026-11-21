@@ -21,6 +21,7 @@
 #include "wasapi_interfaces.hpp"
 #include "gui_lifecycle_trace.hpp"
 #include "dinput_interfaces.hpp"
+#include "dxdiag_interfaces.hpp"
 #include "gui_timing_layout.h"
 #include "x64arm/raster_surface.hpp"
 #include "x64arm/windows_transform.hpp"
@@ -82,6 +83,7 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"dwmapi.dll","DwmExtendFrameIntoClientArea",2},{"dwmapi.dll","DwmEnableBlurBehindWindow",2},
         {"dwmapi.dll","DwmSetWindowAttribute",4},{"dwmapi.dll","DwmGetWindowAttribute",4},
         {"dwmapi.dll","DwmDefWindowProc",5},{"dwmapi.dll","DwmGetCompositionTimingInfo",2},{"dwmapi.dll","DwmFlush",0},
+        {"dwmapi.dll","DwmGetColorizationColor",2},{"dwmapi.dll","#127",1},{"dwmapi.dll","#131",2,0,0,2},
         {"user32.dll","RegisterTouchWindow",2},{"user32.dll","UnregisterTouchWindow",1},{"user32.dll","IsTouchWindow",2},
         {"user32.dll","GetTouchInputInfo",4},{"user32.dll","CloseTouchInputHandle",1},
         
@@ -427,9 +429,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             if(current_process_handle(process,0) || process_handle_pid(process,0x1000))fail(5);else fail(6);
         }else {gui_.observe_resources();const auto index=(flags==1 || flags==4)?1U:0U;result=std::min<std::uint64_t>(UINT32_MAX,flags>=2?gui_.resource_peaks[index]:gui_.resource_counts()[index]);last_error_=0;}
     }else if(service.family=="dwmapi.dll"){
+#include "dwm_colorization.inc"
         // 本後端提供一般視窗，尚無 DWM redirection 與其合成查詢，維持一致的停用狀態；
         // DwmExtendFrameIntoClientArea 的整片玻璃由原生非不透明視窗承接，客戶區依內容 alpha 合成。
-        if(symbol=="DwmExtendFrameIntoClientArea"){
+        else if(symbol=="DwmExtendFrameIntoClientArea"){
             const auto found=gui_.windows.find(arg(0));
             if(found==gui_.windows.end())result=0x80070578U;
             else if(!arg(1) || found->second.parent)result=0x80070057U;
@@ -537,7 +540,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             if(!callbacks.empty()){start_callbacks(state,memory,std::move(callbacks),Continuation::Return,0);return std::nullopt;}
         }}
     }
-    else if(symbol=="CoCreateInstance" || symbol=="CoGetClassObject"){if(begin_registered_com(state,memory,service))return std::nullopt;if(begin_avi_disk(state,memory,service))return std::nullopt;if(begin_msxml_com(state,memory,service))return std::nullopt;if(begin_webbrowser_com(state,memory,service))return std::nullopt;if(begin_ribbon_com(state,memory,service))return std::nullopt;if(begin_moniker_com(state,memory,service))return std::nullopt;if(begin_ole_picture_com(state,memory,service))return std::nullopt;if(begin_file_dialog_com(state,memory,service))return std::nullopt;if(dmusic::is_class(memory,arg(0)))return invoke_directmusic(state,memory,service);if(wic::is_class(memory,arg(0)))return invoke_wic(state,memory,service);if(dsound::is_class(memory,arg(0)))return invoke_dsound(state,memory,service);if(xaudio::is_class(memory,arg(0)))return invoke_xaudio(state,memory,service);if(wasapi::is_class(memory,arg(0)))return invoke_wasapi(state,memory,service);if(dinput::is_class(memory,arg(0)))return invoke_dinput(state,memory,service);if(symbol=="CoGetClassObject"){memory.store(GuestAddress{arg(4)},x86_?32:64,0);arg.return_to(state,0x80040154U);return std::nullopt;}return invoke_wmi(state,memory,service);}
+    else if(symbol=="CoCreateInstance" || symbol=="CoGetClassObject"){if(begin_registered_com(state,memory,service))return std::nullopt;if(begin_avi_disk(state,memory,service))return std::nullopt;if(begin_msxml_com(state,memory,service))return std::nullopt;if(begin_webbrowser_com(state,memory,service))return std::nullopt;if(begin_ribbon_com(state,memory,service))return std::nullopt;if(begin_moniker_com(state,memory,service))return std::nullopt;if(begin_ole_picture_com(state,memory,service))return std::nullopt;if(begin_file_dialog_com(state,memory,service))return std::nullopt;if(dmusic::is_class(memory,arg(0)))return invoke_directmusic(state,memory,service);if(wic::is_class(memory,arg(0)))return invoke_wic(state,memory,service);if(dsound::is_class(memory,arg(0)))return invoke_dsound(state,memory,service);if(xaudio::is_class(memory,arg(0)))return invoke_xaudio(state,memory,service);if(wasapi::is_class(memory,arg(0)))return invoke_wasapi(state,memory,service);if(dinput::is_class(memory,arg(0)))return invoke_dinput(state,memory,service);if(dxdiag::is_class(memory,arg(0)))return invoke_dxdiag(state,memory,service);if(symbol=="CoGetClassObject"){memory.store(GuestAddress{arg(4)},x86_?32:64,0);arg.return_to(state,0x80040154U);return std::nullopt;}return invoke_wmi(state,memory,service);}
     else if(symbol.starts_with("InitCommonControls")){if(symbol.ends_with("Ex")){if(memory.load(GuestAddress{arg(0)},32)!=8)fail(87);else result=1;}}
     else if(symbol=="DisableProcessWindowsGhosting"){
         // 此 void API 停用的是 Windows 的替身視窗；AppKit 後端本來不建立替身。
@@ -1074,7 +1077,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             const auto handle=gui_.next_object++;gui_.deferred_positions.emplace(handle,std::move(batch));result=handle;
         }catch(const std::bad_alloc&){fail(8);}
     } else if(symbol=="DeferWindowPos" || symbol=="NtUserDeferWindowPosAndBand"){
-        // 參考實作共用標準定位批次，尾端兩個 band 參數保留原生 ABI。
+        // 參考實作 共用標準定位批次，尾端兩個 band 參數保留原生 ABI。
         const auto batch=gui_.deferred_positions.find(arg(0));const auto window=gui_.windows.find(arg(1));
         if(batch==gui_.deferred_positions.end())fail(1405);
         else if(batch->second.thread!=threads_.current)fail(5);
@@ -1104,7 +1107,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             }catch(const std::bad_alloc&){gui_.deferred_positions.erase(batch);fail(8);}
         }
     } else if(symbol=="EndDeferWindowPos" || symbol=="NtUserEndDeferWindowPosEx"){
-        // 與 參考實作一致，async 也在本次呼叫中完成視窗定位。
+        // 與 參考實作 一致，async 也在本次呼叫中完成視窗定位。
         const auto batch=gui_.deferred_positions.find(arg(0));
         if(batch==gui_.deferred_positions.end())fail(1405);
         else if(batch->second.thread!=threads_.current)fail(5);

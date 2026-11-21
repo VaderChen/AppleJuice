@@ -13,7 +13,7 @@ using HlslIncludeLoader=std::function<std::optional<HlslIncludeSource>(std::stri
 GraphicsCompilation graphics_preprocess_shader(std::span<const std::uint8_t>,const std::string&,
     const std::vector<std::pair<std::string,std::string>>&,const HlslIncludeLoader&);
 GraphicsCompilation graphics_assemble_shader(std::span<const std::uint8_t>,const std::string&,
-    const std::vector<std::pair<std::string,std::string>>&,std::uint32_t,const HlslIncludeLoader&);
+    const std::vector<std::pair<std::string,std::string>>&,std::uint32_t,const HlslIncludeLoader&,bool* assembly_started=nullptr);
 GraphicsCompilation graphics_compile_hlsl_includes(std::span<const std::uint8_t>,const std::string&,
     const std::string&,const std::string&,const std::vector<std::pair<std::string,std::string>>&,std::uint32_t,const HlslIncludeLoader&,std::uint32_t effect_flags=0);
 }

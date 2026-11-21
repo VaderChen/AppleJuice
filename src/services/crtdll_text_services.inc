@@ -1,0 +1,6 @@
+CRTDLL_TEXT(_strdec,2)
+CRTDLL_TEXT(_strinc,1)
+CRTDLL_TEXT(_strncnt,2)
+CRTDLL_TEXT(_strnextc,1)
+CRTDLL_TEXT(_strninc,2)
+CRTDLL_TEXT(_strspnp,2)

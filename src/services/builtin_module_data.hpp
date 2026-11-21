@@ -8,6 +8,7 @@ namespace x64arm::detail {
 // 由提供者宣告模組內的唯讀資料容量；PE 檔案、映像大小與實際映射共用此配置。
 // 介面表屬於提供者映像，不借用程序 heap 或以擴大模組查詢範圍涵蓋外部配置。
 inline constexpr std::size_t builtin_module_data_capacity(std::string_view module) noexcept {
+    if(module=="icu.dll")return 65536U; // ICU 的唯讀字元屬性及書寫系統名稱。
     return module=="d3d12.dll" || module=="dxgi.dll"?16384U:0U;
 }
 // 只在協調者、客體 worker 已停止時初始化未發布的資料；發布後維持唯讀。

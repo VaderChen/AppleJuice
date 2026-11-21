@@ -76,18 +76,98 @@ struct Program {
         std::vector<Annotation> result;const auto count=bounded(next());for(unsigned i=0;i<count;++i){Annotation a;a.name=string(next());a.type=type(next());const auto n=a.type->kind==2 && a.type->detail==1?a.type->count():1;for(unsigned j=0;j<n;++j)a.values.push_back(next());result.push_back(std::move(a));}return result;
     }
     std::vector<Assignment> assignments(unsigned count){std::vector<Assignment> result;bounded(count);for(unsigned i=0;i<count;++i){Assignment a;a.state=next();a.index=next();a.kind=next();a.offset=next();if(a.kind<1 || a.kind>7)throw std::invalid_argument("FX4 assignment 種類無效");result.push_back(a);}return result;}
-    explicit Program(std::span<const std::uint8_t> bytes){
+    static bool same_type(const Type& a,const Type& b){
+        const auto detail=[](const Type& t){return t.kind==2 && t.detail==8?7U:t.detail;};
+        if(a.name!=b.name || a.kind!=b.kind || a.elements!=b.elements || a.size!=b.size ||
+            a.stride!=b.stride || a.packed!=b.packed || detail(a)!=detail(b) ||
+            a.members.size()!=b.members.size())return false;
+        for(std::size_t i=0;i<a.members.size();++i){
+            const auto& first=a.members[i];const auto& second=b.members[i];
+            if(first.name!=second.name || first.offset!=second.offset ||
+                !same_type(*first.type,*second.type))return false;
+        }
+        return true;
+    }
+    void parse_buffer(const Program* shared_pool){
+        Buffer b;
+        b.name=string(next());
+        const auto length=bounded(next());
+        b.flags=next();
+        const auto count=bounded(next());
+        b.bind=next();
+        const Buffer* pooled=nullptr;
+        if(shared_pool){
+            const auto found=std::find_if(shared_pool->buffers.begin(),shared_pool->buffers.end(),
+                [&](const auto& candidate){return candidate.name==b.name;});
+            if(found==shared_pool->buffers.end() || found->bytes.size()!=length ||
+                found->flags!=b.flags || found->variables.size()!=count)
+                throw std::invalid_argument("FX4 共享緩衝與 pool 宣告不符");
+            pooled=&*found;
+        }else{
+            b.bytes.resize(length);
+            b.annotations=annotations();
+        }
+        for(unsigned j=0;j<count;++j){
+            Variable v;
+            v.name=string(next());
+            v.type=type(next());
+            v.semantic=string(next());
+            v.offset=next();
+            auto defaults=next();
+            v.flags=next();
+            if(v.offset>length || v.type->size>length-v.offset)throw std::invalid_argument("FX4 變數超出 cbuffer");
+            if(pooled){
+                const auto& master=shared_pool->variables.at(pooled->variables[j]);
+                if(v.name!=master.name || v.offset!=master.offset || !same_type(*v.type,*master.type))
+                    throw std::invalid_argument("FX4 共享緩衝成員與 pool 宣告不符");
+            }else{
+                v.buffer=static_cast<unsigned>(buffers.size());
+                v.annotations=annotations();
+                if(defaults)unpack(*v.type,defaults,b.bytes,v.offset);
+                b.variables.push_back(static_cast<unsigned>(variables.size()));
+                variables.push_back(std::move(v));
+            }
+        }
+        if(!pooled)buffers.push_back(std::move(b));
+    }
+    void parse_object(const Program* shared_pool){
+        Variable v;
+        v.name=string(next());
+        v.type=type(next());
+        v.semantic=string(next());
+        v.bind=next();
+        if(v.type->kind!=2)throw std::invalid_argument("FX4 物件變數型別無效");
+        if(shared_pool){
+            const auto found=std::find_if(shared_pool->variables.begin(),shared_pool->variables.end(),
+                [&](const auto& candidate){return candidate.name==v.name;});
+            if(found==shared_pool->variables.end() || !same_type(*v.type,*found->type))
+                throw std::invalid_argument("FX4 共享物件與 pool 宣告不符");
+            return;
+        }
+        const auto object=v.type->detail;
+        for(unsigned j=0;j<v.type->count();++j){
+            ObjectValue value;
+            if(object==1 || (object>=5 && object<=8)){
+                value.data=next();
+                if(object==8)value.stream_output=next();
+            }else if(object==2 || object==3 || object==4 || object==21)value.assignments=assignments(next());
+            else if(object<9 || object>23)throw std::invalid_argument("FX4 物件類別無效");
+            v.objects.push_back(std::move(value));
+        }
+        v.annotations=annotations();
+        variables.push_back(std::move(v));
+    }
+    explicit Program(std::span<const std::uint8_t> bytes,const Program* pool=nullptr){
         if(bytes.size()<76 || (word(bytes,0)!=0xfeff1001 && word(bytes,0)!=0xfeff1011))throw std::invalid_argument("FX4 容器標頭無效");
         independent_blend=word(bytes,0)==0xfeff1011;
         const auto size=word(bytes,32);if(size>bytes.size()-76)throw std::invalid_argument("FX4 區段長度無效");data.assign(bytes.begin()+76,bytes.begin()+76+size);structured.assign(bytes.begin()+76+size,bytes.end());
-        if(word(bytes,16) || word(bytes,20) || word(bytes,24))throw std::invalid_argument("FX4 shared pool 需要對應 pool 資料");
+        const auto shared_buffers=bounded(word(bytes,16)),shared_objects=bounded(word(bytes,24));
+        if(!pool && (shared_buffers || word(bytes,20) || shared_objects))throw std::invalid_argument("FX4 child effect 缺少 pool");
         const auto cb=bounded(word(bytes,4)),objects=bounded(word(bytes,12)),techs=bounded(word(bytes,28));
-        for(unsigned i=0;i<cb;++i){Buffer b;b.name=string(next());const auto length=next();if(length>65536)throw std::invalid_argument("FX4 cbuffer 大小超限");b.bytes.resize(length);b.flags=next();const auto count=bounded(next());b.bind=next();b.annotations=annotations();
-            for(unsigned j=0;j<count;++j){Variable v;v.name=string(next());v.type=type(next());v.semantic=string(next());v.offset=next();auto defaults=next();v.flags=next();v.buffer=i;v.annotations=annotations();if(v.offset>b.bytes.size() || v.type->size>b.bytes.size()-v.offset)throw std::invalid_argument("FX4 變數超出 cbuffer");if(defaults)unpack(*v.type,defaults,b.bytes,v.offset);b.variables.push_back(static_cast<unsigned>(variables.size()));variables.push_back(std::move(v));}buffers.push_back(std::move(b));
-        }
-        for(unsigned i=0;i<objects;++i){Variable v;v.name=string(next());v.type=type(next());v.semantic=string(next());v.bind=next();if(v.type->kind!=2)throw std::invalid_argument("FX4 物件變數型別無效");const auto object=v.type->detail;
-            for(unsigned j=0;j<v.type->count();++j){ObjectValue value;if(object==1 || (object>=5 && object<=8)){value.data=next();if(object==8)value.stream_output=next();}else if(object==2 || object==3 || object==4 || object==21)value.assignments=assignments(next());else if(object<9 || object>23)throw std::invalid_argument("FX4 物件類別無效");v.objects.push_back(std::move(value));}v.annotations=annotations();variables.push_back(std::move(v));
-        }
+        for(unsigned i=0;i<cb;++i)parse_buffer(nullptr);
+        for(unsigned i=0;i<objects;++i)parse_object(nullptr);
+        for(unsigned i=0;i<shared_buffers;++i)parse_buffer(pool);
+        for(unsigned i=0;i<shared_objects;++i)parse_object(pool);
         for(unsigned i=0;i<techs;++i){Technique t;t.name=string(next());const auto count=bounded(next());t.annotations=annotations();for(unsigned j=0;j<count;++j){Pass p;p.name=string(next());const auto n=bounded(next());p.annotations=annotations();p.assignments=assignments(n);t.passes.push_back(std::move(p));}techniques.push_back(std::move(t));}
         if(cursor!=structured.size())throw std::invalid_argument("FX4 結構尾端資料未解析");
     }

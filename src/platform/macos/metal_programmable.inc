@@ -1220,7 +1220,16 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         metal_vertex_cull_needed(dynamic_cast<MetalShader&>(*original.stages[0].shader));
     if(original.indirect){
         const auto size=original.indexed?20U:16U;auto& arguments=metal_resource(original.indirect);
-        if(!arguments.buffer || (original.indirect_offset&3U) || std::uint64_t{original.indirect_offset}+size>arguments.desc.width)throw std::invalid_argument("間接繪製參數越界或未對齊");
+        const auto records=std::max<std::uint32_t>(1,original.indirect_count);
+        if(!arguments.buffer || (original.indirect_offset&3U) || (records>1 && (!original.indirect_stride || (original.indirect_stride&3U))) ||
+           std::uint64_t{original.indirect_offset}+std::uint64_t{records-1}*original.indirect_stride+size>arguments.desc.width)throw std::invalid_argument("間接繪製參數越界或未對齊");
+        if(records>1 && (vertex_cull || original.stages[2].shader || original.stages[3].shader || original.stages[4].shader ||
+           std::any_of(original.stream_targets.begin(),original.stream_targets.end(),[](const auto& target){return bool(target);}))){
+            // 需要逐筆處理的管線（讀回、mesh 幾何）：拆成單筆間接繪製依序執行。
+            auto single=std::make_unique<GraphicsDraw>(original);single->indirect_count=1;single->indirect_stride=0;
+            for(std::uint32_t n=0;n<records;++n){single->indirect_offset=original.indirect_offset+n*original.indirect_stride;graphics_draw(*single);}
+            return;
+        }
         // 細分、幾何／SO 需要 CPU 端數量：等 GPU 寫完後讀回參數，轉成一般繪製。SO 統計只在 GS 路徑累計；
         // 每個 context 都持有統計物件，不能以其存在判斷（否則每次間接繪製都同步等待 GPU）。
         // 走 GS mesh 路徑的繪製由 object 階段直接讀參數緩衝，不讀回（管線統計與其他間接繪製相同，不在 CPU 端累計）。
@@ -1803,8 +1812,14 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         // 參數可能由先前的 GPU 工作寫入；Metal 依資源追蹤排序，不讀回 CPU。
         auto& arguments=metal_resource(d.indirect);
         if(metal_labels())hang_note("indirect-draw",arguments.buffer,d.indirect_offset,d.indexed?5:4);
-        if(d.indexed){auto& r=metal_resource(d.indices);[enc drawIndexedPrimitives:primitive indexType:d.index_format==57?MTLIndexTypeUInt16:MTLIndexTypeUInt32 indexBuffer:r.buffer indexBufferOffset:d.index_offset indirectBuffer:arguments.buffer indirectBufferOffset:d.indirect_offset];graphics_pending_.push_back(d.indices);}
-        else [enc drawPrimitives:primitive indirectBuffer:arguments.buffer indirectBufferOffset:d.indirect_offset];
+        // 連續多筆參數共用同一組狀態：每筆各自一次間接繪製（參數由 GPU 決定，實例數 0 的筆數不產生圖元）。
+        const auto records=std::max<std::uint32_t>(1,d.indirect_count);
+        if(records>1 && (!d.indirect_stride || std::uint64_t{d.indirect_offset}+std::uint64_t{records-1}*d.indirect_stride+(d.indexed?20U:16U)>arguments.desc.width))
+            throw std::invalid_argument("多筆間接繪製參數越界");
+        if(d.indexed){auto& r=metal_resource(d.indices);const auto type=d.index_format==57?MTLIndexTypeUInt16:MTLIndexTypeUInt32;
+            for(std::uint32_t n=0;n<records;++n)[enc drawIndexedPrimitives:primitive indexType:type indexBuffer:r.buffer indexBufferOffset:d.index_offset indirectBuffer:arguments.buffer indirectBufferOffset:d.indirect_offset+n*d.indirect_stride];
+            graphics_pending_.push_back(d.indices);}
+        else for(std::uint32_t n=0;n<records;++n)[enc drawPrimitives:primitive indirectBuffer:arguments.buffer indirectBufferOffset:d.indirect_offset+n*d.indirect_stride];
         graphics_pending_.push_back(d.indirect);
     }
     else if(d.indexed){auto& r=metal_resource(d.indices);const auto bpp=d.index_format==57?2U:4U;const auto offset=std::uint64_t{d.index_offset}+std::uint64_t{d.start}*bpp;if(offset+std::uint64_t{d.count}*bpp>r.desc.width)throw std::invalid_argument("索引 buffer 越界");[enc drawIndexedPrimitives:primitive indexCount:d.count indexType:bpp==2?MTLIndexTypeUInt16:MTLIndexTypeUInt32 indexBuffer:r.buffer indexBufferOffset:offset instanceCount:d.instances baseVertex:d.base_vertex baseInstance:d.start_instance];graphics_pending_.push_back(d.indices);}

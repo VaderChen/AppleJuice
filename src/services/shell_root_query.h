@@ -58,7 +58,7 @@ static inline ShellRootAddress shell_root_query(struct ShellRootInput p,enum She
         return shell_root_char(p,at)?p.path+(at+1)*p.unit:0;
     }
     if(p.unit==1){
-        /* ACP 為 UTF-8；參考實作的 A 版先在 MAX_PATH 個 UTF-16 碼元內轉換。 */
+        /* ACP 為 UTF-8；參考實作 的 A 版先在 MAX_PATH 個 UTF-16 碼元內轉換。 */
         unsigned count=0;
         for(ShellRootAddress i=0;;++i){
             unsigned c=shell_root_char(p,i);

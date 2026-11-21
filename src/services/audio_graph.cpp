@@ -140,7 +140,7 @@ struct VoiceGraph::Impl {
             const double boundary=loops?loop_end:end,step=std::min(amount,boundary-b.cursor);
             b.cursor+=step;n.played+=step;amount-=step;
             if(b.cursor<boundary)break;
-            if(loops){if(b.loops!=255)--b.loops;b.cursor=p.loop_begin;event(EventKind::LoopEnd,id,p.context);}
+            if(loops){if(b.loops!=UINT32_MAX)--b.loops;b.cursor=p.loop_begin;event(EventKind::LoopEnd,id,p.context);}
             else finish(id,n,b);
             if(pause)return amount;
         }
@@ -184,12 +184,16 @@ void VoiceGraph::submit(Voice voice,Packet packet){
     const unsigned stride=n.state.format.channels*n.state.format.bits/8;require(!packet.pcm.empty() && packet.pcm.size()%stride==0 && packet.pcm.size()<=0x80000000ULL);
     const auto frames=packet.pcm.size()/stride;
     if(!packet.play_length){require(!packet.play_begin);packet.play_length=static_cast<unsigned>(frames);}
-    require(packet.play_begin<frames && packet.play_length<=frames-packet.play_begin && packet.loop_count<=255);
+    const auto infinite=packet.legacy_loop_count?UINT32_MAX:255U;
+    const auto max_finite=packet.legacy_loop_count?0x100000U:254U;
+    require(packet.play_begin<frames && packet.play_length<=frames-packet.play_begin &&
+        (packet.loop_count<=max_finite || packet.loop_count==infinite));
     if(packet.loop_count){if(!packet.loop_length)packet.loop_length=static_cast<unsigned>(frames)-packet.loop_begin;
         require(packet.loop_begin<frames && packet.loop_length && packet.loop_length<=frames-packet.loop_begin && packet.loop_begin<packet.play_begin+packet.play_length && packet.loop_begin+packet.loop_length>packet.play_begin && packet.loop_begin+packet.loop_length<=packet.play_begin+packet.play_length);
     }else require(!packet.loop_begin && !packet.loop_length);
     require(n.count<maximum_packets);auto slot=std::find_if(n.packets.begin(),n.packets.end(),[](const auto& p){return !p || p->done;});require(slot!=n.packets.end());
-    const unsigned index=static_cast<unsigned>(slot-n.packets.begin()),begin=packet.play_begin,loops=packet.loop_count;
+    const unsigned index=static_cast<unsigned>(slot-n.packets.begin()),begin=packet.play_begin;
+    const auto loops=packet.loop_count==infinite?UINT32_MAX:packet.loop_count;
     *slot=Impl::Block{std::move(packet),static_cast<double>(begin),loops};n.queue[(n.head+n.count)%maximum_packets]=index;++n.count;
     if(n.reset_samples){n.played=0;n.reset_samples=false;}
 }
@@ -212,7 +216,7 @@ std::uint32_t VoiceGraph::required_bytes(Voice voice,unsigned frames,unsigned ra
     double needed=std::ceil(static_cast<double>(frames)*n.state.format.rate*n.state.ratio/rate);
     for(unsigned i=0;i<n.count && needed>0;++i){const auto& b=*n.packets[n.queue[(n.head+i)%maximum_packets]];const auto& p=b.packet;
         double available=p.play_begin+p.play_length-b.cursor;
-        if(b.loops && !b.exit_loop){if(b.loops==255)return 0;available+=static_cast<double>(b.loops)*p.loop_length;}
+        if(b.loops && !b.exit_loop){if(b.loops==UINT32_MAX)return 0;available+=static_cast<double>(b.loops)*p.loop_length;}
         needed-=available;
     }
     if(needed<=0)return 0;return static_cast<std::uint32_t>(std::min(double(UINT32_MAX),std::ceil(needed)*n.state.format.channels*n.state.format.bits/8));
@@ -235,7 +239,8 @@ void VoiceGraph::set_effect_chain(Voice voice,std::vector<EffectSlot> slots){
     // 每一格的輸入聲道數是前一格的輸出；主控音源的效果不得改變聲道數。
     unsigned channels=n.state.format.channels;
     for(const auto& slot:slots){
-        if(slot.frame){require(slot.pairs.empty() && slot.frame->input_channels()==channels && slot.frame->output_channels() && slot.frame->output_channels()<=maximum_channels);channels=slot.frame->output_channels();}
+        if(slot.guest){require(slot.pairs.empty() && !slot.frame && slot.guest->input_channels==channels && slot.guest->output_channels && slot.guest->output_channels<=maximum_channels);channels=slot.guest->output_channels;}
+        else if(slot.frame){require(slot.pairs.empty() && slot.frame->input_channels()==channels && slot.frame->output_channels() && slot.frame->output_channels()<=maximum_channels);channels=slot.frame->output_channels();}
         else require(slot.pairs.size()==(channels+1)/2 && std::all_of(slot.pairs.begin(),slot.pairs.end(),[](const auto& p){return bool(p);}));
     }
     if(n.state.kind==Kind::Master)require(channels==n.state.format.channels);
@@ -285,6 +290,7 @@ std::size_t VoiceGraph::render_frames(std::span<float> output,unsigned rate,bool
             for(unsigned c=0;c<channels;++c)n->frame[c]*=n->state.volume;
             unsigned outputs=channels;
             for(auto& slot:n->effects){
+                if(slot.guest){slot.guest->exchange(n->frame.data());outputs=slot.guest->output_channels;continue;}
                 if(slot.frame){slot.frame->process(n->frame.data(),slot.enabled);outputs=slot.frame->output_channels();continue;}
                 if(slot.enabled)for(unsigned pair=0;pair<slot.pairs.size();++pair){
                     const auto left=pair*2,other=left+1<outputs?left+1:left;float right=n->frame[other];slot.pairs[pair]->process(n->frame[left],right);if(other!=left)n->frame[other]=right;}

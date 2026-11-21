@@ -127,6 +127,7 @@
                 Bytes bytes(n);m.read(GuestAddress{address},bytes);co_return bytes;
             };
             Bytes packet,rgba;
+            std::optional<avi::FrameLayout> decoded_source;
             if(media::video_decoder_available(source->compression)){
                 const auto nearest=co_await service_callback::call(slot(stream,5),{stream,position,0x14});
                 const auto key=static_cast<unsigned>(nearest);
@@ -151,13 +152,34 @@
                     catch(const std::runtime_error&){co_return finish(0);}
                 }
                 if(rgba.empty())co_return finish(0);
+            }else if(avi::is_run_length(*source) || media::video1_fourcc(source->compression)){
+                const auto nearest=co_await service_callback::call(slot(stream,5),{stream,position,0x14});
+                const auto key=static_cast<unsigned>(nearest);
+                if(key>position || position>INT32_MAX)co_return finish(0);
+                decoded_source=avi::frame_layout(avi::uncompressed_frame_header(format));
+                if(!decoded_source || decoded_source->top_down)co_return finish(0);
+                std::unique_ptr<media::Video1Decoder> video1;
+                if(media::video1_fourcc(source->compression)){
+                    try{video1=avi::open_video1(format,*source);}
+                    catch(const std::runtime_error&){co_return finish(0);}
+                }else packet.resize(decoded_source->image_size());
+                for(unsigned pos=key;pos<=position;++pos){
+                    const auto encoded=co_await read_packet(pos);
+                    if(video1){
+                        if(encoded.empty())co_return finish(0);
+                        try{packet=video1->decode(encoded,pos==key);}
+                        catch(const std::runtime_error&){co_return finish(0);}
+                        if(packet.size()!=decoded_source->image_size())co_return finish(0);
+                    }else if(!avi::decode_run_length(encoded,*decoded_source,packet))co_return finish(0);
+                }
             }else{
                 packet=co_await read_packet(position);
                 if(packet.empty())co_return finish(0);
             }
             Bytes pixels(target.image_size());
             if(frame->destination)m.read(GuestAddress{frame->destination},pixels);
-            if(!avi::frame_pixels(format,*source,packet,target,pixels,static_cast<unsigned>(frame->x),static_cast<unsigned>(frame->y),
+            if(!avi::frame_pixels(format,decoded_source?*decoded_source:*source,packet,target,pixels,
+                       static_cast<unsigned>(frame->x),static_cast<unsigned>(frame->y),
                        frame->width==-1?target.width:static_cast<unsigned>(frame->width),
                        frame->height==-1?target.height:static_cast<unsigned>(frame->height),std::move(rgba)))co_return finish(0);
             const auto buffer=allocate_heap(m,header.size()+(frame->destination?0:pixels.size()));

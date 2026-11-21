@@ -755,12 +755,16 @@ struct GuiGlobalMemory {
     std::uint64_t address{},size{};std::uint32_t flags{},locks{};bool clipboard_owned{};
     bool operator==(const GuiGlobalMemory&) const = default;
 };
+class AviPreviewClip;
 struct GuiCommonDialog {
     enum class Kind { Font, Colour, OpenFile, SaveFile, Busy } kind{};
     std::uint64_t request{};std::uint32_t flags{};bool wide{};
     std::uint64_t hook{},blocking_task{},dialog_output{};bool owner_enabled{true};
     std::u16string directory{}, extension{}, overwrite_path{};
     std::vector<std::u16string> filters{};
+    std::uint64_t preview_timer{};
+    std::u16string preview_path{};
+    std::shared_ptr<AviPreviewClip> preview{};
     bool operator==(const GuiCommonDialog&) const = default;
 };
 struct GuiShellOpenWith {

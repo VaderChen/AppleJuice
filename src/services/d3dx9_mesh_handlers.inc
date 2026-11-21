@@ -244,7 +244,9 @@
         else if(symbol=="D3DXGetFVFVertexSize")result=stride_of(fvf_decl(u(0)));
         else if(symbol=="D3DXCreateMesh" || symbol=="D3DXCreateMeshFVF"){
             output(5);const bool fvf=symbol.ends_with("FVF");auto mesh=make_mesh(u(0),u(1),u(2),fvf?fvf_decl(u(3)):declaration(arg(3)),arg(4));if(fvf)mesh->fvf=u(3);store_pointer(arg(5),mesh->root);
-        }else if(symbol=="D3DXComputeTangentFrameEx"){
+        }else if(symbol=="D3DXSplitMesh"){
+#include "d3dx9_mesh_split.inc"
+        }else if(symbol=="D3DXComputeTangent" || symbol=="D3DXComputeTangentFrame" || symbol=="D3DXComputeTangentFrameEx"){
 #include "d3dx9_tangent_frame.inc"
         }else if(symbol=="D3DXComputeNormals"){
             auto mesh=get(arg(0),Kind::Mesh);const auto ix=mesh_indices(*mesh);const auto p=positions(*mesh);std::vector<Vector> normals(mesh->width);

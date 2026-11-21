@@ -136,7 +136,7 @@ private:
 ParallelMappingLock& parallel_mapping_mutex() noexcept;
 std::shared_lock<ParallelMappingLock>*& d3d11_worker_mapping_guard() noexcept;
 // D3D9 worker 呼叫：繪製前放開映射共用鎖（Metal 編碼與命令緩衝節流不碰客體記憶體），收尾以預先讀好的返回位址返回。
-struct D3D9WorkerRelease {std::shared_lock<ParallelMappingLock>* guard{};std::uint64_t return_target{};bool released{};};
+struct D3D9WorkerRelease {std::shared_lock<ParallelMappingLock>* guard{};std::uint64_t return_target{};bool released{};std::uint32_t pop{8};};
 D3D9WorkerRelease& d3d9_worker_release() noexcept;
 struct D3D11RelockMapping {};
 }

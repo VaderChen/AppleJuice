@@ -3,6 +3,7 @@
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/security_access.hpp"
 #include "monotonic_clock.hpp"
+#include "usb_descriptor_operations.h"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -33,12 +34,24 @@ bool interface_path(std::u16string_view text){
 }
 }
 namespace {
+std::uint8_t local_descriptor_byte(const void*,std::uint64_t address){
+    return *reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(address));
+}
+std::uint8_t guest_descriptor_byte(const void* context,std::uint64_t address){
+    return static_cast<std::uint8_t>(static_cast<const GuestMemory*>(context)->load(GuestAddress{address},8));
+}
 // 組態描述元內，指定介面／替代設定的介面描述元與端點描述元。
 struct InterfaceSetting {std::vector<std::uint8_t> descriptor;std::vector<std::vector<std::uint8_t>> endpoints;};
 std::optional<InterfaceSetting> find_setting(const std::vector<std::uint8_t>& config,unsigned number,unsigned alternate){
     std::optional<InterfaceSetting> found;bool inside=false;
-    for(std::size_t at=0;at+2<=config.size();){
-        const auto length=config[at],type=config[at+1];if(length<2 || at+length>config.size())break;
+    const UsbDescriptorReader reader{nullptr,local_descriptor_byte,UINTPTR_MAX};
+    const auto base=reinterpret_cast<std::uintptr_t>(config.data());
+    if(config.size()>UINT32_MAX || !usb_descriptor_range(reader,base,config.size()))return found;
+    const auto size=static_cast<std::uint32_t>(config.size());
+    for(std::uint32_t at=0;at<size;){
+        UsbDescriptor descriptor;
+        if(!usb_descriptor_at(reader,base,size,at,&descriptor))break;
+        const auto length=descriptor.length,type=descriptor.type;
         if(type==4 && length>=9){inside=config[at+2]==number && config[at+3]==alternate;if(inside){found.emplace();found->descriptor.assign(config.begin()+static_cast<std::ptrdiff_t>(at),config.begin()+static_cast<std::ptrdiff_t>(at+9));}}
         else if(type==5 && length>=7 && inside && found)found->endpoints.emplace_back(config.begin()+static_cast<std::ptrdiff_t>(at),config.begin()+static_cast<std::ptrdiff_t>(at+7));
         else if((type==48 || type==49) && inside && found && !found->endpoints.empty())
@@ -47,6 +60,67 @@ std::optional<InterfaceSetting> find_setting(const std::vector<std::uint8_t>& co
     }
     return found;
 }
+
+struct UsbRequestSetting {
+    std::uint32_t descriptor{};
+    std::vector<std::uint32_t> endpoints;
+};
+
+struct UsbRequestLayout {
+    unsigned configuration_pointer;
+    unsigned interface_start;
+    unsigned interface_pipes;
+    unsigned pipe_size;
+    unsigned pointer_size;
+    std::uint8_t pointer_bits;
+};
+
+constexpr UsbRequestLayout usb_request_layout(bool x86){
+    return x86?UsbRequestLayout{16,24,16,20,4,32}:UsbRequestLayout{24,40,24,24,8,64};
+}
+
+std::vector<UsbRequestSetting> usb_request_settings(const std::vector<std::uint8_t>& config){
+    const UsbDescriptorReader reader{nullptr,local_descriptor_byte,UINTPTR_MAX};
+    const auto base=reinterpret_cast<std::uintptr_t>(config.data());
+    const auto length=static_cast<std::uint32_t>(config.size());
+    if(!length || usb_configuration_length(reader,base)!=length)return {};
+    std::vector<UsbRequestSetting> settings;
+    for(std::uint32_t offset=config.front();offset<length;){
+        UsbDescriptor descriptor;
+        if(!usb_descriptor_at(reader,base,length,offset,&descriptor))return {};
+        if(descriptor.type==4){
+            if(descriptor.length<9)return {};
+            settings.push_back({offset,{}});
+        }
+        if(descriptor.type==5){
+            if(settings.empty() || descriptor.length<7)return {};
+            settings.back().endpoints.push_back(offset);
+        }
+        offset+=descriptor.length;
+    }
+    return settings;
+}
+
+void write_usb_request_interface(GuestMemory& memory,const UsbRequestLayout& layout,std::uint64_t address,
+                                 const std::vector<std::uint8_t>& config,const UsbRequestSetting& setting){
+    const auto count=setting.endpoints.size();
+    const auto length=layout.interface_pipes+count*layout.pipe_size;
+    memory.store(GuestAddress{address},16,length);
+    memory.write(GuestAddress{address+2},std::span(config).subspan(setting.descriptor+2,2));
+    memory.write(GuestAddress{address+4},std::span(config).subspan(setting.descriptor+5,3));
+    memory.store(GuestAddress{address+8+layout.pointer_size},32,count);
+    auto pipe=address+layout.interface_pipes;
+    for(const auto offset:setting.endpoints){
+        const auto maximum=static_cast<std::uint16_t>(config[offset+4] | (std::uint16_t{config[offset+5]}<<8));
+        memory.store(GuestAddress{pipe},16,maximum);
+        memory.store(GuestAddress{pipe+2},8,config[offset+2]);
+        memory.store(GuestAddress{pipe+3},8,config[offset+6]);
+        memory.store(GuestAddress{pipe+4},32,config[offset+3]&3U);
+        memory.store(GuestAddress{pipe+8+layout.pointer_size},32,4096); // USBDI 3.00 的預設傳輸大小。
+        pipe+=layout.pipe_size;
+    }
+}
+
 std::uint32_t interval_bytes(const std::vector<std::uint8_t>& endpoint,unsigned speed){
     const auto packet=static_cast<std::uint32_t>(endpoint[4]|(endpoint[5]&7U)<<8);
     auto maximum=packet;
@@ -102,6 +176,15 @@ std::span<const WindowsServiceDescriptor> winusb_service_descriptors(){
         {"winusb.dll","WinUsb_GetCurrentFrameNumber",3},{"winusb.dll","WinUsb_GetAdjustedFrameNumber",2,2},
         {"winusb.dll","WinUsb_StartTrackingForTimeSync",2},{"winusb.dll","WinUsb_StopTrackingForTimeSync",2},
         {"winusb.dll","WinUsb_GetCurrentFrameNumberAndQpc",2},
+        {"winusb.dll","WinUsb_ParseDescriptors",4,0,0,0xa},
+        {"winusb.dll","WinUsb_ParseConfigurationDescriptor",7,0,0,0x7c},
+        {"usbd.sys","USBD_ParseConfigurationDescriptor",3,0,0,6},
+        {"usbd.sys","USBD_GetInterfaceLength",2},
+        {"usbd.sys","USBD_ValidateConfigurationDescriptor",5,0,0,0x16},
+        {"usbd.sys","USBD_CreateConfigurationRequest",2},
+        {"usbd.sys","USBD_CreateConfigurationRequestEx",2},
+        {"usbd.sys","USBD_GetUSBDIVersion",1},
+        {"usbd.sys","USBD_CalculateUsbBandwidth",3,0,0,7},
         {"winusb.dll","WinUsb_ReadIsochPipe",7,0,0,0x16},{"winusb.dll","WinUsb_ReadIsochPipeAsap",7,0,0,0x1e},
         {"winusb.dll","WinUsb_WriteIsochPipe",5,0,0,6},{"winusb.dll","WinUsb_WriteIsochPipeAsap",5,0,0,0xe}};
     return table;
@@ -204,6 +287,93 @@ std::optional<std::uint32_t> WindowsServices::invoke_winusb(GuestState& state,Gu
     const WindowsCall arg(state,memory,service);const auto& name=service.symbol;const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto failed=[&](std::uint32_t error){last_error_=error;return finish(0);};
+    const UsbDescriptorReader descriptor_reader{&memory,guest_descriptor_byte,x86_?UINT32_MAX:UINT64_MAX};
+    const auto u32=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
+    const auto i32=[&](unsigned index){return static_cast<std::int32_t>(u32(index));};
+    if(name=="WinUsb_ParseDescriptors")return finish(usb_find_descriptor(descriptor_reader,arg(0),u32(1),arg(2),i32(3)));
+    if(name=="WinUsb_ParseConfigurationDescriptor")
+        return finish(usb_find_interface(descriptor_reader,arg(0),arg(1),i32(2),i32(3),i32(4),i32(5),i32(6)));
+    if(name=="USBD_ParseConfigurationDescriptor"){
+        const auto legacy=[&](unsigned index){const auto value=static_cast<std::uint8_t>(arg(index));return value==UINT8_MAX?-1:value;};
+        return finish(usb_find_interface(descriptor_reader,arg(0),arg(0),legacy(1),legacy(2),-1,-1,-1));
+    }
+    if(name=="USBD_GetInterfaceLength")return finish(usb_interface_length(descriptor_reader,arg(0),arg(1)));
+    if(name=="USBD_ValidateConfigurationDescriptor"){
+        const auto validation=usb_validate_configuration(descriptor_reader,arg(0),u32(1),static_cast<std::uint16_t>(arg(2)));
+        if(arg(3))memory.store(GuestAddress{arg(3)},bits,validation.address);
+        return finish(validation.status);
+    }
+    if(name=="USBD_GetUSBDIVersion"){
+        if(const auto output=arg(0)){
+            memory.check(GuestAddress{output},8,Access::Write);
+            memory.store(GuestAddress{output},32,usbdi_version);
+            memory.store(GuestAddress{output+4},32,usbdi_specification);
+        }
+        return finish(0);
+    }
+    if(name=="USBD_CalculateUsbBandwidth")
+        return finish(usb_calculate_legacy_bandwidth(u32(0),static_cast<std::uint8_t>(arg(1)),static_cast<std::uint8_t>(arg(2))));
+    if(name=="USBD_CreateConfigurationRequest" || name=="USBD_CreateConfigurationRequestEx"){
+        const bool extended=name=="USBD_CreateConfigurationRequestEx";
+        const auto configuration=arg(0),output=arg(1);
+        if(!output)return finish(0);
+        if(!extended)memory.store(GuestAddress{output},16,0);
+        const auto length=usb_configuration_length(descriptor_reader,configuration);
+        if(!length)return finish(0);
+        std::vector<std::uint8_t> config(length);
+        memory.read(GuestAddress{configuration},config);
+        const auto settings=usb_request_settings(config);
+        if(settings.empty() || !config[4])return finish(0);
+
+        const auto layout=usb_request_layout(x86_);
+        std::vector<const UsbRequestSetting*> selected;
+        std::set<std::uint8_t> numbers;
+        auto size=static_cast<std::size_t>(layout.interface_start);
+        const auto select=[&](const UsbRequestSetting& setting){
+            const auto count=setting.endpoints.size();
+            if(count!=config[setting.descriptor+4] || !numbers.insert(config[setting.descriptor+2]).second)return false;
+            size+=layout.interface_pipes+count*layout.pipe_size;
+            if(size>UINT16_MAX)return false;
+            selected.push_back(&setting);
+            return true;
+        };
+        if(extended){
+            const auto step=2*layout.pointer_size;
+            if(!usb_descriptor_range(descriptor_reader,output,static_cast<std::uint64_t>(config[4]+1)*step))return finish(0);
+            for(std::size_t i=0;i<=config[4];++i){
+                const auto entry=output+i*step;
+                const auto descriptor=memory.load(GuestAddress{entry},layout.pointer_bits);
+                if(!descriptor)break;
+                if(i==config[4])return finish(0);
+                const auto setting=std::ranges::find_if(settings,[&](const UsbRequestSetting& value){
+                    return descriptor==configuration+value.descriptor;
+                });
+                if(setting==settings.end() || !select(*setting))return finish(0);
+                memory.check(GuestAddress{entry+layout.pointer_size},layout.pointer_size,Access::Write);
+            }
+        }else{
+            for(const auto& setting:settings)
+                if(!config[setting.descriptor+3] && !select(setting))return finish(0);
+            if(selected.size()!=config[4])return finish(0);
+        }
+        if(selected.empty())return finish(0);
+        // 和 ExFreePool 共用核心提供的客體配置。先完成驗證，再發布各個輸出指標。
+        const auto request=allocate_heap(memory,size);
+        if(!request)return finish(0);
+        memory.fill(GuestAddress{request},0,size);
+        memory.store(GuestAddress{request},16,size);
+        // URB_FUNCTION_SELECT_CONFIGURATION 為 0，清零即完成 Function 與未指派的控制器欄位。
+        memory.store(GuestAddress{request+layout.configuration_pointer},layout.pointer_bits,configuration);
+        auto address=request+layout.interface_start;
+        for(std::size_t i=0;i<selected.size();++i){
+            const auto& setting=*selected[i];
+            write_usb_request_interface(memory,layout,address,config,setting);
+            if(extended)memory.store(GuestAddress{output+(2*i+1)*layout.pointer_size},layout.pointer_bits,address);
+            address+=layout.interface_pipes+setting.endpoints.size()*layout.pipe_size;
+        }
+        if(!extended)memory.store(GuestAddress{output},16,size);
+        return finish(request);
+    }
     if(!winusb_)winusb_=std::make_shared<WinUsbState>();auto& bridge=*winusb_;
     try{
         const auto now=[&]{return runtime_.host_clock?detail::monotonic_ticks():runtime_.clock_ticks;};

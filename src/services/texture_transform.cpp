@@ -187,6 +187,13 @@ std::vector<std::uint8_t> normal_map(std::span<const std::uint8_t> source,
     Image input{width,height,DXGI_FORMAT_R32G32B32A32_FLOAT,std::size_t(width)*16,rgba.size(),rgba.data()};
     ScratchImage output;checked(ComputeNormalMap(input,static_cast<CNMAP_FLAGS>(mode),amplitude,DXGI_FORMAT_R32G32B32A32_FLOAT,output));
     const auto* image=output.GetImage(0,0,0);valid(image!=nullptr);
+    // 浮點中介格式輸出帶正負號的向量；D3DX 將 RGB 編碼在 [0, 1]，保留 alpha 的遮蔽係數。
+    for(std::uint32_t y=0;y<height;++y){
+        auto row=reinterpret_cast<float*>(image->pixels+y*image->rowPitch);
+        for(std::uint32_t x=0;x<width;++x)
+            for(unsigned component=0;component<3;++component)
+                row[4*x+component]=0.5f*row[4*x+component]+0.5f;
+    }
     return transform(std::span(image->pixels,image->slicePitch),2,size,box,target_format,size,1);
 }
 }

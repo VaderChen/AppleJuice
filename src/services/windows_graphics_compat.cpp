@@ -42,7 +42,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
     if(service.symbol=="ExcludeUpdateRgn")return invoke_gdi_state(state,memory,service);
     if(invoke_remote_gui(state,memory,service))return std::nullopt;
     const WindowsCall arg(state,memory,service);
-    // 參考實作的 GetWindowRgnEx 保留第三個 UINT，兩個入口查詢相同外形。
+    // 參考實作 的 GetWindowRgnEx 保留第三個 UINT，兩個入口查詢相同外形。
     const auto symbol=service.symbol=="NtUserGetWindowRgnEx" ? std::string_view{"GetWindowRgn"} : service.symbol;
     std::uint64_t result{};
     const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};

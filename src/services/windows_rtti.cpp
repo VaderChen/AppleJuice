@@ -1,13 +1,15 @@
 #include "x64arm/windows_services.hpp"
+#include "msvc_exception_exports.hpp"
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <set>
 
 namespace x64arm {
 namespace {
 // MSVC x86 使用絕對指標；x64 的 RTTI／throw metadata 使用 32-bit image RVA。
 // 結構依 Clang MicrosoftCXXABI 的編譯器輸出，不依物件名稱或呼叫位址判斷。
-enum ExceptionKind : unsigned { BadCast,BadTypeid,NonRtti,Exception,BadAlloc,BadFunction,LogicError,LengthError,OutOfRange,RuntimeError,RegexError,InvalidArgument,OverflowError,SystemError,IosFailure,BadException,FutureError,ImproperLock,ImproperSchedulerAttach,ImproperSchedulerDetach,InvalidMultipleScheduling,InvalidSchedulerPolicyKey,InvalidSchedulerPolicyThreadSpecification,InvalidSchedulerPolicyValue,MissingWait,SchedulerResourceAllocationError };
+enum ExceptionKind : unsigned { BadCast,BadTypeid,NonRtti,Exception,BadAlloc,BadFunction,LogicError,LengthError,OutOfRange,RuntimeError,RegexError,InvalidArgument,OverflowError,SystemError,IosFailure,BadException,FutureError,ImproperLock,ImproperSchedulerAttach,ImproperSchedulerDetach,InvalidMultipleScheduling,InvalidSchedulerPolicyKey,InvalidSchedulerPolicyThreadSpecification,InvalidSchedulerPolicyValue,MissingWait,SchedulerResourceAllocationError,LegacyBadCast,LegacyBadTypeid,LegacyNonRtti,LegacyException };
 struct ExceptionType {std::string_view name,message;unsigned parent;bool error_code;};
 constexpr unsigned no_parent=UINT32_MAX;
 constexpr std::array<ExceptionType,static_cast<unsigned>(MsvcExceptionKind::Count)> exception_types{{
@@ -38,6 +40,10 @@ constexpr std::array<ExceptionType,static_cast<unsigned>(MsvcExceptionKind::Coun
     {".?AVinvalid_scheduler_policy_value@Concurrency@@","Unknown exception",Exception,false},
     {".?AVmissing_wait@Concurrency@@","Unknown exception",Exception,false},
     {".?AVscheduler_resource_allocation_error@Concurrency@@","Unknown exception",Exception,false},
+    {".?AVbad_cast@@","Bad dynamic_cast",LegacyException,false},
+    {".?AVbad_typeid@@","Attempted typeid of null pointer",LegacyException,false},
+    {".?AV__non_rtti_object@@","Object has no readable RTTI",LegacyBadTypeid,false},
+    {".?AVexception@@","Unknown exception",no_parent,false},
 }};
 // future_error 與 system_error 相同帶 error_code（值＋分類指標）；what 依 MSVC _Future_error_map。
 constexpr bool category_error(unsigned kind){return kind==SystemError || kind==IosFailure || kind==FutureError;}
@@ -144,6 +150,7 @@ void WindowsServices::initialize_msvc_exception_types(GuestMemory& memory){
             // RTTI 與 STL 拋出入口沿用同一個執行緒例外物件及 unwind 生命週期。
             // 每個型別 metadata 佔 0x300；型別增加時程式頁跟著後移，避免與 metadata 重疊。
             constexpr unsigned metadata_start=0x1000,metadata_stride=0x300,code_page=static_cast<unsigned>((metadata_start+exception_types.size()*metadata_stride+4095)/4096*4096),image_size=code_page+4096;
+            static_assert(0x100+exception_types.size()*0x80<=metadata_start);
             const auto base=runtime_allocate(memory,{},image_size,4096);
             memory.write(GuestAddress{base},std::array<std::uint8_t,image_size>{});
             const auto put=[&](std::uint64_t at,std::uint64_t value,unsigned width=32){memory.store(GuestAddress{base+at},static_cast<std::uint8_t>(width),value);};
@@ -152,11 +159,33 @@ void WindowsServices::initialize_msvc_exception_types(GuestMemory& memory){
             const auto immediate=[&](std::vector<std::uint8_t>& code,std::uint64_t value){for(unsigned b=0;b<unit;++b)code.push_back(static_cast<std::uint8_t>(value>>(8*b)));};
             text(0x40,"invalid random_device value");
             for(unsigned i=0;i<exception_types.size();++i)text(0x100+i*0x80+2*unit,exception_types[i].name);
-            constexpr std::array helpers{"ExceptionDestroy","ExceptionDelete","ExceptionWhat"};
-            for(unsigned i=0;i<helpers.size();++i){
+            const auto trampoline=[&](unsigned offset,std::string_view name){
                 std::vector<std::uint8_t> code;if(!x86_)code.push_back(0x48);code.push_back(0xb8);
-                immediate(code,resolve("x64arm.msvc",helpers[i]).value);code.insert(code.end(),{0xff,0xe0});memory.write(GuestAddress{base+code_page+i*32},code);
-            }
+                immediate(code,resolve("x64arm.msvc",name).value);
+                code.insert(code.end(),{0xff,0xe0});
+                memory.write(GuestAddress{base+code_page+offset},code);
+            };
+            trampoline(0,"ExceptionDestroy");
+            trampoline(32,"ExceptionDelete");
+            static const bool what_lowering=[]{
+                const auto* value=std::getenv("X64ARM_GUEST_CRT_EXCEPTION_WHAT");
+                return !value || std::string_view(value)!="0";
+            }();
+            constexpr unsigned what_offset=64,bad_function_what_offset=0x800;
+            static_assert(96+exception_types.size()*32<=bad_function_what_offset);
+            if(what_lowering && trace_services_.empty()){
+                auto code=x86_?std::vector<std::uint8_t>{0x8b,0x41,0x04,0x85,0xc0,0x75,0x05,0xb8}:
+                    std::vector<std::uint8_t>{0x48,0x8b,0x41,0x08,0x48,0x85,0xc0,0x75,0x0a,0x48,0xb8};
+                immediate(code,base+metadata_start+Exception*metadata_stride+0x100);
+                code.push_back(0xc3);
+                memory.write(GuestAddress{base+code_page+what_offset},code);
+                data.image.entry=base+code_page+what_offset;
+
+                code.clear();if(!x86_)code.push_back(0x48);code.push_back(0xb8);
+                immediate(code,base+metadata_start+BadFunction*metadata_stride+0x100);
+                code.push_back(0xc3);
+                memory.write(GuestAddress{base+code_page+bad_function_what_offset},code);
+            }else trampoline(what_offset,"ExceptionWhat");
             for(unsigned i=0;i<exception_types.size();++i){
                 const auto block=metadata_start+i*metadata_stride,table=block+0x20,locator=block+0xb0,vtable=block+0xd0;
                 std::vector<unsigned> chain;for(auto type=i;type!=no_parent;type=exception_types[type].parent)chain.push_back(type);
@@ -174,7 +203,7 @@ void WindowsServices::initialize_msvc_exception_types(GuestMemory& memory){
                     relative(item+24,metadata_start+type*metadata_stride+0x180);
                 }
                 put(locator,x86_?0:1);relative(locator+12,0x100+i*0x80);relative(locator+16,hierarchy);if(!x86_)relative(locator+20,locator);
-                put(vtable,base+locator,bits);put(vtable+unit,base+code_page+32,bits);put(vtable+2*unit,base+code_page+64,bits);
+                put(vtable,base+locator,bits);put(vtable+unit,base+code_page+32,bits);put(vtable+2*unit,base+code_page+(data.image.entry && i==BadFunction?bad_function_what_offset:what_offset),bits);
                 text(block+0x100,exception_types[i].message);
                 data.throw_info[i]=base+block;data.vtable[i]=base+vtable+unit;data.message[i]=base+block+0x100;
                 // 每個 copy ctor 只設定目標型別 vptr，再進入共用資料複製。
@@ -229,6 +258,84 @@ std::optional<std::uint64_t> rtti_dynamic_cast_x64(const GuestMemory& memory,std
 }
 std::optional<std::uint32_t> WindowsServices::invoke_rtti(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);const auto symbol=service.symbol;
+    const auto destroy=[&](std::uint64_t address){crt_exception_data(state,memory,address+unit,address+unit,true);};
+    const auto delete_objects=[&](std::uint64_t object,std::uint32_t flags,bool vector,unsigned stride){
+        if(vector && (flags&2U)){
+            if(object<unit)throw MemoryFault(GuestAddress{object},Access::Read,unit,"C++ 陣列解構計數位址無效");
+            const auto allocation=object-unit;
+            const auto count=memory.load(GuestAddress{allocation},bits);
+            if(count>SIZE_MAX/stride || count>(UINT64_MAX-object)/stride)
+                throw MemoryFault(GuestAddress{object},Access::Write,0,"C++ 陣列解構長度溢位");
+            memory.check(GuestAddress{object},static_cast<std::size_t>(count*stride),Access::Write);
+            for(auto remaining=count;remaining;--remaining)destroy(object+(remaining-1)*stride);
+            (void)free_heap(memory,allocation,state);
+        }else{
+            destroy(object);
+            if(flags&1U)(void)free_heap(memory,object,state);
+        }
+    };
+    if(const auto* entry=detail::find_msvc_exception_export(service.family,symbol,x86_)){
+        using Op=detail::MsvcExceptionOperation;
+        const auto operation=entry->operation;
+        const bool in_ecx=x86_ && entry->thiscall;
+        const WindowsCall member(state,memory,entry->parameters-(in_ecx?1U:0U),entry->thiscall);
+        const auto object=in_ecx?state.reg(Gpr::Rcx)&UINT32_MAX:member(0);
+        const auto argument=[&]{return member(in_ecx?0U:1U);};
+        const auto finish=[&](std::uint64_t result){member.return_to(state,result);return std::optional<std::uint32_t>{};};
+        initialize_msvc_exception_types(memory);
+        const auto& data=runtime_.cxx_exceptions;
+        const auto kind=static_cast<unsigned>(entry->type);
+        const auto set_type=[&]{memory.store(GuestAddress{object},bits,data.vtable[kind]);};
+        switch(operation){
+        case Op::What: {
+            const auto source=memory.load(GuestAddress{object+unit},bits);
+            return finish(source?source:data.message[Exception]);
+        }
+        case Op::Destroy:
+            destroy(object);
+            return finish(0);
+        case Op::ScalarDelete:
+        case Op::VectorDelete:
+            delete_objects(object,static_cast<std::uint32_t>(argument()),operation==Op::VectorDelete,3U*unit);
+            return finish(object);
+        case Op::Copy:
+        case Op::Assign:{
+            const auto source=argument();
+            if(object==source)return finish(object);
+            memory.check(GuestAddress{object},3U*unit,Access::Write);
+            if(operation==Op::Assign)destroy(object);
+            crt_exception_data(state,memory,source+unit,object+unit,false);
+            set_type();
+            return finish(object);
+        }
+        case Op::Default:
+        case Op::DefaultClosure:
+        case Op::Message:
+        case Op::BorrowMessage:
+        case Op::IndirectMessage:{
+            memory.check(GuestAddress{object},3U*unit,Access::Write);
+            std::uint64_t text{};
+            bool owned=false;
+            if(operation==Op::DefaultClosure){
+                const std::string_view value=kind==LegacyBadCast || kind==BadCast?"bad cast":"bad typeid";
+                text=allocate_heap(memory,value.size()+1);
+                if(!text)throw std::bad_alloc{};
+                memory.write(GuestAddress{text},std::span(reinterpret_cast<const std::uint8_t*>(value.data()),value.size()));
+                memory.store(GuestAddress{text+value.size()},8,0);
+                owned=true;
+            }else if(operation!=Op::Default){
+                const auto source=operation==Op::Message?argument():memory.load(GuestAddress{argument()},bits);
+                if(source && operation!=Op::BorrowMessage){text=crt_duplicate_string(memory,source);owned=true;}
+                else text=source;
+            }
+            memory.store(GuestAddress{object+unit},bits,text);
+            memory.store(GuestAddress{object+2*unit},bits,owned);
+            set_type();
+            return finish(operation==Op::DefaultClosure?0:object);
+        }
+        case Op::Vtable:throw HostCallFault("MSVC 例外 vftable 屬資料匯出");
+        }
+    }
     if(service.family=="x64arm.msvc" && (symbol=="ExceptionDelete" || symbol=="ExceptionDestroy" || symbol=="ExceptionCopy" || symbol=="ExceptionWhat")){
         const bool deleting=symbol=="ExceptionDelete",what=symbol=="ExceptionWhat",copy=symbol=="ExceptionCopy";
         const WindowsCall method(state,memory,x86_?(deleting || copy?1U:0U):(deleting || copy?2U:1U));
@@ -244,9 +351,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_rtti(GuestState& state,Gues
             if(exception_types[kind].error_code)memory.store(GuestAddress{object+3*unit},32,memory.load(GuestAddress{source+3*unit},32));
             if(category_error(static_cast<unsigned>(kind)))memory.store(GuestAddress{object+4*unit},bits,memory.load(GuestAddress{source+4*unit},bits));
         }else {
-            const auto flags=deleting?method(x86_?0U:1U):0;
-            crt_exception_data(state,memory,object+unit,object+unit,true);
-            if(flags&1U)(void)free_heap(memory,object,state);
+            const auto flags=deleting?static_cast<std::uint32_t>(method(x86_?0U:1U)):0;
+            unsigned cells=3;
+            if(flags&2U){
+                const auto& tables=runtime_.cxx_exceptions.vtable;
+                const auto vftable=memory.load(GuestAddress{object},bits);
+                const auto found=std::find(tables.begin(),tables.end(),vftable);
+                if(found!=tables.end()){
+                    const auto kind=static_cast<unsigned>(found-tables.begin());
+                    cells=category_error(kind)?5:exception_types[kind].error_code || kind==SchedulerResourceAllocationError?4:3;
+                }
+            }
+            delete_objects(object,flags,true,cells*unit);
         }
         method.return_to(state,object);return std::nullopt;
     }

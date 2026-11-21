@@ -10,6 +10,9 @@
 namespace x64arm {
 inline constexpr std::array<std::uint8_t,16> hid_interface_guid{0xb2,0x55,0x1e,0x4d,0x6f,0xf1,0xcf,0x11,0x88,0xcb,0,0x11,0x11,0,0,0x30};
 inline constexpr std::array<std::uint8_t,16> hid_class_guid{0xa0,0x17,0x5a,0x74,0xd3,0x74,0xd0,0x11,0xb6,0xfe,0,0xa0,0xc9,0x0f,0x57,0xda};
+inline constexpr std::uint32_t hid_get_driver_config=0x000b0190, hid_set_driver_config=0x000b0194,
+    hid_get_physical_descriptor=0x000b019a, hid_get_genre_descriptor=0x000b01e6;
+inline constexpr std::uint32_t hid_driver_config_size=8;
 std::span<const WindowsServiceDescriptor> raw_input_service_descriptors();
 std::span<const WindowsServiceDescriptor> hid_service_descriptors();
 bool hid_path(std::u16string_view);
@@ -20,10 +23,12 @@ struct HidFile {
     std::deque<std::vector<std::uint8_t>> reports;
     std::uint32_t input_buffer_count{32};
     bool disconnected{};
-    std::uint32_t physical_descriptor(std::vector<std::uint8_t>& bytes){
+    bool available(){return !disconnected && backend && backend->available(device.instance);}
+    std::uint32_t descriptor(std::vector<std::uint8_t>& bytes,bool genre){
         std::uint32_t transferred=0,error=0;
         if(bytes.empty())error=87;
-        else if(disconnected || !backend || !backend->available(device.instance))error=1167;
+        else if(!available())error=1167;
+        else if(genre)error=backend->get_genre_descriptor(device.instance,bytes,transferred);
         else error=backend->get_physical_descriptor(device.instance,bytes,transferred);
         if(!error && transferred>bytes.size())error=31;
         bytes.resize(error?0:transferred);return error;
@@ -60,6 +65,7 @@ struct RawInputState {
     std::map<std::pair<std::uint16_t,std::uint16_t>,RawInputRegistration> registrations;
     std::map<std::uint64_t,RawInputPacket> packets;
     std::set<std::uint64_t> owned_preparsed;
+    std::map<std::uint64_t,std::uint64_t> owned_hid_descriptions;
     std::array<std::uint8_t,256> keyboard{};
     std::uint8_t buttons{};
 };

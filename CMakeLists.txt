@@ -98,6 +98,7 @@ add_library(x64arm_windows STATIC src/loader/pe_loader.cpp src/services/windows_
     src/services/windows_shared_window.cpp src/services/windows_remote_raster.cpp src/services/windows_winstation.cpp src/services/windows_gui.cpp src/services/windows_gui_support.cpp src/services/windows_gui_extra.cpp src/services/windows_common_dialogs.cpp src/services/windows_print_dialogs.cpp src/services/windows_page_setup.cpp src/services/windows_menus.cpp
     src/services/windows_gui_threads.cpp src/services/windows_gui_remote_messages.cpp src/services/windows_gui_text.cpp src/services/windows_gui_async.cpp src/services/windows_window_interaction.cpp src/services/windows_controls.cpp src/services/windows_gdi.cpp src/services/windows_gdi_text.cpp src/services/windows_userdraw.cpp src/services/windows_dib_transfer.cpp src/services/windows_gdiplus.cpp src/services/windows_wic.cpp src/services/windows_ribbon.cpp src/services/windows_task_dialog.cpp src/services/windows_opencl.cpp src/services/windows_vulkan.cpp src/services/windows_xess.cpp src/services/windows_fidelityfx.cpp src/services/windows_system_information.cpp src/services/windows_directml.cpp src/services/windows_msvcp_pmr.cpp src/services/windows_msvcp_values.cpp src/services/windows_console_screen.cpp src/services/windows_user32_legacy.cpp src/services/windows_msvcp_special_math.cpp src/services/windows_webview2.cpp src/services/windows_webbrowser.cpp src/services/windows_d3d12.cpp src/services/windows_dxcore.cpp src/services/windows_crt_io.cpp src/services/windows_crt_buffer.cpp src/services/unicode.cpp src/services/readonly_files.cpp)
 target_include_directories(x64arm_windows PUBLIC include PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+include(cmake/BuiltinPeImages.cmake)
 target_sources(x64arm_windows PRIVATE src/services/network_resources.cpp src/services/network_files.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_region.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_mpr.cpp)
@@ -119,6 +120,7 @@ add_library(x64arm_glsl STATIC src/services/glsl_compiler.cpp src/services/d3d9_
 target_include_directories(x64arm_glsl PUBLIC include)
 target_link_libraries(x64arm_glsl PRIVATE glslang SPIRV glslang-default-resource-limits spirv-cross-msl x64arm_shader_compiler)
 target_sources(x64arm_windows PRIVATE src/services/texture_transform.cpp)
+target_sources(x64arm_windows PRIVATE src/services/d3dx_sh_project.cpp)
 include(cmake/DirectXMesh.cmake)
 include(cmake/UVAtlas.cmake)
 target_link_libraries(x64arm_windows PRIVATE x64arm_glsl x64arm_directxtex x64arm_mesh x64arm_uvatlas)
@@ -184,7 +186,7 @@ target_sources(x64arm_windows PRIVATE src/services/windows_native_file_control.c
 target_sources(x64arm_windows PRIVATE src/services/com_context.cpp src/services/windows_com_context.cpp)
 target_sources(x64arm_windows PRIVATE src/services/com_error.cpp src/services/windows_winrt_strings.cpp src/services/windows_com_error.cpp src/services/windows_bstr.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_winrt_error.cpp)
-target_sources(x64arm_windows PRIVATE src/services/windows_delay_load.cpp src/services/windows_ntdll_misc.cpp src/services/windows_ntdll_pure.cpp src/services/windows_kernel32_extras.cpp src/services/windows_advapi32_extras.cpp src/services/windows_user32_extras.cpp src/services/windows_gdi32_extras.cpp src/services/windows_oleaut32_conversions.cpp src/services/windows_oleaut32_dispatch.cpp src/services/windows_crt_extras.cpp src/services/windows_crt_mbcs.cpp src/services/windows_crt_runtime_extras.cpp src/services/windows_shlwapi_strings.cpp src/services/windows_shlwapi_misc.cpp src/services/windows_shell_paths.cpp src/services/windows_shell_utilities.cpp src/services/windows_url_download.cpp src/services/windows_ole_wrappers.cpp src/services/windows_file_links.cpp src/services/windows_power_schemes.cpp src/services/windows_ole_picture.cpp src/services/windows_ole_font.cpp src/services/windows_crt_console_read.cpp src/services/windows_com_monikers.cpp src/services/windows_ole_advise.cpp src/services/windows_ole_misc.cpp src/services/windows_ntdll_tables.cpp src/services/windows_url.cpp src/services/windows_rpc_client.cpp)
+target_sources(x64arm_windows PRIVATE src/services/windows_delay_load.cpp src/services/windows_ntdll_misc.cpp src/services/windows_ntdll_pure.cpp src/services/windows_kernel32_extras.cpp src/services/windows_advapi32_extras.cpp src/services/windows_user32_extras.cpp src/services/windows_gdi32_extras.cpp src/services/windows_oleaut32_conversions.cpp src/services/windows_oleaut32_dispatch.cpp src/services/windows_crt_extras.cpp src/services/windows_crt_mbcs.cpp src/services/windows_crt_runtime_extras.cpp src/services/windows_shlwapi_strings.cpp src/services/windows_shlwapi_misc.cpp src/services/windows_shell_paths.cpp src/services/windows_shell_utilities.cpp src/services/windows_url_download.cpp src/services/windows_ole_wrappers.cpp src/services/windows_file_links.cpp src/services/windows_power_schemes.cpp src/services/windows_ole_picture.cpp src/services/windows_dxdiag.cpp src/services/windows_ole_font.cpp src/services/windows_crt_console_read.cpp src/services/windows_com_monikers.cpp src/services/windows_ole_advise.cpp src/services/windows_ole_misc.cpp src/services/windows_ntdll_tables.cpp src/services/windows_url.cpp src/services/windows_rpc_client.cpp)
 target_sources(x64arm_windows PRIVATE src/services/desktop_notifications.cpp src/services/windows_desktop_notification.cpp)
 target_sources(x64arm_windows PRIVATE src/services/mouse_drag.cpp src/services/windows_gui_drag.cpp)
 target_sources(x64arm_windows PRIVATE src/services/ole_drag.cpp src/services/windows_ole_drag.cpp)
@@ -216,11 +218,21 @@ target_link_libraries(x64arm_windows PRIVATE ZLIB::ZLIB)
 include(cmake/NativeV8.cmake)
 include(cmake/OpenSSL.cmake)
 include(cmake/FFmpeg.cmake)
-# Windows Media（VC-1／WMV／WMA）軟體解碼：只連結 FFmpeg 解碼器，容器與色彩／PCM 轉換由 MF 流程負責。
+include(cmake/LibGSM.cmake)
+# FFmpeg 供 Windows Media、MPEG 與 H.264 軟體解碼及 MPEG 容器讀取，共用既有色彩與 PCM 轉換。
 target_sources(x64arm_windows PRIVATE src/platform/media_decode_ffmpeg.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_gaming_tcui.cpp)
-target_link_libraries(x64arm_windows PRIVATE X64ArmFFmpeg::avcodec)
+target_link_libraries(x64arm_windows PRIVATE X64ArmFFmpeg::avformat)
 include(cmake/ICU.cmake)
+target_sources(x64arm_windows PRIVATE src/services/windows_icu_character.cpp src/services/windows_icu_set.cpp src/services/windows_icu_trie.cpp
+                                       src/services/windows_icu_string.cpp src/services/windows_icu_break.cpp src/services/windows_icu_case.cpp
+                                       src/services/windows_icu_normalization.cpp src/services/windows_icu_locale.cpp
+                                       src/services/windows_icu_currency.cpp src/services/windows_icu_calendar.cpp
+                                       src/services/windows_icu_date_pattern.cpp src/services/windows_icu_number.cpp
+                                       src/services/windows_icu_number_objects.cpp src/services/windows_icu_date_format.cpp
+                                       src/services/windows_icu_formatted.cpp src/services/windows_icu_modern_number.cpp
+                                       src/services/windows_icu_charset_detection.cpp src/services/windows_icu_region.cpp
+                                       src/services/windows_icu_idna.cpp)
 add_library(x64arm_compound_file STATIC src/services/compound_file.cpp src/services/compound_file_read.cpp src/services/compound_file_write.cpp)
 target_include_directories(x64arm_compound_file PUBLIC include)
 target_link_libraries(x64arm_compound_file PRIVATE x64arm_options ICU::uc)

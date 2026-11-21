@@ -1,6 +1,5 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/midi.hpp"
-#include "x64arm/unicode.hpp"
 #include "wave_device_message.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -11,6 +10,8 @@ struct WinmmMidiOutput {
     std::shared_ptr<midi::Playback> playback;
     std::unique_ptr<midi::Output> output;
     std::uint64_t callback{},target{},instance{};
+    std::optional<std::uint64_t> driver_handle;
+    bool mapper{};
     std::uint32_t callback_type{},volume{UINT32_MAX};
     std::uint8_t running_status{};
     struct Header {std::uint64_t data{};std::uint32_t capacity{};bool queued{};};
@@ -19,6 +20,7 @@ struct WinmmMidiOutput {
 namespace {
 std::optional<GuestCallback> midi_notification(const WinmmMidiOutput& output,std::uint64_t handle,unsigned message,std::uint64_t header=0){
     if(!output.callback)return {};
+    handle=output.driver_handle.value_or(handle);
     if(output.callback_type==0x30000)return GuestCallback{output.target,{handle,message,output.instance,header,0}};
     if(output.callback_type==0x10000 || output.callback_type==0x20000)return GuestCallback{output.target,{output.callback,message,handle,header}};
     if(output.callback_type==0x50000 && message==0x3c9)return GuestCallback{output.target,{output.callback}};
@@ -72,7 +74,11 @@ void WindowsServices::poll_midi_output(GuestMemory& memory){
     }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_winmm_midi(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
+    const WindowsCall call(state,memory,service);
+    const bool driver=service.family=="midimap.dll";
+    auto symbol=service.symbol;
+    std::array<std::uint64_t,6> args{};
+    const auto arg=[&](unsigned i){return args[i];};
     const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
     const std::uint8_t bits=x86_?32:64;const unsigned unit=bits/8;
     std::uint64_t result=0;std::vector<GuestCallback> callbacks;
@@ -80,11 +86,62 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_midi(GuestState& stat
         if(auto callback=midi_notification(output,handle,message,header))callbacks.push_back(std::move(*callback));
     };
     try {
+        for(unsigned i=0;i<service.arguments;++i)args.at(i)=call(i);
+        std::optional<std::uint64_t> driver_handle;
+        if(driver){
+            const auto device=d(0),message=d(1);
+            const auto user=arg(2),first=arg(3),second=arg(4);
+            static constexpr std::string_view messages[]{
+                {}, "midiOutGetNumDevs", "midiOutGetDevCapsW", "midiOutOpen",
+                "midiOutClose", "midiOutPrepareHeader", "midiOutUnprepareHeader", "midiOutShortMsg",
+                "midiOutLongMsg", "midiOutReset", "midiOutGetVolume", "midiOutSetVolume",
+                "midiOutCachePatches", "midiOutCacheDrumPatches", "midiStreamOut", {}, {},
+                "midiStreamPosition", "midiStreamPause", "midiStreamRestart", "midiStreamStop", "midiStreamProperty",
+            };
+            if(device && device!=UINT32_MAX){call.return_to(state,2);return {};}
+            if(message==0x2015 || message==0x2017){
+                symbol="midiOutMessage";
+                args={UINT32_MAX,message,first,second};
+            }else if(message>=std::size(messages) || messages[message].empty()){
+                call.return_to(state,8);return {};
+            }else {
+                symbol=messages[message];
+                args={user,first,second};
+                if(message==2){
+                    if(!first){call.return_to(state,11);return {};}
+                    args[0]=UINT32_MAX;
+                }else if(message==3){
+                    if(!user || !first){call.return_to(state,11);return {};}
+                    memory.check(GuestAddress{user},unit,Access::Write);
+                    memory.check(GuestAddress{first},4*unit+4,Access::Read);
+                    driver_handle=memory.load(GuestAddress{first},bits);
+                    const auto callback=memory.load(GuestAddress{first+unit},bits);
+                    const auto instance=memory.load(GuestAddress{first+2*unit},bits);
+                    const auto count=memory.load(GuestAddress{first+4*unit},32);
+                    const bool stream=second&2U;
+                    if((!stream && count) || (stream && count!=1)){call.return_to(state,11);return {};}
+                    if(stream){
+                        memory.check(GuestAddress{first+4*unit+4},8,Access::Read);
+                        const auto target=memory.load(GuestAddress{first+4*unit+8},32);
+                        if(target && target!=UINT32_MAX){call.return_to(state,2);return {};}
+                        symbol="midiStreamOpen";
+                        args={user,0,1,callback,instance,second&~2ULL};
+                    }else args={user,UINT32_MAX,callback,instance,second};
+                }else if(message>=4){
+                    const auto output=midi_outputs_.find(user);
+                    const bool device_volume=!user && (message==10 || message==11);
+                    if(!device_volume && (output==midi_outputs_.end() || !output->second->driver_handle)){
+                        call.return_to(state,5);return {};
+                    }
+                    if(message==12 || message==13)args={user,static_cast<std::uint32_t>(second)>>16,first,second&0xffffU};
+                }
+            }
+        }
         if(symbol=="midiOutGetNumDevs")result=midi::output_available()?1:0;
         else if(symbol=="midiOutMessage"){
             // 驅動程式訊息與 waveOutMessage 共用處理；內建合成器只有裝置 0。
             const std::vector<std::u16string> ids=midi::output_available()?std::vector<std::u16string>{u"{x64arm-midi-synthesizer}"}:std::vector<std::u16string>{};
-            result=wave::device_message(memory,arg(0),d(1),arg(2),arg(3),ids,midi_outputs_.contains(arg(0)),x86_);
+            result=wave::device_message(memory,arg(0),d(1),arg(2),arg(3),ids,midi_outputs_.contains(arg(0)),x86_,false);
         }else if(symbol=="midiOutCachePatches" || symbol=="midiOutCacheDrumPatches"){
             // (hmo, uBank／uPatch, lpwPatchArray／lpwKeyArray, fuCache)：內建合成器的音色全部常駐，裝置能力不含 MIDICAPS_CACHE，
             // 參數有效時回報 MMSYSERR_NOTSUPPORTED。
@@ -98,11 +155,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_midi(GuestState& stat
             else if(!midi::output_available())result=2;
             else if(!arg(1) && d(2))result=11;
             else {
+                const auto output=midi_outputs_.find(arg(0));
+                const bool mapper=arg(0)==UINT32_MAX || arg(0)==UINT64_MAX ||
+                    (output!=midi_outputs_.end() && output->second->mapper);
                 const bool wide=symbol.ends_with('W');std::vector<std::uint8_t> caps(wide?84:52);
                 const auto put=[&](unsigned at,std::uint32_t value,unsigned count){for(unsigned i=0;i<count;++i)caps[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
-                put(4,0x100,4);const auto name=wide?utf16_bytes(u"macOS DLS Synthesizer"):std::vector<std::uint8_t>{'m','a','c','O','S',' ','D','L','S',' ','S','y','n','t','h','e','s','i','z','e','r',0};
-                std::copy(name.begin(),name.end(),caps.begin()+8);const unsigned offset=wide?72:40;
-                put(offset,7,2);put(offset+6,0xffff,2);put(offset+8,0xb,4); // 軟體合成器、獨立左右音量及串流。
+                const std::u16string_view name=mapper?u"MIDI Mapper":u"macOS DLS Synthesizer";
+                for(unsigned i=0;i<name.size();++i)put(8+i*(wide?2:1),name[i],wide?2:1);
+                const unsigned offset=wide?72:40;
+                if(mapper){put(0,0xff,2);put(2,1,2);}
+                put(4,0x100,4);put(offset,mapper?5:7,2);put(offset+6,0xffff,2);put(offset+8,0xb,4);
                 if(d(2))memory.write(GuestAddress{arg(1)},std::span(caps).first(std::min<std::size_t>(caps.size(),d(2))));
             }
         }else if(symbol=="midiOutGetVolume" || symbol=="midiOutSetVolume"){
@@ -120,7 +182,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_midi(GuestState& stat
             else {
                 memory.store(GuestAddress{arg(0)},bits,0);const auto kind=d(flags_arg)&0x70000;
                 const auto device=stream?(arg(1)?static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)},32)):UINT32_MAX):d(1);
-                if(stream && (d(2)!=1 || !arg(1)))result=11;
+                if(stream && !driver && (d(2)!=1 || !arg(1)))result=11;
                 else if(device!=0 && device!=UINT32_MAX)result=2;
                 else if((d(flags_arg)&~0x70000U) || (kind!=0 && kind!=0x10000 && kind!=0x20000 && kind!=0x30000 && kind!=0x50000))result=stream?11:10;
                 else if(kind && !arg(callback_arg))result=11;
@@ -130,7 +192,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_midi(GuestState& stat
                 else if(midi_outputs_.size()>=64)result=4;
                 else {
                     if(kind==0x30000)memory.check(GuestAddress{arg(callback_arg)},1,Access::Execute);
-                    if(stream)memory.check(GuestAddress{arg(1)},4,Access::Write);
+                    if(stream && !driver)memory.check(GuestAddress{arg(1)},4,Access::Write);
                     if(!runtime_.network.external_io)throw HostCallFault("原生 MIDI 輸出不支援 deterministic compare");
                     auto output=std::make_shared<WinmmMidiOutput>();output->playback=std::make_shared<midi::Playback>();output->playback->reset=false;
                     if(stream)output->playback->stream=std::make_shared<midi::Stream>();
@@ -138,8 +200,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_midi(GuestState& stat
                     try {output->output=midi::open_output(output->playback);}catch(const std::runtime_error&){result=3;}
                     if(output->output){
                         output->callback_type=kind;output->callback=arg(callback_arg);output->instance=arg(instance_arg);
+                        output->driver_handle=driver_handle;output->mapper=device==UINT32_MAX;
                         output->target=kind==0x10000 || kind==0x20000?resolve("user32.dll",kind==0x10000?"PostMessageW":"PostThreadMessageW").value:kind==0x50000?resolve("kernel32.dll","SetEvent").value:output->callback;
-                        if(stream)memory.store(GuestAddress{arg(1)},32,0);
+                        if(stream && !driver)memory.store(GuestAddress{arg(1)},32,0);
                         const auto handle=runtime_.allocate_wait_handle();midi_outputs_.emplace(handle,output);memory.store(GuestAddress{arg(0)},bits,handle);notify(*output,handle,0x3c7);
                     }
                 }
@@ -156,7 +219,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_midi(GuestState& stat
                     for(const auto& [address,header]:output->headers)
                         if(header.queued || (memory.load(GuestAddress{address+(x86_?16:24)},32)&4U)){result=65;break;}
                     if(!result){
-                        if(stream){if(auto callback=midi_notification(*output,arg(0),0x3c8))wave_callbacks_.push_back(std::move(*callback));}
+                        if(stream && !driver){if(auto callback=midi_notification(*output,arg(0),0x3c8))wave_callbacks_.push_back(std::move(*callback));}
                         else notify(*output,arg(0),0x3c8);
                         midi_outputs_.erase(found);
                     }
@@ -221,10 +284,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_midi(GuestState& stat
                     if(stream)poll_midi_output(memory);
                 }else {
                     const auto header=arg(1);const auto flags_offset=x86_?16U:24U;
-                    if(!header || d(2)<(x86_?64U:112U))result=11;
+                    const auto position_offset=x86_?28U:44U;
+                    const bool streaming=symbol=="midiStreamOut";
+                    const unsigned header_size=driver?position_offset+(streaming?4:0):(x86_?64U:112U);
+                    if(!header || d(2)<header_size)result=11;
                     else {
                         // WinMM 結構使用 pack(1)：Win64 MIDIHDR 為 112 bytes。
-                        memory.check(GuestAddress{header},x86_?64:112,Access::Read);memory.check(GuestAddress{header+flags_offset},4,Access::Write);
+                        memory.check(GuestAddress{header},header_size,Access::Read);memory.check(GuestAddress{header+flags_offset},4,Access::Write);
                         const auto flags=static_cast<std::uint32_t>(memory.load(GuestAddress{header+flags_offset},32));
                         const auto prepared=output->headers.find(header);
                         if(symbol=="midiOutUnprepareHeader"){
@@ -239,7 +305,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_midi(GuestState& stat
                                     if(!result){memory.check(GuestAddress{data},size,Access::Read);output->headers.emplace(header,WinmmMidiOutput::Header{data,size});memory.store(GuestAddress{header+flags_offset},32,(flags&~1U)|2U);}
                                 }
                             }
-                        }else if(symbol=="midiStreamOut"){
+                        }else if(streaming){
                             if(prepared==output->headers.end() || !(flags&2U))result=64;
                             else if((flags&4U) || prepared->second.queued)result=65;
                             else {
@@ -248,7 +314,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_midi(GuestState& stat
                                 const auto size=static_cast<std::uint32_t>(memory.load(GuestAddress{header+unit+4},32));
                                 if(data!=prepared->second.data || capacity>prepared->second.capacity || size>capacity || !size || size>=65536)result=11;
                                 else {
-                                    memory.check(GuestAddress{header+(x86_?28:44)},4,Access::Write);
+                                    memory.check(GuestAddress{header+position_offset},4,Access::Write);
                                     std::vector<std::uint8_t> bytes(size);memory.read(GuestAddress{data},bytes);
                                     auto buffer=std::make_shared<midi::Stream::Buffer>();buffer->token=header;
                                     std::lock_guard lock(output->playback->mutex);auto status=stream->queued_status;
@@ -282,6 +348,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_midi(GuestState& stat
         }
     }catch(const MemoryFault&){result=11;}catch(const std::invalid_argument&){result=11;}catch(const std::bad_alloc&){result=7;}
     if(!callbacks.empty()){start_callbacks(state,memory,std::move(callbacks),Continuation::Return,result);return std::nullopt;}
-    arg.return_to(state,result);return std::nullopt;
+    call.return_to(state,result);return std::nullopt;
 }
 }

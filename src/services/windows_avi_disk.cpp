@@ -1,9 +1,16 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_guid.hpp"
 #include "x64arm/unicode.hpp"
+#include "x64arm/windows_window_state.hpp"
+#include "x64arm/windows_gui_abi.hpp"
 #include "avi_container.hpp"
 #include "avi_edit_list.hpp"
 #include "avi_clipboard_media.hpp"
+#include "vfw_codec.hpp"
+#include "vfw_compression.hpp"
+#include "vfw_drawdib.hpp"
+#include "dialog_template.hpp"
+#include "mciwnd.hpp"
 #include "service_callback_task.hpp"
 #include <algorithm>
 
@@ -108,6 +115,13 @@ struct WindowsServices::AviDiskState {
     std::map<std::uint64_t,std::shared_ptr<Frame>> frames;
     std::uint64_t frame_table{};
     std::map<std::uint64_t,std::shared_ptr<avi::EditList>> edits;
+    std::map<std::uint64_t,std::shared_ptr<vfw::Codec>> codecs;
+    std::map<std::uint64_t,std::shared_ptr<vfw::CompressionSequence>> compression_sequences;
+    std::map<std::uint64_t,std::uint64_t> compressor_outputs;
+    std::map<std::uint64_t,std::shared_ptr<vfw::CompressorChoice>> compressor_dialogs;
+    std::map<std::pair<std::uint32_t,std::uint32_t>,vfw::Driver> codec_overrides;
+    std::map<std::uint64_t,std::shared_ptr<vfw::DrawDib>> drawdibs;
+    std::map<std::uint64_t,std::shared_ptr<vfw::MciWindow>> mci_windows;
     unsigned locks{};
 };
 bool WindowsServices::begin_avi_disk(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -126,6 +140,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_avi_disk(GuestState& state,
     const auto done=[&](std::uint64_t value){call.return_to(state,value);return std::optional<std::uint32_t>{};};
     if(!avi_disk_)avi_disk_=std::make_shared<AviDiskState>();
     auto& store=*avi_disk_;
+#include "windows_vfw_mciwnd.inc"
+#include "windows_vfw_choose_proc.inc"
+#include "windows_vfw_codec.inc"
 #include "windows_avi_frame.inc"
     auto guid=[&](std::uint64_t p){WindowsGuid id{};if(p)memory.read(GuestAddress{p},id);return id;};
     auto setptr=[&](std::uint64_t p,std::uint64_t value){memory.store(GuestAddress{p},bits,value);};

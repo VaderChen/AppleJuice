@@ -16,13 +16,26 @@ struct Error:std::runtime_error {
     std::uint32_t status;
     explicit Error(std::uint32_t value):std::runtime_error("HID 報告或預解析資料無效"),status(value){}
 };
+struct CollectionError : Error {
+    std::uint32_t ntstatus, offset, diagnostic;
+    std::array<std::uint32_t,6> arguments;
+    CollectionError(std::uint32_t result,std::uint32_t at,std::uint32_t code,
+                    std::array<std::uint32_t,6> values={})
+        : Error(invalid_preparsed),ntstatus(result),offset(at),diagnostic(code),arguments(values){}
+};
 struct Usage {std::uint16_t page{},value{};bool operator==(const Usage&)const=default;};
+struct UnknownToken {
+    std::uint8_t prefix{};
+    std::uint32_t value{};
+};
 struct Field {
     unsigned type{},offset{},width{},count{},link{},index{};
     std::uint8_t report{};std::uint32_t flags{},unit{},unit_exponent{};
     std::int32_t minimum{},maximum{},physical_minimum{},physical_maximum{};
     Usage link_usage{};bool range{},button{};
     std::vector<Usage> usages;
+    std::array<UnknownToken,4> unknown_globals{};
+    unsigned unknown_global_count{};
     bool variable()const{return flags&2U;}
     bool absolute()const{return !(flags&4U);}
     unsigned data_index(unsigned element)const;
@@ -51,6 +64,12 @@ struct Layout {
     const Field* find(unsigned type,Usage usage,unsigned link,std::uint8_t report,bool button,unsigned* element=nullptr)const;
 };
 Layout parse(std::span<const std::uint8_t> descriptor,Usage top={});
+struct CollectionDescription {
+    Usage usage;
+    std::array<std::array<unsigned,256>,3> report_bytes;
+    std::vector<std::uint8_t> preparsed;
+};
+std::vector<CollectionDescription> describe_collections(std::span<const std::uint8_t> descriptor);
 // HIDP_PREPARSED_DATA 為 opaque；所有本引擎 HID 入口共用版本化、可複製的資料。
 std::vector<std::uint8_t> preparsed(std::span<const std::uint8_t> descriptor,Usage top={});
 Layout decode(std::span<const std::uint8_t> data);

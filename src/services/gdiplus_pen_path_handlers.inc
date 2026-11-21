@@ -58,6 +58,13 @@ if(symbol=="GdipDeleteCustomLineCap"){if(!g.caps.erase(arg(0)))return finish(inv
 if(symbol=="GdipGetCustomLineCapType"){const auto& cap=cap_of(arg(0));if(!arg(1))return finish(invalid_parameter);memory.store(GuestAddress{arg(1)},32,cap.type);return finish(ok);}
 if(symbol=="GdipSetCustomLineCapBaseCap"){if(u32(1)>3)return finish(invalid_parameter);cap_of(arg(0)).base_cap=u32(1);return finish(ok);}
 if(symbol=="GdipSetCustomLineCapStrokeJoin"){if(u32(1)>3)return finish(invalid_parameter);cap_of(arg(0)).join=u32(1);return finish(ok);}
+if(symbol=="GdipGetCustomLineCapStrokeCaps"){
+    const auto& cap=cap_of(arg(0));
+    if(!arg(1) || !arg(2))return finish(invalid_parameter);
+    memory.store(GuestAddress{arg(1)},32,cap.start_cap);
+    memory.store(GuestAddress{arg(2)},32,cap.end_cap);
+    return finish(ok);
+}
 if(symbol=="GdipSetCustomLineCapStrokeCaps"){auto& cap=cap_of(arg(0));if(u32(1)>3 || u32(2)>3)return finish(invalid_parameter);cap.start_cap=u32(1);cap.end_cap=u32(2);return finish(ok);}
 if(symbol=="GdipGetCustomLineCapBaseCap" || symbol=="GdipGetCustomLineCapStrokeJoin"){
     const auto& cap=cap_of(arg(0));if(!arg(1))return finish(invalid_parameter);memory.store(GuestAddress{arg(1)},32,symbol=="GdipGetCustomLineCapBaseCap"?cap.base_cap:cap.join);return finish(ok);}

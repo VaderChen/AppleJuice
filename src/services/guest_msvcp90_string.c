@@ -84,8 +84,8 @@ EXPORT unsigned char MEMBER guest_ifstream_open(const void* object){return guest
 
 #include "msvcp_numeric_values.h"
 /* Windows 的 long double 回傳使用 double ABI；不可採用 MinGW 的 80-bit 型別。 */
-#define NUMERIC(C,T,B,F,S,D,D10,MIN,MAX,EPS,ROUND,INF,NAN,SNAN,DENORM) {MIN,MAX,EPS,ROUND,INF,NAN,SNAN,DENORM},
-EXPORT const unsigned long long guest_numeric_values[][8]={MSVCP_NUMERIC_TYPES(NUMERIC)};
+#define NUMERIC(C,T,B,F,S,D,D10,MIN,MAX,EPS,ROUND,INF,NAN,SNAN,DENORM) {MIN,MAX,EPS,ROUND,INF,NAN,SNAN,DENORM,(F)?((MAX)^(1ULL<<((B)-1))):(MIN)},
+EXPORT const unsigned long long guest_numeric_values[][9]={MSVCP_NUMERIC_TYPES(NUMERIC)};
 #undef NUMERIC
 #define NUMERIC(C,T,B,F,S,D,D10,MIN,MAX,EPS,ROUND,INF,NAN,SNAN,DENORM) NumericIndex_##C,
 enum {MSVCP_NUMERIC_TYPES(NUMERIC)};
@@ -98,7 +98,8 @@ EXPORT T guest_numeric_##C##_##OP(void){ \
 NUMERIC_FUNCTION(C,T,B,F,min,MIN,0) NUMERIC_FUNCTION(C,T,B,F,max,MAX,1) \
 NUMERIC_FUNCTION(C,T,B,F,epsilon,EPS,2) NUMERIC_FUNCTION(C,T,B,F,round_error,ROUND,3) \
 NUMERIC_FUNCTION(C,T,B,F,infinity,INF,4) NUMERIC_FUNCTION(C,T,B,F,quiet_NaN,NAN,5) \
-NUMERIC_FUNCTION(C,T,B,F,signaling_NaN,SNAN,6) NUMERIC_FUNCTION(C,T,B,F,denorm_min,DENORM,7)
+NUMERIC_FUNCTION(C,T,B,F,signaling_NaN,SNAN,6) NUMERIC_FUNCTION(C,T,B,F,denorm_min,DENORM,7) \
+NUMERIC_FUNCTION(C,T,B,F,lowest,MIN,8)
 MSVCP_NUMERIC_TYPES(NUMERIC)
 #undef NUMERIC
 EXPORT void* MEMBER guest_numeric_assign(void* object,const void* source){(void)source;return object;}

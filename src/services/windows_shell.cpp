@@ -820,7 +820,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
                 const auto open=[&](std::uint64_t hive){
                     return nested_service(state,memory,"advapi32.dll","RegOpenKeyW",{hive,root,slot});
                 };
-                // 參考實作先選可開啟的政策根，再查該根底下的子鍵和值。
+                // 參考實作 先選可開啟的政策根，再查該根底下的子鍵和值。
                 if(!open(0x80000002U) || !open(0x80000001U)){
                     const auto key=memory.load(GuestAddress{slot},bits);
                     memory.store(GuestAddress{slot+8},32,0);

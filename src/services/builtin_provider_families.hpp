@@ -6,8 +6,6 @@ namespace x64arm::detail {
 // D3DX9 的版本 DLL 共用已實作的匯出 ABI；不載入系統目錄的可再散布二進位。
 // 只辨識正式的兩位數 SDK 版本，其他名稱仍交既有載入規則。
 constexpr std::string_view builtin_provider_family(std::string_view name){
-    // UWP 版 XInput 與桌面 1.4 共用完整控制器提供者、ABI、裝置狀態與錯誤契約。
-    if(name=="xinputuap.dll")return "xinput1_4.dll";
     if(name.size()==12 && name.starts_with("d3dx9_") && name.ends_with(".dll") &&
        name[6]>='0' && name[6]<='9' && name[7]>='0' && name[7]<='9'){
         const auto version=(name[6]-'0')*10+(name[7]-'0');

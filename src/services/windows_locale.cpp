@@ -9,6 +9,7 @@
 #include "crt_string_conversion.hpp"
 #include "crt_time_storage.hpp"
 #include "guest_crt_state.h"
+#include "guest_heap_cache_layout.h"
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
@@ -805,7 +806,7 @@ std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
         {"crt","_mbslen",1},{"crt","_mbslen_l",2},{"crt","_mbsinc",1},{"crt","_mbsinc_l",2},{"crt","_mbsnextc",1},{"crt","_mbsnextc_l",2},
         {"crt","_mbsnbcnt",2},{"crt","_mbsnbcnt_l",3},{"crt","_mbsnccnt",2},{"crt","_mbsnccnt_l",3},{"crt","_mbsnbcmp",3},{"crt","_mbsnbcmp_l",4},
         {"crt","_mbspbrk",2},{"crt","_mbspbrk_l",3},{"crt","_mbscspn",2},{"crt","_mbscspn_l",3},{"crt","_mbsspn",2},{"crt","_mbsspn_l",3},{"crt","_mbsspnp",2},{"crt","_mbsspnp_l",3},
-        {"crt","isleadbyte",1},{"crt","_isleadbyte_l",2},{"crt","_ismbblead_l",2},{"crt","_ismbbtrail_l",2},
+        {"crt","isleadbyte",1},{"crt","_isleadbyte_l",2},
         {"crt","_setmbcp",1},{"crt","_getmbcp",0},
         {"crt","__p___mb_cur_max",0},{"crt","___mb_cur_max_l_func",1},
         {"normaliz.dll","IdnToAscii",5},{"normaliz.dll","IdnToUnicode",5},
@@ -864,30 +865,73 @@ namespace {
 // 讓 explicit locale、目前 locale 快照及執行緒 clone 共用同一份 ABI 狀態。
 void crt_mbc_assign(GuestMemory& memory,std::uint64_t address,const CrtLocaleCategory& category){
     const auto& characters=windows_crt_character_table(category);
-    memory.fill(GuestAddress{address},0,544);
+    memory.fill(GuestAddress{address},0,CRT_MBC_INFO_SIZE);
     memory.store(GuestAddress{address},32,1);
     memory.store(GuestAddress{address+4},32,category.codepage);
     memory.store(GuestAddress{address+8},32,category.maximum_character_bytes>1 && category.codepage!=65001);
     memory.store(GuestAddress{address+12},32,category.lcid);
+    std::array<std::uint8_t,CRT_MBC_TYPES_SIZE+CRT_MBC_CASE_SIZE> tables{};
     for(unsigned c=0;c<256;++c){
-        memory.store(GuestAddress{address+29+c},8,(category.lead[c]?4U:0U)|(category.trail[c]?8U:0U));
-        memory.store(GuestAddress{address+285+c},8,characters.lower[c]);
+        auto& type=tables[c+1];
+        if(category.lead[c])type|=CRT_MBC_LEAD;
+        if(category.trail[c])type|=CRT_MBC_TRAIL;
+        if(category.codepage==932 && c>=0xa1 && c<=0xdf)
+            type|=c<0xa6?CRT_MBC_KANA_PUNCT:CRT_MBC_KANA_TEXT;
+        if(category.lead[c])continue;
+        const auto mask=characters.masks[c+1];
+        auto& other=tables[CRT_MBC_TYPES_SIZE+c];
+        if(mask&1U){type|=CRT_MBC_SINGLE_UPPER;other=characters.lower[c];}
+        else if(mask&2U){type|=CRT_MBC_SINGLE_LOWER;other=characters.upper[c];}
     }
+    memory.write(GuestAddress{address+CRT_MBC_TYPES_OFFSET},tables);
 }
 void crt_mbc_copy(GuestMemory& memory,const CrtLocaleObject& source,const CrtLocaleObject& destination,bool x86){
-    memory.move(GuestAddress{crt_mbc_address(memory,destination,x86)},GuestAddress{crt_mbc_address(memory,source,x86)},544);
+    memory.move(GuestAddress{crt_mbc_address(memory,destination,x86)},GuestAddress{crt_mbc_address(memory,source,x86)},CRT_MBC_INFO_SIZE);
 }
 std::uint64_t crt_max_address(const GuestMemory& memory,const CrtLocaleObject& locale,bool x86){
     const unsigned p=x86?4U:8U;const auto info=memory.load(GuestAddress{locale.storage},static_cast<std::uint8_t>(p*8));
     return info+(locale.legacy?76U+24U*p:p);
 }
 }
+void initialize_crt_multibyte(GuestMemory& memory,std::uint64_t process_base,std::uint32_t codepage){
+    const auto category=windows_crt_codepage(codepage);
+    if(!category)throw std::logic_error("程序初始 CRT 多位元組碼頁無效");
+    static_assert(CRT_MBC_PROCESS_CASE+CRT_MBC_CASE_SIZE<=0x1000);
+    const auto address=process_base+CRT_MBC_PROCESS_INFO;
+    crt_mbc_assign(memory,address,*category);
+    memory.move(GuestAddress{process_base+CRT_MBC_PROCESS_TYPES},GuestAddress{address+CRT_MBC_TYPES_OFFSET},
+                CRT_MBC_TYPES_SIZE+CRT_MBC_CASE_SIZE);
+}
+
+std::uint32_t windows_crt_collation_lcid(std::uint32_t codepage){
+    const auto encoding=codepage_encoding(codepage);
+    for(const auto& [name,locale]:locales())
+        if(!locale.neutral && !name.empty() && encoding==ansi_encoding(locale))return locale.id;
+    return 0x007f;
+}
+
+static_assert(CRT_MBC_TEB64_VIEW>=GUEST_CRT_TABLE_OFFSET+1024 &&
+              CRT_MBC_TEB64_VIEW+16<=X64ARM_GUEST_HEAP_CACHE_HEAD_OFFSET);
+static_assert(CRT_MBC_TEB32_VIEW>=0x3000 && CRT_MBC_TEB32_VIEW+8<=CRT_MBC_TEB32_CTYPE &&
+              CRT_MBC_TEB32_CTYPE+512<=0x3ff0);
+
 void WindowsServices::sync_crt_thread_state(GuestMemory& memory,std::uint64_t id){
-    if(x86_)return;
     const auto& thread=threads_.items.at(id);
     if(!thread.teb)return;
     const auto local=runtime_.crt_thread_locales.find(id);
     const auto locale=local==runtime_.crt_thread_locales.end()?runtime_.crt_current_locale:local->second;
+    const auto mbc=local==runtime_.crt_thread_locales.end()?runtime_base_.value+CRT_MBC_PROCESS_INFO:
+        crt_mbc_address(memory,runtime_.crt_locales.at(local->second),x86_);
+    const auto view=thread.teb+(x86_?CRT_MBC_TEB32_VIEW:CRT_MBC_TEB64_VIEW);
+    auto ctype_view=runtime_.ctype_table+2;
+    if(x86_ && locale){
+        ctype_view=thread.teb+CRT_MBC_TEB32_CTYPE;
+        const auto source=runtime_.crt_locales.at(locale).storage+8+352+CRT_MBC_INFO_SIZE+2;
+        memory.move(GuestAddress{ctype_view},GuestAddress{source},512);
+    }else if(!x86_ && locale)ctype_view=thread.teb+GUEST_CRT_TABLE_OFFSET;
+    memory.store(GuestAddress{view},x86_?32:64,mbc);
+    memory.store(GuestAddress{view+(x86_?4U:8U)},x86_?32:64,ctype_view);
+    if(x86_)return;
     const auto tables=thread.teb+GUEST_CRT_TABLE_OFFSET;
     std::array<std::uint64_t,7> cells{thread.errno_cell,locale,tables,tables+512,tables+768,0,runtime_base_.value+128};
     if(locale){
@@ -991,7 +1035,7 @@ CrtLocaleObject& WindowsServices::current_crt_locale(GuestState& state,GuestMemo
     const auto found=runtime_.crt_thread_locales.find(threads_.current);auto& address=found==runtime_.crt_thread_locales.end()?runtime_.crt_current_locale:found->second;
     if(!address){
         CrtLocaleObject object;object.legacy=true;address=create_crt_locale(state,memory,std::move(object));
-        if(const auto page=windows_crt_codepage(runtime_.crt_multibyte_codepage))crt_mbc_assign(memory,crt_mbc_address(memory,runtime_.crt_locales.at(address),x86_),*page);
+        memory.store(GuestAddress{address+(x86_?4U:8U)},x86_?32:64,runtime_base_.value+CRT_MBC_PROCESS_INFO);
         sync_crt_thread_states(memory);
     }return runtime_.crt_locales.at(address);
 }
@@ -1223,7 +1267,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
                 }else {const auto locale=windows_crt_locale(text);if(!locale)return returned(0);for(unsigned i=1;i<6;++i)if(!category || category==i)replacement.categories[i]=*locale;}
                 const auto saved=create_crt_locale(state,memory,std::move(replacement));auto& active=runtime_.crt_thread_locales.contains(threads_.current)?runtime_.crt_thread_locales.at(threads_.current):runtime_.crt_current_locale;
                 // setlocale 只改 locinfo；_setmbcp 才改獨立的 multibyte codepage。
-                crt_mbc_copy(memory,current,runtime_.crt_locales.at(saved),x86_);
+                if(runtime_.crt_thread_locales.contains(threads_.current))
+                    crt_mbc_copy(memory,current,runtime_.crt_locales.at(saved),x86_);
+                else
+                    memory.store(GuestAddress{saved+p},bits,runtime_base_.value+CRT_MBC_PROCESS_INFO);
                 const auto old=active;active=saved;
                 sync_crt_thread_states(memory);
                 runtime_.crt_locales.erase(old);(void)free_heap(memory,old,state);
@@ -1267,7 +1314,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             const auto requested=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(0)));
             const auto page=requested==-4?current_crt_locale(state,memory).categories[2].codepage:requested==-3 || requested==-2?65001U:static_cast<std::uint32_t>(requested);
             const auto settings=windows_crt_codepage(page);if(!settings)return error(22,UINT32_MAX);
-            crt_mbc_assign(memory,crt_mbc_address(memory,current_crt_locale(state,memory),x86_),*settings);return returned(0);
+            const auto address=crt_mbc_address(memory,current_crt_locale(state,memory),x86_);
+            crt_mbc_assign(memory,address,*settings);
+            if(!runtime_.crt_thread_locales.contains(threads_.current))
+                memory.move(GuestAddress{runtime_base_.value+CRT_MBC_PROCESS_TYPES},GuestAddress{address+CRT_MBC_TYPES_OFFSET},
+                            CRT_MBC_TYPES_SIZE+CRT_MBC_CASE_SIZE);
+            return returned(0);
         }
         if(name=="_getmbcp"){
             const auto mbc=crt_mbc_address(memory,current_crt_locale(state,memory),x86_);
@@ -1359,14 +1411,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         }
         const bool set_scan=name.starts_with("_mbspbrk") || name.starts_with("_mbscspn") || name.starts_with("_mbsspn");
         const bool search=set_scan || name.starts_with("_mbsrchr") || name.starts_with("_mbschr");
-        if(search || name=="isleadbyte" || name=="_isleadbyte_l" || name.starts_with("_ismbb")){
+        if(search || name=="isleadbyte" || name=="_isleadbyte_l"){
             const auto* selected=&current_crt_locale(state,memory);
             if(name.ends_with("_l") && arg(search?2:1)){
                 const auto object=runtime_.crt_locales.find(arg(search?2:1));
                 if(object==runtime_.crt_locales.end())return invalid(22);selected=&object->second;
             }
             auto locale=selected->categories[2];
-            if(search || name.starts_with("_ismbb")){
+            if(search){
                 const auto address=crt_mbc_address(memory,*selected,x86_);
                 const auto current_codepage=windows_crt_codepage(static_cast<std::uint32_t>(memory.load(GuestAddress{address+4},32)));
                 if(!current_codepage)return error(22);locale=*current_codepage;
@@ -1374,7 +1426,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             }
             if(!search){
                 const auto value=static_cast<std::uint32_t>(arg(0));
-                return returned(value<256 && (name.find("trail")!=name.npos?locale.trail[value]:locale.lead[value]));
+                return returned(value<256 && locale.lead[value]);
             }
             if(!arg(0))return invalid(22);
             if(set_scan){

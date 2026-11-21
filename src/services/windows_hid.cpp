@@ -2,6 +2,7 @@
 #include "x64arm/windows_raw_input.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
+#include "hid_array_operations.h"
 #include <algorithm>
 #include <map>
 
@@ -19,6 +20,15 @@ std::vector<Button> pressed(const hid::Layout& layout,unsigned type,std::span<co
         }
     }
     return result;
+}
+std::uint32_t system_button(hid::Usage usage){
+    if(usage.page!=1)return 0;
+    switch(usage.value){
+    case 0x81:return 1;
+    case 0x82:return 2;
+    case 0x83:return 0x80000000U;
+    default:return 0;
+    }
 }
 // 鍵盤頁（0x07）用法對 i8042 Set 1 掃描碼：E0 前綴以 0xe000 標示，0 表示沒有對應。
 // 依 USB HID 用法表與 PS/2 Set 1 的標準對照；PrintScreen（0x46）與 Pause（0x48）另依修飾鍵處理。
@@ -55,11 +65,76 @@ std::vector<std::uint8_t> scan_codes(unsigned usage,bool make,std::uint32_t modi
     if(code&0xe000U)return {0xe0,base};
     return {base};
 }
+
+std::vector<std::uint8_t> consumer_scan_codes(std::uint16_t usage,bool make){
+    // Consumer Control 的傳媒、音量、應用程式與瀏覽器鍵使用 Set 1 的 E0 延伸碼。
+    static constexpr std::pair<std::uint16_t,std::uint8_t> codes[]{
+        {0xb5,0x19},{0xb6,0x10},{0xb7,0x24},{0xcd,0x22},
+        {0xe2,0x20},{0xe9,0x30},{0xea,0x2e},{0x183,0x6d},
+        {0x18a,0x6c},{0x192,0x21},{0x194,0x6b},{0x221,0x65},
+        {0x223,0x32},{0x224,0x6a},{0x225,0x69},{0x226,0x68},
+        {0x227,0x67},{0x22a,0x66},
+    };
+    const auto code=std::ranges::find_if(codes,[&](const auto& entry){return entry.first==usage;});
+    if(code==std::end(codes))throw hid::Error(hid::i8042_trans_unknown);
+    return {0xe0,static_cast<std::uint8_t>(code->second|(make?0:0x80))};
+}
+
+struct HidDeviceDescription {
+    std::vector<std::uint8_t> collections;
+    std::vector<std::uint8_t> reports;
+    std::vector<std::pair<unsigned,unsigned>> pointers;
+    bool large_preparsed{};
+};
+
+HidDeviceDescription pack_hid_descriptions(std::span<const hid::CollectionDescription> collections,unsigned pointer_size){
+    const unsigned pointer_at=pointer_size==4?28:32;
+    const unsigned entry_size=pointer_at+pointer_size;
+    const auto align=[](unsigned value){return (value+15)&~15U;};
+    HidDeviceDescription result;
+    auto offset=align(entry_size*static_cast<unsigned>(collections.size()));
+    for(const auto& collection:collections)offset=align(offset+static_cast<unsigned>(collection.preparsed.size()));
+    result.collections.resize(offset);
+    std::array<std::array<unsigned,4>,256> reports{};
+    offset=align(entry_size*static_cast<unsigned>(collections.size()));
+    for(unsigned i=0;i<collections.size();++i){
+        const auto& collection=collections[i];
+        const auto at=i*entry_size;
+        put(result.collections,at,collection.usage.page,2);
+        put(result.collections,at+2,collection.usage.value,2);
+        result.collections[at+4]=static_cast<std::uint8_t>(i+1);
+        for(unsigned type=0;type<3;++type){
+            const auto& lengths=collection.report_bytes[type];
+            put(result.collections,at+20+type*2,*std::max_element(lengths.begin(),lengths.end()),2);
+            for(unsigned id=0;id<256;++id)if(lengths[id]){
+                reports[id][0]=i+1;
+                reports[id][type+1]=lengths[id];
+            }
+        }
+        result.large_preparsed|=collection.preparsed.size()>UINT16_MAX;
+        put(result.collections,at+26,collection.preparsed.size(),2);
+        result.pointers.emplace_back(at+pointer_at,offset);
+        std::ranges::copy(collection.preparsed,result.collections.begin()+offset);
+        offset=align(offset+static_cast<unsigned>(collection.preparsed.size()));
+    }
+    for(unsigned id=0;id<256;++id){
+        const auto& report=reports[id];
+        if(!report[0])continue;
+        const auto at=static_cast<unsigned>(result.reports.size());
+        result.reports.resize(at+8);
+        result.reports[at]=static_cast<std::uint8_t>(id);
+        result.reports[at+1]=static_cast<std::uint8_t>(report[0]);
+        for(unsigned type=0;type<3;++type)put(result.reports,at+2+type*2,report[type+1],2);
+    }
+    return result;
+}
 }
 std::span<const WindowsServiceDescriptor> hid_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"hid.dll","HidD_GetHidGuid",1},{"hid.dll","HidD_GetAttributes",2},
         {"hid.dll","HidD_GetPhysicalDescriptor",3,0,0,0x4},
+        {"hid.dll","HidD_GetMsGenreDescriptor",3,0,0,0x4},{"hid.dll","HidD_Hello",2,0,0,0x2},
+        {"hid.dll","HidD_GetConfiguration",3,0,0,0x4},{"hid.dll","HidD_SetConfiguration",3,0,0,0x4},
         {"hid.dll","HidD_GetNumInputBuffers",2},{"hid.dll","HidD_SetNumInputBuffers",2},{"hid.dll","HidD_FlushQueue",1},
         {"hid.dll","HidD_GetManufacturerString",3},{"hid.dll","HidD_GetProductString",3},
         {"hid.dll","HidD_GetSerialNumberString",3},{"hid.dll","HidD_GetPreparsedData",2},
@@ -75,10 +150,14 @@ std::span<const WindowsServiceDescriptor> hid_service_descriptors(){
         {"hid.dll","HidD_GetFeature",3},{"hid.dll","HidD_SetFeature",3},{"hid.dll","HidD_GetInputReport",3},{"hid.dll","HidD_SetOutputReport",3},
         {"hid.dll","HidD_GetIndexedString",4},{"hid.dll","HidP_GetSpecificButtonCaps",7},{"hid.dll","HidP_GetSpecificValueCaps",7},
         {"hid.dll","HidP_GetLinkCollectionNodes",3},{"hid.dll","HidP_MaxUsageListLength",3},{"hid.dll","HidP_SetData",6},{"hid.dll","HidP_UnsetUsages",8},
-        {"hid.dll","HidP_TranslateUsagesToI8042ScanCodes",6}};return table;
+        {"hid.dll","HidP_TranslateUsagesToI8042ScanCodes",6},{"hid.dll","HidP_TranslateUsageAndPagesToI8042ScanCodes",6},
+        {"hid.dll","HidP_GetExtendedAttributes",5,0,0,0x3},{"hid.dll","HidP_UsageListDifference",5,0,0,0x10},
+        {"hid.dll","HidP_UsageAndPageListDifference",5,0,0,0x10},
+        {"hidparse.sys","HidP_GetCollectionDescription",4,0,0,6},{"hidparse.sys","HidP_FreeCollectionDescription",1},
+        {"hidparse.sys","HidP_SysPowerCaps",2},{"hidparse.sys","HidP_SysPowerEvent",4,0,0,2}};return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_hid(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    if(service.symbol=="HidP_TranslateUsagesToI8042ScanCodes")
+    if(service.symbol=="HidP_TranslateUsagesToI8042ScanCodes" || service.symbol=="HidP_TranslateUsageAndPagesToI8042ScanCodes")
         // (ChangedUsageList, UsageListLength, KeyAction, ModifierState, InsertCodesProcedure, Context)：每個鍵依序呼叫一次插入回呼（cdecl）。
         return nested_continuation(state,memory,"HID i8042",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
             const WindowsCall call(s,m,service);const auto finish=[&](std::uint32_t status){call.return_to(s,status);return std::optional<std::uint32_t>{};};
@@ -87,25 +166,113 @@ std::optional<std::uint32_t> WindowsServices::invoke_hid(GuestState& state,Guest
             try{
                 const auto count=static_cast<std::uint32_t>(call(1));const bool make=static_cast<std::uint32_t>(call(2))==1;const auto state_at=call(3),procedure=call(4),context=call(5);
                 if(static_cast<std::uint32_t>(call(2))>1 || !state_at || !procedure || (count && !call(0)))co_return finish(0xc000000dU); // STATUS_INVALID_PARAMETER
-                std::vector<std::uint16_t> usages(count);for(std::uint32_t i=0;i<count;++i)usages[i]=static_cast<std::uint16_t>(m.load(GuestAddress{call(0)+i*2},16));
+                const bool has_page=service.symbol=="HidP_TranslateUsageAndPagesToI8042ScanCodes";
+                const unsigned width=has_page?4:2;
+                const std::uint8_t bits=has_page?32:16;
+                const auto start=call(0),maximum=x86_?UINT32_MAX:UINT64_MAX;
+                if(count && (start>maximum || static_cast<std::uint64_t>(count)*width-1>maximum-start))
+                    co_return finish(0xc000000dU);
+                std::vector<hid::Usage> usages;
+                for(std::uint64_t i=0;i<count;++i){
+                    const auto item=m.load(GuestAddress{start+i*width},bits);
+                    if(!item)break;
+                    usages.push_back({has_page?static_cast<std::uint16_t>(item>>16):std::uint16_t{7},
+                                      static_cast<std::uint16_t>(item)});
+                }
+                if(usages.empty())co_return finish(hid::success);
                 auto modifiers=static_cast<std::uint32_t>(m.load(GuestAddress{state_at},32));
                 buffer=allocate_heap(m,8);if(!buffer)co_return finish(0xc0000017U);
-                for(const auto usage:usages){
-                    if(!usage)continue;
-                    const auto codes=scan_codes(usage,make,modifiers);
-                    // 修飾鍵依按下／放開設定；CapsLock、ScrollLock、NumLock 在按下時切換。
-                    if(usage>=0xe0 && usage<=0xe7){const auto bit=1U<<(usage-0xe0);modifiers=make?modifiers|bit:modifiers&~bit;}
-                    else if(make && (usage==0x39 || usage==0x47 || usage==0x53))modifiers^=usage==0x39?0x100U:usage==0x47?0x200U:0x400U;
-                    m.store(GuestAddress{state_at},32,modifiers);
+                for(const auto [page,usage]:usages){
+                    std::vector<std::uint8_t> codes;
+                    if(page==7){
+                        codes=scan_codes(usage,make,modifiers);
+                        // 修飾鍵依按下／放開設定，鎖定鍵在按下時切換。
+                        if(usage>=0xe0 && usage<=0xe7){const auto bit=1U<<(usage-0xe0);modifiers=make?modifiers|bit:modifiers&~bit;}
+                        else if(make && (usage==0x39 || usage==0x47 || usage==0x53))modifiers^=usage==0x39?0x100U:usage==0x47?0x200U:0x400U;
+                        m.store(GuestAddress{state_at},32,modifiers);
+                    }else if(page==0x0c){
+                        codes=consumer_scan_codes(usage,make);
+                    }else {
+                        co_return finish(hid::i8042_trans_unknown);
+                    }
                     if(codes.empty())continue;
                     m.write(GuestAddress{buffer},codes);
                     (void)co_await service_callback::call_value(procedure,{context,buffer,codes.size()});
                 }
                 co_return finish(hid::success);
             }catch(const hid::Error& error){co_return finish(error.status);}
+            catch(const std::bad_alloc&){co_return finish(0xc000009aU);}
             catch(const MemoryFault&){co_return finish(0xc0000005U);}
         });
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const auto d=[&](unsigned n){return static_cast<std::uint32_t>(arg(n));};const auto bits=static_cast<std::uint8_t>(x86_?32:64);
+    if(name=="HidP_GetCollectionDescription" || name=="HidP_FreeCollectionDescription"){
+        const auto unit=static_cast<unsigned>(bits/8);
+        const auto debug_at=3*unit+4;
+        const auto device_size=x86_?48U:64U;
+        const auto finish=[&](std::uint32_t status){arg.return_to(state,status);return std::optional<std::uint32_t>{};};
+        const auto output=arg(name=="HidP_GetCollectionDescription"?3U:0U);
+        if(!output)return finish(name=="HidP_GetCollectionDescription"?0xc000000dU:0U);
+        if(name=="HidP_FreeCollectionDescription"){
+            if(!raw_input_)return finish(0);
+            const auto collections=memory.load(GuestAddress{output},bits);
+            const auto found=raw_input_->owned_hid_descriptions.find(collections);
+            if(found==raw_input_->owned_hid_descriptions.end())return finish(0);
+            const auto reports=found->second;
+            raw_input_->owned_hid_descriptions.erase(found);
+            if(reports)(void)free_heap(memory,reports,state);
+            (void)free_heap(memory,collections,state);
+            return finish(0);
+        }
+        std::array<std::uint8_t,64> device{};
+        const auto output_bytes=std::span(device).first(device_size);
+        std::uint64_t collections_at=0,reports_at=0;
+        try{
+            memory.check(GuestAddress{output},device_size,Access::Write);
+            if(d(1) && !arg(0))throw hid::CollectionError(0xc000000dU,0,2);
+            if(d(1)>UINT16_MAX)throw hid::CollectionError(0xc0000023U,0,2);
+            std::vector<std::uint8_t> descriptor(d(1));
+            if(!descriptor.empty())memory.read(GuestAddress{arg(0)},descriptor);
+            const auto collections=hid::describe_collections(descriptor);
+            auto packed=pack_hid_descriptions(collections,unit);
+            collections_at=allocate_heap(memory,packed.collections.size());
+            if(!collections_at)throw std::bad_alloc{};
+            if(!packed.reports.empty()){
+                reports_at=allocate_heap(memory,packed.reports.size());
+                if(!reports_at)throw std::bad_alloc{};
+            }
+            for(const auto& [pointer,offset]:packed.pointers)put(packed.collections,pointer,collections_at+offset,unit);
+            memory.write(GuestAddress{collections_at},packed.collections);
+            if(reports_at)memory.write(GuestAddress{reports_at},packed.reports);
+            put(output_bytes,0,collections_at,unit);put(output_bytes,unit,collections.size());
+            put(output_bytes,2*unit,reports_at,unit);put(output_bytes,3*unit,packed.reports.size()/8);
+            if(packed.large_preparsed)put(output_bytes,debug_at+4,0x23);
+            if(!raw_input_)raw_input_=std::make_shared<RawInputState>();
+            raw_input_->owned_hid_descriptions.emplace(collections_at,reports_at);
+            memory.write(GuestAddress{output},output_bytes);
+            return finish(0);
+        }catch(const MemoryFault&){
+            if(raw_input_)raw_input_->owned_hid_descriptions.erase(collections_at);
+            if(reports_at)(void)free_heap(memory,reports_at,state);
+            if(collections_at)(void)free_heap(memory,collections_at,state);
+            return finish(0xc0000005U);
+        }catch(const hid::CollectionError& error){
+            put(output_bytes,debug_at,error.offset);put(output_bytes,debug_at+4,error.diagnostic);
+            for(unsigned n=0;n<error.arguments.size();++n)put(output_bytes,debug_at+8+n*4,error.arguments[n]);
+            memory.write(GuestAddress{output},output_bytes);
+            return finish(error.ntstatus);
+        }catch(const hid::Error&){
+            put(output_bytes,debug_at+4,0x40);
+            memory.write(GuestAddress{output},output_bytes);
+            return finish(0xc00000b9U);
+        }catch(const std::bad_alloc&){
+            if(reports_at)(void)free_heap(memory,reports_at,state);
+            if(collections_at)(void)free_heap(memory,collections_at,state);
+            device.fill(0);
+            put(output_bytes,debug_at+4,1);
+            memory.write(GuestAddress{output},output_bytes);
+            return finish(0xc000009aU);
+        }
+    }
     const bool parser=name.starts_with("HidP_");std::uint32_t result=parser?hid::success:0;
     const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
     const auto layout_at=[&](std::uint64_t address){if(!address)throw hid::Error(hid::invalid_preparsed);std::array<std::uint8_t,20> header{};memory.read(GuestAddress{address},header);const auto size=hid::preparsed_size(header);std::vector<std::uint8_t> data(size);memory.read(GuestAddress{address},data);return hid::decode(data);};
@@ -114,7 +281,41 @@ std::optional<std::uint32_t> WindowsServices::invoke_hid(GuestState& state,Guest
         std::vector<std::uint8_t> data(d(length));memory.read(GuestAddress{arg(pointer)},data);layout.validate(type,data);return data;
     };
     try{
-        if(name=="HidD_GetHidGuid"){
+        if(name=="HidP_UsageListDifference" || name=="HidP_UsageAndPageListDifference"){
+            const std::uint64_t addresses[]{arg(0),arg(1),arg(2),arg(3)};
+            const auto count=d(4);
+            const auto width=name=="HidP_UsageListDifference"?2U:4U;
+            const auto item_bits=static_cast<std::uint8_t>(width*8);
+            result=hid_diff_validate(addresses,count,width,x86_?UINT32_MAX:UINT64_MAX);
+            if(result==hid::success && count){
+                const auto bytes=std::size_t(count)*width;
+                memory.check(GuestAddress{addresses[2]},bytes,Access::Write);
+                memory.check(GuestAddress{addresses[3]},bytes,Access::Write);
+                std::array<std::vector<std::uint8_t>,2> lists;
+                for(unsigned i=0;i<2;++i){
+                    for(std::uint64_t n=0;n<count;++n){
+                        const auto value=static_cast<std::uint32_t>(memory.load(GuestAddress{addresses[i]+width*n},item_bits));
+                        const auto offset=lists[i].size();
+                        lists[i].resize(offset+width);
+                        hid_write_list_item(lists[i].data()+offset,value,width);
+                        if(!value)break;
+                    }
+                }
+                std::vector<std::uint8_t> released(bytes),pressed(bytes);
+                hid_diff(lists[0].data(),lists[1].data(),released.data(),pressed.data(),count,width);
+                memory.write(GuestAddress{addresses[2]},released);
+                memory.write(GuestAddress{addresses[3]},pressed);
+            }
+        }else if(name=="HidD_Hello"){
+            std::array<std::uint8_t,7> text{};
+            const auto size=std::min<std::size_t>(text.size(),d(1));
+            const auto address=arg(0);
+            const auto max=x86_?UINT32_MAX:UINT64_MAX;
+            if(!size || (address && address<=max && size-1<=max-address)){
+                result=hid_hello(text.data(),d(1));
+                if(size)memory.write(GuestAddress{address},std::span(text).first(size));
+            }
+        }else if(name=="HidD_GetHidGuid"){
             memory.write(GuestAddress{arg(0)},hid_interface_guid);
         }else if(name=="HidD_FreePreparsedData"){
             if(!raw_input_ || !raw_input_->owned_preparsed.contains(arg(0)))fail(87);
@@ -122,13 +323,29 @@ std::optional<std::uint32_t> WindowsServices::invoke_hid(GuestState& state,Guest
         }else if(!parser){
             const auto file=files_.find(arg(0));
             if(file==files_.end() || !file->second.hid)fail(6);
-            else if(file->second.hid->disconnected || !file->second.hid->backend->available(file->second.hid->device.instance))fail(1167);
+            else if(!file->second.hid->available())fail(1167);
             else {const auto& device=file->second.hid->device;
                 if(name=="HidD_GetNumInputBuffers"){
                     if(!arg(1))fail(87);
                     else {memory.store(GuestAddress{arg(1)},32,file->second.hid->input_buffer_count);process_io::record(process_io::Kind::Other,4);result=1;}
                 }else if(name=="HidD_SetNumInputBuffers"){
                     if(!file->second.hid->set_input_buffer_count(d(1)))fail(87);
+                    else {process_io::record(process_io::Kind::Other,0);result=1;}
+                }else if(name=="HidD_GetConfiguration" || name=="HidD_SetConfiguration"){
+                    const auto unit=bits/8U;
+                    const auto config=arg(1);
+                    const auto cookie=resolve("hid.dll","HidD_GetConfiguration").value;
+                    if(!config || d(2)<unit+hid_driver_config_size)fail(87);
+                    else if(name=="HidD_GetConfiguration"){
+                        std::array<std::uint8_t,16> data{};
+                        put(data,0,cookie,unit);
+                        put(data,unit,hid_driver_config_size);
+                        put(data,unit+4,file->second.hid->input_buffer_count);
+                        memory.write(GuestAddress{config},std::span(data).first(unit+hid_driver_config_size));
+                        process_io::record(process_io::Kind::Other,unit+hid_driver_config_size);result=1;
+                    }else if(memory.load(GuestAddress{config},bits)!=cookie ||
+                             memory.load(GuestAddress{config+unit},32)!=hid_driver_config_size ||
+                             !file->second.hid->set_input_buffer_count(static_cast<std::uint32_t>(memory.load(GuestAddress{config+unit+4},32))))fail(87);
                     else {process_io::record(process_io::Kind::Other,0);result=1;}
                 }else if(name=="HidD_FlushQueue"){
                     file->second.hid->reports.clear();process_io::record(process_io::Kind::Other,0);result=1;
@@ -147,10 +364,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_hid(GuestState& state,Guest
                     else {std::vector<std::uint8_t> report(d(2));memory.read(GuestAddress{arg(1)},report);file->second.hid->layout.validate(type,report);if(!write)memory.check(GuestAddress{arg(1)},report.size(),Access::Write);
                         const auto error=write?file->second.hid->backend->set_report(device.instance,type,report):file->second.hid->backend->get_report(device.instance,type,report);
                         if(error)fail(error);else {if(!write)memory.write(GuestAddress{arg(1)},report);process_io::record(process_io::Kind::Other,report.size());result=1;}}
-                }else if(name=="HidD_GetPhysicalDescriptor"){
+                }else if(name=="HidD_GetPhysicalDescriptor" || name=="HidD_GetMsGenreDescriptor"){
                     if(!arg(1) || !d(2))fail(87);
                     else {memory.check(GuestAddress{arg(1)},d(2),Access::Write);std::vector<std::uint8_t> bytes(std::min<std::uint32_t>(d(2),UINT16_MAX));
-                        const auto error=file->second.hid->physical_descriptor(bytes);
+                        const auto error=file->second.hid->descriptor(bytes,name=="HidD_GetMsGenreDescriptor");
                         if(error)fail(error);else {memory.write(GuestAddress{arg(1)},bytes);process_io::record(process_io::Kind::Other,bytes.size());result=1;}}
                 }else if(name=="HidD_GetIndexedString"){
                     // 只回答裝置登錄的 iManufacturer／iProduct／iSerialNumber；其他索引與裝置不回應時相同，回報 ERROR_GEN_FAILURE。
@@ -160,6 +377,56 @@ std::optional<std::uint32_t> WindowsServices::invoke_hid(GuestState& state,Guest
                 }else {const auto& text=name=="HidD_GetProductString"?device.name:name=="HidD_GetManufacturerString"?device.manufacturer:device.serial;
                     if(text.empty())fail(31);else {const auto data=utf16_bytes(utf8_to_utf16(text));if(!arg(1) || d(2)<data.size())fail(122);else {memory.write(GuestAddress{arg(1)},data);process_io::record(process_io::Kind::Other,data.size());result=1;}}}
             }
+        }else if(name=="HidP_GetExtendedAttributes"){
+            const auto layout=layout_at(arg(2));
+            if(d(0)>=3)throw hid::Error(hid::invalid_type);
+            const auto index=static_cast<std::uint16_t>(d(1));
+            const auto field=std::find_if(layout.fields.begin(),layout.fields.end(),[&](const auto& item){
+                return item.type==d(0) && index>=item.index && index-item.index<item.indices();
+            });
+            if(field==layout.fields.end())throw hid::Error(hid::data_index_not_found);
+            if(!arg(4))throw hid::Error(hid::buffer_too_small);
+            const auto unit=bits/8U;
+            // hidpi.h 使用 4 位元組對齊；兩種 ABI 的指標欄位都從偏移 4 開始。
+            const unsigned token_pointer=4,header=token_pointer+unit,minimum=header+4;
+            const auto required=std::max(minimum,header+field->unknown_global_count*8);
+            const auto length=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(4)},32));
+            const unsigned written=arg(3)?std::min(length,required):0;
+            if(written)memory.check(GuestAddress{arg(3)},written,Access::Write);
+            memory.store(GuestAddress{arg(4)},32,required);
+            if(written){
+                std::array<std::uint8_t,48> data{};
+                data[0]=static_cast<std::uint8_t>(field->unknown_global_count);
+                if(field->unknown_global_count){
+                    if(written>=header+8)put(data,token_pointer,arg(3)+header,unit);
+                    for(unsigned i=0;i<field->unknown_global_count;++i){
+                        const auto& token=field->unknown_globals[i];
+                        data[header+8*i]=token.prefix;
+                        put(data,header+8*i+4,token.value);
+                    }
+                }
+                memory.write(GuestAddress{arg(3)},std::span(data).first(written));
+            }
+            if(written<required)throw hid::Error(hid::buffer_too_small);
+        }else if(name=="HidP_SysPowerCaps" || name=="HidP_SysPowerEvent"){
+            const bool read_event=name=="HidP_SysPowerEvent";
+            const auto layout=layout_at(arg(read_event?2U:0U));
+            std::uint32_t buttons=0;
+            if(read_event){
+                const auto length=static_cast<std::uint16_t>(d(1));
+                if(!length || !arg(0))throw hid::Error(hid::invalid_length);
+                std::vector<std::uint8_t> data(length);
+                memory.read(GuestAddress{arg(0)},data);
+                const auto report_length=layout.report_bytes[0][data[0]];
+                if(report_length && length==report_length)data.resize(layout.bytes(0));
+                layout.validate(0,data);
+                for(const auto button:pressed(layout,0,data))buttons|=system_button(button.field->usages[button.element]);
+            }else{
+                for(const auto& field:layout.fields)if(!field.type && field.button)
+                    for(const auto usage:field.usages)buttons|=system_button(usage);
+            }
+            memory.store(GuestAddress{arg(read_event?3U:1U)},32,buttons);
+            result=0;
         }else if(name=="HidP_GetCaps"){const auto output=layout_at(arg(0)).caps();memory.write(GuestAddress{arg(1)},output);}
         else if(name=="HidP_MaxDataListLength"){const auto layout=layout_at(arg(1));if(d(0)>=3)throw hid::Error(hid::invalid_type);std::array<unsigned,256> counts{};
             for(const auto& field:layout.fields)if(field.type==d(0)){

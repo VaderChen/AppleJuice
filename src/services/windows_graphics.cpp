@@ -11,32 +11,103 @@
 #include <filesystem>
 #include <fstream>
 namespace x64arm {
-std::string graphics_disassemble_shader(std::span<const std::uint8_t> bytes,std::uint32_t flags,std::string_view comments){
-    if(bytes.size()<4 || bytes.size()>16U*1024U*1024U || (flags&~0xffU))throw std::invalid_argument("shader 反組譯參數無效");
-    const dxbc::Reader input{bytes};const bool container=input.u32(0)==0x43425844U;
-    auto source=container?VKD3D_SHADER_SOURCE_DXBC_TPF:VKD3D_SHADER_SOURCE_D3D_BYTECODE;
-    std::vector<std::uint64_t> offsets;std::span<const std::uint8_t> tokens=bytes;std::uint64_t token_base=0;
+namespace {
+enum class ShaderInstructionKind { Executable, Declaration, Comment, End };
+struct ShaderInstruction { std::uint64_t offset; ShaderInstructionKind kind; };
+struct ShaderDisassemblyInput {
+    vkd3d_shader_source_type source;
+    std::vector<ShaderInstruction> instructions;
+    std::uint64_t end;
+};
+
+ShaderDisassemblyInput decode_disassembly_input(std::span<const std::uint8_t> bytes){
+    if(bytes.size()<4 || bytes.size()>16U*1024U*1024U)throw std::invalid_argument("shader bytecode 大小無效");
+    const dxbc::Reader input{bytes};
+    const bool container=input.u32(0)==0x43425844U;
+    ShaderDisassemblyInput decoded{container?VKD3D_SHADER_SOURCE_DXBC_TPF:VKD3D_SHADER_SOURCE_D3D_BYTECODE,{},bytes.size()};
+    auto tokens=bytes;
+    std::uint64_t token_base=0;
     if(container){
         if(bytes.size()<32 || input.u32(24)!=bytes.size())throw std::invalid_argument("DXBC 反組譯容器無效");
-        const auto count=input.u32(28);if(count>65536)throw std::invalid_argument("DXBC 區塊數量超過上限");input.check(32,std::uint64_t{count}*4);bool found=false;
-        for(unsigned i=0;i<count;++i){const auto at=input.u32(32+4*i);input.check(at,8);const auto size=input.u32(at+4);input.check(std::uint64_t{at}+8,size);const auto tag=input.u32(at);
-            if(tag==0x4c495844U){source=VKD3D_SHADER_SOURCE_DXBC_DXIL;tokens={};found=true;}
-            if(tag==0x52444853U || tag==0x58454853U){tokens=bytes.subspan(static_cast<std::size_t>(at)+8,size);token_base=std::uint64_t{at}+8;found=true;}
-        }if(!found)throw std::invalid_argument("DXBC 缺少 shader 指令");
-    }
-    if(!tokens.empty()){
-        const dxbc::Reader code{tokens};if(tokens.size()%4)throw std::invalid_argument("shader token 沒有對齊");
-        const auto words=tokens.size()/4;const auto begin=container?2U:1U;
-        if(container && (words<2 || code.u32(4)!=words))throw std::invalid_argument("DXBC 指令長度無效");
-        for(std::size_t at=begin;at<words;){const auto token=code.u32(at*4);std::size_t length=0;
-            if(container){length=(token&0x7ffU)==53U?code.u32(at*4+4):(token>>24)&0x7fU;}
-            else {const auto opcode=token&0xffffU;if(opcode==0xffffU){offsets.push_back(token_base+at*4);break;}if(opcode==0xfffeU){length=1+((token>>16)&0x7fffU);}
-                else {length=1+((token>>24)&15U);if(((code.u32(0)>>8)&255U)==1U){const auto size=shader_disassembly::sm1_length(opcode,code.u32(0));if(!size)throw std::invalid_argument("SM1 shader opcode 無效");length=*size;}}
+        const auto count=input.u32(28);
+        if(count>65536)throw std::invalid_argument("DXBC 區塊數量超過上限");
+        input.check(32,std::uint64_t{count}*4);
+        bool found=false;
+        for(unsigned i=0;i<count;++i){
+            const auto at=input.u32(32+4*i);
+            input.check(at,8);
+            const auto size=input.u32(at+4),tag=input.u32(at);
+            input.check(std::uint64_t{at}+8,size);
+            if(tag==0x4c495844U){decoded.source=VKD3D_SHADER_SOURCE_DXBC_DXIL;found=true;}
+            if(tag==0x52444853U || tag==0x58454853U){
+                token_base=std::uint64_t{at}+8;
+                tokens=bytes.subspan(static_cast<std::size_t>(token_base),size);
+                found=true;
             }
-            if(!length || length>words-at)throw std::invalid_argument("shader 指令被截斷");
-            if(container || (token&0xffffU)!=0xfffeU)offsets.push_back(token_base+at*4);at+=length;
         }
+        if(!found)throw std::invalid_argument("DXBC 缺少 shader 指令");
+        if(decoded.source==VKD3D_SHADER_SOURCE_DXBC_DXIL)return decoded;
     }
+    const dxbc::Reader code{tokens};
+    if(tokens.size()%4)throw std::invalid_argument("shader token 沒有對齊");
+    const auto words=tokens.size()/4;
+    const auto first=container?2U:1U;
+    if(container && (words<2 || code.u32(4)!=words))throw std::invalid_argument("DXBC 指令長度無效");
+    const auto version=code.u32(0);
+    const auto shader_model=(version>>8)&255U;
+    if(!container && ((version>>16)<0xfffeU || shader_model<1 || shader_model>3))
+        throw std::invalid_argument("未知的舊版 shader 版本");
+    decoded.end=token_base+tokens.size();
+    for(std::size_t at=first;at<words;){
+        const auto token=code.u32(at*4);
+        auto kind=ShaderInstructionKind::Executable;
+        std::size_t length=0;
+        if(container){
+            const auto opcode=token&0x7ffU;
+            length=opcode==53U?code.u32(at*4+4):(token>>24)&0x7fU;
+            // SM4／SM5 的 dcl、立即常數區塊及 hull phase 標記。
+            if(opcode==53 || (opcode>=0x58 && opcode<=0x6a) || (opcode>=0x71 && opcode<=0x74) ||
+                (opcode>=0x8f && opcode<=0xa2) || opcode==0xce)kind=ShaderInstructionKind::Declaration;
+        }else{
+            const auto opcode=token&0xffffU;
+            if(opcode==0xffffU){
+                decoded.instructions.push_back({token_base+at*4,ShaderInstructionKind::End});
+                decoded.end=token_base+(at+1)*4;
+                return decoded;
+            }
+            if(opcode==0xfffeU){
+                kind=ShaderInstructionKind::Comment;
+                length=1+((token>>16)&0x7fffU);
+            }else{
+                if(opcode==31 || opcode==47 || opcode==48 || opcode==81)kind=ShaderInstructionKind::Declaration;
+                length=1+((token>>24)&15U);
+                if(shader_model==1){
+                    const auto size=shader_disassembly::sm1_length(opcode,version);
+                    if(!size)throw std::invalid_argument("SM1 shader opcode 無效");
+                    length=*size;
+                }
+            }
+        }
+        if(!length || length>words-at)throw std::invalid_argument("shader 指令被截斷");
+        decoded.instructions.push_back({token_base+at*4,kind});
+        at+=length;
+    }
+    if(!container)throw std::invalid_argument("舊版 shader 缺少 END 指令");
+    return decoded;
+}
+
+std::vector<std::uint64_t> disassembly_offsets(const ShaderDisassemblyInput& input){
+    std::vector<std::uint64_t> offsets;
+    offsets.reserve(input.instructions.size());
+    for(const auto& instruction:input.instructions)
+        if(instruction.kind!=ShaderInstructionKind::Comment)offsets.push_back(instruction.offset);
+    return offsets;
+}
+
+std::string disassemble_shader(std::span<const std::uint8_t> bytes,vkd3d_shader_source_type source,
+    std::uint32_t flags,std::string_view comments,std::span<const std::uint64_t> offsets,
+    std::optional<shader_disassembly::InstructionRange> range={}){
+    if(flags&~0xffU)throw std::invalid_argument("shader 反組譯旗標無效");
     struct Output{vkd3d_shader_code code{};char* messages{};~Output(){vkd3d_shader_free_shader_code(&code);vkd3d_shader_free_messages(messages);}} output;
     const std::array<vkd3d_shader_compile_option,2> options{{
         {VKD3D_SHADER_COMPILE_OPTION_FORMATTING,VKD3D_SHADER_COMPILE_OPTION_FORMATTING_INDENT},
@@ -48,7 +119,7 @@ std::string graphics_disassemble_shader(std::span<const std::uint8_t> bytes,std:
     if(status<0 || !output.code.code || !output.code.size)throw std::invalid_argument("shader 反組譯失敗："+std::string(output.messages?output.messages:""));
     std::string text(static_cast<const char*>(output.code.code),output.code.size);while(!text.empty() && !text.back())text.pop_back();
     std::string header;
-    if(!(flags&0x40U) && container && source==VKD3D_SHADER_SOURCE_DXBC_TPF){
+    if(!(flags&0x40U) && source==VKD3D_SHADER_SOURCE_DXBC_TPF){
         const dxbc::Reflection reflection{bytes};if(!reflection.creator.empty())header+="// "+reflection.creator+"\n";
         if(flags&2U)for(const auto& buffer:reflection.buffers)for(const auto& variable:buffer.variables)if(!variable.initial.empty()){
             header+="// "+buffer.name+"."+variable.name+" = ";for(std::size_t at=0;at<variable.initial.size();at+=4){
@@ -57,8 +128,41 @@ std::string graphics_disassemble_shader(std::span<const std::uint8_t> bytes,std:
             }header+='\n';
         }
     }
-    return shader_disassembly::format(text,flags,comments,header,offsets);
+    return shader_disassembly::format(text,flags,comments,header,offsets,range);
 }
+}
+std::string graphics_disassemble_shader(std::span<const std::uint8_t> bytes,std::uint32_t flags,std::string_view comments){
+    const auto decoded=decode_disassembly_input(bytes);
+    return disassemble_shader(bytes,decoded.source,flags,comments,disassembly_offsets(decoded));
+}
+
+shader_disassembly::DisassembledRegion shader_disassembly::region(std::span<const std::uint8_t> bytes,
+    std::uint32_t flags,std::string_view comments,std::uint64_t start,std::uint64_t count){
+    const auto decoded=decode_disassembly_input(bytes);
+    if(decoded.source==VKD3D_SHADER_SOURCE_DXBC_DXIL)throw std::invalid_argument("DXIL 不提供 DXBC 指令區段");
+    auto offsets=disassembly_offsets(decoded);
+    if(!decoded.instructions.empty() && decoded.instructions.back().kind==ShaderInstructionKind::End)offsets.pop_back();
+    const auto first=start?std::lower_bound(offsets.begin(),offsets.end(),start):offsets.begin();
+    if(start && (first==offsets.end()?start!=decoded.end:*first!=start))
+        throw std::invalid_argument("shader 區段起點須對齊指令");
+    const auto begin=static_cast<std::size_t>(first-offsets.begin());
+    const auto end=begin+static_cast<std::size_t>(std::min<std::uint64_t>(count,offsets.size()-begin));
+    const auto finish=end<offsets.size()?offsets[end]:decoded.end;
+    return {disassemble_shader(bytes,decoded.source,flags&~0x40U,comments,offsets,InstructionRange{begin,end}),finish};
+}
+
+std::vector<std::uint64_t> shader_disassembly::trace_offsets(std::span<const std::uint8_t> bytes,bool include_declarations){
+    const auto decoded=decode_disassembly_input(bytes);
+    if(decoded.source==VKD3D_SHADER_SOURCE_DXBC_DXIL)throw std::invalid_argument("DXIL 不提供 DXBC 指令位移");
+    std::vector<std::uint64_t> offsets;
+    offsets.reserve(decoded.instructions.size());
+    for(const auto& instruction:decoded.instructions)
+        if(instruction.kind==ShaderInstructionKind::Executable ||
+            (include_declarations && instruction.kind==ShaderInstructionKind::Declaration))
+            offsets.push_back(instruction.offset);
+    return offsets;
+}
+
 GraphicsCompilation graphics_compile_hlsl(std::span<const std::uint8_t> source,const std::string& name,
     const std::string& entry,const std::string& profile,const std::vector<std::pair<std::string,std::string>>& macros,std::uint32_t flags){
     return graphics_compile_hlsl_includes(source,name,entry,profile,macros,flags,{});
@@ -88,8 +192,10 @@ GraphicsCompilation graphics_preprocess_shader(std::span<const std::uint8_t> sou
     vkd3d_shader_free_shader_code(&output);return compiled;
 }
 GraphicsCompilation graphics_assemble_shader(std::span<const std::uint8_t> source,const std::string& name,
-    const std::vector<std::pair<std::string,std::string>>& macros,std::uint32_t flags,const HlslIncludeLoader& loader){
+    const std::vector<std::pair<std::string,std::string>>& macros,std::uint32_t flags,const HlslIncludeLoader& loader,bool* assembly_started){
+    if(assembly_started)*assembly_started=false;
     auto expanded=graphics_preprocess_shader(source,name,macros,loader);if(expanded.bytecode.empty())return expanded;
+    if(assembly_started)*assembly_started=true;
     auto result=d3dx9::Assembler{}.assemble(expanded.bytecode,name);result.messages=expanded.messages+result.messages;
     if(!result.bytecode.empty() && !(flags&2)){
         vkd3d_shader_compile_info info{};info.type=VKD3D_SHADER_STRUCTURE_TYPE_COMPILE_INFO;

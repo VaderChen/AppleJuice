@@ -4,6 +4,7 @@
 #include "x64arm/audio.hpp"
 #include "x64arm/unicode.hpp"
 #include "dsound_interfaces.hpp"
+#include "directx_audio_registration.hpp"
 #include "audio_endpoints.hpp"
 #include "pcm_wave_format.hpp"
 #include "audio_spatial.hpp"
@@ -170,6 +171,8 @@ std::span<const WindowsServiceDescriptor> dsound_service_descriptors(){
         for(auto symbol:{"DirectSoundCaptureEnumerateA","DirectSoundCaptureEnumerateW"})result.push_back({"dsound.dll",symbol,2});
         for(const auto table:{std::span<const Method>(capture_device_methods),std::span<const Method>(capture_buffer_methods)})for(std::size_t i=3;i<table.size();++i)if(table[i].name.starts_with("C_"))result.push_back({"internal-dsound",table[i].name,table[i].args,0,0,table[i].scalars});
         result.push_back({"dsound.dll","DirectSoundFullDuplexCreate",10,0,0,0x20});result.push_back({"dsound.dll","DllGetClassObject",3});result.push_back({"dsound.dll","DllCanUnloadNow",0});
+        result.push_back({"dsound.dll","DllRegisterServer",0});
+        result.push_back({"dsound.dll","DllUnregisterServer",0});
         for(auto table:{std::span<const Method>(factory_methods),std::span<const Method>(duplex_methods)})for(std::size_t i=3;i<table.size();++i)result.push_back({"internal-dsound",table[i].name,table[i].args,0,0,table[i].scalars});
         for(std::size_t i=3;i<std::size(effect_methods);++i)result.push_back({"internal-dsound",effect_methods[i].name,effect_methods[i].args,0,0,effect_methods[i].scalars});
         return result;
@@ -261,7 +264,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_dsound(GuestState& state,Gu
     };
     std::uint64_t result=0;
     try {
-        if(name=="DllCanUnloadNow")result=bridge.objects.empty() && !bridge.locks?0:1;
+        if(name=="DllRegisterServer" || name=="DllUnregisterServer"){
+            const auto update=com_registry::update(runtime_.registry,registry_file_,registry_store_cache_,
+                registry_view(0,x86_),directx_audio_registration::dsound_classes,u"dsound.dll",
+                name=="DllUnregisterServer",runtime_.system_filetime());
+            result=update.error;
+            if(!result)for(const auto& path:update.changed)poll_registry_notifications(true,path,5);
+        }else if(name=="DllCanUnloadNow")result=bridge.objects.empty() && !bridge.locks?0:1;
         else if(name=="DllGetClassObject" || name=="CoGetClassObject"){
             const bool com=name=="CoGetClassObject";const auto out=arg(com?4:2);check_out(out,unit);write(out,0,bits);Guid cls{},iid{};memory.read(GuestAddress{arg(0)},cls);memory.read(GuestAddress{arg(com?3:1)},iid);
             if(!dsound::is_class(memory,arg(0)) || (com && !(arg(1)&1)))result=0x80040111U;else if(iid!=unknown && iid!=dsound::factory_iid)result=no_interface;else write(out,instantiate(cls,iid,true),bits);

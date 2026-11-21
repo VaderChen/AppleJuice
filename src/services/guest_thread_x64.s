@@ -1111,5 +1111,7 @@ end SwapMouseButton
 .globl _guest_SwapMouseButton_gui_timing_patch
 .set _guest_SwapMouseButton_gui_timing_patch, Lswap_patch - _guest_SwapMouseButton
 
+#include "guest_sh_linear.inc"
+
 .globl _guest_thread_end
 _guest_thread_end:

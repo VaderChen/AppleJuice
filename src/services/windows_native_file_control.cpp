@@ -190,9 +190,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_fs_control(GuestState& stat
             }
             else error=1;
         }else if(file.hid){
-            if(service.symbol=="NtFsControlFile" || code!=0x000b019aU)error=1; // IOCTL_GET_PHYSICAL_DESCRIPTOR，METHOD_OUT_DIRECT。
-            else if(!output || !output_size)error=87;
-            else {bytes.resize(std::min<std::uint32_t>(output_size,UINT16_MAX));error=file.hid->physical_descriptor(bytes);if(!error)process_io::record(process_io::Kind::Other,bytes.size());}
+            if(service.symbol=="NtFsControlFile")error=1;
+            else if(code==hid_get_physical_descriptor || code==hid_get_genre_descriptor){
+                if(!output || !output_size)error=87;
+                else{
+                    bytes.resize(std::min<std::uint32_t>(output_size,UINT16_MAX));
+                    error=file.hid->descriptor(bytes,code==hid_get_genre_descriptor);
+                }
+            }else if(code==hid_get_driver_config || code==hid_set_driver_config){
+                if(!file.hid->available())error=1167;
+                else if(code==hid_get_driver_config){
+                    if(!output || output_size<hid_driver_config_size)error=122;
+                    else{
+                        bytes.resize(hid_driver_config_size);
+                        bytes[0]=hid_driver_config_size;
+                        for(unsigned i=0;i<4;++i)bytes[4+i]=static_cast<std::uint8_t>(file.hid->input_buffer_count>>(8*i));
+                    }
+                }else if(!input || input_size<hid_driver_config_size ||
+                         memory.load(GuestAddress{input},32)!=hid_driver_config_size ||
+                         !file.hid->set_input_buffer_count(static_cast<std::uint32_t>(memory.load(GuestAddress{input+4},32))))error=87;
+            }else error=1;
+            if(!error)process_io::record(process_io::Kind::Other,bytes.size());
         }else if(file.serial || file.usb || (file.native && file.native->null_device()))error=1;
         else if(file.native && file.native->volume_device()){
             // 卷以授權映射的檔案樹承接；識別與容量共用卷後台，沒有 NTFS 或原始磁區映像。

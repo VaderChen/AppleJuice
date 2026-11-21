@@ -12,7 +12,7 @@
 // 標準輸入輸出補充（getwchar／putwchar、gets(_s)、_getws／_putws、_getw／_putw、fread_s、clearerr_s、freopen_s）、
 // 清單參數的 _spawnl*／_execl*（收集到 NULL 後交給既有 _spawnv*／_execv*）、作業系統包裝（_beep、_sleep、_seterrormode、
 // _getdrives、_getdiskfree、_getdllprocaddr、_loaddll、_unloaddll、_eof、_pipe）、_mktemp 系列、_searchenv 系列、
-// __fpecode／__pxcptinfoptrs、__p__mbctype、__pwctype_func、set_unexpected／_get_unexpected、
+// __fpecode／__pxcptinfoptrs、__pwctype_func、set_unexpected／_get_unexpected、
 // 作業系統版本查詢（_get_osplatform／_get_osver／_get_winver／_get_winmajor／_get_winminor，與 GetVersionEx 同一版本常數）、
 // _set_SSE2_enable 與 small-block heap 門檻（_get／_set_sbh_threshold）。
 // 會阻塞或回呼客體的操作（串流、程序、DLL 載入、Sleep、Beep）經既有 CRT／kernel32 入口續行；其餘在宿主端直接完成。
@@ -35,7 +35,7 @@ std::span<const WindowsServiceDescriptor> crt_runtime_extra_service_descriptors(
         {"crt","_seterrormode",1},{"crt","_getdrives",0},{"crt","_getdiskfree",2},{"crt","_getdllprocaddr",3},{"crt","_eof",1},{"crt","_pipe",3},
         {"crt","_mktemp",1},{"crt","_wmktemp",1},{"crt","_mktemp_s",2},{"crt","_wmktemp_s",2},
         {"crt","_searchenv",3},{"crt","_wsearchenv",3},{"crt","_searchenv_s",4},{"crt","_wsearchenv_s",4},
-        {"crt","__fpecode",0},{"crt","__pxcptinfoptrs",0},{"crt","__p__mbctype",0},{"crt","__pwctype_func",0},
+        {"crt","__fpecode",0},{"crt","__pxcptinfoptrs",0},{"crt","__pwctype_func",0},
         {"crt","set_unexpected",1},{"crt","_get_unexpected",0},
         {"crt","_get_osplatform",1},{"crt","_get_osver",1},{"crt","_get_winver",1},{"crt","_get_winmajor",1},{"crt","_get_winminor",1},
         {"crt","_set_SSE2_enable",1},{"crt","_get_sbh_threshold",0},{"crt","_set_sbh_threshold",1},
@@ -60,7 +60,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_runtime_extra(GuestStat
     // ---- 宿主端直接完成 ----
     if(name=="_seterrormode" || name=="_getdrives" || name=="_getdiskfree" || name=="_getdllprocaddr" || name=="_eof" || name=="_pipe" ||
        name.find("mktemp")!=name.npos || name.find("searchenv")!=name.npos || name=="__fpecode" || name=="__pxcptinfoptrs" ||
-       name=="__p__mbctype" || name=="__pwctype_func" || name=="set_unexpected" || name=="_get_unexpected" ||
+       name=="__pwctype_func" || name=="set_unexpected" || name=="_get_unexpected" ||
        name.starts_with("_get_os") || name.starts_with("_get_win") || name=="_set_SSE2_enable" || name.ends_with("_sbh_threshold") ||
        name.starts_with("__p__") || name=="_vacopy" || name=="_heapadd" || name.starts_with("_CRT_RTC_INIT")){
         auto& state=entry_state;auto& memory=entry_memory;const WindowsCall arg(state,memory,service);
@@ -182,7 +182,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_runtime_extra(GuestStat
                 if(!thread.crt_signal_cells){thread.crt_signal_cells=allocate_heap(memory,16);if(!thread.crt_signal_cells)return done(0);memory.write(GuestAddress{thread.crt_signal_cells},std::array<std::uint8_t,16>{});}
                 return done(thread.crt_signal_cells+(name=="__fpecode"?0U:8U));
             }
-            if(name=="__p__mbctype")return done(crt_mbc_address(memory,current_crt_locale(state,memory),x86_)+28);
             // 與 _iob、_pctype、_pwctype、_dstbias、_amblksiz、_winver 等資料匯出同一位址。
             if(name=="__p__iob")return done(cell(0x800));
             if(name=="__p__pctype")return done(cell(136));

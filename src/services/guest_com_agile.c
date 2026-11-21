@@ -321,7 +321,7 @@ __declspec(dllexport) void CALL SwapPlong(Word *values,Word count){
 __declspec(dllexport) void CALL SwapPword(unsigned short *values,Word count){
     for(Word i=0;i<count;++i)values[i]=__builtin_bswap16(values[i]);
 }
-/* 參考實作的 #64 回傳含終止字元的位元組數；#65 的修飾名稱為 @24，但入口接受三個引數。 */
+/* 參考實作 的 #64 回傳含終止字元的位元組數；#65 的修飾名稱為 @24，但入口接受三個引數。 */
 EXPORT MapiCopyW(unsigned short *dest,const unsigned short *src){
     Word bytes=0;
     do { bytes+=2; } while((*dest++=*src++)!=0);

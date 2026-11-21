@@ -4,6 +4,7 @@
 #include <numeric>
 #include "mf_interfaces.hpp"
 #include "mf_image_layout.h"
+#include "mf_fp16_layout.h"
 #include "guest_mf_image.hpp"
 #include "guest_mf_image_code.hpp"
 #include "mf_buffer_layout.h"
@@ -346,6 +347,7 @@ std::span<const WindowsServiceDescriptor> media_foundation_service_descriptors()
             {"mfplat.dll","MFGetSystemTime",0},{"mfplat.dll","MFFrameRateToAverageTimePerFrame",3,0,0,3},
             {"mfplat.dll","MFGetStrideForBitmapInfoHeader",3,0,0,3},{"mfplat.dll","MFGetPlaneSize",4,0,0,7},
             {"mfplat.dll","MFCalculateImageSize",4,0,0,6},{"mfplat.dll","MFCopyImage",6,0,0,0x3a},
+            {"mfplat.dll","MFConvertFromFP16Array",3,0,0,4},{"mfplat.dll","MFConvertToFP16Array",3,0,0,4},
             {"mfplat.dll","MFCreateAttributes",2,0,0,2},{"mfplat.dll","MFCreateMediaType",1},
             {"mfplat.dll","MFCreateSample",1},{"mfplat.dll","MFCreateMemoryBuffer",2,0,0,1},
             {"mfplat.dll","MFCreateAlignedMemoryBuffer",3,0,0,3},{"mfplat.dll","MFCreateMediaBufferWrapper",4,0,0,6},
@@ -396,6 +398,35 @@ std::span<const WindowsServiceDescriptor> media_foundation_service_descriptors()
     }();return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if (service.symbol == "MFConvertFromFP16Array" || service.symbol == "MFConvertToFP16Array") {
+        const WindowsCall call(state, memory, service);
+        const auto destination = call(0);
+        const auto source = call(1);
+        const auto count = static_cast<std::uint32_t>(call(2));
+        const bool expand = service.symbol == "MFConvertFromFP16Array";
+        MfFp16Plan plan;
+        const auto status = mf_fp16_plan(destination, source, count, x86_ ? UINT32_MAX : UINT64_MAX, expand, &plan);
+        if (!status && count) {
+            if (expand) {
+                const auto convert = [&](std::uint64_t index) {
+                    const auto value = static_cast<std::uint16_t>(memory.load(GuestAddress{source + 2 * index}, 16));
+                    memory.store(GuestAddress{destination + 4 * index}, 32, mf_fp16_expand(value));
+                };
+                const auto split = plan.overlaps ? plan.split : count;
+                for (std::uint32_t index = 0; index < split; ++index) convert(index);
+                for (std::uint32_t index = count; index > split; --index) convert(index - 1);
+            } else {
+                const auto convert = [&](std::uint64_t index) {
+                    const auto value = static_cast<std::uint32_t>(memory.load(GuestAddress{source + 4 * index}, 32));
+                    memory.store(GuestAddress{destination + 2 * index}, 16, mf_fp16_narrow(value));
+                };
+                for (std::uint32_t index = plan.split; index > 0; --index) convert(index - 1);
+                for (std::uint32_t index = plan.split; index < count; ++index) convert(index);
+            }
+        }
+        call.return_to(state, status);
+        return std::nullopt;
+    }
     // 純影像工具保留完整宿主回退，不配置 COM／解碼器狀態。
     if(service.symbol=="MFGetStrideForBitmapInfoHeader" || service.symbol=="MFGetPlaneSize" || service.symbol=="MFCalculateImageSize" || service.symbol=="MFCopyImage"){
         const WindowsCall a(state,memory,service);const auto d=[&](unsigned i){return static_cast<std::uint32_t>(a(i));};std::uint32_t status=0;

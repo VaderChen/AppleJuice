@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "msvc_exception_exports.hpp"
 #include <algorithm>
 #include <bit>
 #include <map>
@@ -42,6 +43,12 @@ void WindowsServices::initialize_guest_msvcp90(GuestMemory& memory){
     static const bool numeric_lowering=[] {const auto* v=std::getenv("X64ARM_GUEST_CPP_NUMERIC");return !v || std::string_view(v)!="0";}();
     if(lowering && numeric_lowering)for(const auto& entry:msvcp_numeric::functions())if(!entry.assignment || entry.x86==x86_)
         image.export_names.emplace(entry.name,parsed.runtime.export_ordinals.at(parsed.runtime.export_names.at(entry.native)));
+    if(lowering && numeric_lowering)for(const auto& entry:msvcp_numeric::modern_functions()){
+        if(!entry.lowest && entry.x86!=x86_)continue;
+        const auto native=entry.lowest?
+            "guest_numeric_"+std::string(msvcp_numeric::types[entry.type].code)+"_lowest":"guest_numeric_assign";
+        image.export_names.emplace(entry.name,parsed.runtime.export_ordinals.at(parsed.runtime.export_names.at(native)));
+    }
     image.export_names.emplace("__numeric_values",parsed.runtime.export_ordinals.at(parsed.runtime.export_names.at("guest_numeric_values")));
     if(lowering)for(const auto& pair:std::array<std::pair<std::string_view,std::string_view>,4>{{
         {x86_?"??8type_info@@QBE_NABV0@@Z":"??8type_info@@QEBA_NAEBV0@@Z","guest_type_equal"},
@@ -156,6 +163,7 @@ std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
         {"crt","??1__non_rtti_object@std@@UEAA@XZ",1},{"crt","??1__non_rtti_object@std@@UAE@XZ",0},
         {"crt","??4__non_rtti_object@std@@QEAAAEAV01@AEBV01@@Z",2},{"crt","??4__non_rtti_object@std@@QAEAAV01@ABV01@@Z",1},
         {"crt","?unexpected@@YAXXZ",0},{"crt","?set_new_handler@@YAP6AXXZP6AXXZ@Z",1},
+        {"crtdll.dll","_amsg_exit",1,0,0,0,true},
         {"crt","_seh_filter_dll",2},{"crt","_seh_filter_exe",2},{"crt","_amsg_exit",1},{"crt","_assert",3},{"crt","_wassert",3},{"crt","_except_handler3",4},{"crt","_except_handler4_common",6},
         {"crt","_set_error_mode",1},{"crt","_set_purecall_handler",1},{"crt","_get_purecall_handler",0},{"crt","set_terminate",1},{"crt","_get_terminate",0},{"crt","_set_se_translator",1},
         {"crt","_local_unwind2",2},{"crt","_seh_longjmp_unwind",1},{"crt","__CxxLongjmpUnwind",1},{"crt","_abnormal_termination",0},
@@ -169,10 +177,14 @@ std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
     // 不把不同版本 STL 物件版面或其餘匯出一概別名至 VC14。
     static const auto versions=[] {
         std::vector<WindowsServiceDescriptor> all(std::begin(table),std::end(table));
+        for(const auto& entry:detail::msvc_exception_exports){
+            if(entry.operation==detail::MsvcExceptionOperation::Vtable)continue;
+            const auto count=entry.parameters-(entry.architectures==1 && entry.thiscall?1U:0U);
+            all.push_back({entry.library,entry.name,count,0,0,0,!entry.thiscall});
+        }
         const auto strings=msvcp90_string::descriptors();all.insert(all.end(),strings.begin(),strings.end());
         const auto streams=msvcp90_stream::descriptors();all.insert(all.end(),streams.begin(),streams.end());
         const auto numeric=msvcp_numeric::descriptors();all.insert(all.end(),numeric.begin(),numeric.end());
-        const auto modern=msvcp_numeric::modern_descriptors();all.insert(all.end(),modern.begin(),modern.end());
         for(const auto& item:table)if(item.symbol.starts_with("?_Fiopen@std@@")){auto entry=item;entry.family="msvcp90.dll";all.push_back(entry);}
         // 零參數 bool 查詢不帶 STL 物件版型，各版本共用目前執行緒／fiber 的 EH 狀態。
         for(const auto family:{"msvcp90.dll","msvcp100.dll","msvcp110.dll","msvcp120.dll"}) // msvcp80 經家族對應共用 msvcp90
@@ -319,32 +331,47 @@ std::uint64_t WindowsServices::msvc_exception_cells(GuestState&,GuestMemory& mem
     return cells;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(detail::find_msvc_exception_export(service.family,service.symbol,x86_))return invoke_rtti(state,memory,service);
     if((service.family=="msvcp100.dll" || service.family=="msvcp120.dll") && service.symbol.find("_Lockit@std@@")!=service.symbol.npos)return invoke_nt_native(state,memory,service);
     if(service.symbol.starts_with("?_XGetLastError@") || service.symbol.starts_with("?generic_category@") || service.symbol.starts_with("?system_category@") || service.symbol.starts_with("?iostream_category@") || service.symbol.starts_with("?_Winerror_map@") || service.symbol.starts_with("?_Winerror_message@") || service.symbol.starts_with("?_Syserror_map@") || service.symbol.starts_with("?_Throw_future_error@") || service.symbol.starts_with("?_Rethrow_future_exception@"))return invoke_msvcp100(state,memory,service);
     if(service.symbol.starts_with("??0exception@") || service.symbol.starts_with("??1exception@") || service.symbol.starts_with("??4exception@") || service.symbol.starts_with("??0bad_") || service.symbol.starts_with("??1bad_") ||
        service.symbol.starts_with("??4bad_") || service.symbol.starts_with("??_Fbad_") || service.symbol.find("__non_rtti_object@")!=std::string_view::npos || service.symbol.starts_with("?what@exception@") || service.symbol.starts_with("?_type_info_dtor_internal_method@") || service.family=="x64arm.msvc" || service.symbol.starts_with("__RT") || service.symbol.starts_with("?_X") || service.symbol=="?_Random_device@std@@YAIXZ")return invoke_rtti(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
-    if(service.family=="msvcp100.dll")if(const auto* modern=msvcp_numeric::modern_function(symbol)){
-        if(!modern->lowest){arg.return_to(state,x86_?state.reg(Gpr::Rcx)&UINT32_MAX:arg(0));return std::nullopt;}
-        const auto& type=msvcp_numeric::types[modern->type];const auto value=msvcp_numeric::lowest_value(type);
-        // -max() 是有限值，經 double 中介回傳不改變位元。
-        if(type.floating)windows_floating_return(state,x86_,type.bits==32?static_cast<double>(std::bit_cast<float>(static_cast<std::uint32_t>(value))):std::bit_cast<double>(value),type.bits==32);
-        arg.return_to(state,value,!type.floating && type.bits==64);return std::nullopt;
-    }
-    if(service.family=="msvcp90.dll" || service.family=="msvcp100.dll")if(const auto* numeric=msvcp_numeric::function(symbol)){
-        if(numeric->assignment){arg.return_to(state,x86_?state.reg(Gpr::Rcx)&UINT32_MAX:arg(0));return std::nullopt;}
-        const auto& type=msvcp_numeric::types[numeric->type];const auto value=type.values[numeric->operation];
-        if(type.floating){
-            if(x86_){
-                // 沿用核心 x87 載入契約，包括 sNaN、非正規數、堆疊與待處理例外。
-                const auto& image=runtime_.builtin_images.at(callback_return_.value+msvcp90_string::image_offset);
-                Instruction load{};load.opcode=Opcode::X87;load.x87_operation=X87Op::Load;load.operand_count=1;load.width=static_cast<std::uint8_t>(type.bits);
-                load.operands[0].kind=OperandKind::Memory;load.operands[0].width=static_cast<std::uint8_t>(type.bits);
-                load.operands[0].memory.displacement=image.base+image.export_names.at("__numeric_values")+(numeric->type*8+numeric->operation)*8;
-                auto next=state;execute_x87(load,state,next,memory);state=next;
-            }else for(unsigned i=0;i<type.bits/8;++i)state.xmm[0][i]=static_cast<std::uint8_t>(value>>(8*i));
+    if(msvcp_numeric::provider(service.family)){
+        const auto* numeric=msvcp_numeric::function(symbol);
+        const auto* modern=msvcp_numeric::modern_function(symbol);
+        if(numeric || modern){
+            const bool assign=numeric?numeric->assignment:!modern->lowest;
+            if(assign){
+                arg.return_to(state,x86_?state.reg(Gpr::Rcx)&UINT32_MAX:arg(0));
+                return std::nullopt;
+            }
+            const auto index=numeric?numeric->type:modern->type;
+            const auto operation=numeric?numeric->operation:std::size(msvcp_numeric::operations);
+            const auto& type=msvcp_numeric::types[index];
+            const auto value=numeric?type.values[operation]:msvcp_numeric::lowest_value(type);
+            if(type.floating){
+                if(x86_){
+                    // x87 使用與常駐程式相同的位元資料，保留 sNaN、非正規數與待處理例外。
+                    const auto& image=runtime_.builtin_images.at(callback_return_.value+msvcp90_string::image_offset);
+                    const auto bits=static_cast<std::uint8_t>(type.bits);
+                    Instruction load{};
+                    load.opcode=Opcode::X87;
+                    load.x87_operation=X87Op::Load;
+                    load.operand_count=1;
+                    load.width=bits;
+                    load.operands[0].kind=OperandKind::Memory;
+                    load.operands[0].width=bits;
+                    load.operands[0].memory.displacement=image.base+image.export_names.at("__numeric_values")+
+                        (index*msvcp_numeric::value_stride+operation)*sizeof(std::uint64_t);
+                    auto next=state;
+                    execute_x87(load,state,next,memory);
+                    state=next;
+                }else for(unsigned i=0;i<type.bits/8;++i)state.xmm[0][i]=static_cast<std::uint8_t>(value>>(8*i));
+            }
+            arg.return_to(state,value,!type.floating && type.bits==64);
+            return std::nullopt;
         }
-        arg.return_to(state,value,!type.floating && type.bits==64);return std::nullopt;
     }
 #include "msvcp90_string_handlers.inc"
     if(symbol.starts_with("??8type_info@@") || symbol.starts_with("??9type_info@@") || symbol.starts_with("?before@type_info@@") || symbol.starts_with("?raw_name@type_info@@")){

@@ -11,7 +11,24 @@ constexpr unsigned limit=1U<<20;
 void put(std::span<std::uint8_t> bytes,unsigned at,std::uint64_t value,unsigned size=2){for(unsigned i=0;i<size;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(i*8));}
 std::uint32_t get(std::span<const std::uint8_t> bytes,unsigned at,unsigned size=4){std::uint32_t value{};for(unsigned i=0;i<size;++i)value|=std::uint32_t{bytes[at+i]}<<(i*8);return value;}
 std::int32_t signed_value(std::uint32_t value,unsigned size){if(!size)return 0;const unsigned shift=32-size*8;return std::bit_cast<std::int32_t>(value<<shift)>>shift;}
-struct Global {unsigned page{},bits{},count{};std::uint8_t report{};std::int32_t minimum{},maximum{},physical_minimum{},physical_maximum{};std::uint32_t unit{},exponent{};};
+struct Global {
+    unsigned page{},bits{},count{};
+    std::uint8_t report{};
+    std::int32_t minimum{},maximum{},physical_minimum{},physical_maximum{};
+    std::uint32_t unit{},exponent{};
+    std::array<UnknownToken,4> unknown{};
+    unsigned unknown_count{};
+
+    void set_unknown(std::uint8_t prefix,std::uint32_t value) {
+        // 未辨識的全域 short item 仍遵守同一 tag 覆寫及 Push／Pop。
+        const auto end=unknown.begin()+unknown_count;
+        const auto entry=std::find_if(unknown.begin(),end,[&](const UnknownToken& token){
+            return (token.prefix>>4)==(prefix>>4);
+        });
+        if(entry==end)++unknown_count;
+        *entry={prefix,value};
+    }
+};
 struct Local {
     std::vector<Usage> usages;Usage minimum{},maximum{};bool have_minimum{},have_maximum{},delimiter{};
     void clear(){*this={};}
@@ -27,20 +44,32 @@ struct Local {
 struct Collection {Usage usage{};unsigned parent{},root{},type{};};
 struct ParsedField {Field field;unsigned root{};};
 constexpr std::array<std::uint8_t,8> signature{'M','W','H','P','D','0','0','1'};
-}
-Layout parse(std::span<const std::uint8_t> descriptor,Usage top){
-    if(descriptor.empty() || descriptor.size()>limit)throw Error(invalid_preparsed);
-    Global global;Local local;std::vector<Global> globals;std::vector<unsigned> stack;
+constexpr std::array<std::uint8_t,8> root_signature{'M','W','H','P','D','0','0','2'};
+struct ParsedDescriptor {
     std::vector<Collection> collections;std::vector<ParsedField> fields;
+    std::vector<unsigned> roots;
     std::array<std::array<unsigned,256>,3> offsets{};
-    std::array<std::array<bool,256>,3> used{};bool numbered=false;
     std::map<std::pair<unsigned,unsigned>,std::set<unsigned>> report_roots;
+    bool numbered{};
+};
+ParsedDescriptor parse_descriptor(std::span<const std::uint8_t> descriptor,bool driver){
+    if(descriptor.size()>limit)throw CollectionError(0xc0000023U,0,2);
+    ParsedDescriptor parsed;
+    auto& [collections,fields,roots,offsets,report_roots,numbered]=parsed;
+    Global global;Local local;std::vector<Global> globals;std::vector<unsigned> stack;
+    std::array<unsigned,256> report_collections{};
     const auto usage=[&](std::uint32_t value,unsigned size){return Usage{static_cast<std::uint16_t>(size==4?value>>16:global.page),static_cast<std::uint16_t>(value)};};
     for(std::size_t cursor=0;cursor<descriptor.size();){
+        const auto item_at=static_cast<unsigned>(cursor);
         const auto prefix=descriptor[cursor++];
-        if(prefix==0xfe){if(descriptor.size()-cursor<2)throw Error(invalid_preparsed);const auto size=descriptor[cursor];cursor+=2;if(size>descriptor.size()-cursor)throw Error(invalid_preparsed);cursor+=size;continue;}
+        if(prefix==0xfe){
+            if(descriptor.size()-cursor<2)throw CollectionError(0xc0000023U,item_at,7);
+            const auto size=descriptor[cursor];cursor+=2;
+            if(size>descriptor.size()-cursor)throw CollectionError(0xc0000023U,item_at,2);
+            cursor+=size;continue;
+        }
         unsigned size=prefix&3U;if(size==3)size=4;
-        if(size>descriptor.size()-cursor)throw Error(invalid_preparsed);
+        if(size>descriptor.size()-cursor)throw CollectionError(0xc0000023U,item_at,size==4?8:5+size);
         const auto number=get(descriptor,static_cast<unsigned>(cursor),size);cursor+=size;
         const unsigned kind=(prefix>>2)&3U,tag=static_cast<unsigned>(prefix)>>4;
         if(kind==1){
@@ -53,11 +82,14 @@ Layout parse(std::span<const std::uint8_t> descriptor,Usage top){
                 case 5:global.exponent=std::bit_cast<std::uint32_t>((number&8U)?static_cast<std::int32_t>(number&15U)-16:static_cast<std::int32_t>(number&15U));break;
                 case 6:global.unit=number;break;
                 case 7:global.bits=number;break;
-                case 8:if(!number || number>255)throw Error(invalid_preparsed);global.report=static_cast<std::uint8_t>(number);numbered=true;break;
+                case 8:
+                    if(!number || number>255)throw CollectionError(invalid_type,item_at,0x14,{number});
+                    if(driver && stack.empty())throw CollectionError(0xc00000b9U,item_at,0x13,{number});
+                    global.report=static_cast<std::uint8_t>(number);numbered=true;break;
                 case 9:global.count=number;break;
                 case 10:if(globals.size()>=64)throw Error(invalid_preparsed);globals.push_back(global);break;
                 case 11:if(globals.empty())throw Error(invalid_preparsed);global=globals.back();globals.pop_back();break;
-                default:break;
+                default:global.set_unknown(prefix,number);break;
             }
         }else if(kind==2){
             if(local.delimiter)continue;
@@ -69,32 +101,73 @@ Layout parse(std::span<const std::uint8_t> descriptor,Usage top){
             if(tag==10){
                 if(stack.size()>=64 || collections.size()>=65535)throw Error(invalid_preparsed);
                 const auto values=local.expand();const auto index=static_cast<unsigned>(collections.size());
-                collections.push_back({values.empty()?Usage{}:values.front(),stack.empty()?index:stack.back(),stack.empty()?index:collections[stack.back()].root,number&0xffU});stack.push_back(index);
-            }else if(tag==12){if(stack.empty())throw Error(invalid_preparsed);stack.pop_back();}
+                if(stack.empty()){
+                    if(driver && values.size()!=1)
+                        throw CollectionError(0xc00000b9U,item_at,0x0b,{static_cast<std::uint32_t>(roots.size()+1)});
+                    roots.push_back(index);
+                }
+                collections.push_back({values.empty()?Usage{}:values.front(),stack.empty()?index:stack.back(),roots.back(),number&0xffU});
+                stack.push_back(index);
+            }else if(tag==12){
+                if(stack.empty())throw CollectionError(0xc00000b9U,item_at,4);
+                stack.pop_back();
+            }
             else if(tag==8 || tag==9 || tag==11){
-                if(stack.empty() || !global.bits || global.bits>65535 || !global.count || global.count>65535)throw Error(invalid_preparsed);
+                if(stack.empty())throw CollectionError(0xc00000b9U,item_at,0x1b,{prefix});
+                if(!global.bits || global.bits>65535 || !global.count || global.count>65535)throw Error(invalid_preparsed);
                 const unsigned type=tag==8?0U:tag==9?1U:2U;
+                if(driver){
+                    const auto collection=static_cast<unsigned>(roots.size());
+                    auto& owner=report_collections[global.report];
+                    if((!global.report && (collection>1 || numbered)) || (global.report && report_collections[0]))
+                        throw CollectionError(0xc00000b9U,item_at,0x16,{collection});
+                    if(owner && owner!=collection)throw CollectionError(0xc00000b9U,item_at,0x15,{collection});
+                    owner=collection;
+                }
                 auto& offset=offsets[type][global.report];if(std::uint64_t{global.bits}*global.count+offset>limit*8U)throw Error(invalid_preparsed);
-                const auto at=offset+8;offset+=global.bits*global.count;used[type][global.report]=true;report_roots[{type,global.report}].insert(collections[stack.back()].root);
+                const auto at=offset+8;offset+=global.bits*global.count;report_roots[{type,global.report}].insert(roots.back());
                 if(!(number&1U)){
-                    auto values=local.expand();if(values.empty()){local.clear();continue;}
+                    auto values=local.expand();
+                    if(values.empty()){
+                        if(driver)throw CollectionError(0xc00000b9U,item_at,0x0a);
+                        local.clear();continue;
+                    }
                     Field field;field.type=type;field.offset=at;field.width=global.bits;field.count=global.count;field.link=stack.back();field.report=global.report;field.flags=number;
                     field.minimum=global.minimum;field.maximum=global.maximum;field.physical_minimum=global.physical_minimum;field.physical_maximum=global.physical_maximum;
                     field.unit=global.unit;field.unit_exponent=global.exponent;field.range=local.have_minimum;field.link_usage=collections[stack.back()].usage;
+                    field.unknown_globals=global.unknown;field.unknown_global_count=global.unknown_count;
                     // 一位元及 array controls 為 button；一般整數軸為 value。
                     field.button=global.bits==1 || !(number&2U);field.usages=std::move(values);
                     if(field.variable()){field.usages.resize(field.count,field.usages.back());}
                     if(fields.size()>=65536)throw Error(invalid_preparsed);
-                    fields.push_back({std::move(field),collections[stack.back()].root});
+                    fields.push_back({std::move(field),roots.back()});
                 }
+            }else if(driver){
+                throw CollectionError(0xc000001dU,item_at,0x12,{prefix});
             }
             local.clear();
+        }else if(driver){
+            throw CollectionError(0xc000001dU,item_at,0x12,{prefix});
         }
     }
-    if(!stack.empty() || !globals.empty() || collections.empty())throw Error(invalid_preparsed);
-    const auto selected=std::find_if(collections.begin(),collections.end(),[&](const auto& c){return &c==&collections[c.root] && ((!top.page && !top.value) || c.usage==top);});
-    if(selected==collections.end())throw Error(invalid_preparsed);
-    const auto root=static_cast<unsigned>(selected-collections.begin());Layout result;result.usage=selected->usage;result.numbered=numbered;
+    const auto end=static_cast<unsigned>(descriptor.size());
+    if(!stack.empty() || !globals.empty())throw CollectionError(0xc00000b9U,end,0x40);
+    if(collections.empty())throw CollectionError(0x80000022U,end,0x1a);
+    if(driver){
+        if(roots.size()>UINT8_MAX)throw CollectionError(0xc00000b9U,end,0x40);
+        if(roots.size()>1 && report_collections[0])throw CollectionError(0xc00000b9U,end,0x16,{2});
+        for(unsigned id=0;id<256;++id){
+            const auto input=offsets[0][id],output=offsets[1][id],feature=offsets[2][id];
+            if((input|output|feature)&7U)
+                throw CollectionError(0xc00000b9U,end,9,{report_collections[id],id,input,output,feature});
+        }
+    }
+    return parsed;
+}
+Layout build_layout(ParsedDescriptor& parsed,unsigned root){
+    auto& collections=parsed.collections;
+    if(root>=collections.size() || collections[root].root!=root)throw Error(invalid_preparsed);
+    Layout result;result.usage=collections[root].usage;result.numbered=parsed.numbered;
     std::map<unsigned,unsigned> links;
     for(unsigned i=0;i<collections.size();++i)if(collections[i].root==root)links.emplace(i,static_cast<unsigned>(links.size()));
     result.links=static_cast<std::uint16_t>(links.size());
@@ -103,12 +176,37 @@ Layout parse(std::span<const std::uint8_t> descriptor,Usage top){
     for(const auto [collection,node]:links){auto& item=result.nodes[node];item.usage=collections[collection].usage;item.type=collections[collection].type;
         if(collection==root)continue;const auto parent=links.at(collections[collection].parent);item.parent=parent;
         item.next_sibling=result.nodes[parent].first_child;result.nodes[parent].first_child=node;++result.nodes[parent].children;}
-    for(auto& item:fields)if(item.root==root){auto& f=item.field;f.link=links.at(f.link);f.index=result.data_indices[f.type];
+    for(auto& item:parsed.fields)if(item.root==root){auto& f=item.field;f.link=links.at(f.link);f.index=result.data_indices[f.type];
         if(f.indices()>65535-result.data_indices[f.type])throw Error(invalid_preparsed);
         result.data_indices[f.type]+=f.indices();result.fields.push_back(std::move(f));}
-    for(unsigned type=0;type<3;++type)for(unsigned report=0;report<256;++report)if(used[type][report]){
-        const bool belongs=report_roots.at({type,report}).contains(root);
-        if(belongs){const auto bytes=(offsets[type][report]+7)/8+1;if(bytes>65535)throw Error(invalid_preparsed);result.report_bytes[type][report]=bytes;}}
+    for(const auto& [report,owners]:parsed.report_roots)if(owners.contains(root)){
+        const auto [type,id]=report;const auto bytes=(parsed.offsets[type][id]+7)/8+1;
+        if(bytes>65535)throw Error(invalid_preparsed);
+        result.report_bytes[type][id]=bytes;
+    }
+    return result;
+}
+}
+Layout parse(std::span<const std::uint8_t> descriptor,Usage top){
+    auto parsed=parse_descriptor(descriptor,false);
+    const auto root=std::ranges::find_if(parsed.roots,[&](unsigned i){return (!top.page && !top.value) || parsed.collections[i].usage==top;});
+    if(root==parsed.roots.end())throw Error(invalid_preparsed);
+    return build_layout(parsed,*root);
+}
+std::vector<CollectionDescription> describe_collections(std::span<const std::uint8_t> descriptor){
+    // HID 描述元長度來自 16 位元 wDescriptorLength。
+    if(descriptor.size()>UINT16_MAX)throw CollectionError(0xc0000023U,0,2);
+    auto parsed=parse_descriptor(descriptor,true);
+    std::vector<CollectionDescription> result;
+    result.reserve(parsed.roots.size());
+    for(const auto root:parsed.roots){
+        auto layout=build_layout(parsed,root);
+        std::vector<std::uint8_t> data(20+descriptor.size());
+        std::copy(root_signature.begin(),root_signature.end(),data.begin());
+        put(data,8,data.size(),4);put(data,12,root,4);put(data,16,descriptor.size(),4);
+        std::copy(descriptor.begin(),descriptor.end(),data.begin()+20);
+        result.push_back({layout.usage,std::move(layout.report_bytes),std::move(data)});
+    }
     return result;
 }
 unsigned Layout::bytes(unsigned type)const{if(type>=3)throw Error(invalid_type);return *std::max_element(report_bytes[type].begin(),report_bytes[type].end());}
@@ -229,8 +327,16 @@ std::vector<std::uint8_t> preparsed(std::span<const std::uint8_t> descriptor,Usa
     const auto layout=parse(descriptor,top);std::vector<std::uint8_t> data(20+descriptor.size());std::copy(signature.begin(),signature.end(),data.begin());put(data,8,data.size(),4);put(data,12,layout.usage.page);put(data,14,layout.usage.value);put(data,16,descriptor.size(),4);std::copy(descriptor.begin(),descriptor.end(),data.begin()+20);return data;
 }
 std::uint32_t preparsed_size(std::span<const std::uint8_t> header){
-    if(header.size()<20 || !std::equal(signature.begin(),signature.end(),header.begin()))throw Error(invalid_preparsed);
+    if(header.size()<20 || (!std::equal(signature.begin(),signature.end(),header.begin()) &&
+                            !std::equal(root_signature.begin(),root_signature.end(),header.begin())))throw Error(invalid_preparsed);
     const auto size=get(header,8);if(size<21 || size>limit+20 || size-20!=get(header,16))throw Error(invalid_preparsed);return size;
 }
-Layout decode(std::span<const std::uint8_t> data){if(preparsed_size(data)!=data.size())throw Error(invalid_preparsed);return parse(data.subspan(20),{static_cast<std::uint16_t>(get(data,12,2)),static_cast<std::uint16_t>(get(data,14,2))});}
+Layout decode(std::span<const std::uint8_t> data){
+    if(preparsed_size(data)!=data.size())throw Error(invalid_preparsed);
+    if(std::equal(root_signature.begin(),root_signature.end(),data.begin())){
+        auto parsed=parse_descriptor(data.subspan(20),false);
+        return build_layout(parsed,get(data,12));
+    }
+    return parse(data.subspan(20),{static_cast<std::uint16_t>(get(data,12,2)),static_cast<std::uint16_t>(get(data,14,2))});
+}
 }

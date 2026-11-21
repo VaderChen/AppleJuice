@@ -12,7 +12,8 @@ inline constexpr std::u16string_view output_id=u"{0.0.0.00000000}.{x64arm-core-a
 inline constexpr std::u16string_view input_id=u"{0.0.1.00000000}.{x64arm-core-audio-input}";
 // ids 為依 WinMM 裝置編號排列的端點 ID；第 0 個是系統預設裝置。
 inline std::uint32_t device_message(GuestMemory& memory,std::uint64_t device,std::uint32_t message,
-                                  std::uint64_t first,std::uint64_t second,std::span<const std::u16string> ids,bool opened,bool x86){
+                                  std::uint64_t first,std::uint64_t second,std::span<const std::u16string> ids,bool opened,bool x86,
+                                  bool preferred_only=true){
     // 系統攔截查詢接受 device ID，不接受已開啟的 HWAVE handle。
     if(opened)return 8;
     const bool mapper=device==UINT32_MAX || device==UINT64_MAX;const bool available=!ids.empty();
@@ -22,7 +23,7 @@ inline std::uint32_t device_message(GuestMemory& memory,std::uint64_t device,std
         if(!mapper)return 8;
         if(!first || !second)return 11;
         memory.check(GuestAddress{first},4,Access::Write);memory.check(GuestAddress{second},4,Access::Write);
-        memory.store(GuestAddress{first},32,available?0:UINT32_MAX);memory.store(GuestAddress{second},32,1);return 0;
+        memory.store(GuestAddress{first},32,available?0:UINT32_MAX);memory.store(GuestAddress{second},32,preferred_only?1:0);return 0;
     }
     if(mapper)return 2;
     if(!available)return 2;

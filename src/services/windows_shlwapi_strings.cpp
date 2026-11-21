@@ -145,7 +145,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_string(GuestState& 
             std::size_t count=source.characters.size();
             if(reverse && arg(1)){
                 if(arg(1)<arg(0))return done(0);
-                // 參考實作的 A 版包含 end 指向的字元，W 版則以 end 為上限。
+                // 參考實作 的 A 版包含 end 指向的字元，W 版則以 end 為上限。
                 const auto end=arg(1)-arg(0);
                 const auto stop=std::find_if(source.characters.begin(),source.characters.end(),
                     [&](const auto& c){return wide?c.offset>=end:c.offset>end;});
@@ -304,7 +304,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_string(GuestState& 
             if(!arg(0) || !arg(1) || capacity<=0)return done(0);
             const auto source=read_utf16(memory,GuestAddress{arg(0)},1U<<20);
             const auto written=write_as(arg(1),source,static_cast<std::size_t>(capacity),false);
-            // 參考實作使用 MAX_PATH 個 WCHAR（含 NUL）作反向轉換。
+            // 參考實作 使用 MAX_PATH 個 WCHAR（含 NUL）作反向轉換。
             if(source.size()>=260)return done(0);
             const auto encoded=read_ansi(memory,arg(1),written+1);
             return done(utf8_to_utf16_lossy(encoded)==source);

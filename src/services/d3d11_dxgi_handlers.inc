@@ -15,15 +15,20 @@
             if(offer){
                 // Metal 資源仍實際駐留，不任意丟棄內容；先完成使用中命令，並解除所有 context 綁定。
                 device->native->graphics_flush(true);
-                std::vector<std::uint64_t> detached;
+                struct Binding {std::uint64_t* slot;std::uint64_t address;bool retained,internal;};
+                std::vector<Binding> detached;
                 for(auto& [pointer,item]:bridge.objects){
                     (void)pointer;if(item.kind!=Kind::Context || item.identity->device!=device->root)continue;
-                    for(auto& [name,values]:item.identity->bindings){(void)name;for(auto& value:values)if(value){
+                    for(auto& [name,values]:item.identity->bindings){for(auto& value:values)if(value){
                         auto bound=object(value).identity;if(bound->texture)bound=object(bound->texture).identity;
-                        if(std::find(resources.begin(),resources.end(),bound)!=resources.end()){detached.push_back(value);value=0;}
+                        if(std::find(resources.begin(),resources.end(),bound)!=resources.end()){
+                            detached.push_back({&value,value,!item.identity->weak_bindings,internal_binding(*item.identity,name)});
+                        }
                     }}
                 }
-                for(auto ptr:detached)release(ptr);
+                for(const auto& item:detached)*item.slot=0;
+                // 管線保有的資源綁定依原本持有方式釋放，保留客體的 COM 引用。
+                for(const auto& item:detached)if(item.retained)release_object(release_object,item.address,item.internal);
             }
             for(unsigned i=0;i<resources.size();++i){resources[i]->offered=offer;if(!offer && arg(3))memory.store(GuestAddress{arg(3)+4*i},32,0);}
         }else if(symbol=="EnqueueSetEvent"){

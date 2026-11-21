@@ -3,7 +3,7 @@
 #include "x64arm/unicode.hpp"
 
 namespace x64arm {
-// 系統視窗程序的名稱與 參考實作的內建類別拼法一致，使用者註冊名稱保留原大小寫。
+// 系統視窗程序的名稱與 參考實作 的內建類別拼法一致，使用者註冊名稱保留原大小寫。
 inline std::u16string_view builtin_class_name(std::u16string_view key){
     static constexpr std::pair<std::u16string_view,std::u16string_view> names[]{
         {u"button",u"Button"},{u"static",u"Static"},{u"edit",u"Edit"},{u"listbox",u"ListBox"},

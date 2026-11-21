@@ -47,7 +47,7 @@ static inline uint32_t mapi_hex_convert(enum MapiHexOperation op,uint64_t src,ui
         if(lo<0)return op==MapiHexBounded?invalid:op==MapiHexNumber?value:0;
         unsigned byte=((unsigned)hi<<4)|(unsigned)lo;
         if(op==MapiHexNumber){
-            /* 參考實作每消耗兩個字元即乘 16，累計結果保留低 32 位。 */
+            /* 參考實作 每消耗兩個字元即乘 16，累計結果保留低 32 位。 */
             value=value*16+byte;
         }else{
             if(op==MapiHexBounded && !count--)return too_big;

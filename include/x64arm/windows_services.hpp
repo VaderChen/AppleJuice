@@ -35,7 +35,13 @@
 #include "x64arm/debug_events.hpp"
 #include "x64arm/usb.hpp"
 
+struct USet;
+struct UEnumeration;
+struct UFieldPositionIterator;
+struct UFormattedValue;
+
 namespace x64arm {
+namespace icu_abi {struct IcuStatus;}
 namespace dns_detail {struct Record;}
 namespace wlan {class Backend;}
 // 協調者本地一般服務的 provider 要啟動客體回呼時丟出；呼叫端恢復狀態交回完整路徑。
@@ -192,6 +198,7 @@ struct ConcrtContext {
     std::uint64_t object{}, event{};
     bool blocked{}, unblocked{};
 };
+struct DxDiagState;
 class WindowsServices final : public HostServices {
     friend struct WindowsNetworkTestAccess;
     friend struct WindowsHeapTestAccess;
@@ -334,6 +341,7 @@ public:
     void restrict_comparison() { runtime_.detach_machine_clock();machine_shutdown_.reset();runtime_.network.external_io=false;shared_tokens_.clear();mutating_shared_token_=0; }
     // 唯讀檢查；名稱須為 loader 使用的小寫 DLL basename。
     bool builtin_module(std::string_view name) const;
+    bool builtin_pe_export(std::string_view module, std::string_view symbol) const;
     GuestAddress resolve(std::string_view dll, std::string_view symbol) const;
     GuestAddress bind_import(std::string_view dll, std::string_view symbol, bool trap_unresolved);
     const std::vector<std::string>& unresolved_imports() const noexcept { return unresolved_imports_; }
@@ -465,6 +473,57 @@ private:
     void discard_unstarted_thread(GuestMemory&,std::uint64_t,std::uint32_t);
     std::uint32_t process_image_source(std::uint64_t,ProcessImageSource&);
     NativeLibraries native_libraries_;
+    std::map<std::string,std::uint64_t,std::less<>> icu_character_literals_;
+    std::uint64_t publish_icu_literal(GuestMemory&,const char*);
+    std::optional<std::uint32_t> invoke_icu_character(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuSetState> icu_sets_;
+    bool publish_icu_set(GuestState&,GuestMemory&,std::uint64_t,struct IcuSetObject&,const USet*);
+    std::uint64_t adopt_icu_set(GuestState&,GuestMemory&,struct IcuSetObject);
+    std::uint64_t install_icu_set(GuestState&,GuestMemory&,std::uint64_t,USet*);
+    std::optional<std::uint32_t> invoke_icu_set(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuTrieState> icu_tries_;
+    std::optional<std::uint32_t> invoke_icu_trie(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_icu_guest_text(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuBreakState> icu_breaks_;
+    std::optional<std::uint32_t> invoke_icu_break(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuCaseState> icu_cases_;
+    std::optional<std::uint32_t> invoke_icu_case(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuNormalizationState> icu_normalization_;
+    std::optional<std::uint32_t> invoke_icu_normalization(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuLocaleState> icu_locale_;
+    const char* icu_default_locale() const;
+    std::optional<std::uint32_t> invoke_icu_locale(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    service_callback::Task<std::uint64_t> export_icu_enumeration(GuestState&,GuestMemory&,UEnumeration&,icu_abi::IcuStatus&);
+    std::shared_ptr<struct IcuCurrencyState> icu_currency_;
+    std::optional<std::uint32_t> invoke_icu_currency(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuCalendarState> icu_calendar_;
+    const char16_t* icu_default_time_zone() const;
+    bool publish_icu_calendar_view(GuestMemory&,std::uint64_t,const void*);
+    std::uint64_t adopt_icu_calendar(GuestState&,GuestMemory&,struct IcuCalendarObject);
+    std::optional<std::uint32_t> invoke_icu_calendar(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuDatePatternState> icu_date_pattern_;
+    std::optional<std::uint32_t> invoke_icu_date_pattern(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuNumberState> icu_number_;
+    bool publish_icu_field_positions(GuestState&,GuestMemory&,std::uint64_t,UFieldPositionIterator&);
+    void publish_icu_formattable(GuestMemory&,std::uint64_t,const void*);
+    std::uint64_t adopt_icu_formattable(GuestState&,GuestMemory&,struct IcuFormattableObject);
+    void clear_icu_formattable_references(GuestState&,GuestMemory&,struct IcuFormattableObject&);
+    std::optional<std::uint32_t> invoke_icu_number_object(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_icu_number(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuDateFormatState> icu_date_format_;
+    std::optional<std::uint32_t> invoke_icu_date_format(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuFormattedState> icu_formatted_;
+    std::optional<std::uint32_t> invoke_icu_formatted(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::uint64_t adopt_icu_formatted_value(GuestState&,GuestMemory&,const UFormattedValue*,icu_abi::IcuStatus&);
+    void refresh_icu_formatted_value(GuestState&,GuestMemory&,std::uint64_t,icu_abi::IcuStatus&);
+    void release_icu_formatted_value(GuestState&,GuestMemory&,std::uint64_t);
+    std::shared_ptr<struct IcuModernNumberState> icu_modern_number_;
+    std::optional<std::uint32_t> invoke_icu_modern_number(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuCharsetDetectionState> icu_charset_detection_;
+    std::optional<std::uint32_t> invoke_icu_charset_detection(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_icu_region(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuIdnaState> icu_idna_;
+    std::optional<std::uint32_t> invoke_icu_idna(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<NativeAngle> native_angle_;
     std::optional<std::uint32_t> invoke_angle(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<NativeV8> native_v8_;
@@ -1021,7 +1080,7 @@ private:
     std::optional<std::uint32_t> resume_eh4(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     std::optional<std::uint32_t> invoke_crt_error(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint64_t find_module(std::u16string_view name) const;
-    GuestAddress resolve_service(std::string_view,std::string_view,bool required) const;
+    GuestAddress resolve_service(std::string_view,std::string_view,bool required,bool allow_resident=true) const;
     // 描述元本身的宿主服務入口（不經匯出改導向的客體快速常式）；沒有對應描述元時回 0。
     GuestAddress host_service_stub(std::string_view family,std::string_view symbol) const;
 public:
@@ -1156,6 +1215,9 @@ private:
     std::optional<std::uint32_t> invoke_fiber(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void destroy_fiber(GuestState&,GuestMemory&,std::uint64_t);
     std::optional<std::uint32_t> invoke_dib_transfer(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::uint32_t read_gdiplus_image(GuestState&,GuestMemory&,std::span<const std::uint8_t> bytes,
+                                     std::uint64_t output,std::string_view operation,std::uint64_t source_handle=0,
+                                     bool take_ownership=false,std::uint64_t placeable=0);
     std::optional<std::uint32_t> invoke_gdiplus(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<GdiplusState> gdiplus_;
     std::shared_ptr<RibbonState> ribbon_;
@@ -1380,6 +1442,8 @@ private:
     void initialize_msvcp_numeric_facet(GuestState&,GuestMemory&,std::uint64_t,bool,bool,const CrtLocaleCategory&,std::uint32_t,bool=false,unsigned variant=0);
     void queue_msvcp_facet_retirement(std::uint64_t);
     std::optional<std::uint32_t> invoke_msvcp100(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // worker 端的基底 ctype<char>::toupper／tolower（單字元）：只讀 facet 語系表；衍生 facet 或資料不在表內時回 false 交回協調者。
+    bool msvcp_ctype_case_worker(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_msvcp100(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     void discard_msvcp100(std::uint64_t,GuestState&,GuestMemory&);
     void prepare_msvcp_exception_capture(GuestState&,GuestMemory&,std::uint64_t);
@@ -1391,7 +1455,7 @@ private:
     std::optional<std::uint32_t> resume_stack_walk(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     void discard_stack_walk(std::uint64_t,GuestMemory&,const GuestState&);
     FileInformation publish_font_file(std::span<const std::uint8_t>);
-    std::uint32_t publish_module_file(std::u16string_view,std::span<const std::uint8_t>);
+    std::uint32_t publish_module_file(std::u16string_view,std::span<const std::uint8_t>,std::filesystem::path* source=nullptr);
     std::optional<std::uint32_t> invoke_dwrite(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_dwrite(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     void discard_dwrite(std::uint64_t,GuestMemory&,const GuestState&);
@@ -1490,6 +1554,9 @@ private:
     std::map<std::uint64_t,std::shared_ptr<NativeGraphics>> present_waits_;
     // 等背景著色器編譯的建立重試（ThreadWaitKind::ShaderRetry）：執行緒 → 圖形後端與票號；只在協調者讀寫。
     std::map<std::uint64_t,std::pair<std::shared_ptr<NativeGraphics>,std::uint64_t>> shader_waits_;
+    // select／WSAPoll 等待（ThreadWaitKind::SocketSelect）的下一次就緒檢查時刻（clock_ticks）：執行緒 → 期限；只在協調者讀寫。
+    std::map<std::uint64_t,std::uint64_t> socket_poll_due_;
+    bool socket_poll_due(std::uint64_t thread) const noexcept;
     // 只有 X64ARM_TRACE_CRITICAL_STALLS 開啟時記錄；等待結束才輸出，不在正常路徑收集事件。
     struct CriticalWaitDiagnostic {
         std::uint64_t started_us{},address{},caller{},initial_owner{},dependency_us{},dependency_owner{},dependency_ticket{};
@@ -1554,6 +1621,7 @@ private:
     void discard_d3dx_progress(GuestState&,GuestMemory&,std::uint64_t);
     std::optional<std::uint32_t> invoke_d3d9(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     std::shared_ptr<D3D11State> d3d11_;
+    bool dxgi_guest_layers() const noexcept;
     std::optional<std::uint32_t> resume_d3d_compile(GuestState&, GuestMemory&, std::uint64_t, std::uint32_t);
     void discard_d3d_compile(GuestState&, GuestMemory&, std::uint64_t);
     std::optional<std::uint32_t> invoke_d3d11(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
@@ -1936,6 +2004,9 @@ private:
     std::optional<std::uint32_t> resume_registered_wait(GuestState&,GuestMemory&);
     std::optional<std::uint32_t> invoke_registered_wait(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_thread(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_thread_ordering(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    void release_thread_ordering(std::uint64_t thread) noexcept;
+    std::map<std::uint64_t,std::shared_ptr<class ThreadOrderingContext>> thread_ordering_contexts_;
     // MMCSS 工作設定與工作索引（avrt 與 Media Foundation 的 MMCSS 工作佇列共用）；呼叫端須持有登錄交易。
     struct MultimediaProfile {std::u16string name;std::uint32_t error{};int priority{2},minimum{},maximum{};};
     std::optional<std::uint32_t> multimedia_responsiveness() const;
@@ -2623,6 +2694,7 @@ private:
     }
     void initialize_runtime(GuestMemory& memory, std::u16string_view command_line);
     void configure_runtime_arguments(GuestMemory&,std::u16string_view,std::uint64_t);
+    std::uint32_t configure_crt_argv(GuestState&,GuestMemory&,bool wide,bool expand);
     void configure_initial_environment(GuestMemory&,const GuestState&,std::span<const std::uint8_t>);
     void configure_native_startup(GuestMemory&,const NativeProcessParameters&,std::uint64_t);
     std::uint32_t adopt_initial_process_parameters(GuestState&,GuestMemory&);
@@ -2740,6 +2812,7 @@ private:
     std::optional<std::uint32_t> invoke_crt_mbcs(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_crt_runtime_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     void initialize_crt_wctype(GuestMemory& memory);
+    void initialize_crt_error_data(GuestMemory& memory);
     // CreateStdDispatch 物件的內部 IUnknown 與 IDispatch vtable（每個程序建立一次）。
     std::array<std::uint64_t,2> std_dispatch_vtables_{};
     std::optional<std::uint32_t> invoke_shlwapi_string(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
@@ -2751,6 +2824,8 @@ private:
     std::optional<std::uint32_t> invoke_file_links(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_power_schemes(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_ole_picture(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_dxdiag(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::shared_ptr<DxDiagState> dxdiag_; // DxDiag provider／container 物件、虛擬函式表與容器樹
     std::optional<std::uint32_t> invoke_crt_console_read(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_com_monikers(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_ole_advise(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);

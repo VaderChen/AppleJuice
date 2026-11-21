@@ -1,18 +1,34 @@
         if(!graphics_handled && symbol.starts_with("Fx")){
             graphics_handled=true;auto id=object(arg(0)).identity,owner=fx_owner(id);require(bool(owner->effect));auto& program=*owner->effect;
-            const auto fx_buffer=[&](unsigned index){auto value=fx_handle(owner,Kind::EffectBuffer10,"buffer:"+std::to_string(index));value->effect_buffer=index;value->effect_valid=index<program.buffers.size();if(value->effect_valid && !value->effect_type){value->effect_type=std::make_shared<fx10::Type>();auto& t=*value->effect_type;t.name=program.buffers[index].name;t.kind=2;t.detail=18;t.size=static_cast<std::uint32_t>(program.buffers[index].bytes.size());}return value;};
             const auto fx_technique=[&](unsigned index){auto value=fx_handle(owner,Kind::EffectTechnique10,"technique:"+std::to_string(index));value->effect_technique=index;value->effect_valid=index<program.techniques.size();return value;};
             const auto fx_pass=[&](unsigned technique,unsigned pass){auto value=fx_handle(owner,Kind::EffectPass10,"pass:"+std::to_string(technique)+":"+std::to_string(pass));value->effect_technique=technique;value->effect_pass=pass;value->effect_valid=technique<program.techniques.size() && pass<program.techniques[technique].passes.size();return value;};
-            if(symbol.ends_with("IsValid"))result=id->effect_valid;
-            else if(symbol=="FxIsPool")result=0;
+            if(symbol=="FxPoolAsEffect")result=owner->root; // 借用介面，與 pool 共用引用計數。
+            else if(symbol.ends_with("IsValid"))result=id->effect_valid;
+            else if(symbol=="FxIsPool")result=owner->effect_is_pool;
             else if(symbol=="FxIsOptimized")result=owner->effect_optimized;
             else if(symbol=="FxGetDevice"){output(1);hold(owner->device);write_pointer(arg(1),owner->device);}
-            else if(symbol=="FxGetDesc"){std::vector<std::uint8_t> bytes(24);put_word(bytes,4,static_cast<std::uint32_t>(program.buffers.size()));put_word(bytes,12,static_cast<std::uint32_t>(program.variables.size()));put_word(bytes,20,static_cast<std::uint32_t>(program.techniques.size()));memory.write(GuestAddress{arg(1)},bytes);}
+            else if(symbol=="FxGetDesc"){
+                require(arg(1)!=0);
+                const auto pool=fx_pool(owner);
+                std::vector<std::uint8_t> bytes(24);
+                put_word(bytes,0,bool(pool));
+                put_word(bytes,4,static_cast<std::uint32_t>(program.buffers.size()));
+                put_word(bytes,12,static_cast<std::uint32_t>(program.variables.size()));
+                put_word(bytes,20,static_cast<std::uint32_t>(program.techniques.size()));
+                if(pool){
+                    put_word(bytes,8,static_cast<std::uint32_t>(pool->effect->buffers.size()));
+                    put_word(bytes,16,static_cast<std::uint32_t>(pool->effect->variables.size()));
+                }
+                memory.write(GuestAddress{arg(1)},bytes);
+            }
             else if(symbol.starts_with("FxGetVariableBy")){
-                unsigned index=u32(1);if(symbol!="FxGetVariableByIndex"){index=UINT32_MAX;const auto name=read_ansi(memory,arg(1));for(unsigned i=0;i<program.variables.size();++i)if((symbol.ends_with("Semantic")?program.variables[i].semantic:program.variables[i].name)==name){index=i;break;}}
-                result=fx_variable(owner,index)->root;
+                const auto location=symbol.ends_with("Index")?fx_index(owner,u32(1),false):
+                    fx_named(owner,arg(1)?read_ansi(memory,arg(1)):std::string{},false,symbol.ends_with("Semantic"));
+                result=fx_variable(location?location.scope:owner,location.index)->root;
             }else if(symbol.starts_with("FxGetConstantBufferBy")){
-                unsigned index=u32(1);if(symbol.ends_with("Name")){index=UINT32_MAX;const auto name=read_ansi(memory,arg(1));for(unsigned i=0;i<program.buffers.size();++i)if(program.buffers[i].name==name){index=i;break;}}result=fx_buffer(index)->root;
+                const auto location=symbol.ends_with("Index")?fx_index(owner,u32(1),true):
+                    fx_named(owner,arg(1)?read_ansi(memory,arg(1)):std::string{},true);
+                result=fx_buffer(location?location.scope:owner,location.index)->root;
             }else if(symbol.starts_with("FxGetTechniqueBy")){
                 unsigned index=u32(1);if(symbol.ends_with("Name")){index=UINT32_MAX;const auto name=read_ansi(memory,arg(1));for(unsigned i=0;i<program.techniques.size();++i)if(program.techniques[i].name==name){index=i;break;}}result=fx_technique(index)->root;
             }else if(symbol.starts_with("FxTechniqueGetPassBy")){
@@ -37,18 +53,35 @@
                         else throw std::invalid_argument("FX4 pass state 無效");
                     }
                     for(unsigned stage=0;stage<3;++stage)if(changed[stage])if(const auto shader=binding(context,stage_names[stage]+"Shader")){
-                        const auto reflected=object(shader).identity->reflection;require(bool(reflected));
+                        const auto shader_id=object(shader).identity;
+                        const auto shader_scope=fx_owner(shader_id);
+                        const auto reflected=shader_id->reflection;require(bool(reflected));
                         for(const auto& slot:reflected->bindings){
-                            if(slot.type==0 || slot.type==1){unsigned index=UINT32_MAX;for(unsigned i=0;i<program.buffers.size();++i)if(program.buffers[i].name==slot.name){index=i;break;}require(index!=UINT32_MAX && slot.count==1);const auto key="EffectBuffer:"+std::to_string(index);const auto buffer=owner->bindings.at(key).at(0);if(buffer && !owner->effect_handles.contains("external-buffer:"+std::to_string(index)))context->native->graphics_write(GraphicsView{object(buffer).identity->resource},program.buffers[index].bytes,0,0);const auto pointer=slot.type==0?buffer:owner->bindings.at("EffectBufferView:"+std::to_string(index)).at(0);const std::array values{pointer};bind(context,stage_names[stage]+(slot.type==0?"ConstantBuffers":"ShaderResources"),slot.slot,values,slot.type==0?14:128);
-                            }else if(slot.type==2 || slot.type==3){const auto variable=fx_find_variable(owner,slot.name);require(variable!=UINT32_MAX);const auto& v=program.variables[variable];require(slot.count<=v.type->count());std::vector<std::uint64_t> values(slot.count);
+                            if(slot.type==0 || slot.type==1){
+                                const auto location=fx_named(shader_scope,slot.name,true);
+                                require(location && slot.count==1);
+                                const auto suffix=std::to_string(location.index);
+                                const auto buffer=location.scope->bindings.at("EffectBuffer:"+suffix).at(0);
+                                if(buffer && !location.scope->effect_handles.contains("external-buffer:"+suffix))
+                                    context->native->graphics_write(GraphicsView{object(buffer).identity->resource},
+                                        location.scope->effect->buffers[location.index].bytes,0,0);
+                                const auto pointer=slot.type==0?buffer:location.scope->bindings.at("EffectBufferView:"+suffix).at(0);
+                                const std::array values{pointer};
+                                bind(context,stage_names[stage]+(slot.type==0?"ConstantBuffers":"ShaderResources"),slot.slot,values,slot.type==0?14:128);
+                            }else if(slot.type==2 || slot.type==3){
+                                const auto variable=fx_named(shader_scope,slot.name,false);
+                                require(bool(variable));
+                                const auto& v=variable.scope->effect->variables[variable.index];
+                                require(slot.count<=v.type->count());
+                                std::vector<std::uint64_t> values(slot.count);
                                 for(unsigned i=0;i<slot.count;++i){
-                                    if(slot.type==3)values[i]=fx_state(owner,variable,i);
+                                    if(slot.type==3)values[i]=fx_state(variable.scope,variable.index,i);
                                     else if(v.type->detail==21){
                                         // 舊式 sampler_state.Texture 的關聯隨每次 Apply 解析，保留變數更新。
                                         require(i<v.objects.size());const auto& assignments=v.objects[i].assignments;
                                         const auto texture=std::find_if(assignments.rbegin(),assignments.rend(),[](const auto& a){return a.state==55;});
-                                        if(texture!=assignments.rend())values[i]=fx_object(owner,*texture,stage);
-                                    }else values[i]=owner->bindings.at("EffectObject:"+std::to_string(variable)).at(i);
+                                        if(texture!=assignments.rend())values[i]=fx_object(variable.scope,*texture,stage);
+                                    }else values[i]=variable.scope->bindings.at("EffectObject:"+std::to_string(variable.index)).at(i);
                                     if(slot.type==2 && outputs_conflict(context,values[i]))values[i]=0;
                                 }
                                 bind(context,stage_names[stage]+(slot.type==3?"Samplers":"ShaderResources"),slot.slot,values,slot.type==3?16:128);
@@ -61,7 +94,18 @@
                 const auto& pass=program.techniques.at(id->effect_technique).passes.at(id->effect_pass);const auto found=std::find_if(pass.assignments.rbegin(),pass.assignments.rend(),[&](const auto& a){return a.state==state_id;});
                 auto value=fx_handle(owner,Kind::EffectShader10,"pass-shader:"+std::to_string(id->root)+":"+std::to_string(state_id));value->effect_valid=found!=pass.assignments.rend();unsigned index=0;
                 if(value->effect_valid){const auto& a=*found;if(a.kind==1 || a.kind==7){value->effect_anonymous=true;value->effect_type=std::make_shared<fx10::Type>();value->effect_type->kind=2;value->effect_type->detail=state_id==6?6:state_id==7?5:7;value->effect_type->name=state_id==6?"VertexShader":state_id==7?"PixelShader":"GeometryShader";value->effect_inline_shader=fx_object(owner,a,state_id==6?0:state_id==7?1:2);}
-                    else {std::string name;if(a.kind==2)name=program.string(a.offset);else if(a.kind==3 || a.kind==4){name=program.string(program.get(a.offset));index=program.get(a.offset+4);if(a.kind==4){const auto selector=fx_find_variable(owner,program.string(index));require(selector!=UINT32_MAX);const auto& v=program.variables[selector];require(v.buffer<program.buffers.size());index=word(program.buffers[v.buffer].bytes,v.offset);}}else throw std::invalid_argument("FX4 pass shader expression 尚未解碼");const auto variable=fx_find_variable(owner,name);require(variable!=UINT32_MAX && index<program.variables[variable].type->count());value=fx_variable(owner,variable);}
+                    else {
+                        std::string name;
+                        if(a.kind==2)name=program.string(a.offset);
+                        else if(a.kind==3 || a.kind==4){
+                            name=program.string(program.get(a.offset));
+                            index=program.get(a.offset+4);
+                            if(a.kind==4)index=fx_subscript(owner,program.string(index));
+                        }else throw std::invalid_argument("FX4 pass shader expression 尚未解碼");
+                        const auto variable=fx_named(owner,name,false);
+                        require(variable && index<variable.scope->effect->variables[variable.index].type->count());
+                        value=fx_variable(variable.scope,variable.index);
+                    }
                 }
                 memory.fill(GuestAddress{arg(1)},0,pointer_size*2);write_pointer(arg(1),interface(value,Kind::EffectShader10));memory.store(GuestAddress{arg(1)+pointer_size},32,index);
             }else if(symbol.find("GetAnnotationBy")!=symbol.npos){
@@ -114,7 +158,7 @@
                 }else {const auto expected=symbol=="FxShaderGetVertexShader"?6U:symbol=="FxShaderGetPixelShader"?5U:7U;require(variable.type->detail==expected || (expected==7 && variable.type->detail==8));require(arg(2));if(pointer)hold(pointer);write_pointer(arg(2),pointer);}
             }else if(symbol=="FxVariableGetType"){
                 auto value=fx_handle(owner,Kind::EffectType10,"type:"+std::to_string(id->root));value->effect_type=id->effect_type;value->effect_valid=id->effect_valid;result=value->root;
-            }else if(symbol=="FxVariableGetParentConstantBuffer")result=fx_buffer(id->effect_buffer)->root;
+            }else if(symbol=="FxVariableGetParentConstantBuffer")result=fx_buffer(owner,id->effect_buffer)->root;
             else if(symbol.starts_with("FxVariableAs")){
                 Kind kind=Kind::EffectVariable10;bool valid=id->effect_valid && bool(id->effect_type);const auto type=valid?id->effect_type->kind:0,detail=valid?id->effect_type->detail:0;
                 if(symbol.ends_with("Scalar")){kind=Kind::EffectScalar10;valid&=type==1 && (detail&7)==1;}
@@ -132,7 +176,7 @@
                 else if(symbol.ends_with("Sampler")){kind=Kind::EffectSampler10;valid&=type==2 && detail==21;}
                 if(valid)result=interface(id,kind);else{auto value=fx_handle(owner,kind,"invalid:"+std::to_string(static_cast<unsigned>(kind)));value->effect_valid=false;result=value->root;}
             }else if(symbol=="FxVariableGetDesc"){
-                require(id->effect_valid);if(id->effect_anonymous){std::vector<std::uint8_t> bytes(pointer_size*2+16);const auto name=fx_string(owner,"$Anonymous");std::memcpy(bytes.data(),&name,pointer_size);memory.write(GuestAddress{arg(1)},bytes);}else if(id->effect_annotation){std::vector<std::uint8_t> bytes(pointer_size*2+16);const auto name=fx_string(owner,id->effect_annotation->name);std::memcpy(bytes.data(),&name,pointer_size);put_word(bytes,pointer_size*2,2);memory.write(GuestAddress{arg(1)},bytes);}else {const auto buffer=id->effect_variable==UINT32_MAX;const auto name=fx_string(owner,buffer?program.buffers.at(id->effect_buffer).name:program.variables.at(id->effect_variable).name),semantic=buffer?0:fx_string(owner,program.variables[id->effect_variable].semantic);std::vector<std::uint8_t> bytes(pointer_size*2+16);std::memcpy(bytes.data(),&name,pointer_size);std::memcpy(bytes.data()+pointer_size,&semantic,pointer_size);put_word(bytes,pointer_size*2,buffer?0:program.variables[id->effect_variable].flags);put_word(bytes,pointer_size*2+4,static_cast<std::uint32_t>(buffer?program.buffers[id->effect_buffer].annotations.size():program.variables[id->effect_variable].annotations.size()));put_word(bytes,pointer_size*2+8,id->effect_offset);put_word(bytes,pointer_size*2+12,buffer?program.buffers[id->effect_buffer].bind:program.variables[id->effect_variable].bind);memory.write(GuestAddress{arg(1)},bytes);}
+                require(id->effect_valid);if(id->effect_anonymous){std::vector<std::uint8_t> bytes(pointer_size*2+16);const auto name=fx_string(owner,"$Anonymous");std::memcpy(bytes.data(),&name,pointer_size);memory.write(GuestAddress{arg(1)},bytes);}else if(id->effect_annotation){std::vector<std::uint8_t> bytes(pointer_size*2+16);const auto name=fx_string(owner,id->effect_annotation->name);std::memcpy(bytes.data(),&name,pointer_size);put_word(bytes,pointer_size*2,2);memory.write(GuestAddress{arg(1)},bytes);}else {const auto buffer=id->effect_variable==UINT32_MAX;const auto name=fx_string(owner,buffer?program.buffers.at(id->effect_buffer).name:program.variables.at(id->effect_variable).name),semantic=buffer?0:fx_string(owner,program.variables[id->effect_variable].semantic);std::vector<std::uint8_t> bytes(pointer_size*2+16);std::memcpy(bytes.data(),&name,pointer_size);std::memcpy(bytes.data()+pointer_size,&semantic,pointer_size);put_word(bytes,pointer_size*2,buffer?static_cast<unsigned>(owner->effect_is_pool):program.variables[id->effect_variable].flags);put_word(bytes,pointer_size*2+4,static_cast<std::uint32_t>(buffer?program.buffers[id->effect_buffer].annotations.size():program.variables[id->effect_variable].annotations.size()));put_word(bytes,pointer_size*2+8,id->effect_offset);put_word(bytes,pointer_size*2+12,buffer?program.buffers[id->effect_buffer].bind:program.variables[id->effect_variable].bind);memory.write(GuestAddress{arg(1)},bytes);}
             }else if(symbol=="FxVariableGetElement" || symbol.starts_with("FxVariableGetMemberBy")){
                 unsigned index=u32(1);const auto array=symbol=="FxVariableGetElement";
                 if(!array && !id->effect_annotation && id->effect_variable==UINT32_MAX && id->effect_valid && id->effect_buffer<program.buffers.size()){

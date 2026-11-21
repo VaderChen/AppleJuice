@@ -18,6 +18,7 @@
 #include "guest_heap_layout.hpp"
 #include "guest_tls.hpp"
 #include "parallel_mapping_lock.hpp"
+#include "msvcp_stream_abi.hpp"
 #include "x64arm/gpu_memory.hpp"
 #include "windows_display_identity.hpp"
 #include "windows_system_info_layout.hpp"
@@ -318,6 +319,21 @@ bool msvcp_exception_ptr_worker_service(std::string_view symbol) noexcept {
     return msvcp_once_worker_enabled() && (symbol=="?__ExceptionPtrCreate@@YAXPEAX@Z" || symbol=="?__ExceptionPtrDestroy@@YAXPEAX@Z");
 }
 bool msvcp_thread_id_worker_service(std::string_view symbol) noexcept {return msvcp_once_worker_enabled() && symbol=="_Thrd_id";}
+// basic_streambuf::_Lock／_Unlock（x64）：VC12 以後的基底版本沒有鎖成員，直接返回；VC10／11 把 this+8 的臨界區段指標交給
+// Enter／LeaveCriticalSection（與 provider 的回呼相同，改成尾跳）。Control 遊玩中兩者各約 3 萬次，原本每次交回協調者並全停。
+// 與上列同一開關。
+// std::_Lockit 建構／解構（x64）：種類 0（locale 鎖）依客體快速常式 _lock_locales／_unlock_locales 的同一協定直接操作狀態格
+// （+0 擁有者＝TEB+0x48 的執行緒編號、+4 遞迴、+8 宿主等待者數）；其他執行緒持有、遞迴上限、有等待者的釋放、其他鎖種類交回協調者。
+// ctype<char>::toupper／tolower 單字元見 msvcp_ctype_case_worker。緋夜傳奇逐字元 use_facet＋toupper，三者各約 83 萬次原本都回協調者。
+bool msvcp_lockit_worker_service(std::string_view symbol) noexcept {
+    return msvcp_once_worker_enabled() && (symbol=="??0_Lockit@std@@QEAA@H@Z" || symbol=="??1_Lockit@std@@QEAA@XZ");
+}
+bool msvcp_ctype_case_worker_service(std::string_view symbol) noexcept {
+    return msvcp_once_worker_enabled() && (symbol=="?toupper@?$ctype@D@std@@QEBADD@Z" || symbol=="?tolower@?$ctype@D@std@@QEBADD@Z");
+}
+bool msvcp_streambuf_lock_service(std::string_view symbol) noexcept {
+    return msvcp_once_worker_enabled() && (symbol.starts_with("?_Lock@?$basic_streambuf@") || symbol.starts_with("?_Unlock@?$basic_streambuf@")) && symbol.ends_with("@std@@UEAAXXZ");
+}
 // type_info::name()：第一次解修飾後名稱指標快取在 type_info 資料的第一個字組，之後每次只讀回該指標（與 provider 的快取分支相同）。
 // 尚未快取（要配置並掛入串列）時交回協調者。Control 每秒數千次。與上列同一開關。
 // type_info 名稱：__std_type_info_name 讀名稱格；VC12 以前的 name()／_name_internal_method 讀 this+8 的反修飾名稱快取。
@@ -674,6 +690,8 @@ bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
 }
 bool WindowsServices::parallel_service_static(GuestAddress address) const noexcept {
     if(parallel_crt_format_service(address))return true;
+    // x86 D3D9 也走 worker（FF XIII 每秒約 18 萬次 Set*／Draw 原本都要往返協調者）；資格與返回彈出量與 x64 共用。
+    if(x86_ && d3d9_worker_enabled())if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,address);runtime && runtime->family=="internal-d3d9")return true;
     if(!x86_)if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,address);runtime &&
        (dsound_worker_symbol(*runtime) || d3dx_math_worker_service(*runtime) || (d3d9_worker_enabled() && runtime->family=="internal-d3d9") ||
         (pipe_peek_worker_enabled() && runtime->family=="kernel32.dll" && runtime->symbol=="PeekNamedPipe")))return true;
@@ -695,6 +713,7 @@ bool WindowsServices::parallel_service_static(GuestAddress address) const noexce
     if(vulkan_worker_symbol(symbol))return true; // 橋接未就緒時 worker 分支交回協調者。
     if(parallel_peek_service(symbol))return true;
     if(parallel_srw_enabled() && (srw_service(symbol) || msvcp_mutex_service(symbol)))return true;
+    if(msvcp_streambuf_lock_service(symbol) || msvcp_lockit_worker_service(symbol) || msvcp_ctype_case_worker_service(symbol))return true;
     if(msvcp_once_tail_service(symbol) || msvcp_exception_ptr_worker_service(symbol) || msvcp_thread_id_worker_service(symbol) || type_info_name_worker_service(symbol))return true;
     if(rtti_cast_worker_service(symbol) || key_state_worker_service(symbol) || process_memory_worker_service(symbol))return true;
     if(thrd_tail_service(symbol) || parallel_event_service(symbol) || parallel_wait_service(symbol) || parallel_null_wait_service(symbol) || parallel_semaphore_service(symbol) ||
@@ -803,14 +822,14 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         }catch(const MemoryFault&){count_scope.accepted=false;return false;}catch(const HostCallFault&){count_scope.accepted=false;return false;}
         state.rep_compare={};return true;
     }
-    if(!x86_ && d3d9_worker_enabled())if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,state.rip);runtime && runtime->family=="internal-d3d9"){
+    if(d3d9_worker_enabled())if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,state.rip);runtime && runtime->family=="internal-d3d9"){
         std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         // 資格不符或輸出頁是寫入時複製頁時交回協調者（本地或完整路徑），尚未改任何狀態。
         if(!d3d9_local_eligible(state,memory,*runtime) || !worker_pointer_arguments_private(state,memory,*runtime)){count_scope.accepted=false;return false;}
         // 失去最後引用／綁定的物件延到下一次完整呼叫銷毀（同協調者本地路徑）；旗標只在持圖形鎖的執行者間傳遞。
         struct LocalCall {WindowsServices& self;~LocalCall(){self.d3d9_local_call_=false;detail::d3d9_worker_release()={};}} local_call{*this};d3d9_local_call_=true;
-        // 繪製前放開映射共用鎖時，返回位址先在持鎖時讀好（x64 的 [rsp]）。
-        detail::d3d9_worker_release()={&mapping_guard,memory.load(GuestAddress{state.reg(Gpr::Rsp)},64),false};
+        // 繪製前放開映射共用鎖時，返回位址與堆疊彈出量先在持鎖時讀好（[rsp]；x86 stdcall 另含參數槽，與 return_to 相同）。
+        detail::d3d9_worker_release()={&mapping_guard,memory.load(GuestAddress{state.reg(Gpr::Rsp)},x86_?32:64),false,WindowsCall(state,memory,*runtime).return_pop()};
         try{
             if(invoke_runtime(state,memory,*runtime))throw std::logic_error("worker 上的 D3D9 服務意外終止客體");
         }catch(const MemoryFault&){if(detail::d3d9_worker_release().released)throw;count_scope.accepted=false;return false;}
@@ -1020,6 +1039,53 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         if(symbol=="_Thrd_sleep"){try{argument=msvcp_wait_milliseconds(memory,state.reg(Gpr::Rcx));}catch(...){return false;}}
         const auto target=resolve_service("kernel32.dll",symbol=="_Thrd_sleep"?"Sleep":"SwitchToThread",false);if(!target.value)return false;
         state.reg(Gpr::Rcx)=argument;state.rip=target;state.rep_compare={};return true;
+    }
+    if(!x86_ && msvcp_ctype_case_worker_service(symbol)){
+        const auto* descriptor=detail::runtime_stub_descriptor(stub_base_,state.rip);if(!descriptor)return false;
+        try{if(!msvcp_ctype_case_worker(state,memory,*descriptor))return false;}catch(...){return false;}
+        state.rep_compare={};return true;
+    }
+    if(!x86_ && msvcp_lockit_worker_service(symbol)){
+        if(!guest_locale_lock_state_.value)return false;
+        try{
+            const bool constructor=symbol.starts_with("??0");const auto object=state.reg(Gpr::Rcx);
+            const GuestAddress owner_cell=guest_locale_lock_state_,recursion_cell{owner_cell.value+4},waiter_cell{owner_cell.value+8};
+            const auto self=static_cast<std::uint32_t>(memory.load(GuestAddress{state.gs_base+0x48},32));if(!self)return false;
+            const auto target=memory.load(GuestAddress{state.reg(Gpr::Rsp)},64);
+            if(constructor){
+                if(static_cast<std::uint32_t>(state.reg(Gpr::Rdx)))return false; // 只處理 locale 鎖。
+                memory.check(GuestAddress{object},4,Access::Write);
+                const auto owner=static_cast<std::uint32_t>(memory.load(owner_cell,32));
+                if(owner==self){
+                    const auto recursion=static_cast<std::uint32_t>(memory.load(recursion_cell,32));if(recursion==UINT32_MAX)return false;
+                    memory.store(recursion_cell,32,recursion+1);
+                }else{
+                    if(owner || memory.atomic_rmw(owner_cell,32,GuestMemory::AtomicRmw::CompareExchange,self,0)!=0)return false;
+                    memory.store(recursion_cell,32,1);
+                }
+                memory.store(GuestAddress{object},32,0);state.reg(Gpr::Rax)=object;
+            }else{
+                if(static_cast<std::uint32_t>(memory.load(GuestAddress{object},32)))return false;
+                if(static_cast<std::uint32_t>(memory.load(owner_cell,32))!=self || memory.load(waiter_cell,32))return false;
+                const auto recursion=static_cast<std::uint32_t>(memory.load(recursion_cell,32));if(!recursion)return false;
+                memory.store(recursion_cell,32,recursion-1);if(recursion==1)memory.store(owner_cell,32,0);
+                state.reg(Gpr::Rax)=0;
+            }
+            state.reg(Gpr::Rsp)+=8;state.rip=GuestAddress{target};
+        }catch(...){return false;}
+        state.rep_compare={};return true;
+    }
+    if(!x86_ && msvcp_streambuf_lock_service(symbol)){
+        const auto* descriptor=detail::runtime_stub_descriptor(stub_base_,state.rip);if(!descriptor)return false;
+        if(msvcp_detail::modern(*descriptor)){
+            // 無鎖成員：等同 provider 的 done(0)。返回位址在共用映射鎖下讀取。
+            std::uint64_t target=0;try{target=memory.load(GuestAddress{state.reg(Gpr::Rsp)},64);}catch(...){return false;}
+            state.reg(Gpr::Rax)=0;state.reg(Gpr::Rsp)+=8;state.rip=GuestAddress{target};state.rep_compare={};return true;
+        }
+        const auto target=resolve_service("kernel32.dll",symbol.starts_with("?_Lock@")?"EnterCriticalSection":"LeaveCriticalSection",false);if(!target.value)return false;
+        std::uint64_t lock=0;try{lock=memory.load(GuestAddress{state.reg(Gpr::Rcx)+8},64);}catch(...){return false;}
+        if(!lock)return false;
+        state.reg(Gpr::Rcx)=lock;state.rip=target;state.rep_compare={};return true;
     }
     if(!x86_ && msvcp_once_tail_service(symbol)){
         // 與協調者的尾跳相同：Context（第四引數）為 NULL，返回位址與影子空間沿用呼叫端，由 InitOnceExecuteOnce 自行返回。

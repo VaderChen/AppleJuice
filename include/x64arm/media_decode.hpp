@@ -26,6 +26,30 @@ struct CompressedAudio {
 
 bool video_decoder_available(std::uint32_t fourcc);
 bool audio_decoder_available(std::uint16_t format_tag);
+bool video1_fourcc(std::uint32_t fourcc);
+inline constexpr unsigned video1_default_key_rate=15;
+
+// Video 1 的點陣圖以 DIB 順序輸出，保留 PAL8 索引或 RGB555 的原始位元。
+class Video1Decoder {
+public:
+    Video1Decoder(unsigned width,unsigned height,unsigned depth,std::span<const std::uint8_t> palette);
+    ~Video1Decoder();
+    std::vector<std::uint8_t> decode(std::span<const std::uint8_t> packet,bool key);
+private:
+    struct State;
+    std::unique_ptr<State> state_;
+};
+
+class Video1Encoder {
+public:
+    struct Packet {std::vector<std::uint8_t> bytes;bool key{};};
+    Video1Encoder(unsigned width,unsigned height);
+    ~Video1Encoder();
+    Packet encode(std::span<const std::uint8_t> rgb555,bool key);
+private:
+    struct State;
+    std::unique_ptr<State> state_;
+};
 
 // 解碼後的音訊：交錯排列的 32 位元浮點樣本，time 為第一個樣本的時間（未知時為 INT64_MIN）。
 struct DecodedAudio {

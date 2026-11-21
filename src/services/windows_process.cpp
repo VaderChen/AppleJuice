@@ -667,6 +667,7 @@ std::uint32_t WindowsServices::remote_thread_identifier(std::uint32_t pid,std::u
     return id==1?pid:id;
 }
 void WindowsServices::publish_thread_lifetime(std::uint64_t id,std::uint32_t code){
+    release_thread_ordering(id);
 #if !defined(_WIN32)
     if(processes_)if(const auto found=processes_->thread_records.find(static_cast<std::uint32_t>(id));found!=processes_->thread_records.end())found->second->finish(code);
 #else

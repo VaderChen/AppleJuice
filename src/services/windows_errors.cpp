@@ -232,6 +232,30 @@ std::u16string windows_error_message(std::uint32_t code){
     }
     return message.empty()?std::u16string{}:utf8_to_utf16(message)+u"\r\n";
 }
+void WindowsServices::initialize_crt_error_data(GuestMemory& memory){
+    if(runtime_.crt_errlist)return;
+    const unsigned unit=x86_?4U:8U;
+    const auto pointers=(crt_error_count+1U)*unit;
+    std::vector<std::uint8_t> contents(pointers+sizeof(std::uint32_t));
+    std::array<std::size_t,crt_error_count+1U> offsets{};
+    for(std::size_t code=0;code<offsets.size();++code){
+        offsets[code]=contents.size();
+        const auto text=crt_message(static_cast<std::uint32_t>(code));
+        contents.insert(contents.end(),text.begin(),text.end());
+        contents.push_back(0);
+    }
+    const auto base=runtime_allocate(memory,{},contents.size());
+    for(std::size_t code=0;code<offsets.size();++code){
+        const auto address=base+offsets[code];
+        for(unsigned byte=0;byte<unit;++byte)
+            contents[code*unit+byte]=static_cast<std::uint8_t>(address>>(byte*8));
+    }
+    for(unsigned byte=0;byte<sizeof(std::uint32_t);++byte)
+        contents[pointers+byte]=static_cast<std::uint8_t>(crt_error_count>>(byte*8));
+    memory.write(GuestAddress{base},contents);
+    runtime_.crt_nerr_cell=base+pointers;
+    runtime_.crt_errlist=base;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);std::uint64_t result=0;
     if(service.family=="crt") {
@@ -248,20 +272,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,Gue
             arg.return_to(state,result);return std::nullopt;
         }
         if(name=="__sys_nerr" || name=="__sys_errlist"){
-            if(!runtime_.crt_errlist){
-                // 與 strerror 共用 errno 對照表；末項保留越界錯誤的 Unknown error。
-                const unsigned unit=x86_?4U:8U;
-                const auto table=runtime_allocate(memory,{},(crt_error_count+1)*unit);
-                for(std::uint32_t code=0;code<=crt_error_count;++code){
-                    const auto message=crt_message(code);
-                    std::vector<std::uint8_t> bytes(message.begin(),message.end());bytes.push_back(0);
-                    const auto pointer=runtime_allocate(memory,bytes);
-                    memory.store(GuestAddress{table+code*unit},static_cast<std::uint8_t>(unit*8),pointer);
-                }
-                const auto count=runtime_allocate(memory,{},4);
-                memory.store(GuestAddress{count},32,crt_error_count);
-                runtime_.crt_nerr_cell=count;runtime_.crt_errlist=table;
-            }
+            initialize_crt_error_data(memory);
             arg.return_to(state,name=="__sys_nerr"?runtime_.crt_nerr_cell:runtime_.crt_errlist);return std::nullopt;
         }
         if(service.symbol=="strerror_s" || service.symbol=="_wcserror_s"){

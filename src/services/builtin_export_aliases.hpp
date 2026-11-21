@@ -4,9 +4,11 @@
 #include <utility>
 
 namespace x64arm::detail {
-// 參考實作的 Unicode 相容層只提供 i386 映像，載入與靜態匯入使用相同架構限制。
+// 載入與靜態匯入共用固定 參考實作 規格及建置所限定的客體架構。
 inline constexpr bool builtin_arch_supported(std::string_view module,bool x86){
-    return x86 || (module!="unicows.dll" && module!="krnl386.exe16");
+    return x86 || (module!="unicows.dll" && module!="krnl386.exe16" &&
+                   module!="msvcrt20.dll" && module!="msvcrt40.dll" &&
+                   module!="msvcp70.dll" && module!="msvcp71.dll" && module!="crtdll.dll" && module!="msvcrtd.dll");
 }
 // Windows CRT 的 long double 與 double 同為 binary64；名稱、參數及回傳 ABI
 // 完全相同的入口共用實作與 resident AOT 配方。不要依字尾猜測混合型別的 ABI。
@@ -64,8 +66,7 @@ inline constexpr std::pair<std::string_view,std::string_view> crt_export_aliases
     {"_fgetchar","getchar"},{"_fputchar","putchar"},{"_copysignf","copysignf"},{"is_wctype","iswctype"},{"_set_controlfp","_controlfp"},
     {"scalbln","scalbn"},{"scalblnf","scalbnf"},{"scalblnl","scalbn"},{"_scalb","scalbn"},{"_scalbf","scalbnf"},{"remquol","remquo"},
     // 多位元組：逐字元比較的結果與無號位元組比較相同，不受 locale 影響；C locale 的排序即比較。_s 複製／串接失敗而不截斷，與位元組版本相同。
-    {"_mbscmp_l","_mbscmp"},{"_mbscoll","_mbscmp"},{"_mbscoll_l","_mbscmp"},{"_mbsicoll","_mbsicmp"},{"_mbsicoll_l","_mbsicmp_l"},
-    {"_mbsnbcoll","_mbsnbcmp"},{"_mbsnbcoll_l","_mbsnbcmp_l"},{"_mbsnbicoll","_mbsnbicmp"},{"_mbsnbicoll_l","_mbsnbicmp_l"},
+    {"_mbscmp_l","_mbscmp"},
     {"_mbscpy_s","strcpy_s"},{"_mbscpy_s_l","strcpy_s"},{"_mbscat_s","strcat_s"},{"_mbscat_s_l","strcat_s"},{"_mbsdup","_strdup"},
     // _Exit 與 _exit 同為不執行 atexit 的立即結束；寬字元舊名稱；_fread_nolock_s 與 fread_s 共用可遞迴的串流鎖；
     // __CxxFrameHandler2 與 __CxxFrameHandler 共用同一份 FuncInfo 版本判讀；mbsnbcmp_l 為 UCRT 匯出的無底線舊名稱。
@@ -102,6 +103,401 @@ inline std::string_view builtin_module_forwarder(std::string_view module){
     return {};
 }
 inline constexpr ServiceExportAlias service_export_aliases[]{
+    {"icuuc.dll","uset_add","icu.dll","uset_add"},
+#define ICU_ENUM_API(name,count) {"icuuc.dll",#name,"icu.dll",#name},
+#include "icu_enumeration_services.inc"
+#undef ICU_ENUM_API
+#define ICU_LOCALE_ALIAS_icu(name)
+#define ICU_LOCALE_ALIAS_icuuc(name) {"icuuc.dll",#name,"icu.dll",#name},
+#define ICU_LOCALE_ALIAS_icuin(name) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_LOCALE_API(name,count,legacy) ICU_LOCALE_ALIAS_##legacy(name)
+#define ICU_LOCALE_RESIDENT ICU_LOCALE_API
+#include "icu_locale_services.inc"
+#undef ICU_LOCALE_RESIDENT
+#undef ICU_LOCALE_API
+#undef ICU_LOCALE_ALIAS_icuin
+#undef ICU_LOCALE_ALIAS_icuuc
+#undef ICU_LOCALE_ALIAS_icu
+#define ICU_CURR_API(name,count,wide) {"icuuc.dll",#name,"icu.dll",#name},
+#define ICU_CURR_QUERY ICU_CURR_API
+#include "icu_currency_services.inc"
+#undef ICU_CURR_QUERY
+#undef ICU_CURR_API
+#define ICU_CAL_ALIAS_icu(name)
+#define ICU_CAL_ALIAS_icuin(name) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_CAL_API(name,count,wide,legacy) ICU_CAL_ALIAS_##legacy(name)
+#define ICU_CAL_QUERY ICU_CAL_API
+#include "icu_calendar_services.inc"
+#undef ICU_CAL_QUERY
+#undef ICU_CAL_API
+#undef ICU_CAL_ALIAS_icuin
+#undef ICU_CAL_ALIAS_icu
+#define ICU_DPG_ALIAS_icu(name)
+#define ICU_DPG_ALIAS_icuin(name) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_DPG_API(name,count,legacy) ICU_DPG_ALIAS_##legacy(name)
+#define ICU_DPG_QUERY ICU_DPG_API
+#include "icu_date_pattern_services.inc"
+#undef ICU_DPG_QUERY
+#undef ICU_DPG_API
+#undef ICU_DPG_ALIAS_icuin
+#undef ICU_DPG_ALIAS_icu
+#define ICU_NUM_API(name,count,wide) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_NUM_QUERY ICU_NUM_API
+#include "icu_number_services.inc"
+#undef ICU_NUM_QUERY
+#undef ICU_NUM_API
+#define ICU_DATE_API(name,count,wide) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_DATE_QUERY ICU_DATE_API
+#include "icu_date_format_services.inc"
+#undef ICU_DATE_QUERY
+#undef ICU_DATE_API
+#define ICU_FMT_ALIAS_icu(name)
+#define ICU_FMT_ALIAS_icuin(name) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_FMT_ALIAS_icuuc(name) {"icuuc.dll",#name,"icu.dll",#name},
+#define ICU_FMT_API(name,count,wide,legacy) ICU_FMT_ALIAS_##legacy(name)
+#define ICU_FMT_QUERY ICU_FMT_API
+#include "icu_formatted_services.inc"
+#include "icu_list_services.inc"
+#undef ICU_FMT_QUERY
+#undef ICU_FMT_API
+#undef ICU_FMT_ALIAS_icuuc
+#undef ICU_FMT_ALIAS_icuin
+#undef ICU_FMT_ALIAS_icu
+#define ICU_BIDI_API(name,count) {"icuuc.dll",#name,"icu.dll",#name},
+#include "icu_bidi_services.inc"
+#include "icu_bidi_transform_services.inc"
+#undef ICU_BIDI_API
+#define ICU_CHARDET_API(name,count) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_CHARDET_QUERY ICU_CHARDET_API
+#include "icu_charset_detection_services.inc"
+#undef ICU_CHARDET_QUERY
+#undef ICU_CHARDET_API
+#define ICU_REGION_API(name,count) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_REGION_QUERY ICU_REGION_API
+#include "icu_region_services.inc"
+#undef ICU_REGION_QUERY
+#undef ICU_REGION_API
+#define ICU_IDNA_API(name,count) {"icuuc.dll",#name,"icu.dll",#name},
+#define ICU_IDNA_QUERY(name,count,type,label) {"icuuc.dll",#name,"icu.dll",#name},
+#include "icu_idna_services.inc"
+#undef ICU_IDNA_QUERY
+#undef ICU_IDNA_API
+#define ICU_MODERN_NUM_ALIAS_icu(name)
+#define ICU_MODERN_NUM_ALIAS_icuin(name) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_MODERN_NUM_API(name,count,wide,legacy) ICU_MODERN_NUM_ALIAS_##legacy(name)
+#define ICU_MODERN_NUM_QUERY ICU_MODERN_NUM_API
+#include "icu_modern_number_services.inc"
+#undef ICU_MODERN_NUM_QUERY
+#undef ICU_MODERN_NUM_API
+#undef ICU_MODERN_NUM_ALIAS_icuin
+#undef ICU_MODERN_NUM_ALIAS_icu
+#define ICU_NORM_API(name,count) {"icuuc.dll",#name,"icu.dll",#name},
+#define ICU_NORM_QUERY ICU_NORM_API
+#include "icu_normalization_services.inc"
+#undef ICU_NORM_QUERY
+#undef ICU_NORM_API
+    {"icuuc.dll","u_memcasecmp","icu.dll","u_memcasecmp"},
+    {"icuuc.dll","u_strCaseCompare","icu.dll","u_strCaseCompare"},
+    {"icuuc.dll","u_strFoldCase","icu.dll","u_strFoldCase"},
+    {"icuuc.dll","u_strToLower","icu.dll","u_strToLower"},
+    {"icuuc.dll","u_strToTitle","icu.dll","u_strToTitle"},
+    {"icuuc.dll","u_strToUpper","icu.dll","u_strToUpper"},
+    {"icuuc.dll","u_strcasecmp","icu.dll","u_strcasecmp"},
+    {"icuuc.dll","u_strncasecmp","icu.dll","u_strncasecmp"},
+    {"icuuc.dll","ucasemap_close","icu.dll","ucasemap_close"},
+    {"icuuc.dll","ucasemap_getBreakIterator","icu.dll","ucasemap_getBreakIterator"},
+    {"icuuc.dll","ucasemap_getLocale","icu.dll","ucasemap_getLocale"},
+    {"icuuc.dll","ucasemap_getOptions","icu.dll","ucasemap_getOptions"},
+    {"icuuc.dll","ucasemap_open","icu.dll","ucasemap_open"},
+    {"icuuc.dll","ucasemap_setBreakIterator","icu.dll","ucasemap_setBreakIterator"},
+    {"icuuc.dll","ucasemap_setLocale","icu.dll","ucasemap_setLocale"},
+    {"icuuc.dll","ucasemap_setOptions","icu.dll","ucasemap_setOptions"},
+    {"icuuc.dll","ucasemap_toTitle","icu.dll","ucasemap_toTitle"},
+    {"icuuc.dll","ucasemap_utf8FoldCase","icu.dll","ucasemap_utf8FoldCase"},
+    {"icuuc.dll","ucasemap_utf8ToLower","icu.dll","ucasemap_utf8ToLower"},
+    {"icuuc.dll","ucasemap_utf8ToTitle","icu.dll","ucasemap_utf8ToTitle"},
+    {"icuuc.dll","ucasemap_utf8ToUpper","icu.dll","ucasemap_utf8ToUpper"},
+    {"icuuc.dll","ubrk_close","icu.dll","ubrk_close"},
+    {"icuuc.dll","ubrk_countAvailable","icu.dll","ubrk_countAvailable"},
+    {"icuuc.dll","ubrk_current","icu.dll","ubrk_current"},
+    {"icuuc.dll","ubrk_first","icu.dll","ubrk_first"},
+    {"icuuc.dll","ubrk_following","icu.dll","ubrk_following"},
+    {"icuuc.dll","ubrk_getAvailable","icu.dll","ubrk_getAvailable"},
+    {"icuuc.dll","ubrk_getBinaryRules","icu.dll","ubrk_getBinaryRules"},
+    {"icuuc.dll","ubrk_getLocaleByType","icu.dll","ubrk_getLocaleByType"},
+    {"icuuc.dll","ubrk_getRuleStatus","icu.dll","ubrk_getRuleStatus"},
+    {"icuuc.dll","ubrk_getRuleStatusVec","icu.dll","ubrk_getRuleStatusVec"},
+    {"icuuc.dll","ubrk_isBoundary","icu.dll","ubrk_isBoundary"},
+    {"icuuc.dll","ubrk_last","icu.dll","ubrk_last"},
+    {"icuuc.dll","ubrk_next","icu.dll","ubrk_next"},
+    {"icuuc.dll","ubrk_open","icu.dll","ubrk_open"},
+    {"icuuc.dll","ubrk_openBinaryRules","icu.dll","ubrk_openBinaryRules"},
+    {"icuuc.dll","ubrk_openRules","icu.dll","ubrk_openRules"},
+    {"icuuc.dll","ubrk_preceding","icu.dll","ubrk_preceding"},
+    {"icuuc.dll","ubrk_previous","icu.dll","ubrk_previous"},
+    {"icuuc.dll","ubrk_refreshUText","icu.dll","ubrk_refreshUText"},
+    {"icuuc.dll","ubrk_safeClone","icu.dll","ubrk_safeClone"},
+    {"icuuc.dll","ubrk_setText","icu.dll","ubrk_setText"},
+    {"icuuc.dll","ubrk_setUText","icu.dll","ubrk_setUText"},
+    {"icuuc.dll","utext_char32At","icu.dll","utext_char32At"},
+    {"icuuc.dll","utext_clone","icu.dll","utext_clone"},
+    {"icuuc.dll","utext_close","icu.dll","utext_close"},
+    {"icuuc.dll","utext_copy","icu.dll","utext_copy"},
+    {"icuuc.dll","utext_current32","icu.dll","utext_current32"},
+    {"icuuc.dll","utext_equals","icu.dll","utext_equals"},
+    {"icuuc.dll","utext_extract","icu.dll","utext_extract"},
+    {"icuuc.dll","utext_freeze","icu.dll","utext_freeze"},
+    {"icuuc.dll","utext_getNativeIndex","icu.dll","utext_getNativeIndex"},
+    {"icuuc.dll","utext_getPreviousNativeIndex","icu.dll","utext_getPreviousNativeIndex"},
+    {"icuuc.dll","utext_hasMetaData","icu.dll","utext_hasMetaData"},
+    {"icuuc.dll","utext_isLengthExpensive","icu.dll","utext_isLengthExpensive"},
+    {"icuuc.dll","utext_isWritable","icu.dll","utext_isWritable"},
+    {"icuuc.dll","utext_moveIndex32","icu.dll","utext_moveIndex32"},
+    {"icuuc.dll","utext_nativeLength","icu.dll","utext_nativeLength"},
+    {"icuuc.dll","utext_next32","icu.dll","utext_next32"},
+    {"icuuc.dll","utext_next32From","icu.dll","utext_next32From"},
+    {"icuuc.dll","utext_openUChars","icu.dll","utext_openUChars"},
+    {"icuuc.dll","utext_openUTF8","icu.dll","utext_openUTF8"},
+    {"icuuc.dll","utext_previous32","icu.dll","utext_previous32"},
+    {"icuuc.dll","utext_previous32From","icu.dll","utext_previous32From"},
+    {"icuuc.dll","utext_replace","icu.dll","utext_replace"},
+    {"icuuc.dll","utext_setNativeIndex","icu.dll","utext_setNativeIndex"},
+    {"icuuc.dll","utext_setup","icu.dll","utext_setup"},
+    {"icuuc.dll","u_countChar32","icu.dll","u_countChar32"},
+    {"icuuc.dll","u_memchr","icu.dll","u_memchr"},
+    {"icuuc.dll","u_memchr32","icu.dll","u_memchr32"},
+    {"icuuc.dll","u_memcmp","icu.dll","u_memcmp"},
+    {"icuuc.dll","u_memcmpCodePointOrder","icu.dll","u_memcmpCodePointOrder"},
+    {"icuuc.dll","u_memcpy","icu.dll","u_memcpy"},
+    {"icuuc.dll","u_memmove","icu.dll","u_memmove"},
+    {"icuuc.dll","u_memrchr","icu.dll","u_memrchr"},
+    {"icuuc.dll","u_memrchr32","icu.dll","u_memrchr32"},
+    {"icuuc.dll","u_memset","icu.dll","u_memset"},
+    {"icuuc.dll","u_strCompare","icu.dll","u_strCompare"},
+    {"icuuc.dll","u_strCompareIter","icu.dll","u_strCompareIter"},
+    {"icuuc.dll","u_strFindFirst","icu.dll","u_strFindFirst"},
+    {"icuuc.dll","u_strFindLast","icu.dll","u_strFindLast"},
+    {"icuuc.dll","u_strFromJavaModifiedUTF8WithSub","icu.dll","u_strFromJavaModifiedUTF8WithSub"},
+    {"icuuc.dll","u_strFromUTF32","icu.dll","u_strFromUTF32"},
+    {"icuuc.dll","u_strFromUTF32WithSub","icu.dll","u_strFromUTF32WithSub"},
+    {"icuuc.dll","u_strFromUTF8","icu.dll","u_strFromUTF8"},
+    {"icuuc.dll","u_strFromUTF8Lenient","icu.dll","u_strFromUTF8Lenient"},
+    {"icuuc.dll","u_strFromUTF8WithSub","icu.dll","u_strFromUTF8WithSub"},
+    {"icuuc.dll","u_strFromWCS","icu.dll","u_strFromWCS"},
+    {"icuuc.dll","u_strHasMoreChar32Than","icu.dll","u_strHasMoreChar32Than"},
+    {"icuuc.dll","u_strToJavaModifiedUTF8","icu.dll","u_strToJavaModifiedUTF8"},
+    {"icuuc.dll","u_strToUTF32","icu.dll","u_strToUTF32"},
+    {"icuuc.dll","u_strToUTF32WithSub","icu.dll","u_strToUTF32WithSub"},
+    {"icuuc.dll","u_strToUTF8","icu.dll","u_strToUTF8"},
+    {"icuuc.dll","u_strToUTF8WithSub","icu.dll","u_strToUTF8WithSub"},
+    {"icuuc.dll","u_strToWCS","icu.dll","u_strToWCS"},
+    {"icuuc.dll","u_strcat","icu.dll","u_strcat"},
+    {"icuuc.dll","u_strchr","icu.dll","u_strchr"},
+    {"icuuc.dll","u_strchr32","icu.dll","u_strchr32"},
+    {"icuuc.dll","u_strcmp","icu.dll","u_strcmp"},
+    {"icuuc.dll","u_strcmpCodePointOrder","icu.dll","u_strcmpCodePointOrder"},
+    {"icuuc.dll","u_strcpy","icu.dll","u_strcpy"},
+    {"icuuc.dll","u_strcspn","icu.dll","u_strcspn"},
+    {"icuuc.dll","u_strlen","icu.dll","u_strlen"},
+    {"icuuc.dll","u_strncat","icu.dll","u_strncat"},
+    {"icuuc.dll","u_strncmp","icu.dll","u_strncmp"},
+    {"icuuc.dll","u_strncmpCodePointOrder","icu.dll","u_strncmpCodePointOrder"},
+    {"icuuc.dll","u_strncpy","icu.dll","u_strncpy"},
+    {"icuuc.dll","u_strpbrk","icu.dll","u_strpbrk"},
+    {"icuuc.dll","u_strrchr","icu.dll","u_strrchr"},
+    {"icuuc.dll","u_strrchr32","icu.dll","u_strrchr32"},
+    {"icuuc.dll","u_strrstr","icu.dll","u_strrstr"},
+    {"icuuc.dll","u_strspn","icu.dll","u_strspn"},
+    {"icuuc.dll","u_strstr","icu.dll","u_strstr"},
+    {"icuuc.dll","u_strtok_r","icu.dll","u_strtok_r"},
+    {"icuuc.dll","u_unescape","icu.dll","u_unescape"},
+    {"icuuc.dll","u_unescapeAt","icu.dll","u_unescapeAt"},
+    {"icuuc.dll","uiter_current32","icu.dll","uiter_current32"},
+    {"icuuc.dll","uiter_getState","icu.dll","uiter_getState"},
+    {"icuuc.dll","uiter_next32","icu.dll","uiter_next32"},
+    {"icuuc.dll","uiter_previous32","icu.dll","uiter_previous32"},
+    {"icuuc.dll","uiter_setState","icu.dll","uiter_setState"},
+    {"icuuc.dll","uiter_setString","icu.dll","uiter_setString"},
+    {"icuuc.dll","uiter_setUTF16BE","icu.dll","uiter_setUTF16BE"},
+    {"icuuc.dll","uiter_setUTF8","icu.dll","uiter_setUTF8"},
+    {"icuuc.dll","utf8_appendCharSafeBody","icu.dll","utf8_appendCharSafeBody"},
+    {"icuuc.dll","utf8_back1SafeBody","icu.dll","utf8_back1SafeBody"},
+    {"icuuc.dll","utf8_nextCharSafeBody","icu.dll","utf8_nextCharSafeBody"},
+    {"icuuc.dll","utf8_prevCharSafeBody","icu.dll","utf8_prevCharSafeBody"},
+    {"icuuc.dll","uset_addAll","icu.dll","uset_addAll"},
+    {"icuuc.dll","uset_addAllCodePoints","icu.dll","uset_addAllCodePoints"},
+    {"icuuc.dll","uset_addRange","icu.dll","uset_addRange"},
+    {"icuuc.dll","uset_addString","icu.dll","uset_addString"},
+    {"icuuc.dll","uset_applyIntPropertyValue","icu.dll","uset_applyIntPropertyValue"},
+    {"icuuc.dll","uset_applyPattern","icu.dll","uset_applyPattern"},
+    {"icuuc.dll","uset_applyPropertyAlias","icu.dll","uset_applyPropertyAlias"},
+    {"icuuc.dll","uset_charAt","icu.dll","uset_charAt"},
+    {"icuuc.dll","uset_clear","icu.dll","uset_clear"},
+    {"icuuc.dll","uset_clone","icu.dll","uset_clone"},
+    {"icuuc.dll","uset_cloneAsThawed","icu.dll","uset_cloneAsThawed"},
+    {"icuuc.dll","uset_close","icu.dll","uset_close"},
+    {"icuuc.dll","uset_closeOver","icu.dll","uset_closeOver"},
+    {"icuuc.dll","uset_compact","icu.dll","uset_compact"},
+    {"icuuc.dll","uset_complement","icu.dll","uset_complement"},
+    {"icuuc.dll","uset_complementAll","icu.dll","uset_complementAll"},
+    {"icuuc.dll","uset_contains","icu.dll","uset_contains"},
+    {"icuuc.dll","uset_containsAll","icu.dll","uset_containsAll"},
+    {"icuuc.dll","uset_containsAllCodePoints","icu.dll","uset_containsAllCodePoints"},
+    {"icuuc.dll","uset_containsNone","icu.dll","uset_containsNone"},
+    {"icuuc.dll","uset_containsRange","icu.dll","uset_containsRange"},
+    {"icuuc.dll","uset_containsSome","icu.dll","uset_containsSome"},
+    {"icuuc.dll","uset_containsString","icu.dll","uset_containsString"},
+    {"icuuc.dll","uset_equals","icu.dll","uset_equals"},
+    {"icuuc.dll","uset_freeze","icu.dll","uset_freeze"},
+    {"icuuc.dll","uset_getItem","icu.dll","uset_getItem"},
+    {"icuuc.dll","uset_getItemCount","icu.dll","uset_getItemCount"},
+    {"icuuc.dll","uset_getSerializedRange","icu.dll","uset_getSerializedRange"},
+    {"icuuc.dll","uset_getSerializedRangeCount","icu.dll","uset_getSerializedRangeCount"},
+    {"icuuc.dll","uset_getSerializedSet","icu.dll","uset_getSerializedSet"},
+    {"icuuc.dll","uset_indexOf","icu.dll","uset_indexOf"},
+    {"icuuc.dll","uset_isEmpty","icu.dll","uset_isEmpty"},
+    {"icuuc.dll","uset_isFrozen","icu.dll","uset_isFrozen"},
+    {"icuuc.dll","uset_open","icu.dll","uset_open"},
+    {"icuuc.dll","uset_openEmpty","icu.dll","uset_openEmpty"},
+    {"icuuc.dll","uset_openPattern","icu.dll","uset_openPattern"},
+    {"icuuc.dll","uset_openPatternOptions","icu.dll","uset_openPatternOptions"},
+    {"icuuc.dll","uset_remove","icu.dll","uset_remove"},
+    {"icuuc.dll","uset_removeAll","icu.dll","uset_removeAll"},
+    {"icuuc.dll","uset_removeAllStrings","icu.dll","uset_removeAllStrings"},
+    {"icuuc.dll","uset_removeRange","icu.dll","uset_removeRange"},
+    {"icuuc.dll","uset_removeString","icu.dll","uset_removeString"},
+    {"icuuc.dll","uset_resemblesPattern","icu.dll","uset_resemblesPattern"},
+    {"icuuc.dll","uset_retain","icu.dll","uset_retain"},
+    {"icuuc.dll","uset_retainAll","icu.dll","uset_retainAll"},
+    {"icuuc.dll","uset_serialize","icu.dll","uset_serialize"},
+    {"icuuc.dll","uset_serializedContains","icu.dll","uset_serializedContains"},
+    {"icuuc.dll","uset_set","icu.dll","uset_set"},
+    {"icuuc.dll","uset_setSerializedToOne","icu.dll","uset_setSerializedToOne"},
+    {"icuuc.dll","uset_size","icu.dll","uset_size"},
+    {"icuuc.dll","uset_span","icu.dll","uset_span"},
+    {"icuuc.dll","uset_spanBack","icu.dll","uset_spanBack"},
+    {"icuuc.dll","uset_spanBackUTF8","icu.dll","uset_spanBackUTF8"},
+    {"icuuc.dll","uset_spanUTF8","icu.dll","uset_spanUTF8"},
+    {"icuuc.dll","uset_toPattern","icu.dll","uset_toPattern"},
+    {"icuuc.dll","u_UCharsToChars","icu.dll","u_UCharsToChars"},
+    {"icuuc.dll","u_charAge","icu.dll","u_charAge"},
+    {"icuuc.dll","u_charDigitValue","icu.dll","u_charDigitValue"},
+    {"icuuc.dll","u_charDirection","icu.dll","u_charDirection"},
+    {"icuuc.dll","u_charFromName","icu.dll","u_charFromName"},
+    {"icuuc.dll","u_charMirror","icu.dll","u_charMirror"},
+    {"icuuc.dll","u_charName","icu.dll","u_charName"},
+    {"icuuc.dll","u_charType","icu.dll","u_charType"},
+    {"icuuc.dll","u_charsToUChars","icu.dll","u_charsToUChars"},
+    {"icuuc.dll","u_digit","icu.dll","u_digit"},
+    {"icuuc.dll","u_enumCharNames","icu.dll","u_enumCharNames"},
+    {"icuuc.dll","u_enumCharTypes","icu.dll","u_enumCharTypes"},
+    {"icuuc.dll","u_errorName","icu.dll","u_errorName"},
+    {"icuuc.dll","u_foldCase","icu.dll","u_foldCase"},
+    {"icuuc.dll","u_forDigit","icu.dll","u_forDigit"},
+    {"icuuc.dll","u_getBidiPairedBracket","icu.dll","u_getBidiPairedBracket"},
+    {"icuuc.dll","u_getCombiningClass","icu.dll","u_getCombiningClass"},
+    {"icuuc.dll","u_getDataVersion","icu.dll","u_getDataVersion"},
+    {"icuuc.dll","u_getFC_NFKC_Closure","icu.dll","u_getFC_NFKC_Closure"},
+    {"icuuc.dll","u_getIntPropertyMaxValue","icu.dll","u_getIntPropertyMaxValue"},
+    {"icuuc.dll","u_getIntPropertyMinValue","icu.dll","u_getIntPropertyMinValue"},
+    {"icuuc.dll","u_getIntPropertyValue","icu.dll","u_getIntPropertyValue"},
+    {"icuuc.dll","u_getNumericValue","icu.dll","u_getNumericValue"},
+    {"icuuc.dll","u_getPropertyEnum","icu.dll","u_getPropertyEnum"},
+    {"icuuc.dll","u_getPropertyName","icu.dll","u_getPropertyName"},
+    {"icuuc.dll","u_getPropertyValueEnum","icu.dll","u_getPropertyValueEnum"},
+    {"icuuc.dll","u_getPropertyValueName","icu.dll","u_getPropertyValueName"},
+    {"icuuc.dll","u_getUnicodeVersion","icu.dll","u_getUnicodeVersion"},
+    {"icuuc.dll","u_getVersion","icu.dll","u_getVersion"},
+    {"icuuc.dll","u_hasBinaryProperty","icu.dll","u_hasBinaryProperty"},
+    {"icuuc.dll","u_isIDIgnorable","icu.dll","u_isIDIgnorable"},
+    {"icuuc.dll","u_isIDPart","icu.dll","u_isIDPart"},
+    {"icuuc.dll","u_isIDStart","icu.dll","u_isIDStart"},
+    {"icuuc.dll","u_isISOControl","icu.dll","u_isISOControl"},
+    {"icuuc.dll","u_isJavaIDPart","icu.dll","u_isJavaIDPart"},
+    {"icuuc.dll","u_isJavaIDStart","icu.dll","u_isJavaIDStart"},
+    {"icuuc.dll","u_isJavaSpaceChar","icu.dll","u_isJavaSpaceChar"},
+    {"icuuc.dll","u_isMirrored","icu.dll","u_isMirrored"},
+    {"icuuc.dll","u_isUAlphabetic","icu.dll","u_isUAlphabetic"},
+    {"icuuc.dll","u_isULowercase","icu.dll","u_isULowercase"},
+    {"icuuc.dll","u_isUUppercase","icu.dll","u_isUUppercase"},
+    {"icuuc.dll","u_isUWhiteSpace","icu.dll","u_isUWhiteSpace"},
+    {"icuuc.dll","u_isWhitespace","icu.dll","u_isWhitespace"},
+    {"icuuc.dll","u_isalnum","icu.dll","u_isalnum"},
+    {"icuuc.dll","u_isalpha","icu.dll","u_isalpha"},
+    {"icuuc.dll","u_isbase","icu.dll","u_isbase"},
+    {"icuuc.dll","u_isblank","icu.dll","u_isblank"},
+    {"icuuc.dll","u_iscntrl","icu.dll","u_iscntrl"},
+    {"icuuc.dll","u_isdefined","icu.dll","u_isdefined"},
+    {"icuuc.dll","u_isdigit","icu.dll","u_isdigit"},
+    {"icuuc.dll","u_isgraph","icu.dll","u_isgraph"},
+    {"icuuc.dll","u_islower","icu.dll","u_islower"},
+    {"icuuc.dll","u_isprint","icu.dll","u_isprint"},
+    {"icuuc.dll","u_ispunct","icu.dll","u_ispunct"},
+    {"icuuc.dll","u_isspace","icu.dll","u_isspace"},
+    {"icuuc.dll","u_istitle","icu.dll","u_istitle"},
+    {"icuuc.dll","u_isupper","icu.dll","u_isupper"},
+    {"icuuc.dll","u_isxdigit","icu.dll","u_isxdigit"},
+    {"icuuc.dll","u_tolower","icu.dll","u_tolower"},
+    {"icuuc.dll","u_totitle","icu.dll","u_totitle"},
+    {"icuuc.dll","u_toupper","icu.dll","u_toupper"},
+    {"icuuc.dll","u_versionFromString","icu.dll","u_versionFromString"},
+    {"icuuc.dll","u_versionFromUString","icu.dll","u_versionFromUString"},
+    {"icuuc.dll","u_versionToString","icu.dll","u_versionToString"},
+    {"icuuc.dll","ublock_getCode","icu.dll","ublock_getCode"},
+    {"icuuc.dll","uscript_breaksBetweenLetters","icu.dll","uscript_breaksBetweenLetters"},
+    {"icuuc.dll","uscript_getCode","icu.dll","uscript_getCode"},
+    {"icuuc.dll","uscript_getName","icu.dll","uscript_getName"},
+    {"icuuc.dll","uscript_getSampleString","icu.dll","uscript_getSampleString"},
+    {"icuuc.dll","uscript_getScript","icu.dll","uscript_getScript"},
+    {"icuuc.dll","uscript_getScriptExtensions","icu.dll","uscript_getScriptExtensions"},
+    {"icuuc.dll","uscript_getShortName","icu.dll","uscript_getShortName"},
+    {"icuuc.dll","uscript_getUsage","icu.dll","uscript_getUsage"},
+    {"icuuc.dll","uscript_hasScript","icu.dll","uscript_hasScript"},
+    {"icuuc.dll","uscript_isCased","icu.dll","uscript_isCased"},
+    {"icuuc.dll","uscript_isRightToLeft","icu.dll","uscript_isRightToLeft"},
+    {"hidparse.sys","HidP_GetButtonCaps","hid.dll","HidP_GetButtonCaps"},
+    {"hidparse.sys","HidP_GetCaps","hid.dll","HidP_GetCaps"},
+    {"hidparse.sys","HidP_GetData","hid.dll","HidP_GetData"},
+    {"hidparse.sys","HidP_GetExtendedAttributes","hid.dll","HidP_GetExtendedAttributes"},
+    {"hidparse.sys","HidP_GetLinkCollectionNodes","hid.dll","HidP_GetLinkCollectionNodes"},
+    {"hidparse.sys","HidP_GetScaledUsageValue","hid.dll","HidP_GetScaledUsageValue"},
+    {"hidparse.sys","HidP_GetSpecificButtonCaps","hid.dll","HidP_GetSpecificButtonCaps"},
+    {"hidparse.sys","HidP_GetSpecificValueCaps","hid.dll","HidP_GetSpecificValueCaps"},
+    {"hidparse.sys","HidP_GetUsageValue","hid.dll","HidP_GetUsageValue"},
+    {"hidparse.sys","HidP_GetUsageValueArray","hid.dll","HidP_GetUsageValueArray"},
+    {"hidparse.sys","HidP_GetUsages","hid.dll","HidP_GetUsages"},
+    {"hidparse.sys","HidP_GetUsagesEx","hid.dll","HidP_GetUsagesEx"},
+    {"hidparse.sys","HidP_GetValueCaps","hid.dll","HidP_GetValueCaps"},
+    {"hidparse.sys","HidP_InitializeReportForID","hid.dll","HidP_InitializeReportForID"},
+    {"hidparse.sys","HidP_MaxDataListLength","hid.dll","HidP_MaxDataListLength"},
+    {"hidparse.sys","HidP_MaxUsageListLength","hid.dll","HidP_MaxUsageListLength"},
+    {"hidparse.sys","HidP_SetData","hid.dll","HidP_SetData"},
+    {"hidparse.sys","HidP_SetScaledUsageValue","hid.dll","HidP_SetScaledUsageValue"},
+    {"hidparse.sys","HidP_SetUsageValue","hid.dll","HidP_SetUsageValue"},
+    {"hidparse.sys","HidP_SetUsageValueArray","hid.dll","HidP_SetUsageValueArray"},
+    {"hidparse.sys","HidP_SetUsages","hid.dll","HidP_SetUsages"},
+    {"hidparse.sys","HidP_TranslateUsageAndPagesToI8042ScanCodes","hid.dll","HidP_TranslateUsageAndPagesToI8042ScanCodes"},
+    {"hidparse.sys","HidP_TranslateUsagesToI8042ScanCodes","hid.dll","HidP_TranslateUsagesToI8042ScanCodes"},
+    {"hidparse.sys","HidP_UnsetUsages","hid.dll","HidP_UnsetUsages"},
+    {"hidparse.sys","HidP_UsageAndPageListDifference","hid.dll","HidP_UsageAndPageListDifference"},
+    {"hidparse.sys","HidP_UsageListDifference","hid.dll","HidP_UsageListDifference"},
+    {"usbd.sys","USBD_ParseConfigurationDescriptorEx","winusb.dll","WinUsb_ParseConfigurationDescriptor"},
+    {"usbd.sys","_USBD_ParseConfigurationDescriptorEx@28","winusb.dll","WinUsb_ParseConfigurationDescriptor"},
+    {"usbd.sys","USBD_ParseDescriptors","winusb.dll","WinUsb_ParseDescriptors"},
+    {"usbd.sys","_USBD_ParseDescriptors@16","winusb.dll","WinUsb_ParseDescriptors"},
+    {"usbd.sys","_USBD_CreateConfigurationRequestEx@8","usbd.sys","USBD_CreateConfigurationRequestEx"},
+    {"lz32.dll","CopyLZFile","kernel32.dll","CopyLZFile"},
+    {"lz32.dll","GetExpandedNameA","kernel32.dll","GetExpandedNameA"},
+    {"lz32.dll","GetExpandedNameW","kernel32.dll","GetExpandedNameW"},
+    {"lz32.dll","LZClose","kernel32.dll","LZClose"},
+    {"lz32.dll","LZCopy","kernel32.dll","LZCopy"},
+    {"lz32.dll","LZDone","kernel32.dll","LZDone"},
+    {"lz32.dll","LZInit","kernel32.dll","LZInit"},
+    {"lz32.dll","LZOpenFileA","kernel32.dll","LZOpenFileA"},
+    {"lz32.dll","LZOpenFileW","kernel32.dll","LZOpenFileW"},
+    {"lz32.dll","LZRead","kernel32.dll","LZRead"},
+    {"lz32.dll","LZSeek","kernel32.dll","LZSeek"},
+    {"lz32.dll","LZStart","kernel32.dll","LZStart"},
     {"coml2.dll","CreateILockBytesOnHGlobal","ole32.dll","CreateILockBytesOnHGlobal"},
     {"coml2.dll","GetHGlobalFromILockBytes","ole32.dll","GetHGlobalFromILockBytes"},
     {"coml2.dll","StgCreateDocfile","ole32.dll","StgCreateDocfile"},
@@ -715,8 +1111,6 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     // winmm：Drv* 為可安裝驅動程式函式的舊名；無尾碼的 PlaySound 即 ANSI 版本。
     {"winmm.dll","DrvOpen","winmm.dll","OpenDriver"},{"winmm.dll","DrvOpenA","winmm.dll","OpenDriverA"},{"winmm.dll","DrvClose","winmm.dll","CloseDriver"},
     {"winmm.dll","DrvSendMessage","winmm.dll","SendDriverMessage"},{"winmm.dll","DrvDefDriverProc","winmm.dll","DefDriverProc"},
-    // msacm32 的 DriverProc：作為可安裝驅動程式時只處理標準 DRV_* 訊息，與 DefDriverProc 相同。
-    {"msacm32.dll","DriverProc","winmm.dll","DefDriverProc"},
     // kernel32 的 timeGetSystemTime 與 winmm 同一實作。
     {"kernel32.dll","timeGetSystemTime","winmm.dll","timeGetSystemTime"},
     // kernel32 的 K32 裝置驅動程式入口與 psapi 同一實作。
@@ -934,6 +1328,8 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"evr.dll","MFGetStrideForBitmapInfoHeader","mfplat.dll","MFGetStrideForBitmapInfoHeader"},
     {"evr.dll","MFGetPlaneSize","mfplat.dll","MFGetPlaneSize"},
     {"evr.dll","MFCopyImage","mfplat.dll","MFCopyImage"},
+    {"evr.dll","MFConvertFromFP16Array","mfplat.dll","MFConvertFromFP16Array"},
+    {"evr.dll","MFConvertToFP16Array","mfplat.dll","MFConvertToFP16Array"},
     // D3D12 的序號匯出（SDK 匯入庫以序號連結）與具名 API 共用同一實作及 ABI。
     {"d3d12.dll","#102","d3d12.dll","D3D12GetDebugInterface"},
     {"d3d12.dll","#107","d3d12.dll","D3D12CreateRootSignatureDeserializer"},
@@ -1703,6 +2099,32 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"comctl32.dll","#344","comctl32.dll","TaskDialog"},
     {"comctl32.dll","#345","comctl32.dll","TaskDialogIndirect"},
     {"mmdevapi.dll","#17","mmdevapi.dll","ActivateAudioInterfaceAsync"},
+    {"x3daudio1_0.dll","_X3DAudioInitialize@12","x3daudio1_0.dll","X3DAudioInitialize",true},
+    {"x3daudio1_0.dll","_X3DAudioCalculate@20","x3daudio1_0.dll","X3DAudioCalculate",true},
+    {"x3daudio1_1.dll","_X3DAudioInitialize@12","x3daudio1_0.dll","X3DAudioInitialize",true},
+    {"x3daudio1_1.dll","_X3DAudioCalculate@20","x3daudio1_0.dll","X3DAudioCalculate",true},
+    {"x3daudio1_2.dll","_X3DAudioInitialize@12","x3daudio1_0.dll","X3DAudioInitialize",true},
+    {"x3daudio1_2.dll","_X3DAudioCalculate@20","x3daudio1_0.dll","X3DAudioCalculate",true},
+    {"x3daudio1_1.dll","X3DAudioInitialize","x3daudio1_0.dll","X3DAudioInitialize"},
+    {"x3daudio1_1.dll","X3DAudioCalculate","x3daudio1_0.dll","X3DAudioCalculate"},
+    {"x3daudio1_2.dll","X3DAudioInitialize","x3daudio1_0.dll","X3DAudioInitialize"},
+    {"x3daudio1_2.dll","X3DAudioCalculate","x3daudio1_0.dll","X3DAudioCalculate"},
+    {"x3daudio1_3.dll","X3DAudioInitialize","x3daudio1_7.dll","X3DAudioInitialize"},
+    {"x3daudio1_3.dll","X3DAudioCalculate","x3daudio1_7.dll","X3DAudioCalculate"},
+    {"x3daudio1_4.dll","X3DAudioInitialize","x3daudio1_7.dll","X3DAudioInitialize"},
+    {"x3daudio1_4.dll","X3DAudioCalculate","x3daudio1_7.dll","X3DAudioCalculate"},
+    {"x3daudio1_5.dll","X3DAudioInitialize","x3daudio1_7.dll","X3DAudioInitialize"},
+    {"x3daudio1_5.dll","X3DAudioCalculate","x3daudio1_7.dll","X3DAudioCalculate"},
+    {"x3daudio1_6.dll","X3DAudioInitialize","x3daudio1_7.dll","X3DAudioInitialize"},
+    {"x3daudio1_6.dll","X3DAudioCalculate","x3daudio1_7.dll","X3DAudioCalculate"},
+    // 參考實作 的 XAudio 2.8 用相同序號，但建立引擎與效果必須保留 2.8 的介面及結構 ABI。
+    {"xaudio2_8.dll","#1","xaudio2_8.dll","XAudio2Create"},
+    {"xaudio2_8.dll","#2","xaudio2_8.dll","CreateAudioReverb"},
+    {"xaudio2_8.dll","#3","xaudio2_8.dll","CreateAudioVolumeMeter"},
+    {"xaudio2_8.dll","#4","xaudio2_8.dll","CreateFX"},
+    {"xaudio2_8.dll","#5","x3daudio1_7.dll","X3DAudioCalculate"},
+    {"xaudio2_8.dll","#6","x3daudio1_7.dll","X3DAudioInitialize"},
+    {"xaudio2_8.dll","#7","xaudio2_8.dll","XAudio2CreateWithVersionInfo"},
     // XAudio 2.9 與 Redist 的實際匯出序號；SDK 匯入庫以序號連結，X3DAudio 與舊版共用實作。
     {"xaudio2_9.dll","#1","xaudio2_9.dll","XAudio2Create"},
     {"xaudio2_9.dll","#2","xaudio2_9.dll","CreateAudioReverb"},
@@ -1718,6 +2140,17 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"xinput1_3.dll","XInputGetStateEx","xinput1_3.dll","#100"},{"xinput1_4.dll","XInputGetStateEx","xinput1_4.dll","#100"},
     {"xinput1_4.dll","XInputGetCapabilitiesEx","xinput1_4.dll","#108"},
     {"xaudio2_8.dll","X3DAudioCalculate","x3daudio1_7.dll","X3DAudioCalculate"},{"xaudio2_8.dll","X3DAudioInitialize","x3daudio1_7.dll","X3DAudioInitialize"},
+    {"xinput1_1.dll","XInputEnable","xinput1_3.dll","XInputEnable"},
+    {"xinput1_1.dll","XInputGetCapabilities","xinput1_3.dll","XInputGetCapabilities"},
+    {"xinput1_1.dll","XInputGetDSoundAudioDeviceGuids","xinput1_3.dll","XInputGetDSoundAudioDeviceGuids"},
+    {"xinput1_1.dll","XInputGetState","xinput1_3.dll","XInputGetState"},
+    {"xinput1_1.dll","XInputSetState","xinput1_3.dll","XInputSetState"},
+    {"xinput1_2.dll","XInputEnable","xinput1_3.dll","XInputEnable"},
+    {"xinput1_2.dll","XInputGetCapabilities","xinput1_3.dll","XInputGetCapabilities"},
+    {"xinput1_2.dll","XInputGetDSoundAudioDeviceGuids","xinput1_3.dll","XInputGetDSoundAudioDeviceGuids"},
+    {"xinput1_2.dll","XInputGetState","xinput1_3.dll","XInputGetState"},
+    {"xinput1_2.dll","XInputSetState","xinput1_3.dll","XInputSetState"},
+    {"xinput1_3.dll","#1","xinput1_3.dll","DllMain"},
     {"xinput1_3.dll","#2","xinput1_3.dll","XInputGetState"},
     {"xinput1_3.dll","#3","xinput1_3.dll","XInputSetState"},
     {"xinput1_3.dll","#4","xinput1_3.dll","XInputGetCapabilities"},
@@ -1725,6 +2158,7 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"xinput1_3.dll","#6","xinput1_3.dll","XInputGetDSoundAudioDeviceGuids"},
     {"xinput1_3.dll","#7","xinput1_3.dll","XInputGetBatteryInformation"},
     {"xinput1_3.dll","#8","xinput1_3.dll","XInputGetKeystroke"},
+    {"xinput1_4.dll","#1","xinput1_4.dll","DllMain"},
     {"xinput1_4.dll","#2","xinput1_4.dll","XInputGetState"},
     {"xinput1_4.dll","#3","xinput1_4.dll","XInputSetState"},
     {"xinput1_4.dll","#4","xinput1_4.dll","XInputGetCapabilities"},
@@ -1732,6 +2166,28 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"xinput1_4.dll","#7","xinput1_4.dll","XInputGetBatteryInformation"},
     {"xinput1_4.dll","#8","xinput1_4.dll","XInputGetKeystroke"},
     {"xinput1_4.dll","#10","xinput1_4.dll","XInputGetAudioDeviceIds"},
+    // UWP 與桌面版共用裝置狀態；UWP 有獨立的 PE 匯出序號。
+    {"xinputuap.dll","DllMain","xinput1_4.dll","DllMain"},
+    {"xinputuap.dll","XInputEnable","xinput1_4.dll","XInputEnable"},
+    {"xinputuap.dll","XInputGetAudioDeviceIds","xinput1_4.dll","XInputGetAudioDeviceIds"},
+    {"xinputuap.dll","XInputGetBatteryInformation","xinput1_4.dll","XInputGetBatteryInformation"},
+    {"xinputuap.dll","XInputGetCapabilities","xinput1_4.dll","XInputGetCapabilities"},
+    {"xinputuap.dll","XInputGetKeystroke","xinput1_4.dll","XInputGetKeystroke"},
+    {"xinputuap.dll","XInputGetState","xinput1_4.dll","XInputGetState"},
+    {"xinputuap.dll","XInputSetState","xinput1_4.dll","XInputSetState"},
+    {"xinputuap.dll","#1","xinput1_4.dll","DllMain"},
+    {"xinputuap.dll","#2","xinput1_4.dll","XInputEnable"},
+    {"xinputuap.dll","#3","xinput1_4.dll","XInputGetAudioDeviceIds"},
+    {"xinputuap.dll","#4","xinput1_4.dll","XInputGetBatteryInformation"},
+    {"xinputuap.dll","#5","xinput1_4.dll","XInputGetCapabilities"},
+    {"xinputuap.dll","#6","xinput1_4.dll","XInputGetKeystroke"},
+    {"xinputuap.dll","#7","xinput1_4.dll","XInputGetState"},
+    {"xinputuap.dll","#8","xinput1_4.dll","XInputSetState"},
+    {"xinputuap.dll","#10","xinput1_4.dll","XInputGetAudioDeviceIds"},
+    {"xinputuap.dll","XInputGetStateEx","xinput1_4.dll","#100"},
+    {"xinputuap.dll","#100","xinput1_4.dll","#100"},
+    {"xinputuap.dll","XInputGetCapabilitiesEx","xinput1_4.dll","#108"},
+    {"xinputuap.dll","#108","xinput1_4.dll","#108"},
     {"winspool.drv","#201","winspool.drv","GetDefaultPrinterA"},
     {"winspool.drv","#203","winspool.drv","GetDefaultPrinterW"},
     {"shlwapi.dll","#394","shell32.dll","SHChangeNotify"},
@@ -2439,7 +2895,12 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     // Windows 同名轉送：簽章與語義和目標相同（d3d10_1→d3d10、d3d11 的 D3DKMT→gdi32、evr 的影像格式→mfplat、spoolss→winspool、combase→ole32 的 proxy blanket 查詢）。
     {"combase.dll","CoCopyProxy","ole32.dll","CoCopyProxy"},
     {"combase.dll","CoQueryProxyBlanket","ole32.dll","CoQueryProxyBlanket"},{"d3d10_1.dll","D3D10CreateEffectFromMemory","d3d10.dll","D3D10CreateEffectFromMemory"},
+    {"d3d10_1.dll","D3D10CreateEffectPoolFromMemory","d3d10.dll","D3D10CreateEffectPoolFromMemory"},
     // D3D10 的著色器工具：簽章與 d3dcompiler 相同者直接共用（D3D10DisassembleShader 的 EnableColorCode 即 D3D_DISASM_ENABLE_COLOR_CODE）；d3d10_1 轉送 d3d10。
+    {"d3dcompiler_41.dll","D3DAssemble","d3dcompiler_47.dll","D3DAssemble"},
+    {"d3dcompiler_42.dll","D3DAssemble","d3dcompiler_47.dll","D3DAssemble"},
+    {"d3dcompiler_46.dll","D3DAssemble","d3dcompiler_47.dll","D3DAssemble"},
+    {"d3dcompiler_46.dll","D3DCreateBlob","d3dcompiler_47.dll","D3DCreateBlob"},
     {"d3dcompiler_46.dll","D3DReadFileToBlob","d3dcompiler_47.dll","D3DReadFileToBlob"},
     {"d3dcompiler_46.dll","D3DWriteBlobToFile","d3dcompiler_47.dll","D3DWriteBlobToFile"},
     {"d3dcompiler_46.dll","D3DGetBlobPart","d3dcompiler_47.dll","D3DGetBlobPart"},
@@ -2447,6 +2908,29 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"d3dcompiler_40.dll","D3DStripShader","d3dcompiler_43.dll","D3DStripShader"},
     {"d3dcompiler_41.dll","D3DStripShader","d3dcompiler_43.dll","D3DStripShader"},
     {"d3dcompiler_42.dll","D3DStripShader","d3dcompiler_43.dll","D3DStripShader"},
+    // 參考實作 舊編譯器名稱沿用共用 HLSL 與 bytecode 後端；反射另保留實際 DLL 版號。
+#define D3DCOMPILER_LEGACY_NAMES(module) \
+    {module,"D3DCompileFromMemory","d3dcompiler_43.dll","D3DCompile"}, \
+    {module,"D3DDisassembleCode","d3dcompiler_43.dll","D3DDisassemble"}, \
+    {module,"D3DDisassembleEffect","d3dcompiler_43.dll","D3DDisassemble10Effect"},
+    D3DCOMPILER_LEGACY_NAMES("d3dcompiler_33.dll")
+    D3DCOMPILER_LEGACY_NAMES("d3dcompiler_34.dll")
+    D3DCOMPILER_LEGACY_NAMES("d3dcompiler_35.dll")
+    D3DCOMPILER_LEGACY_NAMES("d3dcompiler_36.dll")
+    D3DCOMPILER_LEGACY_NAMES("d3dcompiler_37.dll")
+    D3DCOMPILER_LEGACY_NAMES("d3dcompiler_38.dll")
+    D3DCOMPILER_LEGACY_NAMES("d3dcompiler_39.dll")
+#undef D3DCOMPILER_LEGACY_NAMES
+#define D3DCOMPILER_STANDARD_NAMES(module) \
+    {module,"D3DCompile","d3dcompiler_43.dll","D3DCompile"}, \
+    {module,"D3DDisassemble","d3dcompiler_43.dll","D3DDisassemble"},
+    D3DCOMPILER_STANDARD_NAMES("d3dcompiler_40.dll")
+    D3DCOMPILER_STANDARD_NAMES("d3dcompiler_41.dll")
+    D3DCOMPILER_STANDARD_NAMES("d3dcompiler_42.dll")
+    D3DCOMPILER_STANDARD_NAMES("d3dcompiler_46.dll")
+#undef D3DCOMPILER_STANDARD_NAMES
+    {"d3dcompiler_46.dll","D3DCompile2","d3dcompiler_47.dll","D3DCompile2"},
+    {"d3dcompiler_46.dll","D3DCompileFromFile","d3dcompiler_47.dll","D3DCompileFromFile"},
     {"d3dcompiler_33.dll","D3DGetCodeDebugInfo","d3dcompiler_47.dll","D3DGetDebugInfo"},
     {"d3dcompiler_34.dll","D3DGetCodeDebugInfo","d3dcompiler_47.dll","D3DGetDebugInfo"},
     {"d3dcompiler_35.dll","D3DGetCodeDebugInfo","d3dcompiler_47.dll","D3DGetDebugInfo"},
@@ -2472,7 +2956,7 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"d3dcompiler_46.dll","D3DPreprocess","d3dcompiler_47.dll","D3DPreprocess"},
     {"d3d10.dll","D3D10PreprocessShader","d3dcompiler_47.dll","D3DPreprocess"},
     {"d3d10_1.dll","D3D10PreprocessShader","d3dcompiler_47.dll","D3DPreprocess"},
-    // 參考實作各版編譯器的簽章擷取入口共用相同的 DXBC 與 ID3DBlob 契約。
+    // 參考實作 各版編譯器的簽章擷取入口共用相同的 DXBC 與 ID3DBlob 契約。
     {"d3dcompiler_33.dll","D3DGetInputSignatureBlob","d3dcompiler_47.dll","D3DGetInputSignatureBlob"},
     {"d3dcompiler_33.dll","D3DGetOutputSignatureBlob","d3dcompiler_47.dll","D3DGetOutputSignatureBlob"},
     {"d3dcompiler_33.dll","D3DGetInputAndOutputSignatureBlob","d3dcompiler_47.dll","D3DGetInputAndOutputSignatureBlob"},
@@ -2577,7 +3061,57 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"evr.dll","MFConvertColorInfoToDXVA","mfplat.dll","MFConvertColorInfoToDXVA"},{"evr.dll","MFCreateDXSurfaceBuffer","mfplat.dll","MFCreateDXSurfaceBuffer"},{"evr.dll","MFCreateVideoMediaType","mfplat.dll","MFCreateVideoMediaType"},
     {"evr.dll","MFCreateVideoMediaTypeFromSubtype","mfplat.dll","MFCreateVideoMediaTypeFromSubtype"},{"evr.dll","MFCreateVideoMediaTypeFromVideoInfoHeader","mfplat.dll","MFCreateVideoMediaTypeFromVideoInfoHeader"},{"evr.dll","MFInitVideoFormat_RGB","mfplat.dll","MFInitVideoFormat_RGB"},
     {"spoolss.dll","EnumMonitorsW","winspool.drv","EnumMonitorsW"},{"spoolss.dll","EnumPortsW","winspool.drv","EnumPortsW"},{"spoolss.dll","GetPrinterDriverDirectoryW","winspool.drv","GetPrinterDriverDirectoryW"},
-    // D3DX10 的矩陣堆疊與 D3DX9 為同一個 ID3DXMatrixStack 介面與實作。
+    // 舊版 D3DX10 的數學入口轉發到共用數學服務。
+#define D3DX_MATH_EXPORTS(module) \
+    {module,"D3DXFloat16To32Array","d3dx9_43.dll","D3DXFloat16To32Array"}, \
+    {module,"D3DXFloat32To16Array","d3dx9_43.dll","D3DXFloat32To16Array"}, \
+    {module,"D3DXSHAdd","d3dx9_43.dll","D3DXSHAdd"}, \
+    {module,"D3DXSHDot","d3dx9_43.dll","D3DXSHDot"}, \
+    {module,"D3DXSHScale","d3dx9_43.dll","D3DXSHScale"}, \
+    {module,"D3DXSHEvalDirection","d3dx9_43.dll","D3DXSHEvalDirection"}, \
+    {module,"D3DXSHEvalDirectionalLight","d3dx9_43.dll","D3DXSHEvalDirectionalLight"}, \
+    {module,"D3DXSHEvalHemisphereLight","d3dx9_43.dll","D3DXSHEvalHemisphereLight"}, \
+    {module,"D3DXSHEvalConeLight","d3dx9_43.dll","D3DXSHEvalConeLight"}, \
+    {module,"D3DXSHEvalSphericalLight","d3dx9_43.dll","D3DXSHEvalSphericalLight"}, \
+    {module,"D3DXSHMultiply2","d3dx9_43.dll","D3DXSHMultiply2"}, \
+    {module,"D3DXSHMultiply3","d3dx9_43.dll","D3DXSHMultiply3"}, \
+    {module,"D3DXSHMultiply4","d3dx9_43.dll","D3DXSHMultiply4"}, \
+    {module,"D3DXSHMultiply5","d3dx9_43.dll","D3DXSHMultiply5"}, \
+    {module,"D3DXSHMultiply6","d3dx9_43.dll","D3DXSHMultiply6"}, \
+    {module,"D3DXSHRotate","d3dx9_43.dll","D3DXSHRotate"}, \
+    {module,"D3DXSHRotateZ","d3dx9_43.dll","D3DXSHRotateZ"}
+    // 舊版在自己的 DLL 公開這些編譯／效果入口；ABI 與 43 相同，共用內建編譯器。
+#define D3DX10_LOCAL_COMPILER_EXPORTS(module) \
+    {module,"D3DX10CompileFromMemory","d3dx10_43.dll","D3DX10CompileFromMemory"}, \
+    {module,"D3DX10PreprocessShaderFromMemory","d3dx10_43.dll","D3DX10PreprocessShaderFromMemory"}, \
+    {module,"D3DX10CreateEffectFromFileA","d3dx10_43.dll","D3DX10CreateEffectFromFileA"}, \
+    {module,"D3DX10CreateEffectFromFileW","d3dx10_43.dll","D3DX10CreateEffectFromFileW"}, \
+    {module,"D3DX10CreateEffectFromMemory","d3dx10_43.dll","D3DX10CreateEffectFromMemory"}, \
+    {module,"D3DX10CreateEffectFromResourceA","d3dx10_43.dll","D3DX10CreateEffectFromResourceA"}, \
+    {module,"D3DX10CreateEffectFromResourceW","d3dx10_43.dll","D3DX10CreateEffectFromResourceW"}
+    D3DX10_LOCAL_COMPILER_EXPORTS("d3dx10_33.dll"),
+    D3DX10_LOCAL_COMPILER_EXPORTS("d3dx10_34.dll"),
+    D3DX10_LOCAL_COMPILER_EXPORTS("d3dx10_35.dll"),
+    D3DX10_LOCAL_COMPILER_EXPORTS("d3dx10_36.dll"),
+    D3DX10_LOCAL_COMPILER_EXPORTS("d3dx10_37.dll"),
+    D3DX10_LOCAL_COMPILER_EXPORTS("d3dx10_38.dll"),
+    D3DX10_LOCAL_COMPILER_EXPORTS("d3dx10_39.dll"),
+    D3DX10_LOCAL_COMPILER_EXPORTS("d3dx10_40.dll"),
+    D3DX10_LOCAL_COMPILER_EXPORTS("d3dx10_41.dll"),
+    D3DX10_LOCAL_COMPILER_EXPORTS("d3dx10_42.dll"),
+#undef D3DX10_LOCAL_COMPILER_EXPORTS
+    {"d3dx10_39.dll","D3DX10ReflectShader","d3d10.dll","D3D10ReflectShader"},
+    D3DX_MATH_EXPORTS("d3dx10_33.dll"),
+    D3DX_MATH_EXPORTS("d3dx10_34.dll"),
+    D3DX_MATH_EXPORTS("d3dx10_35.dll"),
+    D3DX_MATH_EXPORTS("d3dx10_36.dll"),
+    D3DX_MATH_EXPORTS("d3dx10_37.dll"),
+    D3DX_MATH_EXPORTS("d3dx10_38.dll"),
+    D3DX_MATH_EXPORTS("d3dx10_39.dll"),
+    D3DX_MATH_EXPORTS("d3dx10_40.dll"),
+    D3DX_MATH_EXPORTS("d3dx10_41.dll"),
+    D3DX_MATH_EXPORTS("d3dx10_42.dll"),
+#undef D3DX_MATH_EXPORTS
     {"d3dx10_43.dll","D3DXCreateMatrixStack","d3dx9_43.dll","D3DXCreateMatrixStack"},
     // VC10～VC12 的 msvcr 匯出 exception_ptr 輔助（VC14 移到 msvcp140）：兩個指標的儲存版面與語義相同，x64（PEAX）與 x86（PAX）修飾名稱各自對應。
     {"msvcr100.dll","?__ExceptionPtrAssign@@YAXPEAXPEBX@Z","msvcp140.dll","?__ExceptionPtrAssign@@YAXPEAXPEBX@Z"},{"msvcr100.dll","?__ExceptionPtrAssign@@YAXPAXPBX@Z","msvcp140.dll","?__ExceptionPtrAssign@@YAXPAXPBX@Z"},{"msvcr100.dll","?__ExceptionPtrCompare@@YA_NPEBX0@Z","msvcp140.dll","?__ExceptionPtrCompare@@YA_NPEBX0@Z"},
@@ -2607,7 +3141,7 @@ inline constexpr std::string_view ucrt_optional_exports[]{
     "_Getdays", "_Getmonths", "_Gettnames", "_Strftime", "_W_Getdays", "_W_Getmonths", "_W_Gettnames", "_Wcsftime", "___lc_codepage_func",
     "___lc_collate_cp_func", "___lc_locale_name_func", "___mb_cur_max_func", "__acrt_iob_func", "__conio_common_vcprintf",
     "__conio_common_vcwprintf", "__daylight", "__dstbias", "__fpe_flt_rounds", "__p___argc", "__p___argv", "__p___wargv", "__p__acmdln",
-    "__p__commode", "__p__environ", "__p__fmode", "__p__mbctype", "__p__pgmptr", "__p__wcmdln", "__p__wenviron", "__p__wpgmptr",
+    "__p__commode", "__p__environ", "__p__fmode", "__p__mbcasemap", "__p__mbctype", "__p__pgmptr", "__p__wcmdln", "__p__wenviron", "__p__wpgmptr",
     "__pctype_func", "__std_exception_copy", "__std_exception_destroy", "__std_type_info_destroy_list", "__std_type_info_name",
     "__stdio_common_vfprintf", "__stdio_common_vfprintf_p", "__stdio_common_vfprintf_s", "__stdio_common_vfscanf",
     "__stdio_common_vfwprintf", "__stdio_common_vfwprintf_p", "__stdio_common_vfwprintf_s", "__stdio_common_vfwscanf",
@@ -2635,7 +3169,10 @@ inline constexpr std::string_view ucrt_optional_exports[]{
     "_getdrive", "_getdrives", "_getmbcp", "_getw", "_getwc_nolock", "_getwch", "_getwch_nolock", "_getwche", "_getwche_nolock", "_getws",
     "_gmtime32", "_gmtime32_s", "_gmtime64", "_gmtime64_s", "_heapchk", "_heapmin", "_hypot", "_hypotf", "_i64toa", "_i64toa_s", "_i64tow",
     "_i64tow_s", "_initialize_narrow_environment", "_initialize_onexit_table", "_initialize_wide_environment", "_invalid_parameter_noinfo",
-    "_invalid_parameter_noinfo_noreturn", "_isatty", "_isctype", "_isctype_l", "_isleadbyte_l", "_ismbbkana", "_ismbbkana_l", "_ismbblead",
+    "_invalid_parameter_noinfo_noreturn", "_isatty", "_isctype", "_isctype_l", "_isleadbyte_l", "_ismbbalnum", "_ismbbalnum_l", "_ismbbalpha", "_ismbbalpha_l",
+    "_ismbbblank", "_ismbbblank_l", "_ismbbgraph", "_ismbbgraph_l", "_ismbbkalnum", "_ismbbkalnum_l",
+    "_ismbbkana", "_ismbbkana_l", "_ismbbkprint", "_ismbbkprint_l", "_ismbbkpunct", "_ismbbkpunct_l",
+    "_ismbbprint", "_ismbbprint_l", "_ismbbpunct", "_ismbbpunct_l", "_ismbcblank", "_ismbcblank_l", "_ismbblead",
     "_ismbblead_l", "_ismbbtrail", "_ismbbtrail_l", "_ismbcalnum", "_ismbcalnum_l", "_ismbcalpha", "_ismbcalpha_l", "_ismbcdigit",
     "_ismbcdigit_l", "_ismbcgraph", "_ismbcgraph_l", "_ismbchira", "_ismbchira_l", "_ismbckata", "_ismbckata_l", "_ismbcl0", "_ismbcl0_l",
     "_ismbcl1", "_ismbcl1_l", "_ismbcl2", "_ismbcl2_l", "_ismbclegal", "_ismbclegal_l", "_ismbclower_l", "_ismbcprint", "_ismbcprint_l",
@@ -2652,7 +3189,7 @@ inline constexpr std::string_view ucrt_optional_exports[]{
     "_mbsnbcat", "_mbsnbcat_l", "_mbsnbcat_s", "_mbsnbcat_s_l", "_mbsnbcmp", "_mbsnbcnt", "_mbsnbcnt_l", "_mbsnbcoll", "_mbsnbcoll_l",
     "_mbsnbcpy", "_mbsnbcpy_l", "_mbsnbcpy_s", "_mbsnbcpy_s_l", "_mbsnbicmp", "_mbsnbicmp_l", "_mbsnbicoll", "_mbsnbicoll_l", "_mbsnbset",
     "_mbsnbset_l", "_mbsncat", "_mbsncat_l", "_mbsnccnt", "_mbsnccnt_l", "_mbsncmp", "_mbsncmp_l", "_mbsncpy", "_mbsncpy_l", "_mbsncpy_s",
-    "_mbsncpy_s_l", "_mbsnextc", "_mbsnextc_l", "_mbsnicmp", "_mbsnicmp_l", "_mbsninc", "_mbsnlen", "_mbsnlen_l", "_mbsnset", "_mbsnset_l",
+    "_mbsncpy_s_l", "_mbsncoll", "_mbsncoll_l", "_mbsnextc", "_mbsnextc_l", "_mbsnicmp", "_mbsnicmp_l", "_mbsnicoll", "_mbsnicoll_l", "_mbsninc", "_mbsnlen", "_mbsnlen_l", "_mbsnset", "_mbsnset_l",
     "_mbspbrk", "_mbspbrk_l", "_mbsrchr", "_mbsrchr_l", "_mbsrev", "_mbsrev_l", "_mbsset", "_mbsset_l", "_mbsspn", "_mbsspn_l", "_mbsspnp",
     "_mbsspnp_l", "_mbsstr", "_mbstok", "_mbstok_l", "_mbstok_s", "_mbstok_s_l", "_mbstowcs_l", "_mbstowcs_s_l", "_mbstrlen", "_mbstrlen_l",
     "_mbsupr", "_mbsupr_l", "_mbsupr_s", "_mbsupr_s_l", "_mbtowc_l", "_memicmp", "_memicmp_l", "_mkdir", "_mkgmtime32", "_mkgmtime64",

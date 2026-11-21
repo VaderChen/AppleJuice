@@ -75,6 +75,15 @@ struct SharedEventStorage {
 };
 SharedEventLock::SharedEventLock(int value):descriptor(value) {
 #if !defined(_WIN32)
+    // 診斷：X64ARM_TRACE_SHARED_LOCK_WAIT=1 每 4096 次取鎖列出累計次數、等待總時間與最長等待（區分爭用與系統呼叫成本）。
+    static const bool trace_wait=std::getenv("X64ARM_TRACE_SHARED_LOCK_WAIT")!=nullptr;
+    const auto started=trace_wait && descriptor>=0?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    struct WaitTrace {bool enabled;std::chrono::steady_clock::time_point started;~WaitTrace(){
+        if(!enabled)return;static std::atomic<std::uint64_t> count{},total{},longest{};
+        const auto waited=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count());
+        total.fetch_add(waited,std::memory_order_relaxed);auto previous=longest.load(std::memory_order_relaxed);while(waited>previous && !longest.compare_exchange_weak(previous,waited,std::memory_order_relaxed)){}
+        const auto n=count.fetch_add(1,std::memory_order_relaxed)+1;
+        if(!(n&4095))std::fprintf(stderr,"[shared-lock-wait] pid=%d n=%llu total_ms=%.1f mean_us=%.1f max_ms=%.2f\n",static_cast<int>(::getpid()),static_cast<unsigned long long>(n),static_cast<double>(total.load())/1e6,static_cast<double>(total.load())/1e3/static_cast<double>(n),static_cast<double>(longest.exchange(0))/1e6);}} wait_trace{trace_wait && descriptor>=0,started};
     if(descriptor>=0)while(::flock(descriptor,LOCK_EX)<0)if(errno!=EINTR){
         // 保留真正的宿主錯誤與 fd 狀態，區分生命週期、鎖循環及資源不足；
         // 不忽略失敗或在未取得鎖時繼續消耗共用物件。
@@ -281,6 +290,18 @@ bool SharedMutex::owned()const noexcept{return storage_->lease;}
 void SharedMutex::detach_handles(){
 #if !defined(_WIN32)
     SharedEventLock lock(storage_->directory);if(storage_->counted){if(storage_->data->references && !--storage_->data->references)(void)::unlinkat(storage_->directory,storage_->name.c_str(),0);storage_->counted=false;}
+#endif
+}
+bool SharedMutex::available_hint(std::uint64_t thread) noexcept{
+#if !defined(_WIN32)
+    auto& data=*storage_->data;
+    if(storage_->lease)return std::atomic_ref(data.thread).load(std::memory_order_acquire)==thread;
+    if(!std::atomic_ref(data.process).load(std::memory_order_acquire))return true;
+    // 其他擁有者：只探測 mutex 檔本身的 ownership lease（非阻塞，不碰命名空間鎖）；可取得表示擁有者已結束，交給鎖下流程處理放棄。
+    if(::flock(storage_->file,LOCK_EX|LOCK_NB)==0){(void)::flock(storage_->file,LOCK_UN);return true;}
+    return false;
+#else
+    (void)thread;return true;
 #endif
 }
 bool SharedMutex::available_locked(std::uint64_t thread){

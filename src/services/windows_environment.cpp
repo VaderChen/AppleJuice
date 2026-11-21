@@ -838,7 +838,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
         if(invalid)directory_error=drive?15:87;
         else try {
             const auto input=drive?std::u16string{static_cast<char16_t>(u'A'+number-1),u':'}:text(0);
-            if(input.empty())directory_error=123;
+            if(input.empty())directory_error=crt?3U:123U;
             else {
                 const auto directory=normalized_windows_path(full_windows_environment_path(input,runtime_.current_directory,runtime_.environment),runtime_.current_directory);
                 directory_error=change_current_directory(memory,directory);
@@ -999,7 +999,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
             try{
                 const auto bytes=encode(expand_guest_environment(text(0),runtime_.environment));
                 const auto used=bytes.size()/(wide?2U:1U);
-                // 低位字包括 NUL。參考實作的 W 版允許剛好填滿，A 版要求再有一個位元組空間。
+                // 低位字包括 NUL。參考實作 的 W 版允許剛好填滿，A 版要求再有一個位元組空間。
                 if(wide?used<=capacity:used<capacity){
                     memory.write(GuestAddress{arg(0)},bytes);
                     result=0x10000U|(used&0xffffU);

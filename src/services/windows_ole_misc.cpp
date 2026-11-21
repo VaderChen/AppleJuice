@@ -74,7 +74,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_misc(GuestState& state,
             return done(!host("kernel32.dll",probe,{pointer,size}));
         }
         if(name=="IsValidInterface"){
-            // 參考實作檢查 QueryInterface 入口前九個位元組；依客體指標寬度取得 vtable 與方法。
+            // 參考實作 檢查 QueryInterface 入口前九個位元組；依客體指標寬度取得 vtable 與方法。
             try{
                 const auto table=memory.load(GuestAddress{arg(0)},bits);
                 const auto query=memory.load(GuestAddress{table},bits);

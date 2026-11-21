@@ -3,8 +3,10 @@
             std::vector<std::uint8_t> bytes;
             if(resource)bytes=d3dx_resource_bytes(arg(index),arg(index+1),0,symbol.ends_with('W'));
             else if(from_memory){
-                require(arg(index) && u(index+1) && u(index+1)<=512U*1024U*1024U);
-                bytes=read(arg(index),u(index+1));
+                // 官方 D3DX 依影像內容本身的長度解析（PNG 的 IEND 等）：傳入超過可讀範圍的長度（常見 0xFFFFFFFF）時只讀到所在映射的結尾。
+                require(arg(index) && u(index+1));std::uint64_t size=u(index+1);
+                if(const auto mapping=memory.query(GuestAddress{arg(index)});mapping && mapping->base.value+mapping->size>arg(index))size=std::min<std::uint64_t>(size,mapping->base.value+mapping->size-arg(index));
+                require(size<=512U*1024U*1024U);bytes=read(arg(index),static_cast<std::size_t>(size));
             }else{
                 require(arg(index));
                 const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(index)})):read_ansi(memory,arg(index));

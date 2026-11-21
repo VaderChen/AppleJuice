@@ -119,7 +119,7 @@ struct Msvcp100State {
     std::uint64_t global{},codecvt_table{},ctype_table{},buffer_table{},ios_table{},istream_vb{},iostream_vb{},next{1},next_id{2};
     bool sync_with_stdio{true}; // ios_base::sync_with_stdio 的目前設定（MSVC 只保存值，不改變串流行為）。
     std::uint64_t std_new_handler{},ostream_vb{}; // std::set_new_handler 的處理常式、VC10 ostream 的虛擬基底表。
-    struct Tables {std::uint64_t buffer{},ios{},istream{},ostream{},iostream{},codecvt{},codecvt16{},codecvt32{},codecvt_ushort{},ctype{},num_put{},num_put16{},num_get{},num_get16{},numpunct{},numpunct_byname{},time_put{},time_put16{},time_get{};};
+    struct Tables {std::uint64_t buffer{},ios{},istream{},ostream{},iostream{},codecvt{},codecvt16{},codecvt32{},codecvt_ushort{},ctype{},ctype16{},num_put{},num_put16{},num_get{},num_get16{},numpunct{},numpunct_byname{},time_put{},time_put16{},time_get{};};
     // VC14 與 VC12 各自的常駐物件：虛擬表指向各自的內部家族，locale 物件與標準串流依各自版面建立（索引見 StreamAbi::variant）。
     struct ModernRuntime {
         std::map<std::string,std::uint64_t,std::less<>> data14;
@@ -216,7 +216,12 @@ void WindowsServices::initialize_msvcp100(GuestMemory& memory){
                 msvcp_detail::facet_shape(".?AV?$codecvt@_UDU_Mbstatet@@@std@@",l.p,".?AVcodecvt_base@std@@"));
         }
         const auto ctype_shape=msvcp_detail::facet_shape(".?AV?$ctype@"+character+"@std@@",l.p,".?AUctype_base@std@@");
-        if(element)t.ctype=modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","CtypeIsRange","CtypeIs","CtypeScanIs","CtypeScanNot","CtypeLowerRange","CtypeLower","CtypeUpperRange","CtypeUpper","CtypeWidenRange","CtypeWiden","CtypeNarrowRange","CtypeNarrow"},ctype_shape);
+        if(element){
+            const std::initializer_list<const char*> wide_ctype{"FacetDelete","FacetIncref","FacetDecref","CtypeIsRange","CtypeIs","CtypeScanIs","CtypeScanNot","CtypeLowerRange","CtypeLower","CtypeUpperRange","CtypeUpper","CtypeWidenRange","CtypeWiden","CtypeNarrowRange","CtypeNarrow"};
+            t.ctype=modern_table(variant,prefix,wide_ctype,ctype_shape);
+            // unsigned short 版與 wchar_t 共用分類實作，另有自己的 vtable 與 RTTI。
+            t.ctype16=modern_table(variant,prefix,wide_ctype,msvcp_detail::facet_shape(".?AV?$ctype@G@std@@",l.p,".?AUctype_base@std@@"));
+        }
         else t.ctype=modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","CtypeLowerRange","CtypeLower","CtypeUpperRange","CtypeUpper","CtypeWidenRange","CtypeWiden","CtypeNarrowRange","CtypeNarrow"},ctype_shape);
         const auto num_put_table=[&](const std::string& c){return modern_table(variant,prefix,{"FacetDelete","FacetIncref","FacetDecref","NumPutPointer","NumPutLongDouble","NumPutDouble","NumPutUnsigned64","NumPutSigned64","NumPutUnsigned32","NumPutSigned32","NumPutBoolean"},
             msvcp_detail::facet_shape(".?AV?$num_put@"+c+"V?$ostreambuf_iterator@"+c+"U?$char_traits@"+c+"@std@@@std@@@std@@",l.p));};
@@ -286,9 +291,11 @@ void WindowsServices::initialize_msvcp100(GuestMemory& memory){
         "?id@?$time_put@GV?$ostreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A",
         "?id@?$codecvt@_SDU_Mbstatet@@@std@@2V0locale@2@A","?id@?$codecvt@_UDU_Mbstatet@@@std@@2V0locale@2@A","?id@?$codecvt@GDU_Mbstatet@@@std@@2V0locale@2@A",
         "?id@?$time_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A",
-        "?id@?$time_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A"}){
+        "?id@?$time_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A","?id@?$ctype@G@std@@2V0locale@2@A"}){
         const auto address=runtime_allocate(memory,{},l.p);put(address,0);m.data14.emplace(symbol,address);
     }
+    // ctype<char>::table_size（靜態常數 256，x86 為 unsigned int、x64 為 size_t）。
+    {const auto address=runtime_allocate(memory,{},l.p);put(address,256);m.data14.emplace(x86_?"?table_size@?$ctype@D@std@@2IB":"?table_size@?$ctype@D@std@@2_KB",address);}
     for(unsigned element=0;element<2;++element){const auto character=element?"_W":"D";const auto& tables=m.tables14[element];
         m.data14.emplace(std::string("??_7?$numpunct@")+character+"@std@@6B@",tables.numpunct);
         m.data14.emplace(std::string("??_7?$num_put@")+character+"V?$ostreambuf_iterator@"+character+"U?$char_traits@"+character+"@std@@@std@@@std@@6B@",tables.num_put);
@@ -429,6 +436,22 @@ void WindowsServices::discard_msvcp100(std::uint64_t token,GuestState& state,Gue
     if(operation.scratch){msvcp100_->exception_pointers.erase(operation.scratch);(void)free_heap(memory,operation.scratch,state);}
 }
 
+// worker 端（x64，持共用映射鎖）：ctype<char>::toupper(char)／tolower(char) 的公開包裝在虛擬表仍是內建基底實作時，
+// 直接查 facet 語系的大小寫表（與下方 CtypeUpper／CtypeLower 的 convert 相同）。facet 表只在協調者完整路徑增刪
+// （全停或獨占映射鎖），這裡唯讀。衍生 facet、表內沒有紀錄或記憶體不可讀時交回協調者，不改任何狀態。
+bool WindowsServices::msvcp_ctype_case_worker(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(x86_ || !msvcp100_)return false;
+    const auto l=msvcp_detail::abi(x86_,service);if(!l.modern || l.element!=1)return false;
+    const bool upper=service.symbol.starts_with("?toupper@");
+    const auto object=state.reg(Gpr::Rcx);const unsigned slot=3U+(upper?2U:0U)+1U;
+    const auto entry=resolve_service(msvcp_detail::modern_internal(l.variant()),upper?"DCtypeUpper64":"DCtypeLower64",false);if(!entry.value)return false;
+    const auto table_pointer=memory.load(GuestAddress{object},64);
+    if(memory.load(GuestAddress{table_pointer+slot*8U},64)!=entry.value)return false;
+    const auto locale=msvcp100_->facet_locales.find(object);if(locale==msvcp100_->facet_locales.end())return false;
+    const auto& table=windows_crt_character_table(locale->second.category);
+    const auto target=memory.load(GuestAddress{state.reg(Gpr::Rsp)},64);
+    state.reg(Gpr::Rax)=(upper?table.upper:table.lower)[state.reg(Gpr::Rdx)&255U];state.reg(Gpr::Rsp)+=8;state.rip=GuestAddress{target};return true;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall call(state,memory,service);auto& s=*msvcp100_;const auto l=msvcp_detail::abi(x86_,service);const auto bits=static_cast<std::uint8_t>(l.p*8);
     auto& m=s.runtimes[l.variant()];const auto* const modern_internal=msvcp_detail::modern_internal(l.variant());
@@ -460,6 +483,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
     // _Cvtvec／_Ctypevec 與 VC11／VC12 的 C 匯出共用 windows_msvcp_runtime.cpp；表配置失敗時退回常駐 classic 表。
     const auto write_cvtvec=[&](std::uint64_t output){msvcp_cvt_vector(state,memory,output);};
     const auto write_ctypevec=[&](std::uint64_t output){if(!msvcp_ctype_vector(state,memory,output))put(output+(x86_?4U:8U),m.ctype_masks14);};
+    // ctype 的 _Tidy：_Ctypevec＝{碼頁, 表, _Delfl, 語系名稱}；_Delfl>0 以 free、<0 以 delete[] 配置（兩者都是本執行階段的堆積），語系名稱以 free。
+    // 釋放後把 _Delfl 與名稱清零，避免解構與刪除重複釋放。
+    const auto tidy_msvcp_ctype=[&](std::uint64_t facet){
+        const auto vector=facet+2*l.p,table_at=vector+(x86_?4U:8U),delfl_at=vector+2*l.p,name_at=vector+3*l.p;
+        const auto table=ptr(table_at);const auto delfl=memory.load(GuestAddress{delfl_at},32);
+        if(table && delfl && table!=m.ctype_masks14)(void)free_heap(memory,table,state);
+        if(const auto label=ptr(name_at))(void)free_heap(memory,label,state);
+        memory.store(GuestAddress{delfl_at},32,0);put(name_at,0);
+    };
     if(!internal && name.starts_with('_')){
         // C 匯出：x64 浮點引數在與參數序相同的 XMM，Win32 cdecl 在堆疊；回傳值分別走 XMM0 與 x87 ST(0)。
         if(name=="_Getctype"){write_ctypevec(a(0));return done(a(0));}
@@ -954,7 +986,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
             if(!facet){throw_msvc_exception(state,memory,service,MsvcExceptionKind::BadAlloc);return {};}Msvcp100State::FacetLocale metadata;metadata.category=*category;
             try{
                 memory.write(GuestAddress{facet},std::vector<std::uint8_t>(size));
-                put(facet,codecvt?(l.modern?(cvt16?tables.codecvt16:cvt32?tables.codecvt32:cvt_ushort?tables.codecvt_ushort:tables.codecvt):s.codecvt_table):(l.modern?tables.ctype:s.ctype_table));
+                put(facet,codecvt?(l.modern?(cvt16?tables.codecvt16:cvt32?tables.codecvt32:cvt_ushort?tables.codecvt_ushort:tables.codecvt):s.codecvt_table):(l.modern?(name.find("ctype@G@")!=name.npos?tables.ctype16:tables.ctype):s.ctype_table));
                 if(l.modern && cvt_plain){if(!cvt_char)memory.store(GuestAddress{facet+2*l.p},32,0x10ffffU);}
                 else if(l.modern){
                     const auto cvt=codecvt?facet+2*l.p:facet+(x86_?24U:48U);
@@ -979,9 +1011,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
             const auto token=s.next++;s.operations.emplace(token,std::move(op));return resume_msvcp100(state,memory,token,0);
         }
         if(const auto locale=s.facet_locales.find(object);locale!=s.facet_locales.end()){for(const auto resource:locale->second.resources)(void)free_heap(memory,resource,state);s.facet_locales.erase(locale);}
+        else if(l.modern){const auto type=ptr(object);if(type && (type==m.tables14[0].ctype || type==m.tables14[1].ctype || type==m.tables14[1].ctype16))tidy_msvcp_ctype(object);}
         if((a(0)&1U) && !free_heap(memory,object,state))throw HostCallFault("VC10 facet 配置無效");return done(object);
     }
-    if(method=="is" && name.find("ctype@")!=name.npos)return done((character_mask(static_cast<char16_t>(a(1)))&a(0))!=0);
+    if(!l.modern && method=="is" && name.find("ctype@")!=name.npos)return done((character_mask(static_cast<char16_t>(a(1)))&a(0))!=0);
     if(method=="always_noconv")return virtual_call(object,l.facet_slot(1),{});
     if(l.modern && (name.find("codecvt@")!=name.npos || name.find("codecvt_base@")!=name.npos)){
         if(method=="length")return virtual_call(object,l.facet_slot(7),{a(0),a(1),a(2),a(3)});
@@ -1208,6 +1241,34 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         }return done(closure?0:object);
     }
     if(l.modern && (name.starts_with("??1facet@") || name.starts_with("??1?$codecvt@"))){s.facet_locales.erase(object);put(object,m.facet_table14);return done(0);}
+    // ctype<char／wchar_t／unsigned short> 的建構、解構、_Init 與 _Tidy：只寫 MSVC 物件本身的欄位，不越過 sizeof(ctype)——
+    // vptr、refs、_Ctypevec（2 個指標寬之後），寬字元版另有 _Cvtvec（x86 +24、x64 +48，44 位元組）。
+    if(l.modern && name.find("?$ctype@")!=name.npos && (name.starts_with("??0?$ctype@") || name.starts_with("??1?$ctype@") || method=="_Init" || method=="_Tidy")){
+        const auto vector=object+2*l.p,table_at=vector+(x86_?4U:8U),delfl_at=vector+2*l.p,cvt_at=object+(x86_?24U:48U);
+        const bool narrow_type=l.element==1,ushort_type=name.find("ctype@G@")!=name.npos;
+        if(method=="_Tidy"){tidy_msvcp_ctype(object);return done(0);}
+        if(method=="_Init"){write_ctypevec(vector);if(!narrow_type)write_cvtvec(cvt_at);return done(0);}
+        if(name.starts_with("??1")){
+            if(const auto locale=s.facet_locales.find(object);locale!=s.facet_locales.end()){for(const auto resource:locale->second.resources)(void)free_heap(memory,resource,state);s.facet_locales.erase(locale);}
+            else tidy_msvcp_ctype(object);
+            put(object,m.facet_table14);return done(0);
+        }
+        // 建構：(_Locinfo, refs) 依該 _Locinfo 目前套用的 CRT locale 填入；char 的 (表, 是否刪除, refs) 與寬字元的 (refs) 以預設 _Locinfo（"C"）初始化。
+        const bool by_locinfo=name.find("_Locinfo@")!=name.npos,table_constructor=narrow_type && !by_locinfo;
+        const auto size=narrow_type?6*l.p:(x86_?24U:48U)+44U;memory.check(GuestAddress{object},size,Access::Write);memory.fill(GuestAddress{object},0,size);
+        put(object,ushort_type?tables.ctype16:tables.ctype);put_refs(object,a(by_locinfo?1:table_constructor?2:0));
+        if(by_locinfo){write_ctypevec(vector);if(!narrow_type)write_cvtvec(cvt_at);}
+        else if(table_constructor){
+            // MSVC 在 "C" 的 _Init 之後立即 _Tidy 再換表：最終碼頁 0、無名稱；未給表時用 classic 表且不擁有。
+            const auto table=a(0);put(table_at,table?table:m.ctype_masks14);memory.store(GuestAddress{delfl_at},32,table && (a(1)&255U)?UINT32_MAX:0U);
+        }else{
+            const auto copy=allocate_heap(memory,512);if(!copy){throw_msvc_exception(state,memory,service,MsvcExceptionKind::BadAlloc);return {};}
+            std::array<std::uint8_t,512> masks{};memory.read(GuestAddress{m.ctype_masks14},masks);memory.write(GuestAddress{copy},masks);
+            put(table_at,copy);memory.store(GuestAddress{delfl_at},32,1);
+            std::array<std::uint8_t,44> classic{};classic[4]=1;classic[8]=1;memory.write(GuestAddress{cvt_at},classic); // 碼頁 0、最大 1 位元組、C locale
+        }
+        return done(object);
+    }
     // 區間多載的簽章含指標；x64 與 x86 裝飾名都只在此處出現 P。
     const bool ctype_range=name.find("@?$ctype@")!=name.npos && name.substr(name.rfind("@@")+2).find('P')!=name.npos;
     // 公開包裝轉呼叫的虛擬函式仍是本引擎的基底實作（facet 沒有覆寫）時直接計算，不經客體回呼；引數與虛擬函式相同。
@@ -1216,6 +1277,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         const auto entry=std::string(1,l.element==1?'D':'W')+std::string(operation)+(x86_?"32":"64");
         return ptr(ptr(object)+slot*l.p)==resolve(msvcp_detail::modern_internal(l.variant()),entry).value;
     };
+    // ctype 分類公開成員：char 版依物件自己的 _Ctypevec 表（MSVC 標頭內聯語義，不經虛擬函式）；
+    // 寬字元版轉呼叫 do_is／do_scan_is／do_scan_not（衍生 facet 的覆寫一併生效，基底實作直接計算）。
+    if(l.modern && name.find("@?$ctype@")!=name.npos && (method=="is" || method=="scan_is" || method=="scan_not" || method=="table" || method=="classic_table")){
+        if(method=="classic_table")return done(m.ctype_masks14);
+        const auto own_table=[&]{const auto value=ptr(object+2*l.p+(x86_?4U:8U));return value?value:m.ctype_masks14;};
+        if(method=="table")return done(own_table());
+        const bool scan=method!="is";
+        if(l.element==1){
+            const auto masks=own_table();const auto mask_of=[&](std::uint64_t c){return static_cast<std::uint32_t>(memory.load(GuestAddress{masks+(c&255U)*2},16));};
+            if(!scan && !ctype_range)return done((mask_of(a(1))&a(0)&0xffffU)!=0);
+            if(!scan){
+                const auto first=a(0),last=a(1),output=a(2);if(last<first)throw HostCallFault("STL ctype 分類範圍無效");const auto count=last-first;
+                memory.check(GuestAddress{first},static_cast<std::size_t>(count),Access::Read);memory.check(GuestAddress{output},static_cast<std::size_t>(count*2),Access::Write);
+                for(std::uint64_t i=0;i<count;++i)memory.store(GuestAddress{output+i*2},16,mask_of(memory.load(GuestAddress{first+i},8)));return done(last);
+            }
+            auto first=a(1);const auto last=a(2);if(last<first)throw HostCallFault("STL ctype 掃描範圍無效");
+            const auto wanted=static_cast<std::uint32_t>(a(0)&0xffffU);const bool want_match=method=="scan_is";
+            while(first<last && ((mask_of(memory.load(GuestAddress{first},8))&wanted)!=0)!=want_match)++first;return done(first);
+        }
+        const unsigned slot=method=="scan_is"?5U:method=="scan_not"?6U:ctype_range?3U:4U;
+        const std::string operation=method=="scan_is"?"CtypeScanIs":method=="scan_not"?"CtypeScanNot":ctype_range?"CtypeIsRange":"CtypeIs";
+        if(!base_virtual(slot,operation))return virtual_call(object,slot,scan?std::vector<std::uint64_t>{a(0)&0xffffU,a(1),a(2)}:
+            ctype_range?std::vector<std::uint64_t>{a(0),a(1),a(2)}:std::vector<std::uint64_t>{a(0)&0xffffU,a(1)&0xffffU});
+        devirtualized=operation;
+    }
     if(l.modern && (method=="tolower" || method=="toupper")){
         const auto slot=(l.element==1?3U:7U)+(method=="toupper"?2U:0U)+(ctype_range?0U:1U);
         const std::string operation=std::string(method=="toupper"?"CtypeUpper":"CtypeLower")+(ctype_range?"Range":"");

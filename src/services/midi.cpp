@@ -108,12 +108,42 @@ struct Raw {std::uint64_t tick;std::uint32_t tempo;std::uint8_t status,first,sec
 }
 Sequence parse(std::span<const std::uint8_t> bytes){
     if(bytes.size()>16*1024*1024)throw std::invalid_argument("MIDI exceeds 16 MiB");
-    if(bytes.size()>=4 && std::equal(bytes.begin(),bytes.begin()+4,"RIFF"))return parse_directmusic(bytes);
+    if(bytes.size()>=12 && directmusic_file::tag(bytes)=="RIFF" && directmusic_file::tag(bytes,8)=="DMSG")
+        return parse_directmusic(bytes);
+    return parse_midi_file(bytes);
+}
+Sequence parse_midi_file(std::span<const std::uint8_t> bytes){
+    if(bytes.size()>16*1024*1024)throw std::invalid_argument("MIDI exceeds 16 MiB");
+    if(bytes.size()>=4 && directmusic_file::tag(bytes)=="RIFF"){
+        const auto root=directmusic_file::chunks(bytes);
+        if(root.size()!=1 || directmusic_file::tag(root.front().bytes)!="RMID")
+            throw std::invalid_argument("not a RIFF MIDI file");
+        const auto entries=directmusic_file::chunks(root.front().bytes.subspan(4));
+        const auto data=std::find_if(entries.begin(),entries.end(),[](const auto& entry){return entry.id=="data";});
+        if(data==entries.end() || std::any_of(std::next(data),entries.end(),[](const auto& entry){return entry.id=="data";}))
+            throw std::invalid_argument("invalid RIFF MIDI data chunk");
+        bytes=data->bytes;
+    }
     Reader r{bytes};if(r.number(4)!=0x4d546864)throw std::invalid_argument("not a standard MIDI file");
     const auto size=r.number(4);if(size<6)throw std::invalid_argument("invalid MIDI header");Reader h{r.take(size)};
     const auto format=h.number(2),tracks=h.number(2),division=h.number(2);
-    if(format>1 || !tracks || tracks>128 || (format==0 && tracks!=1) || !division || (division&0x8000))throw std::invalid_argument("unsupported MIDI format/division");
+    if(format>1 || !tracks || tracks>128 || (format==0 && tracks!=1) || !Stream::valid_division(division))
+        throw std::invalid_argument("unsupported MIDI format/division");
+    Sequence seq;
+    seq.division=static_cast<std::uint16_t>(division);
+    const bool smpte=division&0x8000;
+    const auto fps=256U-(division>>8);
+    const auto smpte_frame=[&](std::uint64_t tick){
+        if(fps==29)return tick*48000*1001/(30000ULL*(division&255U));
+        return tick*48000/(fps*(division&255U));
+    };
+    const auto music_time=[&](std::uint64_t tick){
+        const auto value=smpte?smpte_frame(tick)*1536/48000:tick*768/division;
+        if(value>INT32_MAX)throw std::invalid_argument("MUSIC_TIME overflow");
+        return static_cast<std::uint32_t>(value);
+    };
     std::vector<Raw> raw;std::vector<TimeSignature> signatures;std::uint64_t end=0;unsigned event_count=0;
+    bool found_offset=false;
     for(unsigned track=0;track<tracks;++track){
         if(r.number(4)!=0x4d54726b)throw std::invalid_argument("missing MIDI track");const auto length=r.number(4);Reader t{r.take(length)};
         std::uint64_t tick=0;std::uint8_t running=0;bool ended=false;std::vector<std::uint8_t> pending_sysex;
@@ -125,7 +155,21 @@ Sequence parse(std::span<const std::uint8_t> bytes){
                 running=0;const auto type=t.byte();const auto n=t.vlq();const auto data=t.take(n);
                 if(type==0x2f){if(n || t.at!=t.bytes.size())throw std::invalid_argument("invalid end of track");ended=true;break;}
                 if(type==0x51){if(n!=3)throw std::invalid_argument("invalid tempo");const auto tempo=(std::uint32_t{data[0]}<<16)|(std::uint32_t{data[1]}<<8)|data[2];if(!tempo)throw std::invalid_argument("zero tempo");raw.push_back({tick,tempo,0,0,0});}
-                if(type==0x58){if(n!=4 || !data[0] || data[1]>7)throw std::invalid_argument("invalid MIDI time signature");signatures.push_back({static_cast<std::uint32_t>(tick*768/division),data[0],static_cast<std::uint8_t>(1U<<data[1]),4});}
+                if(type==0x58){if(n!=4 || !data[0] || data[1]>7)throw std::invalid_argument("invalid MIDI time signature");signatures.push_back({music_time(tick),data[0],static_cast<std::uint8_t>(1U<<data[1]),4});}
+                if(type==0x54 && smpte && !found_offset){
+                    const auto nominal=fps==29?30:fps;
+                    if(n!=5 || (data[0]&0x80U) || (data[0]&31U)>23 || data[1]>=60 ||
+                       data[2]>=60 || data[3]>=nominal || data[4]>=100 ||
+                       (fps==29 && data[1]%10 && !data[2] && data[3]<2))
+                        throw std::invalid_argument("invalid MIDI SMPTE offset");
+                    seq.smpte_offset=(data[0]&31U)|(std::uint32_t{data[1]}<<8)|
+                        (std::uint32_t{data[2]}<<16)|(std::uint32_t{data[3]}<<24);
+                    found_offset=true;
+                }
+                if((type==2 || type==3) && !data.empty()){
+                    auto& text=type==2?seq.copyright:seq.title;
+                    if(text.empty())text.assign(reinterpret_cast<const char*>(data.data()),data.size());
+                }
             }else if(status==0xf0 || status==0xf7){
                 running=0;const auto data=t.take(t.vlq());
                 if(status==0xf0){if(!pending_sysex.empty())throw std::invalid_argument("unfinished MIDI SysEx");pending_sysex.push_back(0xf0);}
@@ -144,11 +188,25 @@ Sequence parse(std::span<const std::uint8_t> bytes){
     }
     if(r.at!=bytes.size())throw std::invalid_argument("trailing MIDI data");
     std::stable_sort(raw.begin(),raw.end(),[](const auto& a,const auto& b){return a.tick<b.tick;});
-    Sequence seq;std::uint64_t previous=0,scaled=0;std::uint32_t tempo=500000;
-    const auto frame=[&](std::uint64_t tick){scaled+=(tick-previous)*tempo;previous=tick;const auto f=scaled*48/(static_cast<std::uint64_t>(division)*1000);if(f>48000*600ULL)throw std::invalid_argument("MIDI exceeds ten minutes");return f;};
-    for(auto& e:raw){const auto at=frame(e.tick);if(e.tempo){tempo=e.tempo;seq.tempos.push_back({static_cast<std::uint32_t>(e.tick*768/division),at,60000000.0/tempo});}else seq.events.push_back({at,e.status,e.first,e.second,std::move(e.sysex)});}
+    std::uint64_t previous=0,scaled=0;std::uint32_t tempo=500000;
+    const auto frame=[&](std::uint64_t tick){
+        if(smpte)return smpte_frame(tick);
+        scaled+=(tick-previous)*tempo;
+        previous=tick;
+        return scaled*48/(static_cast<std::uint64_t>(division)*1000);
+    };
+    for(auto& e:raw){
+        const auto at=frame(e.tick);
+        if(!e.tempo)seq.events.push_back({at,e.status,e.first,e.second,std::move(e.sysex)});
+        else if(!smpte){
+            tempo=e.tempo;
+            seq.tempos.push_back({music_time(e.tick),at,60000000.0/tempo});
+        }
+    }
     std::stable_sort(signatures.begin(),signatures.end(),[](const auto& a,const auto& b){return a.music<b.music;});seq.signatures.insert(seq.signatures.end(),signatures.begin(),signatures.end());
-    seq.frames=std::max<std::uint64_t>(1,frame(end));const auto music=end*768/division;if(music>INT32_MAX)throw std::invalid_argument("MUSIC_TIME overflow");seq.music_length=static_cast<std::uint32_t>(music);return seq;
+    seq.frames=std::max<std::uint64_t>(1,frame(end));
+    seq.music_length=music_time(end);
+    return seq;
 }
 std::uint64_t Sequence::frame_at(std::uint32_t music)const{
     const Tempo* point=&tempos.front();for(const auto& t:tempos){if(t.music>music)break;point=&t;}
@@ -157,6 +215,11 @@ std::uint64_t Sequence::frame_at(std::uint32_t music)const{
 std::uint32_t Sequence::music_at(std::uint64_t frame)const{
     const Tempo* point=&tempos.front();for(const auto& t:tempos){if(t.frame>frame)break;point=&t;}
     return point->music+static_cast<std::uint32_t>(static_cast<double>(frame-point->frame)*768*point->bpm/(48000*60));
+}
+double Sequence::tempo_at(double frame)const{
+    const auto next=std::upper_bound(tempos.begin(),tempos.end(),frame,
+        [](double value,const Tempo& point){return value<static_cast<double>(point.frame);});
+    return next==tempos.begin()?120:std::prev(next)->bpm;
 }
 std::vector<Event> chase(const Sequence& sequence,std::uint64_t frame){
     std::map<unsigned,Event> controls;std::array<std::array<std::uint8_t,128>,16> notes{};std::vector<Event> result;
@@ -278,9 +341,9 @@ void Playback::advance(unsigned count,Send send,void* context,SendSysex sysex){
             if(!v.chased){for(const auto& e:v.initial_chase)emit(e);v.chased=true;}v.started=true;
             while(v.next<v.sequence->events.size() && static_cast<double>(v.sequence->events[v.next].frame)<=v.position)emit(v.sequence->events[v.next++]);
             auto speed=tempo_scale;
-            if(tempo_override>0){const Tempo* current=&v.sequence->tempos.front();for(const auto& t:v.sequence->tempos){if(static_cast<double>(t.frame)>v.position)break;current=&t;}speed*=tempo_override/current->bpm;}
+            if(tempo_override>0)speed*=tempo_override/v.sequence->tempo_at(v.position);
             v.position+=speed;
-            const auto end=v.repeats && v.loop_end?v.loop_end:v.sequence->frames;
+            const auto end=std::min(v.end_frame,v.repeats && v.loop_end?v.loop_end:v.sequence->frames);
             if(v.position>=static_cast<double>(end)){if(end==v.sequence->frames)while(v.next<v.sequence->events.size() && v.sequence->events[v.next].frame<=end){const auto& e=v.sequence->events[v.next++];if(!e.sysex.empty())emit(e);}notes_off();if(v.repeats){if(v.repeats!=UINT32_MAX)--v.repeats;++v.loops;v.position=static_cast<double>(v.loop_start);v.next=static_cast<std::size_t>(std::lower_bound(v.sequence->events.begin(),v.sequence->events.end(),v.loop_start,[](const Event& e,std::uint64_t f){return e.frame<f;})-v.sequence->events.begin());v.initial_chase=v.loop_chase;v.chased=false;}
                 else {v.playing=false;v.finished=true;}}
         }

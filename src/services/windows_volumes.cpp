@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
+#include "cd_audio_disc.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <limits>
@@ -287,7 +288,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
         }
     } else if (symbol.starts_with("GetDriveType")) {
         const auto path = arg(0) ? text(0) : utf16_to_utf8(full_windows_environment_path(u"\\",runtime_.current_directory,runtime_.environment));
-        result = filesystem_.network_path(path)?4:!mount_volume(path).second?3:1;
+        if(filesystem_.network_path(path))result=4;
+        else if(const auto [volume,error]=mount_volume(path);error)result=1;
+        else if(volume>='D' && !cdda::volume_cue(filesystem_,path).path.empty())result=5;
+        else result=3;
     } else if (symbol.starts_with("GetDiskSpaceInformation")) {
         // DISK_SPACE_INFORMATION：與 GetDiskFreeSpaceEx 共用卷資訊，換算成配置單位；回傳 HRESULT。
         const auto path = arg(0) ? text(0) : utf16_to_utf8(full_windows_environment_path(u"\\",runtime_.current_directory,runtime_.environment));

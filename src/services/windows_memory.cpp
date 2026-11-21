@@ -58,8 +58,9 @@ VirtualMemoryInformation WindowsServices::virtual_memory_information(const Guest
     const auto address=raw,address_limit=user_address_limit();const auto& regions=runtime_.virtual_regions;
     auto found=regions.upper_bound(address);if(found!=regions.begin()){--found;if(address-found->first>=found->second.size)found=regions.end();}else found=regions.end();
     const auto mapped=memory.query(GuestAddress{address});
+    const auto layout=windows_address_layout::for_mode(memory.execution_mode());
     const bool provider_reservation=found!=regions.end() &&
-        found->first==windows_address_layout::for_mode(memory.execution_mode()).images;
+        (found->first==layout.images || found->first==layout.overflow);
     const auto view=mapping_view_info(address);
     const bool section_image=view && (view->protection&0x1000000U);
     std::uint64_t base=address,allocation=0,end=address_limit;std::uint32_t initial=0,mode=0,allocation_state=0x10000,type=0;

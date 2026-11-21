@@ -114,7 +114,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_userstring(GuestState& stat
             return info->lead[static_cast<std::uint8_t>(byte)] != 0;
         };
         if (symbol.ends_with("ExW")) {
-            // 參考實作的兩個 Unicode 擴充入口回傳 NULL，並保留呼叫者的 last-error。
+            // 參考實作 的兩個 Unicode 擴充入口回傳 NULL，並保留呼叫者的 last-error。
             result = 0;
         } else if (previous) {
             const auto start = arg(shift), current = arg(shift + 1);

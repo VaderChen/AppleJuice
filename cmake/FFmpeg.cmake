@@ -1,5 +1,5 @@
-# FFmpeg 只用來解碼 Windows Media 系列內容（ASF 內的 VC-1／WMV 視訊與 WMA 音訊），不編入編碼器、容器、濾鏡、裝置與網路。
-# 從本機固定的官方原始碼建置靜態 libavcodec／libavutil（LGPL 2.1+，不啟用 GPL／nonfree 元件），
+# FFmpeg 提供 Windows Media、MPEG、H.264 解碼和 Video 1 編解碼。MPEG 容器使用已開啟的沙箱檔案。
+# 從本機固定的官方原始碼建置靜態程式庫（LGPL 2.1+，不啟用 GPL／nonfree 元件），
 # 使用與引擎相同的編譯器與 macOS deployment target；不自動偵測宿主程式庫，執行時不依賴 Homebrew 或系統 FFmpeg。
 include(FetchContent)
 include(ExternalProject)
@@ -16,8 +16,9 @@ if(NOT EXISTS "${x64arm_ffmpeg_source_SOURCE_DIR}/configure"
 endif()
 set(X64ARM_FFMPEG_BUILD "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg")
 file(MAKE_DIRECTORY "${X64ARM_FFMPEG_BUILD}")
-# 解碼器清單即支援範圍：VC-1（WVC1／WMVA／WMV3）、WMV7／WMV8，以及 WMA 1／2／Pro／Lossless／Voice。
-set(X64ARM_FFMPEG_DECODERS vc1 wmv1 wmv2 wmv3 wmav1 wmav2 wmapro wmalossless wmavoice)
+# VFW 的 RGB555 壓縮使用同一套 Video 1 後端。H.264 由共用 VideoToolbox 優先解碼。
+set(X64ARM_FFMPEG_DECODERS vc1 wmv1 wmv2 wmv3 wmav1 wmav2 wmapro wmalossless wmavoice msvideo1
+    h264 mpeg1video mpeg2video mp2float mp3float)
 list(JOIN X64ARM_FFMPEG_DECODERS "," X64ARM_FFMPEG_DECODER_LIST)
 set(X64ARM_FFMPEG_CFLAGS "")
 set(X64ARM_FFMPEG_LDFLAGS "")
@@ -36,10 +37,12 @@ set(X64ARM_FFMPEG_FLAGS
   --cc=${CMAKE_C_COMPILER} --pkg-config=false
   --enable-static --disable-shared --enable-pic
   --disable-programs --disable-doc --disable-network --disable-autodetect --disable-everything
-  --disable-avdevice --disable-avformat --disable-avfilter --disable-swscale --disable-swresample
+  --disable-avdevice --disable-avfilter --disable-swscale --disable-swresample
   --disable-debug
   --enable-decoder=${X64ARM_FFMPEG_DECODER_LIST}
-  --enable-parser=vc1)
+  --enable-encoder=msvideo1
+  --enable-parser=vc1,mpegvideo,mpegaudio
+  --enable-demuxer=mpegps,mpegvideo,mp3)
 if(X64ARM_FFMPEG_CFLAGS)
   list(APPEND X64ARM_FFMPEG_FLAGS "--extra-cflags=${X64ARM_FFMPEG_CFLAGS}" "--extra-ldflags=${X64ARM_FFMPEG_LDFLAGS}")
 endif()
@@ -48,13 +51,13 @@ ExternalProject_Add(x64arm_ffmpeg_build
   BINARY_DIR "${X64ARM_FFMPEG_BUILD}"
   DOWNLOAD_COMMAND ""
   CONFIGURE_COMMAND "${x64arm_ffmpeg_source_SOURCE_DIR}/configure" ${X64ARM_FFMPEG_FLAGS}
-  BUILD_COMMAND "${X64ARM_MAKE}" "-j${X64ARM_EXTERNAL_BUILD_JOBS}" libavcodec/libavcodec.a libavutil/libavutil.a
+  BUILD_COMMAND "${X64ARM_MAKE}" "-j${X64ARM_EXTERNAL_BUILD_JOBS}" libavformat/libavformat.a libavcodec/libavcodec.a libavutil/libavutil.a
   # 只安裝公開標頭（含 configure 產生的 avconfig.h），不把建置目錄的 config.h 暴露給引擎來源。
   INSTALL_COMMAND "${X64ARM_MAKE}" install-headers
-  BUILD_BYPRODUCTS "${X64ARM_FFMPEG_BUILD}/libavcodec/libavcodec.a" "${X64ARM_FFMPEG_BUILD}/libavutil/libavutil.a"
+  BUILD_BYPRODUCTS "${X64ARM_FFMPEG_BUILD}/libavformat/libavformat.a" "${X64ARM_FFMPEG_BUILD}/libavcodec/libavcodec.a" "${X64ARM_FFMPEG_BUILD}/libavutil/libavutil.a"
   LOG_CONFIGURE TRUE LOG_BUILD TRUE LOG_INSTALL TRUE)
 file(MAKE_DIRECTORY "${X64ARM_FFMPEG_BUILD}/install/include")
-foreach(component avutil avcodec)
+foreach(component avutil avcodec avformat)
   add_library(X64ArmFFmpeg::${component} STATIC IMPORTED GLOBAL)
   set_target_properties(X64ArmFFmpeg::${component} PROPERTIES
     IMPORTED_LOCATION "${X64ARM_FFMPEG_BUILD}/lib${component}/lib${component}.a"
@@ -62,3 +65,4 @@ foreach(component avutil avcodec)
   add_dependencies(X64ArmFFmpeg::${component} x64arm_ffmpeg_build)
 endforeach()
 set_property(TARGET X64ArmFFmpeg::avcodec PROPERTY INTERFACE_LINK_LIBRARIES X64ArmFFmpeg::avutil)
+set_property(TARGET X64ArmFFmpeg::avformat PROPERTY INTERFACE_LINK_LIBRARIES X64ArmFFmpeg::avcodec)

@@ -1,6 +1,7 @@
 #pragma once
 #include "x64arm/windows_abi.hpp"
 #include "audio_spatial.hpp"
+#include "x3daudio_initialization.h"
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -68,18 +69,18 @@ inline std::uint64_t invoke(GuestMemory& memory,const WindowsCall& arg,const Gue
     const auto ptr=[&](std::uint64_t p){return memory.load(GuestAddress{p},bits);};
     const auto vector=[&](std::uint64_t p){return Vector{real(p),real(p+4),real(p+8)};};
     const auto put=[&](std::uint64_t p,float v){memory.store(GuestAddress{p},32,std::bit_cast<std::uint32_t>(std::isfinite(v)?v:0.0F));};
-    constexpr std::uint32_t signature=0x58443341;
     if(initialize){
         const auto mask=static_cast<std::uint32_t>(arg(0));auto raw=static_cast<std::uint32_t>(arg(1));
         if(!x86){raw=0;for(unsigned i=0;i<4;++i)raw|=std::uint32_t{state.xmm[1][i]}<<(8*i);}
-        const auto sound=std::bit_cast<float>(raw);
-        if(!mask || (mask&~0x3ffffU) || !std::isfinite(sound) || sound<std::numeric_limits<float>::min() || !arg(2))return 0x80070057U;
-        memory.check(GuestAddress{arg(2)},20,Access::Write);memory.fill(GuestAddress{arg(2)},0,20);
-        memory.store(GuestAddress{arg(2)},32,signature);memory.store(GuestAddress{arg(2)+4},32,mask);put(arg(2)+8,sound);return 0;
+        if(!arg(2) || !x3daudio_valid_instance(mask,raw))return X3DAUDIO_INVALID_ARGUMENT;
+        const std::array<std::uint32_t,X3DAUDIO_INSTANCE_WORDS> words{X3DAUDIO_INSTANCE_SIGNATURE,mask,raw,0,0};
+        memory.check(GuestAddress{arg(2)},X3DAUDIO_INSTANCE_BYTES,Access::Write);
+        memory.write(GuestAddress{arg(2)},std::span(reinterpret_cast<const std::uint8_t*>(words.data()),sizeof(words)));
+        return 0;
     }
     constexpr std::uint32_t flag_matrix=1,flag_delay=2,flag_lpf_direct=4,flag_lpf_reverb=8,flag_reverb=0x10,flag_doppler=0x20,flag_angle=0x40,flag_zero_center=0x10000,flag_redirect_lfe=0x20000;
     const auto listener=arg(1),emitter=arg(2),dsp=arg(4);const auto flags=static_cast<std::uint32_t>(arg(3));
-    if(!arg(0) || !listener || !emitter || !dsp || u32(arg(0))!=signature)throw HostCallFault("X3DAudio 無效 instance／結構");
+    if(!arg(0) || !listener || !emitter || !dsp || u32(arg(0))!=X3DAUDIO_INSTANCE_SIGNATURE)throw HostCallFault("X3DAudio 無效 instance／結構");
     const auto mask=u32(arg(0)+4);
     // 未定義旗標與高度喇叭遮罩沒有文件語義，維持明確失敗；其餘旗標與水平喇叭配置都實際計算。
     if((flags&~0x3007fU) || (mask&~0x7ffU))throw HostCallFault("X3DAudio 未定義旗標或不支援的高度喇叭配置");

@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "crt_program_data.hpp"
 #include "x64arm/unicode.hpp"
 #include <bit>
 #include <cerrno>
@@ -14,7 +15,7 @@ namespace x64arm {
 void windows_floating_return(GuestState& state,bool x86,double value,bool single);
 namespace {
 // CRT 資料區（runtime_base_）中本家族使用的固定位置；0～143 與 0x800 起的串流由既有資料匯出使用。
-constexpr unsigned pgmptr_offset=144,wpgmptr_offset=152,dstbias_offset=160,fma3_offset=168,strerror_offset=176,wcserror_offset=184;
+constexpr unsigned dstbias_offset=160,fma3_offset=168,strerror_offset=176,wcserror_offset=184;
 constexpr std::uint32_t einval=22,erange=34,eilseq=42,enomem=12;
 }
 std::span<const WindowsServiceDescriptor> crt_extra_service_descriptors(){
@@ -126,13 +127,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_extra(GuestState& state
         if(name=="_set_FMA3_enable"){const auto previous=memory.load(GuestAddress{cell(fma3_offset)},32);memory.store(GuestAddress{cell(fma3_offset)},32,u32(0)?1U:0U);return done(previous);}
         if(name=="__dstbias")return done(cell(dstbias_offset));
         if(name=="_get_pgmptr" || name=="_get_wpgmptr" || name=="__p__pgmptr" || name=="__p__wpgmptr"){
-            // 程式完整路徑的指標格；第一次使用時由 GetModuleFileName 取得，之後沿用同一份字串。
-            const bool wide=name.find("wpgmptr")!=name.npos;const auto slot=cell(wide?wpgmptr_offset:pgmptr_offset);
-            if(!memory.load(GuestAddress{slot},bits)){
-                const auto buffer=runtime_allocate(memory,{},wide?2*1024U:1024U*3U);
-                (void)nested_service(state,memory,"kernel32.dll",wide?"GetModuleFileNameW":"GetModuleFileNameA",{0,buffer,wide?1023U:3071U});
-                memory.store(GuestAddress{slot},bits,buffer);
-            }
+            const bool wide=name.find("wpgmptr")!=name.npos;
+            const auto slot=cell(wide?detail::crt_wpgmptr_offset:detail::crt_pgmptr_offset);
             if(name.starts_with("__p__"))return done(slot);
             if(!arg(0))return invalid(einval);
             memory.store(GuestAddress{arg(0)},bits,memory.load(GuestAddress{slot},bits));return done(0);

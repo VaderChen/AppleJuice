@@ -1,7 +1,15 @@
 // D3D9 COM ABI；參照 Microsoft d3d9.h 與 MinGW-w64 宣告。
 #pragma once
 namespace x64arm::d3d9_abi {
-enum class Kind { Factory, Device, Surface, Texture, CubeTexture, VertexBuffer, IndexBuffer, SwapChain, Mesh, Blob, PRT, VertexShader, PixelShader, VertexDeclaration, ConstantTable, Sprite, Font, StateBlock, Effect, EffectPool, RenderToSurface, XFile, XEnum, XData, Gutter, Skin, AnimSet, CompressedSet, AnimController, PRTComp, RenderToEnvMap, PRTEngine, VolumeTexture, Volume, Query, MatrixStack, Line, EffectCompiler };
+enum class Kind { Factory, Device, Surface, Texture, CubeTexture, VertexBuffer, IndexBuffer, SwapChain, Mesh, Blob, PRT, VertexShader, PixelShader, VertexDeclaration, ConstantTable, Sprite, Font, StateBlock, Effect, EffectPool, RenderToSurface, XFile, XEnum, XData, Gutter, Skin, AnimSet, CompressedSet, AnimController, PRTComp, RenderToEnvMap, PRTEngine, VolumeTexture, Volume, Query, MatrixStack, Line, EffectCompiler, ShaderValidator };
+constexpr WindowsServiceDescriptor shaderValidatorMethods[]{
+    {"internal-d3d9","ShaderValidator.QueryInterface",3},
+    {"internal-d3d9","ShaderValidator.AddRef",1},
+    {"internal-d3d9","ShaderValidator.Release",1},
+    {"internal-d3d9","ShaderValidator.Begin",4},
+    {"internal-d3d9","ShaderValidator.Instruction",5,0,0,0x14},
+    {"internal-d3d9","ShaderValidator.End",1},
+};
 constexpr WindowsServiceDescriptor queryMethods[]{
 {"internal-d3d9","Query.QueryInterface",3},{"internal-d3d9","Query.AddRef",1},{"internal-d3d9","Query.Release",1},
 {"internal-d3d9","Query.GetDevice",2},{"internal-d3d9","Query.GetType",1},{"internal-d3d9","Query.GetDataSize",1},

@@ -4,9 +4,45 @@
 #include <spirv_msl.hpp>
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <mutex>
 
 namespace x64arm {
+std::optional<unsigned> legacy_shader_instruction_words(std::uint32_t version,std::uint32_t token){
+    const auto opcode=token&0xffffU;
+    if(opcode==0xffff)return 1;
+    if(opcode==0xfffe)return 1+((token>>16)&0x7fffU);
+    if(((version>>8)&0xffU)>=2)return 1+((token>>24)&15U);
+    switch(opcode){
+        case 0:case 0xfffd:return 1;
+        case 65:case 87:return 2;
+        case 1:case 6:case 7:case 14:case 15:case 16:case 19:case 31:case 78:case 79:return 3;
+        case 64:case 66:return (version>>16)==0xffff && (version&255U)>=4?3:2;
+        case 76:case 89:return 4;
+        case 4:case 18:case 80:case 88:return 5;
+        case 81:return 6;
+        default:
+            if(opcode>=2 && opcode<=24)return 4;
+            if(opcode>=67 && opcode<=86)return 3;
+            return std::nullopt;
+    }
+}
+
+std::optional<std::string> legacy_shader_validation_error(std::span<const std::uint8_t> bytes){
+    vkd3d_shader_compile_info info{};
+    info.type=VKD3D_SHADER_STRUCTURE_TYPE_COMPILE_INFO;
+    info.source={bytes.data(),bytes.size()};
+    info.source_type=VKD3D_SHADER_SOURCE_D3D_BYTECODE;
+    info.target_type=VKD3D_SHADER_TARGET_SPIRV_BINARY;
+    info.log_level=VKD3D_SHADER_LOG_ERROR;
+    const auto release=[](char* messages){vkd3d_shader_free_messages(messages);};
+    char* messages=nullptr;
+    const auto status=vkd3d_shader_scan(&info,&messages);
+    const std::unique_ptr<char,decltype(release)> diagnostics(messages,release);
+    if(status<0)return std::string(messages && *messages?messages:"Invalid Direct3D 9 shader.");
+    return std::nullopt;
+}
+
 std::vector<std::array<std::uint32_t,2>> graphics_legacy_semantics(std::span<const std::uint8_t> bytes,bool output){
     struct Scan {
         vkd3d_shader_scan_signature_info signatures{};

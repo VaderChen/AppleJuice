@@ -664,7 +664,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
         else {
             GuiMenuTrack track;track.menu=arg(0);track.owner=owner;track.thread=threads_.current;track.flags=flags;track.x=signed32(arg(2));track.y=signed32(arg(3));
             if(ex && arg(5)){
-                // 參考實作讀取 rcExclude，保留傳統入口忽略 nReserved 與 lpRect 的契約。
+                // 參考實作 讀取 rcExclude，保留傳統入口忽略 nReserved 與 lpRect 的契約。
                 for(unsigned i=0;i<4;++i)track.exclude[i]=signed32(memory.load(GuestAddress{arg(5)+4+4*i},32));
             }
             const auto token=gui_.next_object++;gui_.menu_tracks[token]=track;

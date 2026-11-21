@@ -48,7 +48,10 @@ public:
         return directory && *directory?std::make_unique<OutputCapture>(directory,tag,rate,identity):nullptr;
     }
     OutputCapture(const char* directory,const char* tag,unsigned rate,const void* identity):rate_(rate){
-        char name[96];std::snprintf(name,sizeof name,"/%s-%d-%p-%u.wav",tag,static_cast<int>(getpid()),identity,rate);
+        static std::atomic<std::uint64_t> next_capture{};
+        const auto sequence=next_capture.fetch_add(1,std::memory_order_relaxed);
+        char name[128];std::snprintf(name,sizeof name,"/%s-%d-%p-%llu-%u.wav",tag,static_cast<int>(getpid()),identity,
+            static_cast<unsigned long long>(sequence),rate);
         path_=std::string(directory)+name;file_=std::fopen(path_.c_str(),"wb");if(!file_)return;
         header();thread_=std::thread([this]{run();});
     }

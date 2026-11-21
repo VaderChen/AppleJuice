@@ -3,6 +3,8 @@
 #include "parallel_mapping_lock.hpp"
 #include "x64arm/resource_usage.hpp"
 #include "x64arm/windows_services.hpp"
+#include "crt_program_data.hpp"
+#include "windows_image_dump.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/windows_unwind.hpp"
 #include "guest_heap_layout.hpp"
@@ -10,17 +12,63 @@
 #include "gui_timing_layout.h"
 #include "crt_library.hpp"
 #include "builtin_export_aliases.hpp"
+#include "builtin_export_forwarders.hpp"
+#include "builtin_numbered_exports.hpp"
 #include "builtin_export_catalog.hpp"
 #include "builtin_provider_families.hpp"
 #include "msvcp90_string_exports.hpp"
+#include "msvcp_numeric_limits.hpp"
 #include "msvcp90_stream_exports.hpp"
 #include "guest_mf_image.hpp"
+#include "guest_hid_arrays_code.hpp"
+#include "guest_usb_descriptors_code.hpp"
+#include "guest_icu_character_code.hpp"
+#include "guest_icu_trie_code.hpp"
+#include "guest_icu_string_code.hpp"
+#include "guest_icu_text_code.hpp"
+#include "guest_icu_case_code.hpp"
+#include "guest_icu_normalization_code.hpp"
+#include "guest_icu_enumeration_code.hpp"
+#include "icu_enumeration_guest.hpp"
+#include "guest_icu_locale_code.hpp"
+#include "icu_locale_guest.hpp"
+#include "guest_icu_currency_code.hpp"
+#include "icu_currency_guest.hpp"
+#include "guest_icu_calendar_code.hpp"
+#include "icu_calendar_guest.hpp"
+#include "guest_icu_date_pattern_code.hpp"
+#include "icu_date_pattern_guest.hpp"
+#include "guest_icu_number_code.hpp"
+#include "icu_number_guest.hpp"
+#include "guest_icu_date_format_code.hpp"
+#include "icu_date_format_guest.hpp"
+#include "guest_icu_formatted_code.hpp"
+#include "icu_formatted_guest.hpp"
+#include "guest_icu_bidi_code.hpp"
+#include "icu_bidi_guest.hpp"
+#include "guest_icu_charset_detection_code.hpp"
+#include "icu_charset_detection_guest.hpp"
+#include "guest_icu_region_code.hpp"
+#include "icu_region_guest.hpp"
+#include "guest_icu_idna_code.hpp"
+#include "icu_idna_guest.hpp"
+#include "guest_crt_mbc_code.hpp"
+#include "guest_crtdll_text_code.hpp"
+#include "crtdll_text_guest.hpp"
+#include "crt_mbc_contract.h"
+#include "msvc_exception_exports.hpp"
+#include "icu_normalization_guest.hpp"
+#include "icu_case_guest.hpp"
+#include "icu_string_guest.hpp"
+#include "icu_text_guest.hpp"
+#include "icu_trie_guest.hpp"
 #include "guest_mf_buffer.hpp"
 #include "guest_xaudio.hpp"
 #include "guest_d3d9_formats.hpp"
 #include "guest_com_agile.hpp"
 #include "guest_concrt_queue.hpp"
 #include "guest_vcomp_code.hpp"
+#include "guest_d3dx_thread_pump_code.hpp"
 #include "x64arm/pe_loader.hpp"
 #include "windows_scalar_math.hpp"
 #include "guest_scalar_math_code.hpp"
@@ -483,6 +531,22 @@ constexpr std::array guest_memory_routines{
     GuestMemoryRoutine{"crt","_finite",0x5c0,0x5f8}};
 // callbacks 預留 gateway 範圍內、第一頁之外的獨立唯讀可執行頁。
 constexpr std::uint64_t vcomp_image_offset=0x30000;
+constexpr std::uint64_t d3dx_thread_pump_offset=0x40000;
+constexpr std::uint64_t hid_arrays_offset=0x50000;
+constexpr std::uint64_t usb_descriptors_offset=0x60000;
+constexpr std::uint64_t icu_character_offset=0x70000;
+constexpr std::array<std::string_view,3> d3dx_guest_families{"d3dx10_43.dll","d3dx11_42.dll","d3dx11_43.dll"};
+constexpr std::array<std::string_view,9> d3dx_guest_exports{
+    "D3DX10CreateThreadPump","D3DX10CreateAsyncCompilerProcessor","D3DX10CreateAsyncShaderPreprocessProcessor",
+    "D3DX10CreateAsyncEffectCreateProcessor","D3DX10CreateAsyncEffectPoolCreateProcessor",
+    "D3DX10CreateSkinInfo",
+    "D3DX11CreateThreadPump","D3DX11CreateAsyncCompilerProcessor","D3DX11CreateAsyncShaderPreprocessProcessor",
+};
+constexpr bool d3dx_guest_export(std::string_view family,std::string_view symbol){
+    const auto version=family=="d3dx10_43.dll"?"D3DX10":"D3DX11";
+    return std::ranges::find(d3dx_guest_families,family)!=d3dx_guest_families.end() &&
+        symbol.starts_with(version) && std::ranges::find(d3dx_guest_exports,symbol)!=d3dx_guest_exports.end();
+}
 constexpr std::uint64_t guest_memory_page_offset=0x80000;
 constexpr std::uint64_t guest_scalar_math_page_offset=0x81000;
 constexpr std::uint64_t guest_thread_page_offset=0x82000;
@@ -584,10 +648,15 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
     const auto layout=windows_address_layout::for_mode(memory.execution_mode());
     // 保留完整的 provider／gateway 位址空間，包含尚未載入模組的空洞。
     // 只建立虛擬保留，實際 backing 仍隨模組載入；heap、stack、VirtualAlloc 共用此保留表。
-    if(!memory.range_available(GuestAddress{layout.images},windows_address_layout::reserved_capacity))
-        throw std::invalid_argument("程式映像占用 Windows provider 保留位址");
-    runtime_.virtual_regions.emplace(layout.images,VirtualRegion{windows_address_layout::reserved_capacity,1U});
-    memory.reserve_virtual_range(GuestAddress{layout.images},windows_address_layout::reserved_capacity);
+    const std::array regions{std::pair{layout.images,windows_address_layout::reserved_capacity},
+        std::pair{layout.overflow,windows_address_layout::overflow_capacity}};
+    for(const auto& [base,capacity]:regions)
+        if(!memory.range_available(GuestAddress{base},capacity))
+            throw std::invalid_argument("程式映像占用 Windows provider 保留位址");
+    for(const auto& [base,capacity]:regions){
+        runtime_.virtual_regions.emplace(base,VirtualRegion{capacity,1U});
+        memory.reserve_virtual_range(GuestAddress{base},capacity);
+    }
     unresolved_base_=GuestAddress{layout.unresolved};stub_base_=GuestAddress{layout.services};
     callback_return_=GuestAddress{layout.callbacks};startup_entry_=GuestAddress{layout.callbacks+0x10};exception_entry_=GuestAddress{layout.callbacks+0x20};
     thread_return_=GuestAddress{layout.callbacks+0x30};thread_start_=GuestAddress{layout.callbacks+0x40};process_exit_retry_=GuestAddress{layout.callbacks+0x50};
@@ -773,6 +842,109 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
         static const bool mf_image_lowering=[] {const auto* v=std::getenv("X64ARM_GUEST_MF_IMAGE");return !v || std::string_view(v)!="0";}();
         if(mf_image_lowering && trace_services_.empty() && !startup_profile::enabled())
             mf_image::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value);
+        static const bool hid_arrays_lowering=[] {
+            const auto* value=std::getenv("X64ARM_GUEST_HID_ARRAYS");
+            return !value || std::string_view(value)!="0";
+        }();
+        static const bool usb_descriptors_lowering=[] {
+            const auto* value=std::getenv("X64ARM_GUEST_USB_DESCRIPTORS");
+            return !value || std::string_view(value)!="0";
+        }();
+        static const bool icu_character_lowering=[] {
+            const auto* value=std::getenv("X64ARM_GUEST_ICU_CHARACTER");
+            return !value || std::string_view(value)!="0";
+        }();
+        struct PrivateImageImport {std::string_view module,symbol;};
+        const auto initialize_guest_image=[&](std::uint64_t base,std::span<const std::uint8_t> bytes,
+                std::u16string_view path,std::span<const std::string_view> heap_imports={},
+                std::span<const PrivateImageImport> other_imports={},std::size_t slots=1){
+            auto parsed=parse_pe_image(bytes,GuestAddress{base},true,memory.limit());
+            const auto allowed=[&](std::string_view module,std::string_view symbol){
+                return std::ranges::count_if(parsed.imports,[&](const auto& item){
+                    return item.dll==module && !item.by_ordinal && item.symbol==symbol;
+                })==1;
+            };
+            if(parsed.metadata.image_size>windows_address_layout::module_stride*slots || !parsed.delay_imports.empty() ||
+               parsed.imports.size()!=heap_imports.size()+other_imports.size() ||
+               !std::ranges::all_of(heap_imports,[&](auto name){return allowed("KERNEL32.dll",name);}) ||
+               !std::ranges::all_of(other_imports,[&](const auto& item){return allowed(item.module,item.symbol);}))
+                throw std::logic_error("唯讀常駐映像的大小或匯入不符");
+            auto image=parsed.runtime;
+            image.private_code=true;
+            image.path=path;
+            for(auto& [name,entry]:image.export_names)entry=image.export_ordinals.at(entry);
+            image.export_ordinals.clear();
+            for(auto& mapping:parsed.mappings)
+                mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
+            map_pe_image(memory,parsed);
+            if(!parsed.imports.empty())
+                bind_pe_imports(memory,parsed,[&](const PeImport& item){return resolve(item.dll,item.symbol);});
+            runtime_.builtin_images.emplace(base,std::move(image));
+        };
+        // 帶 filter 的慢路徑也會將客體回呼交給同一份唯讀 ICU 常式。
+        initialize_guest_image(icu_trie::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_trie::image_x86}:
+            std::span<const std::uint8_t>{icu_trie::image_x64},u"[guest-icu-trie]");
+        initialize_guest_image(icu_string::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_string::image_x86}:
+            std::span<const std::uint8_t>{icu_string::image_x64},u"[guest-icu-string]");
+        initialize_guest_image(icu_text::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_text::image_x86}:
+            std::span<const std::uint8_t>{icu_text::image_x64},u"[guest-icu-text]",icu_text::heap_imports);
+        initialize_guest_image(icu_case::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_case::image_x86}:
+            std::span<const std::uint8_t>{icu_case::image_x64},u"[guest-icu-case]",icu_text::heap_imports);
+        initialize_guest_image(icu_normalization::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_normalization::image_x86}:
+            std::span<const std::uint8_t>{icu_normalization::image_x64},u"[guest-icu-normalization]");
+        initialize_guest_image(icu_enumeration::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_enumeration::image_x86}:
+            std::span<const std::uint8_t>{icu_enumeration::image_x64},u"[guest-icu-enumeration]",icu_enumeration::heap_imports);
+        initialize_guest_image(icu_locale::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_locale::image_x86}:
+            std::span<const std::uint8_t>{icu_locale::image_x64},u"[guest-icu-locale]");
+        initialize_guest_image(icu_currency::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_currency::image_x86}:
+            std::span<const std::uint8_t>{icu_currency::image_x64},u"[guest-icu-currency]");
+        initialize_guest_image(icu_calendar::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_calendar::image_x86}:
+            std::span<const std::uint8_t>{icu_calendar::image_x64},u"[guest-icu-calendar]");
+        initialize_guest_image(icu_date_pattern::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_date_pattern::image_x86}:
+            std::span<const std::uint8_t>{icu_date_pattern::image_x64},u"[guest-icu-date-pattern]");
+        initialize_guest_image(icu_number::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_number::image_x86}:
+            std::span<const std::uint8_t>{icu_number::image_x64},u"[guest-icu-number]");
+        initialize_guest_image(icu_date_format::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_date_format::image_x86}:
+            std::span<const std::uint8_t>{icu_date_format::image_x64},u"[guest-icu-date-format]");
+        initialize_guest_image(icu_formatted::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_formatted::image_x86}:
+            std::span<const std::uint8_t>{icu_formatted::image_x64},u"[guest-icu-formatted]");
+        if(trace_services_.empty() && !startup_profile::enabled()){
+            static const bool mbc_lowering=[] {
+                const auto* enabled=std::getenv("X64ARM_GUEST_CRT_MBC");
+                return !enabled || std::string_view(enabled)!="0";
+            }();
+            if(mbc_lowering){
+                const auto base=windows_address_layout::private_code_address(memory.execution_mode(),12);
+                initialize_guest_image(base,x86_?std::span<const std::uint8_t>{crt_mbc::image_x86}:
+                    std::span<const std::uint8_t>{crt_mbc::image_x64},u"[guest-crt-mbc]");
+            }
+            if(x86_ && crtdll_text::resident_enabled()){
+                initialize_guest_image(crtdll_text::image_address,std::span<const std::uint8_t>{crtdll_text::image_x86},
+                    u"[guest-crtdll-text]");
+            }
+            if(hid_arrays_lowering)
+                initialize_guest_image(callback_return_.value+hid_arrays_offset,x86_?std::span<const std::uint8_t>{hid_arrays::image_x86}:
+                    std::span<const std::uint8_t>{hid_arrays::image_x64},u"[guest-hid-arrays]");
+            if(usb_descriptors_lowering)
+                initialize_guest_image(callback_return_.value+usb_descriptors_offset,x86_?std::span<const std::uint8_t>{usb_descriptors::image_x86}:
+                    std::span<const std::uint8_t>{usb_descriptors::image_x64},u"[guest-usb-descriptors]");
+            if(icu_character_lowering)
+                initialize_guest_image(callback_return_.value+icu_character_offset,x86_?std::span<const std::uint8_t>{icu_character::image_x86}:
+                    std::span<const std::uint8_t>{icu_character::image_x64},u"[guest-icu-character]");
+        }
+        // 雙向文字物件留在客體 heap。分類回呼可直接在相同的執行緒與 ABI 內重入 ICU。
+        static constexpr std::array bidi_imports{PrivateImageImport{"icu.dll","u_charType"},
+                                                 PrivateImageImport{"msvcrt.dll","abort"}};
+        initialize_guest_image(icu_bidi::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_bidi::image_x86}:
+            std::span<const std::uint8_t>{icu_bidi::image_x64},u"[guest-icu-bidi]",icu_enumeration::heap_imports,
+            bidi_imports,icu_bidi::image_slots);
+        initialize_guest_image(icu_charset_detection::image_address(x86_),
+            x86_?std::span<const std::uint8_t>{icu_charset_detection::image_x86}:
+                 std::span<const std::uint8_t>{icu_charset_detection::image_x64},u"[guest-icu-charset-detection]");
+        initialize_guest_image(icu_region::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_region::image_x86}:
+            std::span<const std::uint8_t>{icu_region::image_x64},u"[guest-icu-region]");
+        initialize_guest_image(icu_idna::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_idna::image_x86}:
+            std::span<const std::uint8_t>{icu_idna::image_x64},u"[guest-icu-idna]");
         static const bool mf_buffer_lowering=[] {const auto* v=std::getenv("X64ARM_GUEST_MF_BUFFER");return !v || std::string_view(v)!="0";}();
         if(mf_buffer_lowering && trace_services_.empty() && !startup_profile::enabled())
             mf_buffer::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value);
@@ -781,7 +953,8 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             xaudio_lowering::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value);
         static const bool d3d9_formats_lowering=[] {const auto* v=std::getenv("X64ARM_GUEST_D3D9_FORMATS");return !v || std::string_view(v)!="0";}();
         if(d3d9_formats_lowering && trace_services_.empty() && !startup_profile::enabled() && !std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))
-            d3d9_formats::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value);
+            d3d9_formats::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value,
+                {resolve("crt","sin").value,resolve("crt","cos").value});
         // ConcRT concurrent_queue 基底只有客體實作（宿主僅承接 bad_alloc 拋出），追蹤服務或啟動剖析時同樣映射。
         concrt_queue::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value,{
             resolve("crt","_aligned_malloc").value,resolve("crt","_aligned_free").value,resolve("kernel32.dll","SwitchToThread").value,
@@ -800,6 +973,32 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
                 return resolve("kernel32.dll",item.symbol);
             });
             auto image=std::move(parsed.runtime);image.private_code=true;image.path=u"[guest-vcomp]";
+            for(auto& [name,entry]:image.export_names)entry=image.export_ordinals.at(entry);
+            runtime_.builtin_images.emplace(base,std::move(image));
+        }
+        {
+            const auto base=callback_return_.value+d3dx_thread_pump_offset;
+            const auto bytes=x86_?std::span<const std::uint8_t>{d3dx_thread_pump::image_x86}:
+                std::span<const std::uint8_t>{d3dx_thread_pump::image_x64};
+            auto parsed=parse_pe_image(bytes,GuestAddress{base},true,memory.limit());
+            if(parsed.metadata.image_size>0x10000 || !parsed.delay_imports.empty())
+                throw std::logic_error("D3DX Thread Pump 常駐映像不合法");
+            map_pe_image(memory,parsed);
+            bind_pe_imports(memory,parsed,[&](const PeImport& item){
+                if(!item.by_ordinal){
+                    if(item.dll=="KERNEL32.dll")return resolve("kernel32.dll",item.symbol);
+                    if(item.dll=="D3DCOMPILER_47.dll" && (item.symbol=="D3DCompile" || item.symbol=="D3DPreprocess" ||
+                        item.symbol=="D3DCreateBlob"))
+                        return resolve("d3dcompiler_47.dll",item.symbol);
+                    if(item.dll=="d3d10.dll" && (item.symbol=="D3D10CreateEffectFromMemory" ||
+                        item.symbol=="D3D10CreateEffectPoolFromMemory"))
+                        return resolve("d3d10.dll",item.symbol);
+                }
+                throw std::logic_error("D3DX 常駐映像含有預期外的外部相依");
+            });
+            auto image=std::move(parsed.runtime);
+            image.private_code=true;
+            image.path=u"[guest-d3dx-thread-pump]";
             for(auto& [name,entry]:image.export_names)entry=image.export_ordinals.at(entry);
             runtime_.builtin_images.emplace(base,std::move(image));
         }
@@ -871,7 +1070,8 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
         std::error_code error;const std::filesystem::path supplemental{"/System/Library/Fonts/Supplemental"};
         if(host_fonts && std::filesystem::is_directory(supplemental,error))try{filesystem_.mount_readonly("C:/Windows/Fonts",supplemental);}catch(const std::exception&){}
     }
-    initialize_runtime(memory, command_line); initialized_ = true;
+    initialize_runtime(memory, command_line);
+    initialize_msvc_exception_types(memory); initialized_ = true;
     {startup_profile::Scope security("services","security_context",true);refresh_file_security_context();}
     if(writable_files && !c_drive.empty()){
         startup_profile::Scope directories("services","profile_directories",true);
@@ -918,7 +1118,7 @@ GuestAddress WindowsServices::host_service_stub(std::string_view family,std::str
     const auto found=index.find(std::pair{family,symbol});if(found==index.end())return GuestAddress{};
     return GuestAddress{stub_base_.value+(services.size()+found->second)*16};
 }
-GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_view symbol,bool required) const {
+GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_view symbol,bool required,bool allow_resident) const {
     std::string lower(dll);
     for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if(!detail::builtin_arch_supported(lower,x86_)){
@@ -928,13 +1128,53 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     if(angle_module(lower) && (!native_angle_ || !native_angle_->supports(symbol))){if(!required)return GuestAddress{};throw std::invalid_argument("ANGLE Metal 入口未啟用："+lower+"!"+std::string(symbol));}
     if(native_library_module(lower) && !native_libraries_.enabled(lower)){if(!required)return GuestAddress{};throw std::invalid_argument("原生函式庫代理未啟用："+lower+"!"+std::string(symbol));}
     if(const auto host=windows_api_set_host(lower);host!=lower)lower=host;
+    for(const auto& forwarder:detail::builtin_forwarders(lower)){
+        if(const auto name=forwarder.destination(symbol,x86_);!name.empty()){
+            if(const auto target=resolve_service(forwarder.target,name,false,allow_resident);target.value)return target;
+            break;
+        }
+    }
     if(const auto family=detail::builtin_provider_export_family(lower,symbol);family!=lower)lower=family;
+    if(x86_ && (lower=="x3daudio1_0.dll" || lower=="x3daudio1_1.dll" || lower=="x3daudio1_2.dll") &&
+       (symbol=="X3DAudioInitialize" || symbol=="X3DAudioCalculate")){
+        if(!required)return GuestAddress{};
+        throw std::invalid_argument("舊版 Win32 X3DAudio 使用修飾的 stdcall 匯出名稱");
+    }
     if(x86_ && lower=="combase.dll" && symbol.ends_with("64") &&
        (symbol.starts_with("WdtpInterfacePointer_User") || symbol.starts_with("HSTRING_User"))){
         if(!required)return GuestAddress{};
         throw std::invalid_argument("此 COM 封送入口僅供 Win64 使用");
     }
+    if(symbol.starts_with('#')){
+        const auto table=detail::builtin_numbered_exports(lower);
+        if(!table.empty()){
+            unsigned ordinal{};
+            const auto end=symbol.data()+symbol.size();
+            const auto parsed=std::from_chars(symbol.data()+1,end,ordinal);
+            if(parsed.ec!=std::errc{} || parsed.ptr!=end || ordinal>=table.size() || table[ordinal].empty()){
+                if(!required)return GuestAddress{};
+                throw std::invalid_argument("未支援的 PE import："+lower+"!"+std::string(symbol));
+            }
+            symbol=table[ordinal];
+        }
+    }
     if(lower=="ntdll.dll" && symbol.starts_with("Zw")){const auto native=std::string("Nt")+std::string(symbol.substr(2));if(const auto target=resolve_service(lower,native,false);target.value)return target; }
+    if(const auto* entry=detail::find_msvc_exception_export(lower,symbol,x86_)){
+        if(entry->operation==detail::MsvcExceptionOperation::Vtable)
+            return GuestAddress{runtime_.cxx_exceptions.vtable[static_cast<unsigned>(entry->type)]};
+        if(entry->operation==detail::MsvcExceptionOperation::What && allow_resident && runtime_.cxx_exceptions.image.entry)
+            return GuestAddress{runtime_.cxx_exceptions.image.entry};
+        return host_service_stub(lower,symbol);
+    }
+    if(msvcp_numeric::provider(lower)){
+        const auto* legacy=msvcp_numeric::function(symbol);
+        const auto* modern=msvcp_numeric::modern_function(symbol);
+        if((legacy && legacy->assignment && legacy->x86!=x86_) ||
+           (modern && !modern->lowest && modern->x86!=x86_)){
+            if(!required)return GuestAddress{};
+            throw std::invalid_argument("數值極限成員不支援目前客體 ABI");
+        }
+    }
     static const auto aliases=[] {
         std::map<std::pair<std::string_view,std::string_view>,const detail::ServiceExportAlias*> index;
         for(const auto& alias:detail::service_export_aliases)index.emplace(std::pair{alias.family,alias.symbol},&alias);
@@ -946,6 +1186,21 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         const auto& alias=*found->second;lower=alias.target_family;symbol=alias.target_symbol;
     }
     if (lower == "wsock32.dll") lower = "ws2_32.dll";
+    if((lower=="x3daudio1_0.dll" || lower=="x3daudio1_7.dll") && symbol=="X3DAudioInitialize"){
+        if(const auto image=runtime_.builtin_images.find(callback_return_.value+xaudio_lowering::image_offset);
+           image!=runtime_.builtin_images.end()){
+            const auto routine=lower=="x3daudio1_0.dll"?"SpatialInitializeStdcall":"SpatialInitializeCdecl";
+            if(const auto entry=image->second.export_names.find(routine);entry!=image->second.export_names.end())
+                return GuestAddress{image->first+entry->second};
+        }
+    }
+    if(d3dx_guest_export(lower,symbol)){
+        if(const auto image=runtime_.builtin_images.find(callback_return_.value+d3dx_thread_pump_offset);
+            image!=runtime_.builtin_images.end()){
+            if(const auto entry=image->second.export_names.find(std::string(symbol));
+                entry!=image->second.export_names.end())return GuestAddress{image->first+entry->second};
+        }
+    }
     if(lower=="ntdll.dll" && (symbol=="RtlRunEncodeUnicodeString" || symbol=="RtlRunDecodeUnicodeString")){
         const auto target=guest_thread_routine(symbol);
         if(target.value)return target;
@@ -1006,7 +1261,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
                (srw_routines || symbol.find("SRWLock")==symbol.npos) && (critical_routines || symbol.find("CriticalSection")==symbol.npos) &&
                (fls_mirror_ || !symbol.starts_with("FlsGetValue")) &&
                (once_routines || !symbol.starts_with("InitOnce")) &&
-               !message_metadata && symbol!="SwapMouseButton" && symbol!="GetKeyboardType" && symbol!="OleBuildVersion" && !symbol.starts_with("RtlRun") && symbol!="SHAnsiToAnsi" && symbol!="SHUnicodeToUnicode" && !symbol.starts_with("SHGlobalCounter") && symbol!="CreateAllAccessSecurityAttributes" && symbol!="GetDoubleClickTime" && symbol!="SetDoubleClickTime" && symbol!="GetCaretBlinkTime" && symbol!="SetCaretBlinkTime" && !symbol.starts_with("Gdi") &&
+               !message_metadata && !symbol.starts_with("D3DXSH") && symbol!="SwapMouseButton" && symbol!="GetKeyboardType" && symbol!="OleBuildVersion" && !symbol.starts_with("RtlRun") && symbol!="SHAnsiToAnsi" && symbol!="SHUnicodeToUnicode" && !symbol.starts_with("SHGlobalCounter") && symbol!="CreateAllAccessSecurityAttributes" && symbol!="GetDoubleClickTime" && symbol!="SetDoubleClickTime" && symbol!="GetCaretBlinkTime" && symbol!="SetCaretBlinkTime" && !symbol.starts_with("Gdi") &&
                (language_routines || symbol!="IsValidLanguageGroup"))
                 return GuestAddress{guest_thread_routines_.value+guest_thread_offset(found->second)};
         }
@@ -1034,6 +1289,12 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         if(symbol=="__pioinfo")return GuestAddress{runtime_.lowio_table};
         if(symbol=="__badioinfo")return GuestAddress{runtime_.bad_ioinfo};
     }
+    if(lower=="msvcrt.dll" || legacy_crt_library(lower)){
+        if(symbol=="_sys_errlist")return GuestAddress{runtime_.crt_errlist};
+        if(symbol=="_sys_nerr")return GuestAddress{runtime_.crt_nerr_cell};
+        if(symbol=="_pgmptr")return GuestAddress{runtime_base_.value+detail::crt_pgmptr_offset};
+        if(symbol=="_wpgmptr")return GuestAddress{runtime_base_.value+detail::crt_wpgmptr_offset};
+    }
     if (family == "crt") {
         // 舊 MSVCRT 與 UCRT 的 locale 前綴不同；共用物件管理與 NLS，保留各自的客體 ABI。
         if(lower=="msvcrt.dll" || lower.starts_with("msvcr")){
@@ -1055,6 +1316,14 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         if(const auto found=common_aliases.find(symbol);found!=common_aliases.end())symbol=found->second;
         if(symbol=="_iob")return GuestAddress{runtime_base_.value+0x800};
         if(symbol=="_ctype")return GuestAddress{runtime_.ctype_table};
+        if(symbol=="_mbctype")return GuestAddress{runtime_base_.value+CRT_MBC_PROCESS_TYPES};
+        if(symbol=="_mbcasemap")return GuestAddress{runtime_base_.value+CRT_MBC_PROCESS_CASE};
+        if(allow_resident){
+            const auto base=windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,12);
+            if(const auto image=runtime_.builtin_images.find(base);image!=runtime_.builtin_images.end())
+                if(const auto entry=image->second.export_names.find(std::string(symbol));entry!=image->second.export_names.end())
+                    return GuestAddress{base+entry->second};
+        }
         const std::array data{
             std::pair{"__argc", 0U}, std::pair{"__argv", 8U},
             std::pair{"__wargv", 56U}, std::pair{"__initenv", 112U},
@@ -1088,7 +1357,14 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     // DLL 明確登錄的版本 ABI 優先於 CRT 家族別名；例如 FH4 只屬於 vcruntime140_1。
     // 客體端常式只取代匯入位址；追蹤服務時維持宿主入口，讓每次呼叫仍可觀察。
     const auto routine=[&](std::size_t index){
+        if(!allow_resident)return GuestAddress{stub_base_.value+(services.size()+index)*16};
         const auto& descriptor=runtime_service_descriptors()[index];
+        if(descriptor.family=="crtdll.dll"){
+            const auto base=crtdll_text::image_address;
+            if(const auto image=runtime_.builtin_images.find(base);image!=runtime_.builtin_images.end())
+                if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));
+                   entry!=image->second.export_names.end())return GuestAddress{base+entry->second};
+        }
         if(descriptor.family=="crt" && descriptor.symbol=="_getdrive"){
             static const bool enabled=[] {const auto* v=std::getenv("X64ARM_GUEST_CRT_DIRECTORY");return !v || std::string_view(v)!="0";}();
             if(enabled){const auto entry=guest_thread_routine("CrtGetDrive");if(entry.value)return entry;}
@@ -1100,15 +1376,63 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             if(enabled){const bool count=descriptor.symbol=="__uncaught_exceptions" || descriptor.symbol=="?uncaught_exceptions@std@@YAHXZ";
                 const auto entry=guest_thread_routine(count?"CxxUncaughtCount":"CxxUncaughtAny");if(entry.value)return entry;}
         }
-        if((descriptor.family=="msvcp90.dll" || descriptor.family=="crt") && trace_services_.empty()){
+        const bool numeric=msvcp_numeric::provider(descriptor.family) &&
+            (msvcp_numeric::function(descriptor.symbol) || msvcp_numeric::modern_function(descriptor.symbol));
+        if((descriptor.family=="msvcp90.dll" || descriptor.family=="crt" || numeric) && trace_services_.empty()){
             const auto image=runtime_.builtin_images.find(callback_return_.value+msvcp90_string::image_offset);
             if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
                 return GuestAddress{image->first+entry->second};
         }
-        if(descriptor.family=="mfplat.dll" && trace_services_.empty()){
-            const auto image=runtime_.builtin_images.find(callback_return_.value+mf_image::image_offset);
+        const auto guest_offset=[&]() -> std::uint64_t {
+            if(descriptor.family=="mfplat.dll")return mf_image::image_offset;
+            if(descriptor.family=="hid.dll")return hid_arrays_offset;
+            if(descriptor.family=="winusb.dll" || descriptor.family=="usbd.sys")return usb_descriptors_offset;
+            if(descriptor.family=="icu.dll")return icu_character_offset;
+            return 0;
+        }();
+        if(guest_offset && trace_services_.empty()){
+            const auto image=runtime_.builtin_images.find(callback_return_.value+guest_offset);
             if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
                 return GuestAddress{image->first+entry->second};
+        }
+        if(descriptor.family=="icu.dll" && trace_services_.empty() && !startup_profile::enabled()){
+            const auto read_setting=[](const char* name){
+                const auto* value=std::getenv(name);
+                return !value || std::string_view(value)!="0";
+            };
+            static const bool trie=read_setting("X64ARM_GUEST_ICU_TRIE");
+            static const bool string=read_setting("X64ARM_GUEST_ICU_STRING");
+            static const bool text=read_setting("X64ARM_GUEST_ICU_TEXT");
+            static const bool mapping=read_setting("X64ARM_GUEST_ICU_CASE");
+            static const bool normalization=read_setting("X64ARM_GUEST_ICU_NORMALIZATION");
+            static const bool enumeration=read_setting("X64ARM_GUEST_ICU_ENUMERATION");
+            static const bool locale=read_setting("X64ARM_GUEST_ICU_LOCALE");
+            static const bool currency=read_setting("X64ARM_GUEST_ICU_CURRENCY");
+            static const bool calendar=read_setting("X64ARM_GUEST_ICU_CALENDAR");
+            static const bool date_pattern=read_setting("X64ARM_GUEST_ICU_DATE_PATTERN");
+            static const bool number=read_setting("X64ARM_GUEST_ICU_NUMBER");
+            static const bool date_format=read_setting("X64ARM_GUEST_ICU_DATE_FORMAT");
+            static const bool formatted=read_setting("X64ARM_GUEST_ICU_FORMATTED");
+            static const bool bidi=read_setting("X64ARM_GUEST_ICU_BIDI");
+            static const bool charset_detection=read_setting("X64ARM_GUEST_ICU_CHARSET_DETECTION");
+            static const bool region=read_setting("X64ARM_GUEST_ICU_REGION");
+            static const bool idna=read_setting("X64ARM_GUEST_ICU_IDNA");
+            for(const auto base:{trie?icu_trie::image_address(x86_):0,string?icu_string::image_address(x86_):0,
+                    text?icu_text::image_address(x86_):0,mapping?icu_case::image_address(x86_):0,
+                    normalization?icu_normalization::image_address(x86_):0,
+                    enumeration?icu_enumeration::image_address(x86_):0,locale?icu_locale::image_address(x86_):0,
+                    currency?icu_currency::image_address(x86_):0,calendar?icu_calendar::image_address(x86_):0,
+                    date_pattern?icu_date_pattern::image_address(x86_):0,number?icu_number::image_address(x86_):0,
+                    date_format?icu_date_format::image_address(x86_):0,formatted?icu_formatted::image_address(x86_):0,
+                    bidi?icu_bidi::image_address(x86_):0,
+                    charset_detection?icu_charset_detection::image_address(x86_):0,
+                    region?icu_region::image_address(x86_):0,idna?icu_idna::image_address(x86_):0}){
+                if(!base)continue;
+                const auto image=runtime_.builtin_images.find(base);
+                if(image!=runtime_.builtin_images.end())
+                    if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
+                        return GuestAddress{image->first+entry->second};
+            }
         }
         if(descriptor.family=="user32.dll" && descriptor.symbol=="GetKeyboardType"){
             const auto entry=guest_thread_routine(descriptor.symbol);
@@ -1127,6 +1451,21 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             const auto image=runtime_.builtin_images.find(callback_return_.value+concrt_queue::image_offset);
             if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
                 return GuestAddress{image->first+entry->second};
+        }
+        if((descriptor.family=="d3dx9_43.dll" && descriptor.symbol.starts_with("D3DX")) ||
+           descriptor.symbol=="D3DX10CheckVersion"){
+            const auto image=runtime_.builtin_images.find(callback_return_.value+d3d9_formats::image_offset);
+            if(image!=runtime_.builtin_images.end()){
+                auto entry_name=std::string(descriptor.symbol);
+                if(descriptor.symbol=="D3DX10CheckVersion")entry_name.append(descriptor.family.substr(7,2));
+                if(const auto entry=image->second.export_names.find(entry_name);entry!=image->second.export_names.end())
+                    return GuestAddress{image->first+entry->second};
+            }
+        }
+        if(descriptor.family=="d3dx9_43.dll" && (descriptor.symbol=="D3DXSHAdd" ||
+           descriptor.symbol=="D3DXSHScale" || descriptor.symbol=="D3DXSHDot")){
+            const auto entry=guest_thread_routine(descriptor.symbol);
+            if(entry.value)return entry;
         }
         if(descriptor.family=="shlwapi.dll" && (descriptor.symbol=="SHAnsiToAnsi" || descriptor.symbol=="SHUnicodeToUnicode")){
             const auto entry=guest_thread_routine(descriptor.symbol);
@@ -1199,8 +1538,15 @@ const std::map<std::string_view,std::set<std::string>>& detail::builtin_export_c
         }
         // 別名不必另有同名 descriptor；依共用目錄列舉後，由 resolve_service 核對實際目標。
         for(const auto& alias:detail::service_export_aliases)index[alias.family].emplace(alias.symbol);
+        for(const auto family:d3dx_guest_families)for(const auto symbol:d3dx_guest_exports)
+            if(d3dx_guest_export(family,symbol))index[family].emplace(symbol);
         for(const auto& symbol:index["dbghelp.dll"])
             if(detail::builtin_provider_export_family("imagehlp.dll",symbol)=="dbghelp.dll")index["imagehlp.dll"].emplace(symbol);
+        for(auto& [module,symbols]:index){
+            const auto table=detail::builtin_numbered_exports(module);
+            for(std::size_t ordinal=1;ordinal<table.size();++ordinal)
+                if(!table[ordinal].empty())symbols.emplace("#"+std::to_string(ordinal));
+        }
         for(const auto& [ordinal,name]:detail::ole_ordinal_exports){(void)name;index["oleaut32.dll"].emplace("#"+std::to_string(ordinal));}
         for(const auto* module:{"msvcr100.dll","msvcr110.dll","msvcr120.dll","msvcp100.dll","msvcp110.dll","msvcp120.dll"})
             for(const auto& symbol:index["concrt140.dll"])if(detail::builtin_provider_export_family(module,symbol)=="concrt140.dll")index[module].emplace(symbol);
@@ -1228,6 +1574,7 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
     const auto& names=detail::builtin_export_catalog();
     std::map<std::string,std::uint64_t> result;
     const auto guest_entry=[&](GuestAddress target){
+        if(target.value==runtime_.cxx_exceptions.image.entry)return true;
         // 與 resolve_service 共用架構對應的執行緒函式目錄，包含直接返回與同步原語。
         if(guest_thread_routines_.value){
             const auto contains=[&](const auto& routines){
@@ -1245,13 +1592,36 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
             for(const auto& [name,entry]:guest_crt_algorithms_.export_names){
                 (void)name;if(target.value==guest_crt_algorithms_.base+entry)return true;
             }
+        const auto d3d9_base=callback_return_.value+d3d9_formats::image_offset;
+        if(target.value>=d3d9_base && target.value-d3d9_base<0x10000){
+            const auto image=runtime_.builtin_images.find(d3d9_base);
+            if(image!=runtime_.builtin_images.end())for(const auto& [name,rva]:image->second.export_names)
+                if(name.starts_with("D3DX") && target.value==d3d9_base+rva)return true;
+        }
         if(const auto image=runtime_.builtin_images.find(callback_return_.value+msvcp90_string::image_offset);image!=runtime_.builtin_images.end())
             for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
         if(const auto image=runtime_.builtin_images.find(callback_return_.value+com_agile::image_offset);image!=runtime_.builtin_images.end())
             for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
         if(const auto image=runtime_.builtin_images.find(callback_return_.value+mf_image::image_offset);image!=runtime_.builtin_images.end())
             for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
+        for(const auto base:{callback_return_.value+hid_arrays_offset,callback_return_.value+usb_descriptors_offset,
+                callback_return_.value+icu_character_offset,icu_trie::image_address(x86_),icu_string::image_address(x86_),
+                icu_text::image_address(x86_),icu_case::image_address(x86_),icu_normalization::image_address(x86_),
+                icu_enumeration::image_address(x86_),icu_locale::image_address(x86_),icu_currency::image_address(x86_),
+                icu_calendar::image_address(x86_),icu_date_pattern::image_address(x86_),icu_number::image_address(x86_),
+                icu_date_format::image_address(x86_),icu_formatted::image_address(x86_),icu_bidi::image_address(x86_),
+                icu_charset_detection::image_address(x86_),
+                icu_region::image_address(x86_),
+                icu_idna::image_address(x86_),
+                windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,12),
+                x86_?crtdll_text::image_address:0})
+            if(const auto image=runtime_.builtin_images.find(base);image!=runtime_.builtin_images.end())
+                for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
         if(const auto image=runtime_.builtin_images.find(callback_return_.value+vcomp_image_offset);image!=runtime_.builtin_images.end())
+            for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
+        if(const auto image=runtime_.builtin_images.find(callback_return_.value+d3dx_thread_pump_offset);image!=runtime_.builtin_images.end())
+            for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
+        if(const auto image=runtime_.builtin_images.find(callback_return_.value+xaudio_lowering::image_offset);image!=runtime_.builtin_images.end())
             for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
         if(const auto image=runtime_.builtin_images.find(callback_return_.value+concrt_queue::image_offset);image!=runtime_.builtin_images.end())
             for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
@@ -1538,7 +1908,7 @@ unsigned WindowsServices::runtime_compute_boundary(GuestAddress address) const n
                      (descriptor.symbol=="VerLanguageNameA" || descriptor.symbol=="VerLanguageNameW"))))result[index]=13;
             else if(resident_compute && std::find(pointer_operations.begin(),pointer_operations.end(),descriptor.symbol)!=pointer_operations.end())result[index]=14;
             // HID parser 僅處理客體預解析資料與報告緩衝區；裝置 IO 的 HidD_* 保留宿主服務。i8042 轉換會呼叫客體插入回呼，走完整入口。
-            else if(resident_compute && ((descriptor.family=="msvcp90.dll" && !msvcp90_stream::family(descriptor.symbol) && !descriptor.symbol.starts_with("?_Fiopen@")) || (descriptor.family=="hid.dll" && descriptor.symbol.starts_with("HidP_") && descriptor.symbol!="HidP_TranslateUsagesToI8042ScanCodes") ||
+            else if(resident_compute && ((descriptor.family=="msvcp90.dll" && !msvcp90_stream::family(descriptor.symbol) && !descriptor.symbol.starts_with("?_Fiopen@")) || (descriptor.family=="hid.dll" && descriptor.symbol.starts_with("HidP_") && !descriptor.symbol.starts_with("HidP_Translate")) ||
                     ((descriptor.family=="shlwapi.dll" || descriptor.family=="shell32.dll") && std::find(shell_text_operations.begin(),shell_text_operations.end(),descriptor.symbol)!=shell_text_operations.end()) ||
                     (descriptor.family=="gdiplus.dll" && std::find(image_codec_queries.begin(),image_codec_queries.end(),descriptor.symbol)!=image_codec_queries.end())))result[index]=15;
             else if(scalar_math_operation(descriptor))result[index]=3;
@@ -1686,7 +2056,7 @@ const WindowsServiceDescriptor* WindowsServices::graphics_worker_service(GuestAd
     const auto begin=stub_base_.value+services.size()*16;
     if(address.value<begin || ((address.value-begin)&15U))return nullptr;
     const auto index=(address.value-begin)/16;
-    if(!graphics_local_service(index))return nullptr;
+    if(!graphics_local_service(index) || dxgi_guest_layers())return nullptr;
     // GetPrivateData 的輸出長度由客體決定，可能跨越參數核對涵蓋的頁面；建立方法會配置 heap。兩者留給協調者。
     // 依描述元索引一次建表（每次 worker 服務入口與核心出口都要查，原本每次約二十多次名稱比對）。
     static const std::vector<bool> coordinator_only=[] {
@@ -1724,7 +2094,8 @@ std::string_view stub_service_symbol(GuestAddress stub_base,GuestAddress address
 bool WindowsServices::resident_service(GuestAddress address) const noexcept {
     if(trace_services_.empty() && !startup_profile::enabled() && !runtime_.forced_exit_code()){
         const auto begin=stub_base_.value+services.size()*16;
-        if(address.value>=begin && !((address.value-begin)&15U) && graphics_context_service((address.value-begin)/16))return true;
+        if(address.value>=begin && !((address.value-begin)&15U) && graphics_context_service((address.value-begin)/16) &&
+           !dxgi_guest_layers())return true;
     }
     // 第一次初始化編碼金鑰需要隨機來源，保留宿主慢路徑；其後只做程序狀態讀取與 rotate／xor。
     if(runtime_compute_boundary(address)==14 && !runtime_.pointer_cookie)return false;
@@ -1916,7 +2287,7 @@ namespace {
 struct CoordinatedTrace {
     struct Entry {std::uint64_t done{},refused{};std::string_view name;};
     enum WaitReason:unsigned {MustBlock,Sleeping,NoAccess,SharedObject,DuplicateHandle,OtherHandle,PendingApc,BadCount,WaitReasons};
-    std::mutex mutex;std::unordered_map<std::uint64_t,Entry> counts;std::uint64_t refused{};
+    std::mutex mutex;std::unordered_map<std::uint64_t,Entry> counts;std::uint64_t refused{},requests{};
     std::array<std::uint64_t,WaitReasons> wait_reasons{};
     std::map<std::tuple<int,std::uint64_t,std::string_view>,std::uint64_t> callback_returns;
     ~CoordinatedTrace(){dump();}
@@ -1925,6 +2296,8 @@ struct CoordinatedTrace {
     void record(const WindowsServices& provider,std::uint64_t rip,bool completed){
         const std::lock_guard lock(mutex);auto& entry=counts[rip];if(entry.name.empty())entry.name=provider.name(GuestAddress{rip});
         (completed?entry.done:entry.refused)++;
+        // 完成的請求也每 2^20 次輸出一次：協調服務多半是完成的（FF XIII 每秒約 18 萬次），只看拒絕次數會等到程序結束才有資料。
+        if(!(++requests&((UINT64_C(1)<<20)-1))){dump();return;}
         if(completed || (++refused&((UINT64_C(1)<<18)-1)))return;
         dump();
     }
@@ -2321,7 +2694,18 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
            symbol=="mouse_event" || symbol=="keybd_event" || symbol=="SendInput"))native_gui_->prefetch_events();
         // 本地 SetupDiGetClassDevs 的裝置盤點要列舉 IOKit USB 拓撲（每次數毫秒）：先在鎖外列舉，持獨占鎖時只同步表格。
         if(family=="setupapi.dll" && symbol.starts_with("SetupDiGetClassDevs"))usb_prefetch_=usb_backend().devices();
+        // 診斷：X64ARM_TRACE_LOCAL_LOCK_WAIT=<毫秒> 時，本地服務取獨占映射鎖的等待與持鎖執行時間任一超過門檻就列出。
+        static const std::uint64_t lock_wait_threshold=[] {const auto* value=std::getenv("X64ARM_TRACE_LOCAL_LOCK_WAIT");
+            return value?static_cast<std::uint64_t>(std::strtoull(value,nullptr,10))*1000U:UINT64_C(0);}();
+        const auto lock_requested=lock_wait_threshold?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
+        struct LockReport {
+            std::uint64_t threshold;std::string_view symbol;std::chrono::steady_clock::time_point requested,acquired;
+            ~LockReport(){if(!threshold)return;const auto now=std::chrono::steady_clock::now();
+                const auto wait=std::chrono::duration_cast<std::chrono::microseconds>(acquired-requested).count(),held=std::chrono::duration_cast<std::chrono::microseconds>(now-acquired).count();
+                if(static_cast<std::uint64_t>(wait)>=threshold || static_cast<std::uint64_t>(held)>=threshold)
+                    std::fprintf(stderr,"local_lock symbol=%.*s wait_us=%lld held_us=%lld\n",static_cast<int>(symbol.size()),symbol.data(),static_cast<long long>(wait),static_cast<long long>(held));}
+        } lock_report{lock_wait_threshold,symbol,lock_requested,lock_wait_threshold?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}};
         const GuestAddress error_slot{state.gs_base+0x68};
         const auto entry_error=static_cast<std::uint32_t>(memory.load(error_slot,32));
         const auto previous=threads_.current;const auto saved_error=last_error_;const auto saved_errno=runtime_.errno_cell;
@@ -2381,7 +2765,8 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
     // 只操作圖形物件表與 Metal 命令執行緒；資格見 d3d11_local_eligible，物件銷毀延到下一次非本地 D3D11 呼叫。
     // 不切換 context、不排程、不執行客體回呼。X64ARM_LOCAL_GRAPHICS_SERVICE=0 關閉。
     static const bool local_graphics=[] {const auto* value=std::getenv("X64ARM_LOCAL_GRAPHICS_SERVICE");return !value || std::string_view(value)!="0";}();
-    if(local_graphics && (!x86_ || x86_graphics_parallel_enabled()) && graphics_local_service((state.rip.value-begin)/16)){
+    if(local_graphics && (!x86_ || x86_graphics_parallel_enabled()) && graphics_local_service((state.rip.value-begin)/16) &&
+       !dxgi_guest_layers()){
         // 先等 D3D11 命令串流清空（取映射鎖之前，見 d3d11_command_stream.inc）。裝置建立不依賴佇列，不必等。
         d3d11_stream_coordinated(state,memory,device_creation_service(detail::stub_service_symbol(stub_base_,state.rip)));
         // 鎖順序與 worker 服務相同：映射 → D3D11。反過來會與持映射共用鎖、等待 D3D11 鎖的 worker 互鎖
@@ -2588,21 +2973,30 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
             // 共用命名空間物件、錯誤回報與執行緒池已登錄等待交回完整路徑。X64ARM_LOCAL_RELEASE_MUTEX=0 關閉。
             static const bool local_release=[] {const auto* value=std::getenv("X64ARM_LOCAL_RELEASE_MUTEX");return !value || std::string_view(value)!="0";}();
             if(!local_release)return false;
+            // 診斷：X64ARM_TRACE_COORDINATED 時統計交回完整路徑的原因（0非互斥鎖 1共用 2擁有者或遞迴不符 3已登錄等待 4等待封包 5有等待者）。
+            static std::array<std::atomic<std::uint64_t>,6> mutex_refused{};
+            const auto refuse_mutex=[&](unsigned reason){if(trace){const auto hits=mutex_refused[reason].fetch_add(1,std::memory_order_relaxed)+1;if(hits==1 || !(hits&0xffffU))std::fprintf(stderr,"[coordinated_mutex] reason=%u(0非互斥鎖 1共用 2擁有者或遞迴 3已登錄等待 4等待封包 5有等待者) hits=%llu handle=0x%llx\n",reason,static_cast<unsigned long long>(hits),static_cast<unsigned long long>(arg(0)));}return false;};
             const auto found=runtime_.wait_objects.find(arg(0));
-            if(found==runtime_.wait_objects.end() || found->second.kind!=WaitObject::Kind::Mutex)return false;
+            if(found==runtime_.wait_objects.end() || found->second.kind!=WaitObject::Kind::Mutex)return refuse_mutex(0);
             auto& mutex=runtime_.mutex_objects.at(found->second.mutex);
-            if(mutex.shared || mutex.owner!=key || !mutex.recursion)return false;
             const auto same_mutex=[&](std::uint64_t handle){
                 const auto other=runtime_.wait_objects.find(handle);
                 return other!=runtime_.wait_objects.end() && other->second.kind==WaitObject::Kind::Mutex && other->second.mutex==found->second.mutex;
             };
-            for(const auto& [id,wait]:registered_waits_){(void)id;if(same_mutex(wait.target))return false;}
-            for(const auto& [id,wait]:wait_completion_packets_){(void)id;if(wait.phase==WaitCompletionPacketState::Phase::Armed && same_mutex(wait.target))return false;}
-            // 交接給等待者會改變 runnable 集合，協調者要重算期限：有等待者時交回完整路徑。
-            if(mutex.recursion==1 && mutex_has_waiters(found->second.mutex))return false;
-            value=1;
-            if(!--mutex.recursion)mutex.owner=0;
-            trace_event_operation('M',arg(0),key,memory.load(GuestAddress{state.reg(Gpr::Rsp)},pointer_bits));
+            for(const auto& [id,wait]:registered_waits_){(void)id;if(same_mutex(wait.target))return refuse_mutex(3);}
+            for(const auto& [id,wait]:wait_completion_packets_){(void)id;if(wait.phase==WaitCompletionPacketState::Phase::Armed && same_mutex(wait.target))return refuse_mutex(4);}
+            // 共用（具名、跨程序）互斥鎖交回完整路徑。11-21 曾在這裡於命名空間鎖下 release_locked（FF XIII 每秒約 4400 次），但跨程序
+            // 互斥鎖以 flock 實作、沒有釋放時交給等待者的公平交接，本地快速釋放後呼叫者立刻重取，Steam 端等待者搶不到，遊戲等 IPC 回覆
+            // 停頓數秒（2 vCPU 卡住、4 vCPU 最長幀 3.2 秒）。要做需先補跨程序的交接公平性。
+            if(mutex.shared)return refuse_mutex(1);
+            {
+                if(mutex.owner!=key || !mutex.recursion)return refuse_mutex(2);
+                // 交接給等待者會改變 runnable 集合，協調者要重算期限：有等待者時交回完整路徑。
+                if(mutex.recursion==1 && mutex_has_waiters(found->second.mutex))return refuse_mutex(5);
+                value=1;
+                if(!--mutex.recursion)mutex.owner=0;
+                trace_event_operation('M',arg(0),key,memory.load(GuestAddress{state.reg(Gpr::Rsp)},pointer_bits));
+            }
         }else if(symbol=="ReleaseSemaphore"){
             // 與 provider 相同的計數與上限；錯誤回報、共用命名空間物件與執行緒池已登錄等待交回完整路徑。
             // 有等待者時在同一獨占鎖下以物件範圍喚醒（被喚醒者等下一次重選或停駐 slot 原地續跑）。X64ARM_LOCAL_SEMAPHORE=0 關閉。
@@ -2861,7 +3255,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
         return result;
     }
     if(runtime_descriptor && trace_services_.empty() && !startup_profile::enabled() && !runtime_.forced_exit_code() &&
-       graphics_context_service((state.rip.value-runtime_begin)/16)){
+       graphics_context_service((state.rip.value-runtime_begin)/16) && !dxgi_guest_layers()){
         // 與完整入口相同同步 TEB LastError（含 x86）；裝置鎖等待等排程由 provider 更新 concurrency epoch，
         // 核心常駐邊界據此交回宿主。HeapLock 等待沿用 invoke_service 的同一檢查。
         const auto thread=threads_.current;
@@ -3141,21 +3535,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
     if(state.rip.value==callback_return_.value+0xe0)return finish_system_call(state,memory);
     if(!stock_gui_class(state.rip.value).empty())return invoke_stock_gui(state,memory);
     if (state.rip.value >= unresolved_base_.value && state.rip.value - unresolved_base_.value < unresolved_imports_.size() * 16){
-        // 診斷：X64ARM_TRAP_DUMP_DIR=<目錄>：停在未實作匯入時，把主映像目前的記憶體（含執行期才解開的程式碼）逐頁寫成
-        // image-<基底>.bin，讀不到的頁補零；用來離線反組譯加殼程式內嵌的標準函式庫存取，核對物件版面。只讀取。
-        if(const auto* directory=std::getenv("X64ARM_TRAP_DUMP_DIR");directory && *directory && runtime_.image.base && runtime_.image.size){
-            char file[64];std::snprintf(file,sizeof file,"image-%llx.bin",static_cast<unsigned long long>(runtime_.image.base));
-            if(auto* out=std::fopen((std::string(directory)+"/"+file).c_str(),"wb")){
-                std::vector<std::uint8_t> page(GuestMemory::guest_page_size);
-                for(std::uint64_t at=0;at<runtime_.image.size;at+=page.size()){
-                    const auto bytes=std::min<std::uint64_t>(page.size(),runtime_.image.size-at);
-                    try{memory.read(GuestAddress{runtime_.image.base+at},std::span(page.data(),static_cast<std::size_t>(bytes)));}
-                    catch(...){std::fill(page.begin(),page.end(),0);}
-                    std::fwrite(page.data(),1,static_cast<std::size_t>(bytes),out);
-                }
-                std::fclose(out);
-            }
-        }
+        detail::dump_main_image(memory,runtime_.image.base,runtime_.image.size);
         throw HostCallFault("呼叫尚未實作的 PE import：" + std::string(name(state.rip)));
     }
     if(state.rip.value==callback_return_.value+0x60 || state.rip.value==callback_return_.value+0x70){
@@ -3504,8 +3884,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_readwrite(GuestState& 
             io.error=file.native->validate_io(offset,count,writing,key);
         }
         process_io::Batch io_request(writing?process_io::Kind::Write:process_io::Kind::Read);
+        // 診斷：X64ARM_TRACE_FILE_IO_TIMING=<毫秒> 時，單次讀寫超過門檻就列出 check／宿主 I/O／客體記憶體搬移各自的時間。
+        static const std::uint64_t io_timing_threshold=[] {const auto* value=std::getenv("X64ARM_TRACE_FILE_IO_TIMING");
+            return value?static_cast<std::uint64_t>(std::strtoull(value,nullptr,10))*1000U:UINT64_C(0);}();
+        std::uint64_t timing_check=0,timing_host=0,timing_guest=0;const auto timing_now=[]{return std::chrono::steady_clock::now();};
+        const auto timing_since=[](auto start){return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count());};
         if(!io.error)try{
-            memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(extent),writing?Access::Read:Access::Write);
+            {const auto started=timing_now();memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(extent),writing?Access::Read:Access::Write);if(io_timing_threshold)timing_check+=timing_since(started);}
             if(!standard && found->second.native && found->second.native->null_device()){
                 // NUL 沒有 payload；沿用後續 count、IOSB、APC、event 與 IOCP 完成契約。
                 io.bytes=writing?count:0;process_io::record(writing?process_io::Kind::Write:process_io::Kind::Read,io.bytes);
@@ -3518,15 +3903,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_readwrite(GuestState& 
                 if(writing)memory.read(GuestAddress{arg(1)+io.bytes},part);FileIoResult transferred;
                 if(standard && writing)transferred=write_standard_output(static_cast<unsigned>(handle-0x100),part);
                 else if(standard){auto& input=runtime_.standard_input;transferred.bytes=std::min<std::uint64_t>(length,input.bytes.size()-input.position);std::copy_n(input.bytes.begin()+static_cast<std::ptrdiff_t>(input.position),static_cast<std::size_t>(transferred.bytes),part.begin());input.position+=transferred.bytes;process_io::record(process_io::Kind::Read,transferred.bytes);}
-                else if(found->second.native)transferred=writing?found->second.native->write(part,offset+io.bytes,key):found->second.native->read(part,offset+io.bytes,key);
+                else if(found->second.native){const auto started=timing_now();transferred=writing?found->second.native->write(part,offset+io.bytes,key):found->second.native->read(part,offset+io.bytes,key);if(io_timing_threshold)timing_host+=timing_since(started);}
                 else if(writing)transferred.error=5;
                 else{const auto& bytes=*found->second.bytes;const auto position=static_cast<std::size_t>(std::min<std::uint64_t>(offset+io.bytes,bytes.size()));transferred.bytes=std::min<std::uint64_t>(length,bytes.size()-position);std::copy_n(bytes.begin()+static_cast<std::ptrdiff_t>(position),static_cast<std::size_t>(transferred.bytes),part.begin());process_io::record(process_io::Kind::Read,transferred.bytes);}
-                if(!writing && transferred.bytes)memory.write(GuestAddress{arg(1)+io.bytes},part.first(static_cast<std::size_t>(transferred.bytes)));
+                if(!writing && transferred.bytes){const auto started=timing_now();memory.write(GuestAddress{arg(1)+io.bytes},part.first(static_cast<std::size_t>(transferred.bytes)));if(io_timing_threshold)timing_guest+=timing_since(started);}
                 io.bytes+=transferred.bytes;io.error=transferred.error;if(io.error || transferred.bytes<length || !length)break;
             }
             }
             if(writing && !standard && found->second.native && io.bytes)found->second.metadata=found->second.native->information().metadata;
         }catch(const std::bad_alloc&){io.error=8;}catch(const MemoryFault&){io.error=998;}
+        if(io_timing_threshold && timing_check+timing_host+timing_guest>=io_timing_threshold)
+            std::fprintf(stderr,"file_io_timing op=%.*s bytes=%llu check_us=%llu host_us=%llu guest_us=%llu\n",static_cast<int>(symbol.size()),symbol.data(),
+                static_cast<unsigned long long>(io.bytes),static_cast<unsigned long long>(timing_check),static_cast<unsigned long long>(timing_host),static_cast<unsigned long long>(timing_guest));
         // 診斷：X64ARM_TRACE_FILE_READ=<路徑片段> 時，記錄符合檔案每次同步讀寫的位移、長度與宿主時間。
         if(static const char* const read_trace=std::getenv("X64ARM_TRACE_FILE_READ");read_trace && *read_trace && !standard &&
            found->second.path.find(read_trace)!=std::string::npos)

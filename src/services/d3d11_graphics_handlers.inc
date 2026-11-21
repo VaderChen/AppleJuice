@@ -967,14 +967,68 @@
             graphics_handled=true;auto device=typed(arg(0),Kind::DxgiDevice);if(symbol=="SetGPUThreadPriority"){require(static_cast<std::int32_t>(u32(1))>=-7 && static_cast<std::int32_t>(u32(1))<=7);device->priority=u32(1);}else if(symbol=="GetGPUThreadPriority")memory.store(GuestAddress{arg(1)},32,device->priority);else if(symbol=="SetMaximumFrameLatency"){require(u32(1)<=16);device->slice=u32(1)?u32(1):3;}else memory.store(GuestAddress{arg(1)},32,device->slice?device->slice:3);
         }
 
-        else if(symbol.starts_with("D3DX11CompileFrom") || symbol=="D3DCompile" || symbol=="D3DCompile2" || symbol=="D3DDisassemble" || symbol=="D3DCreateBlob" || symbol=="BlobPointer" || symbol=="BlobSize" || symbol=="D3DGetInputSignatureBlob" || symbol=="D3DGetOutputSignatureBlob" || symbol=="D3DGetInputAndOutputSignatureBlob" ||
+        else if(symbol.starts_with("D3DX11CompileFrom") || symbol=="D3DCompile" || symbol=="D3DCompile2" || symbol=="D3DDisassemble" || symbol=="D3DX10DisassembleShader" || symbol=="D3DCreateBlob" || symbol=="BlobPointer" || symbol=="BlobSize" || symbol=="D3DGetInputSignatureBlob" || symbol=="D3DGetOutputSignatureBlob" || symbol=="D3DGetInputAndOutputSignatureBlob" ||
                 symbol=="D3D10CompileShader" || symbol=="D3D10CompileEffectFromMemory" || symbol=="D3D10GetShaderDebugInfo" || (symbol.starts_with("D3D10Get") && symbol.ends_with("ShaderProfile")) ||
                 symbol=="D3DPreprocess" || symbol=="D3DSetBlobPart" || symbol=="D3DGetBlobPart" || symbol=="D3DStripShader" || symbol=="D3DGetDebugInfo" || symbol=="D3DReadFileToBlob" ||
-                symbol=="D3DCompileFromFile" || symbol=="D3DAssemble" || symbol=="D3DX10PreprocessShaderFromMemory"){
+                symbol=="D3DCompileFromFile" || symbol=="D3DAssemble" || symbol=="D3DDisassemble10Effect" || symbol=="D3DX10DisassembleEffect" ||
+                symbol=="D3DDisassembleRegion" || symbol=="D3DGetTraceInstructionOffsets" ||
+                symbol.starts_with("D3DX10PreprocessShaderFrom") || symbol.starts_with("D3DX11PreprocessShaderFrom")){
             graphics_handled=true;
-            const auto blob=[&](std::span<const std::uint8_t> data){auto id=create(Kind::Blob);try{const auto ptr=allocate_heap(memory,std::max<std::size_t>(1,data.size()));if(!ptr)throw std::bad_alloc{};id->allocations.push_back(ptr);id->mapped=ptr;id->sequence=data.size();memory.write(GuestAddress{ptr},data);}catch(...){release(id->root);throw;}return id->root;};
+            const auto make_blob=[&](std::uint64_t size,std::span<const std::uint8_t> initial){
+                auto id=create(Kind::Blob);
+                try{
+                    id->allocations.reserve(1);
+                    const auto ptr=allocate_heap(memory,size);
+                    if(!ptr)throw std::bad_alloc{};
+                    id->allocations.push_back(ptr);
+                    id->mapped=ptr;
+                    id->sequence=size;
+                    if(!initial.empty())memory.write(GuestAddress{ptr},initial);
+                }catch(...){release(id->root);throw;}
+                return id->root;
+            };
+            const auto blob=[&](std::span<const std::uint8_t> data){return make_blob(data.size(),data);};
             if(symbol=="BlobPointer")result=typed(arg(0),Kind::Blob)->mapped;
             else if(symbol=="BlobSize")result=typed(arg(0),Kind::Blob)->sequence;
+            else if(symbol=="D3DDisassemble10Effect" || symbol=="D3DX10DisassembleEffect"){
+                require(arg(2)!=0);
+                output(2);
+                write_pointer(arg(2),0);
+                const auto found=bridge.objects.find_fast(arg(0));
+                require(found!=bridge.objects.end() && found->second.kind==Kind::Effect10);
+                const auto& effect=*found->second.identity;
+                const auto flags=symbol=="D3DX10DisassembleEffect"?static_cast<unsigned>(u32(1)!=0):u32(1);
+                const auto* pool=effect.effect_pool?object(effect.effect_pool).identity->effect.get():nullptr;
+                auto text=fx10::disassemble(*effect.effect,pool,flags);
+                text.push_back(0);
+                write_pointer(arg(2),blob(std::span(reinterpret_cast<const std::uint8_t*>(text.data()),text.size())));
+            }
+            else if(symbol=="D3DDisassembleRegion"){
+                require(arg(7)!=0);
+                output(7);write_pointer(arg(7),0);
+                if(arg(6))output(6);
+                require(arg(0)!=0 && arg(1)>=4 && arg(1)<=16U*1024U*1024U);
+                const auto bytes=read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1)));
+                const auto comment=arg(3)?read_ansi(memory,arg(3),65536):std::string{};
+                auto region=shader_disassembly::region(bytes,u32(2),comment,arg(4),arg(5));
+                region.text.push_back(0);
+                write_pointer(arg(7),blob(std::span(reinterpret_cast<const std::uint8_t*>(region.text.data()),region.text.size())));
+                if(arg(6))write_pointer(arg(6),region.finish);
+            }
+            else if(symbol=="D3DGetTraceInstructionOffsets"){
+                require(arg(0)!=0 && arg(1)>=4 && arg(1)<=16U*1024U*1024U && !(u32(2)&~1U));
+                const auto bytes=read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1)));
+                const auto offsets=shader_disassembly::trace_offsets(bytes,(u32(2)&1U)!=0);
+                const auto start=arg(3);
+                require(start<=offsets.size());
+                const auto count=std::min<std::uint64_t>(arg(4),offsets.size()-start);
+                if(arg(6))output(6);
+                if(arg(5) && count){
+                    memory.check(GuestAddress{arg(5)},count*pointer_size,Access::Write);
+                    for(std::uint64_t i=0;i<count;++i)write_pointer(arg(5)+i*pointer_size,offsets[start+i]);
+                }
+                if(arg(6))write_pointer(arg(6),offsets.size());
+            }
             else if(symbol=="D3DGetInputSignatureBlob" || symbol=="D3DGetOutputSignatureBlob" || symbol=="D3DGetInputAndOutputSignatureBlob"){
                 if(!arg(0) || !arg(2) || arg(1)<32)result=0x8876086cU;
                 else{
@@ -987,12 +1041,16 @@
                     }catch(const std::invalid_argument&){result=0x80004005U;}
                 }
             }
-            else if(symbol=="D3DDisassemble"){
+            else if(symbol=="D3DDisassemble" || symbol=="D3DX10DisassembleShader"){
                 output(4);write_pointer(arg(4),0);require(arg(0) && arg(1)>=4 && arg(1)<=16U*1024U*1024U);
-                auto text=graphics_disassemble_shader(read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1))),u32(2),arg(3)?read_ansi(memory,arg(3),65536):std::string{});
+                const auto flags=symbol=="D3DX10DisassembleShader"?static_cast<unsigned>(u32(2)!=0):u32(2);
+                auto text=graphics_disassemble_shader(read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1))),flags,arg(3)?read_ansi(memory,arg(3),65536):std::string{});
                 text.push_back(0);write_pointer(arg(4),blob({reinterpret_cast<const std::uint8_t*>(text.data()),text.size()}));
             }
-            else if(symbol=="D3DCreateBlob"){require(arg(0)<=64*1024*1024);output(1);std::vector<std::uint8_t> data(static_cast<std::size_t>(arg(0)));write_pointer(arg(1),blob(data));}
+            else if(symbol=="D3DCreateBlob"){
+                if(!arg(1))result=0x8876086cU;
+                else{output(1);write_pointer(arg(1),make_blob(arg(0),{}));}
+            }
             else if(symbol.ends_with("ShaderProfile")){
                 // D3D10Get{Vertex,Pixel,Geometry}ShaderProfile(pDevice)：10.1 等級的裝置為 4_1，其他（含 NULL）為 4_0；字串常駐於程序。
                 std::string level="4_0";if(arg(0) && typed(arg(0),Kind::Device)->feature_level==0xa100)level="4_1";
@@ -1077,7 +1135,7 @@
                 // 遊戲已載入自帶的 HLSL 編譯器（app-local d3dcompiler，見 load_module）：D3DX11CompileFromMemory 直接尾呼叫它的 D3DCompile。
                 // 兩者參數相同，只差 pPump／pHResult（同步編譯時皆為 NULL）：ppShader、ppErrorMsgs 移到 D3DCompile 的第 10、11 個參數位置，
                 // 回傳值就是 D3DCompile 的 HRESULT。x86 為 stdcall：D3DX 多兩個參數（8 位元組），返回位址與參數整體上移 8 位元組，讓被呼叫端的出棧量相符。
-                if(symbol=="D3DX11CompileFromMemory" && !arg(9) && !arg(12)){
+                if(symbol=="D3DX11CompileFromMemory" && !effect_compile && !arg(9) && !arg(12)){
                     std::uint64_t compile=0;
                     for(const std::u16string_view name:{std::u16string_view{u"d3dcompiler_47.dll"},std::u16string_view{u"d3dcompiler_46.dll"},std::u16string_view{u"d3dcompiler_43.dll"}}){
                         const auto base=find_module(name);
@@ -1102,18 +1160,23 @@
                         (void)bits;state.rip=GuestAddress{compile};state.rep_compare={};return std::nullopt;
                     }
                 }
-                const bool d3dx=symbol.starts_with("D3DX11CompileFrom"),file=symbol.starts_with("D3DX11CompileFromFile") || symbol=="D3DCompileFromFile",resource=symbol.starts_with("D3DX11CompileFromResource");
-                // D3DCompileFromFile 與 D3DX11CompileFromFile 同形但沒有 pPump／pHResult；D3DPreprocess（輸出前處理後文字）與 D3DAssemble（組譯 SM1～3）沒有進入點與設定檔。
-                const bool compile_file=symbol=="D3DCompileFromFile",d3dx10_preprocess=symbol=="D3DX10PreprocessShaderFromMemory",preprocess=symbol=="D3DPreprocess" || d3dx10_preprocess,assemble=symbol=="D3DAssemble";
+                const D3dxShaderEntry d3dx_entry(symbol);
+                const bool d3dx=d3dx_entry.valid && !d3dx_entry.preprocess;
+                const bool file=symbol.find("FromFile")!=symbol.npos,resource=symbol.find("FromResource")!=symbol.npos;
+                const bool compile_file=symbol=="D3DCompileFromFile",preprocess=symbol=="D3DPreprocess" || d3dx_entry.preprocess,assemble=symbol=="D3DAssemble";
                 // D3D10CompileShader 與 D3DCompile 相同但沒有 Flags2；D3D10CompileEffectFromMemory 以 fx_4_0 編譯，HLSL／FX 旗標在第 6、7 個參數。
                 const bool d3d10_shader=symbol=="D3D10CompileShader",d3d10_effect=symbol=="D3D10CompileEffectFromMemory";
                 const unsigned macros_arg=file?1:3,include_arg=file?2:4,entry_arg=file?3:5,profile_arg=file?4:6,flags_arg=file?5:(d3d10_effect || assemble?5:7);
-                const unsigned code=d3dx?(file?8:10):compile_file?7:d3dx10_preprocess?6:preprocess?5:assemble?6:d3d10_shader?8:d3d10_effect?7:(symbol=="D3DCompile2"?12:9),errors=code+1;
-                output(code);write_pointer(arg(code),0);if(arg(errors)){output(errors);write_pointer(arg(errors),0);}
+                const unsigned code=d3dx_entry.valid?d3dx_entry.code_arg:compile_file?7:preprocess?5:assemble?6:d3d10_shader?8:d3d10_effect?7:(symbol=="D3DCompile2"?12:9),errors=code+1;
+                if(!assemble || arg(code)){output(code);write_pointer(arg(code),0);}
+                if(arg(errors)){output(errors);write_pointer(arg(errors),0);}
                 // 同步編譯共用 HLSL 後端；自訂 include 經原執行緒的真正客體 callback。
-                if(d3dx)require(!arg(file?7:9) && !arg(code+2));
-                else if(compile_file)require(!(u32(6)&~3U) && (!u32(6) || read_ansi(memory,arg(profile_arg)).starts_with("fx_")));
-                else if(d3dx10_preprocess)require(!arg(5) && !arg(8)); // 同步版本：pPump、pHResult 為 NULL（與 D3DX11 編譯入口相同）
+                if(d3dx_entry.valid){
+                    require(!arg(d3dx_entry.pump_arg));
+                    const auto status=d3dx_entry.has_status?arg(code+2):0;
+                    if(status)memory.check(GuestAddress{status},4,Access::Write);
+                    compile_status=status;
+                }else if(compile_file)require(!(u32(6)&~3U) && (!u32(6) || read_ansi(memory,arg(profile_arg)).starts_with("fx_")));
                 else if(!d3d10_shader && !d3d10_effect && !preprocess && !assemble)require(!(u32(8)&~3U) && (!u32(8) || read_ansi(memory,arg(profile_arg)).starts_with("fx_")));
                 if(symbol=="D3DCompile2")require(!u32(9) && !arg(10) && !arg(11));
                 std::string source_name="shader";
@@ -1137,6 +1200,10 @@
                     require(arg(1)>0 && arg(1)<=16*1024*1024);source=read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1)));
                     if(arg(2))source_name=read_ansi(memory,arg(2));
                 }
+                const auto magic=source.size()>=4?word(source,0):0;
+                if(effect_compile && (magic==0x43425844 || magic==0xfeff1001 || magic==0xfeff1011)){
+                    write_pointer(arg(code),blob(source));
+                }else{
                 std::vector<std::pair<std::string,std::string>> macros;
                 if(arg(macros_arg))for(unsigned i=0;i<256;++i){const auto at=arg(macros_arg)+i*2*pointer_size,name=memory.load(GuestAddress{at},pointer_bits);if(!name)break;const auto value=memory.load(GuestAddress{at+pointer_size},pointer_bits);macros.emplace_back(read_ansi(memory,name),value?read_ansi(memory,value):"");require(i<255);}
                 D3DCompileOperation* operation=nullptr;
@@ -1181,9 +1248,10 @@
                     }
                     return std::nullopt;
                 };
+                bool assembly_started=operation && operation->assembly_started;
                 auto compilation=operation && operation->result?*operation->result:
                     preprocess?graphics_preprocess_shader(source,source_name,macros,include_loader):
-                    assemble?graphics_assemble_shader(source,source_name,macros,u32(flags_arg),include_loader):
+                    assemble?graphics_assemble_shader(source,source_name,macros,u32(flags_arg),include_loader,&assembly_started):
                     graphics_compile_hlsl_includes(source,source_name,!d3d10_effect && arg(entry_arg)?read_ansi(memory,arg(entry_arg)):"main",d3d10_effect?std::string("fx_4_0"):read_ansi(memory,arg(profile_arg)),macros,u32(flags_arg),include_loader,d3dx?u32(file?6:8):compile_file?u32(6):d3d10_shader?0U:d3d10_effect?u32(6):u32(8));
                 if(preprocess && !compilation.bytecode.empty() && compilation.bytecode.back()!=0 && (!operation || !operation->pending))compilation.bytecode.push_back(0); // 前處理文字以 NUL 結尾
                 if(operation){
@@ -1200,6 +1268,7 @@
                         start_callbacks(state,memory,{{callback,{operation->handler,entry.local?0U:1U,filename,parent,operation->scratch,operation->scratch+pointer_size}}},Continuation::D3DCompileOperation,operation->id);
                         return std::nullopt;
                     }
+                    operation->assembly_started=assembly_started;
                     operation->result=compilation;
                     if(!operation->closed){
                         std::vector<GuestCallback> callbacks;
@@ -1213,6 +1282,9 @@
                     bridge.compilations.erase(operation->id);operation=nullptr;
                 }
                 if(compilation.bytecode.empty() && std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[hlsl] %s: %s\n",source_name.c_str(),compilation.messages.c_str());
-                if(!compilation.messages.empty() && arg(errors)){std::vector<std::uint8_t> message(compilation.messages.begin(),compilation.messages.end());message.push_back(0);write_pointer(arg(errors),blob(message));}if(compilation.bytecode.empty())result=failure;else write_pointer(arg(code),blob(compilation.bytecode));
+                if(!compilation.messages.empty() && arg(errors)){std::vector<std::uint8_t> message(compilation.messages.begin(),compilation.messages.end());message.push_back(0);write_pointer(arg(errors),blob(message));}
+                if(compilation.bytecode.empty())result=assembly_started?0x88760b59U:failure;
+                else if(arg(code))write_pointer(arg(code),blob(compilation.bytecode));
+                }
             }
         }

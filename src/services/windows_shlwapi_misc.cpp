@@ -752,7 +752,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         return done(stream);
     }
     if(name=="SHIsChildOrSelf"){
-        // 參考實作的 BOOL 在兩者相同或有子孫關係時為 FALSE，空控制代碼為 TRUE。
+        // 參考實作 的 BOOL 在兩者相同或有子孫關係時為 FALSE，空控制代碼為 TRUE。
         const auto parent=arg(0), child=arg(1);
         if(!parent || !child)return done(1);
         if(parent==child)return done(0);
@@ -1273,7 +1273,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
                 if(call(1))m.store(GuestAddress{call(1)},64,length);
             }
             if(!check_empty)co_return finish(result);
-            // Stat 失敗時從當前位置試讀 DWORD；依 參考實作契約，只有讀滿才重設位置。
+            // Stat 失敗時從當前位置試讀 DWORD；依 參考實作 契約，只有讀滿才重設位置。
             const auto read=status(co_await service_callback::call(method(stream,3),{stream,slot+4,4,slot}));
             if(failed(read) || m.load(GuestAddress{slot},32)!=4)co_return finish(1);
             (void)co_await service_callback::call(entry("shlwapi.dll","IStream_Reset"),{stream});

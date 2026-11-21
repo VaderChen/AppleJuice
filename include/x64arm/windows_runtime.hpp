@@ -76,7 +76,7 @@ struct RuntimeFunctionTable {
     std::u16string out_of_process_callback;
     bool operator==(const RuntimeFunctionTable&) const = default;
 };
-enum class MsvcExceptionKind : unsigned { BadCast,BadTypeid,NonRtti,Exception,BadAlloc,BadFunction,LogicError,LengthError,OutOfRange,RuntimeError,RegexError,InvalidArgument,OverflowError,SystemError,IosFailure,BadException,FutureError,ImproperLock,ImproperSchedulerAttach,ImproperSchedulerDetach,InvalidMultipleScheduling,InvalidSchedulerPolicyKey,InvalidSchedulerPolicyThreadSpecification,InvalidSchedulerPolicyValue,MissingWait,SchedulerResourceAllocationError,Count };
+enum class MsvcExceptionKind : unsigned { BadCast,BadTypeid,NonRtti,Exception,BadAlloc,BadFunction,LogicError,LengthError,OutOfRange,RuntimeError,RegexError,InvalidArgument,OverflowError,SystemError,IosFailure,BadException,FutureError,ImproperLock,ImproperSchedulerAttach,ImproperSchedulerDetach,InvalidMultipleScheduling,InvalidSchedulerPolicyKey,InvalidSchedulerPolicyThreadSpecification,InvalidSchedulerPolicyValue,MissingWait,SchedulerResourceAllocationError,LegacyBadCast,LegacyBadTypeid,LegacyNonRtti,LegacyException,Count };
 struct RuntimeCxxExceptions {
     RuntimeImage image;
     std::array<std::uint64_t,static_cast<unsigned>(MsvcExceptionKind::Count)> throw_info{},vtable{},message{};
@@ -689,6 +689,8 @@ struct RuntimeState {
     std::uint64_t arena_base{},arena_capacity{1024U*1024U};
     std::uint64_t argc_cell{}, argv_cell{}, environ_cell{}, fmode_cell{}, commode_cell{}, errno_cell{}, command_ansi{}, crt_nerr_cell{}, crt_errlist{};
     std::uint64_t wargv_cell{}, wenviron_cell{};
+    std::uint32_t initial_argc{};
+    std::array<std::uint64_t,2> initial_argv{},expanded_argv{};
     std::map<std::string, std::uint64_t> modules;
     std::map<std::uint64_t,RuntimeModule> loaded_modules;
     // PEB->Ldr：PEB_LDR_DATA 與各模組 LDR_DATA_TABLE_ENTRY 的客體位址，及最近一次發布的模組順序（見 publish_loader_data）。

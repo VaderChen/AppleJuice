@@ -30,6 +30,7 @@ inline std::optional<FrameLayout> frame_layout(View header){
     f.top_down=signed_height>INT32_MAX;f.height=f.top_down?0U-signed_height:signed_height;
     f.depth=word(header,12)>>16;f.compression=word(header,16);
     if(!f.width || !f.height || f.width>16384 || f.height>16384 || std::uint64_t(f.width)*f.height>32U*1024*1024)return {};
+    const bool video1=media::video1_fourcc(f.compression);
     if(f.raw()){
         if(f.depth!=1 && f.depth!=4 && f.depth!=8 && f.depth!=16 && f.depth!=24 && f.depth!=32)return {};
         f.stride=((f.width*f.depth+31)/32)*4;
@@ -39,16 +40,31 @@ inline std::optional<FrameLayout> frame_layout(View header){
             if(f.compression==6 || word(header,0)>=56)f.masks[3]=word(header,52);
             if(!valid_dib_masks(f.masks,f.depth))return {};
         }else if(f.depth==16)f.masks={0x7c00,0x03e0,0x001f,0};
-        if(f.depth<=8){
-            if((size-word(header,0))/4>(1U<<f.depth))return {};
-            for(auto at=std::size_t(word(header,0));at<size;at+=4){
-                const auto bgr=word(header,at);f.palette.push_back(((bgr&255)<<16)|(bgr&0xff00)|((bgr>>16)&255));
-            }
-        }
     }else if(f.compression!=1 && f.compression!=2 && f.compression!=4 && f.compression!=5 &&
-             f.compression!=fourcc('M','J','P','G') && f.compression!=fourcc('J','P','E','G') &&
-             f.compression!=fourcc('p','n','g',' ') && !media::video_decoder_available(f.compression))return {};
+             (f.compression|0x20202020U)!=fourcc('m','j','p','g') &&
+             (f.compression|0x20202020U)!=fourcc('j','p','e','g') &&
+             (f.compression|0x20202020U)!=fourcc('p','n','g',' ') && !video1 &&
+             !media::video_decoder_available(f.compression))return {};
+    const bool rle=f.compression==1 || f.compression==2;
+    if(rle && f.depth!=(f.compression==1?8U:4U))return {};
+    if(video1 && (f.top_down || (f.width&3) || (f.height&3) || (f.depth!=8 && f.depth!=16)))return {};
+    if((f.raw() && f.depth<=8) || rle || (video1 && f.depth==8)){
+        if((size-word(header,0))/4>(1U<<f.depth))return {};
+        for(auto at=std::size_t(word(header,0));at<size;at+=4){
+            const auto bgr=word(header,at);f.palette.push_back(((bgr&255)<<16)|(bgr&0xff00)|((bgr>>16)&255));
+        }
+    }
     return f;
+}
+inline Bytes uncompressed_frame_header(View source){
+    Bytes dib(source.begin(),source.end());
+    put(dib,16,0);
+    put(dib,20,0);
+    return dib;
+}
+inline std::unique_ptr<media::Video1Decoder> open_video1(View format,const FrameLayout& layout){
+    const auto palette=layout.depth==8?format.subspan(word(format,0)):View{};
+    return std::make_unique<media::Video1Decoder>(layout.width,layout.height,layout.depth,palette);
 }
 inline Bytes frame_output(View input,const FrameLayout& source,const Bytes& requested){
     Bytes out=requested;
@@ -81,33 +97,39 @@ inline Bytes frame_rgba(const video::DecodedFrame& decoded){
     }
     return rgba;
 }
+inline bool decode_frame_rgba(View format,const FrameLayout& layout,View packet,Bytes& rgba){
+    if(layout.compression!=1 && layout.compression!=2)
+        return decode_frame_image(packet,layout.width,layout.height,rgba);
+    Bytes dib(format.begin(),format.end());
+    dib.insert(dib.end(),packet.begin(),packet.end());
+    return decode_frame_image(dib,layout.width,layout.height,rgba);
+}
 // 原始 DIB 可保留列填充和色表索引。轉換時與 GDI 共用列編解碼，獨立壓縮影格沿用 WIC 的影像解碼器。
 inline bool frame_pixels(View format,const FrameLayout& src,View packet,const FrameLayout& dst,
-                         std::span<std::uint8_t> pixels,unsigned x,unsigned y,unsigned width,unsigned height,Bytes rgba={}){
+                         std::span<std::uint8_t> pixels,unsigned x,unsigned y,unsigned width,unsigned height,Bytes rgba={},
+                         std::array<unsigned,4> crop={}){
     if(src.raw() && packet.size()<src.image_size())return false;
     if(x>dst.width || y>dst.height || !width || !height || width>dst.width-x || height>dst.height-y)return false;
-    if(src.raw() && !x && !y && width==src.width && width==dst.width && height==src.height && height==dst.height &&
+    if(crop==std::array<unsigned,4>{})crop={0,0,src.width,src.height};
+    const auto [sx,sy,sw,sh]=crop;
+    if(sx>=src.width || sy>=src.height || !sw || !sh || sw>src.width-sx || sh>src.height-sy)return false;
+    if(src.raw() && !sx && !sy && sw==src.width && sh==src.height &&
+       !x && !y && width==src.width && width==dst.width && height==src.height && height==dst.height &&
        src.depth==dst.depth && src.masks==dst.masks && src.palette==dst.palette && src.top_down==dst.top_down){
         std::copy_n(packet.begin(),pixels.size(),pixels.begin());return true;
     }
-    if(!src.raw() && rgba.empty()){
-        Bytes bitmap;
-        if(src.compression==1 || src.compression==2){
-            bitmap.assign(format.begin(),format.end());bitmap.insert(bitmap.end(),packet.begin(),packet.end());packet=bitmap;
-        }
-        if(!decode_frame_image(packet,src.width,src.height,rgba))return false;
-    }
+    if(!src.raw() && rgba.empty() && !decode_frame_rgba(format,src,packet,rgba))return false;
     DibRowCodec decoder(src.depth,src.masks,src.palette),encoder(dst.depth,dst.masks,dst.palette);
     std::vector<unsigned> row(src.width),out(width);
     Bytes partial(dst.stride);
     for(unsigned line=0;line<height;++line){
-        const auto sy=line*src.height/height;
+        const auto source_y=sy+line*sh/height;
         if(src.raw()){
-            if(!decoder.decode(packet.subspan((src.top_down?sy:src.height-1-sy)*src.stride,src.stride),row))return false;
-        }else std::memcpy(row.data(),rgba.data()+std::size_t(sy)*src.width*4,src.width*4);
+            if(!decoder.decode(packet.subspan((src.top_down?source_y:src.height-1-source_y)*src.stride,src.stride),row))return false;
+        }else std::memcpy(row.data(),rgba.data()+std::size_t(source_y)*src.width*4,src.width*4);
         const auto dy=y+line;
         auto destination=pixels.subspan((dst.top_down?dy:dst.height-1-dy)*dst.stride,dst.stride);
-        for(unsigned i=0;i<width;++i)out[i]=row[i*src.width/width];
+        for(unsigned i=0;i<width;++i)out[i]=row[sx+i*sw/width];
         const auto bit=x*dst.depth,bit_count=width*dst.depth;
         if(!(bit%8) && !(bit_count%8)){
             if(!encoder.encode(out,destination.subspan(bit/8,bit_count/8)))return false;

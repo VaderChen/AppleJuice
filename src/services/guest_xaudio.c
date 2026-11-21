@@ -1,9 +1,12 @@
 #include "xaudio_layout.h"
+#include "x3daudio_initialization.h"
 typedef __UINT32_TYPE__ Word;
 #if defined(__i386__)
 #define CALL __attribute__((stdcall))
+#define CDECL __attribute__((cdecl))
 #else
 #define CALL
+#define CDECL
 #endif
 #define EXPORT __declspec(dllexport) Word CALL
 #define CELL(self,offset) (*(Word*)((unsigned char*)(self)+(offset)))
@@ -16,7 +19,7 @@ static void copy_words(void* out,const void* source,unsigned count){
 }
 EXPORT GetVoiceDetails(void* self,void* out){
     Word values[4]={CELL(self,XA_FLAGS),CELL(self,XA_ACTIVE),CELL(self,XA_CHANNELS),CELL(self,XA_RATE)};
-    if(CELL(self,XA_VERSION)==7){values[1]=values[2];values[2]=values[3];copy_words(out,values,3);}else copy_words(out,values,4);return 0;
+    if(CELL(self,XA_VERSION)<=7){values[1]=values[2];values[2]=values[3];copy_words(out,values,3);}else copy_words(out,values,4);return 0;
 }
 EXPORT GetVolume(void* self,void* out){copy_words(out,(unsigned char*)self+XA_VOLUME,1);return 0;}
 EXPORT GetFrequencyRatio(void* self,void* out){copy_words(out,(unsigned char*)self+XA_RATIO,1);return 0;}
@@ -36,3 +39,22 @@ static Word voice_state(void* self,void* out){
 }
 EXPORT GetState27(void* self,void* out){return voice_state(self,out);}
 EXPORT GetState28(void* self,void* out,Word flags){if(flags&~256U)return 0x88960001U;return voice_state(self,out);}
+
+static Word spatial_initialize(Word channels,float speed,void *out)
+{
+    const union {float value;Word bits;} raw={speed};
+    if(!out || !x3daudio_valid_instance(channels,raw.bits))return X3DAUDIO_INVALID_ARGUMENT;
+    const Word words[X3DAUDIO_INSTANCE_WORDS]={X3DAUDIO_INSTANCE_SIGNATURE,channels,raw.bits,0,0};
+    copy_words(out,words,X3DAUDIO_INSTANCE_WORDS);
+    return 0;
+}
+
+EXPORT SpatialInitializeStdcall(Word channels,float speed,void *out)
+{
+    return spatial_initialize(channels,speed,out);
+}
+
+__declspec(dllexport) Word CDECL SpatialInitializeCdecl(Word channels,float speed,void *out)
+{
+    return spatial_initialize(channels,speed,out);
+}

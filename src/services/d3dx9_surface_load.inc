@@ -46,7 +46,8 @@
                 const unsigned unit=legacy==20?3:(legacy==27 || legacy==41 || legacy==52)?1:(legacy==29 || legacy==40)?2:graphics_format_pitch(source.format,block,block)[0];
                 const auto rows=(source.size[1]+block-1)/block;const auto row_bytes=std::uint64_t((source.size[0]+block-1)/block)*unit;
                 const auto pitch=std::uint64_t(u(5)),slice=volume?std::uint64_t(u(6)):0;
-                require(pitch>=(std::uint64_t(source_box[3])+block-1)/block*unit);
+                // pitch 只在讀取多列（區塊）時使用：單列時與官方相同不檢查。
+                require(rows*source.size[2]<=1 || pitch>=(std::uint64_t(source_box[3])+block-1)/block*unit);
                 if(volume && source_box[5]>1)require(slice>=pitch*((std::uint64_t(source_box[4])+block-1)/block));
                 require(row_bytes*rows*source.size[2]<=512U*1024U*1024U);
                 source.pixels.resize(row_bytes*rows*source.size[2]);

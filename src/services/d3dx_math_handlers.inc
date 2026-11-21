@@ -12,45 +12,50 @@
         const auto rotation=[](const Vector& q){const auto x=q[0],y=q[1],z=q[2],w=q[3];return Matrix{1-2*(y*y+z*z),2*(x*y+z*w),2*(x*z-y*w),0,2*(x*y-z*w),1-2*(x*x+z*z),2*(y*z+x*w),0,2*(x*z+y*w),2*(y*z-x*w),1-2*(x*x+y*y),0,0,0,0,1};};
         auto result=arg(0);
 #include "d3dx_math_extras.inc"
-        if(symbol=="D3DXSHDot" || symbol=="D3DXSHEvalConeLight"){
-            const auto order=static_cast<unsigned>(arg(0));if(order<2 || order>6){if(symbol=="D3DXSHDot")conversion_result(state,x86_,0,true);arg.return_to(state,symbol=="D3DXSHDot"?0:0x8876086cU);return std::nullopt;}
-            std::array<float,36> a{},b{},c{};
-            if(symbol=="D3DXSHDot"){
-                for(unsigned i=0;i<order*order;++i){a[i]=load(arg(1)+4*i,1)[0];b[i]=load(arg(2)+4*i,1)[0];}
-                conversion_result(state,x86_,sh_dot(order,a.data(),b.data()),true);result=0;
+        if(symbol=="D3DXSHDot" || symbol=="D3DXSHAdd" || symbol=="D3DXSHScale"){
+            const bool inner=symbol=="D3DXSHDot", scale=symbol=="D3DXSHScale";
+            const auto order=static_cast<std::uint32_t>(arg(inner?0:1)), count=order*order;
+            const auto left=arg(inner?1:2);
+            const auto right=scale?0:arg(inner?2:3);
+            const auto address=[&](std::uint64_t base,std::uint32_t i){
+                const auto p=base+std::uint64_t{i}*4;
+                return x86_?static_cast<std::uint64_t>(static_cast<std::uint32_t>(p)):p;
+            };
+            if(inner){
+#pragma clang fp contract(off)
+                float sum=load(left,1)[0]*load(right,1)[0];
+                for(std::uint32_t i=1;i<count;++i){
+                    const float x=load(address(left,i),1)[0], y=load(address(right,i),1)[0];
+                    sum+=x*y;
+                }
+                conversion_result(state,x86_,sum,true);
+                result=0;
             }else{
-                if(!arg(1) || !arg(6)){arg.return_to(state,0x8876086cU);return std::nullopt;}
-                const auto direction=load(arg(1),3);const Vector intensity{f(3),f(4),f(5),0};
-                if(!sh_cone(order,direction.data(),f(2),intensity.data(),a.data(),arg(7)?b.data():nullptr,arg(8)?c.data():nullptr)){arg.return_to(state,0x8876086cU);return std::nullopt;}
-                store(arg(6),a,order*order);if(arg(7))store(arg(7),b,order*order);if(arg(8))store(arg(8),c,order*order);result=0;
+                const auto factor=scale?f(3):0.0f;
+                for(std::uint32_t i=0;i<count;++i){
+                    const auto x=load(address(left,i),1)[0];
+                    const auto value=scale?x*factor:x+load(address(right,i),1)[0];
+                    memory.store(GuestAddress{address(result,i)},32,std::bit_cast<std::uint32_t>(value));
+                }
             }
-        }else if(symbol.starts_with("D3DXSH")){
-            const auto order=static_cast<unsigned>(arg(1));
-            if(!arg(0) || order<2 || order>6){arg.return_to(state,0);return std::nullopt;}
-            const auto count=order*order;std::array<float,36> out{},a{},b{};
-            const auto coefficients=[&](std::uint64_t p,auto& v){for(unsigned i=0;i<count;++i)v[i]=std::bit_cast<float>(static_cast<std::uint32_t>(memory.load(GuestAddress{p+4*i},32)));};
-            if(symbol=="D3DXSHEvalDirection"){
-                const auto v=load(arg(2),3);sh_evaluate(out.data(),order,v.data());
-            }else if(symbol=="D3DXSHRotate"){
-                const auto m=matrix(arg(2));coefficients(arg(3),a);sh_rotate(out.data(),order,m.data(),a.data());
-            }else{
-                coefficients(arg(2),a);
-                if(symbol=="D3DXSHScale")sh_scale(out.data(),order,a.data(),f(3));
-                else if(symbol=="D3DXSHAdd"){coefficients(arg(3),b);sh_add(out.data(),order,a.data(),b.data());}
-                else throw HostCallFault("尚未實作的球諧數學入口");
-            }
-            store(arg(0),out,count);
+        }else if(symbol.starts_with("D3DXSHEval")){
+#include "d3dx_sh_light.inc"
         }else if(symbol=="D3DXOptimizeFaces" || symbol=="D3DXOptimizeVertices"){
 #include "d3dx_mesh_remap.inc"
-        }else if(symbol=="D3DXFloat32To16Array"){
-            const auto count=static_cast<std::uint32_t>(arg(2));memory.check(GuestAddress{arg(1)},std::uint64_t{count}*4,Access::Read);memory.check(GuestAddress{arg(0)},std::uint64_t{count}*2,Access::Write);
-            std::vector<std::uint16_t> values;values.reserve(count);const auto rounding=softfloat_roundingMode;softfloat_roundingMode=softfloat_round_near_even;
-            for(std::uint64_t i=0;i<count;++i)values.push_back(f32_to_f16({static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)+4*i},32))}).v);
-            softfloat_roundingMode=rounding;for(std::uint64_t i=0;i<count;++i)memory.store(GuestAddress{arg(0)+2*i},16,values[i]);
-        }else if(symbol=="D3DXFloat16To32Array"){
-            const auto count=arg(2);memory.check(GuestAddress{arg(1)},count*2,Access::Read);memory.check(GuestAddress{arg(0)},count*4,Access::Write);
-            std::vector<std::uint32_t> values;values.reserve(count);for(std::uint64_t i=0;i<count;++i)values.push_back(f16_to_f32({static_cast<std::uint16_t>(memory.load(GuestAddress{arg(1)+2*i},16))}).v);
-            for(std::uint64_t i=0;i<count;++i)memory.store(GuestAddress{arg(0)+4*i},32,values[i]);
+        }else if(symbol=="D3DXFloat32To16Array" || symbol=="D3DXFloat16To32Array"){
+            const bool narrow=symbol=="D3DXFloat32To16Array";
+            const auto count=static_cast<std::uint32_t>(arg(2));
+            const unsigned src_bytes=narrow?4U:2U,dst_bytes=narrow?2U:4U;
+            const auto address_mask=x86_?std::uint64_t{UINT32_MAX}:UINT64_MAX;
+            auto src=arg(1),dst=result;
+            for(std::uint32_t i=0;i<count;++i){
+                const auto bits=memory.load(GuestAddress{src},narrow?32:16);
+                const auto converted=narrow?d3dx_narrow_half(static_cast<std::uint32_t>(bits)):
+                                            d3dx_expand_half(static_cast<std::uint16_t>(bits));
+                memory.store(GuestAddress{dst},narrow?16:32,converted);
+                src=(src+src_bytes)&address_mask;
+                dst=(dst+dst_bytes)&address_mask;
+            }
         }else if(symbol=="D3DXVec2Normalize" || symbol=="D3DXVec3Normalize" || symbol=="D3DXVec4Normalize" || symbol=="D3DXQuaternionNormalize" || symbol=="D3DXQuaternionInverse"){
             const unsigned n=symbol=="D3DXVec2Normalize"?2:symbol=="D3DXVec3Normalize"?3:4;auto v=load(arg(1),n);
             if(symbol=="D3DXQuaternionInverse"){const auto length=dot(v,v,4);for(unsigned i=0;i<4;++i)v[i]=length!=0?(i<3?-v[i]:v[i])/length:0;}else v=norm(v,n);store(arg(0),v,n);
