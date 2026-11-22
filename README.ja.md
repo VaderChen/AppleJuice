@@ -158,6 +158,7 @@ AppleJuice のライブラリに登録したゲームは、EXE ごとの表示�
 | ドラゴンクエストI&II | x64 | D3D12（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | ドラゴンクエストIII　そして伝説へ… | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | ドラゴンクエストVII Reimagined | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| ドラゴンボールZ KAKAROT | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | デイヴ・ザ・ダイバー | x64 | D3D11（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | デビル メイ クライ 5 | x64 | D3D12 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | ファイナルファンタジーIX | x64 | D3D9（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
@@ -173,7 +174,6 @@ AppleJuice のライブラリに登録したゲームは、EXE ごとの表示�
 | 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | CONTROL アルティメット・エディション | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | ファイナルファンタジーXIII | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
-| ドラゴンボールZ KAKAROT | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | It Takes Two | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | サイバーパンク2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |

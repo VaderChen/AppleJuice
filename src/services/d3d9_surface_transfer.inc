@@ -30,7 +30,11 @@
                         // 反 twiddle／重新上傳（原本每次都 graphics_read 等候在途命令）。順序由命令串流保證；
                         // 濾鏡在等大小時不影響結果。縮放、格式轉換與 UpdateSurface 仍走下方 CPU 路徑。X64ARM_D3D9_GPU_STRETCH=0 關閉。
                         static const bool gpu_stretch=[] {const auto* value=std::getenv("X64ARM_D3D9_GPU_STRETCH");return !value || std::string_view(value)!="0";}();
-                        if(gpu_stretch && !update && source!=target && source->native_view.resource && target->native_view.resource && source->format==target->format &&
+                        // A8R8G8B8 → X8R8G8B8 同樣可直接 blit：兩者在後端是同一種像素格式，X8 的 alpha 在取樣時由 view 的 swizzle 固定為 1，
+                        // 複製過去的 alpha 不可見（與在 X8 目標上繪製時相同）。反向（X8 → A8）alpha 要補成 1，仍走 CPU 路徑。
+                        // FINAL FANTASY XIII 每幀三次 1920×1080 的這種複製，原本每次同步讀回、轉換、再上傳約 2.5 ms。
+                        const bool same_storage=source->format==target->format || (source->format==21 && target->format==22);
+                        if(gpu_stretch && !update && source!=target && source->native_view.resource && target->native_view.resource && same_storage &&
                            area[2]-area[0]==destination[2]-destination[0] && area[3]-area[1]==destination[3]-destination[1]){
                             object.native->graphics_copy(target->native_view,source->native_view,{destination[0],destination[1],0},{area[0],area[1],0,area[2],area[3],1});
                             surface_changed(*target);arg.return_to(state,0);return std::nullopt;

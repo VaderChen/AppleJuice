@@ -149,6 +149,7 @@ For a game already in the AppleJuice library, its EXE's saved display settings t
 | Application | x64/x86 | Core technology | Support level |
 | --- | --- | --- | :---: |
 | 7-Zip | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
+| DRAGON BALL Z: KAKAROT | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | DRAGON QUEST I & II HD-2D Remake | x64 | D3D12 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | DRAGON QUEST III HD-2D Remake | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | DRAGON QUEST VII Reimagined | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
@@ -173,7 +174,6 @@ For a game already in the AppleJuice library, its EXE's saved display settings t
 | 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Control Ultimate Edition | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | FINAL FANTASY XIII | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
-| DRAGON BALL Z: KAKAROT | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Cyberpunk 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | It Takes Two | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Romance of the Three Kingdoms X with Power Up Kit | x86 | Unknown | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |

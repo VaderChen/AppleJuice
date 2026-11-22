@@ -73,8 +73,16 @@ struct SharedEventStorage {
 #endif
     }
 };
+namespace {
+// 命名空間鎖是 flock：同一個 fd 在同程序的執行緒之間不互斥。worker 也會在命名空間鎖下操作共用互斥鎖（見 windows_parallel_services.cpp），
+// 協調者的「檢查可取得→取得」必須與它互斥，否則會在兩步之間被搶走（共用 mutex 尚未釋放）。所有持命名空間鎖的區段另以程序內的鎖序列化；
+// 可重入（同一執行緒巢狀取鎖的既有用法不變）。
+std::recursive_mutex& shared_event_process_lock(){static std::recursive_mutex value;return value;}
+}
 SharedEventLock::SharedEventLock(int value):descriptor(value) {
 #if !defined(_WIN32)
+    if(descriptor>=0)shared_event_process_lock().lock();
+    struct Unlock {bool armed;~Unlock(){if(armed)shared_event_process_lock().unlock();}} unlock{descriptor>=0};
     // 診斷：X64ARM_TRACE_SHARED_LOCK_WAIT=1 每 4096 次取鎖列出累計次數、等待總時間與最長等待（區分爭用與系統呼叫成本）。
     static const bool trace_wait=std::getenv("X64ARM_TRACE_SHARED_LOCK_WAIT")!=nullptr;
     const auto started=trace_wait && descriptor>=0?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
@@ -92,11 +100,12 @@ SharedEventLock::SharedEventLock(int value):descriptor(value) {
             " errno="+std::to_string(error)+" fd_valid="+std::to_string(valid)+
             " mode="+std::to_string(valid?info.st_mode:0));
     }
+    unlock.armed=false;
 #endif
 }
 SharedEventLock::~SharedEventLock(){
 #if !defined(_WIN32)
-    if(descriptor>=0)(void)::flock(descriptor,LOCK_UN);
+    if(descriptor>=0){(void)::flock(descriptor,LOCK_UN);shared_event_process_lock().unlock();}
 #endif
 }
 bool SharedEvent::exclusive()const noexcept{return storage_->exclusive_owner!=0;}

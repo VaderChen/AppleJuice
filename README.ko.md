@@ -152,6 +152,7 @@ AppleJuice 라이브러리에 등록된 게임은 EXE별로 저장한 표시 설
 | 드래곤 퀘스트 I & II HD-2D Remake | x64 | D3D12(Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 드래곤 퀘스트 III HD-2D Remake | x64 | D3D11(Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 드래곤 퀘스트 VII Reimagined | x64 | D3D11(Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
+| 드래곤볼 Z 카카로트 | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 데이브 더 다이버 | x64 | D3D11(Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 데빌 메이 크라이 5 | x64 | D3D12 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 不谙世事的猫艾露莎 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
@@ -172,7 +173,6 @@ AppleJuice 라이브러리에 등록된 게임은 EXE별로 저장한 표시 설
 | 클레르 옵스퀴르: 33 원정대 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="원활 (MetalFX)" title="원활 (MetalFX)"> |
 | 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 사이버펑크 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
-| 드래곤볼 Z 카카로트 | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 컨트롤 얼티밋 에디션 | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 파이널 판타지 XIII | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 테일즈 오브 베르세리아 | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |

@@ -923,7 +923,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
             for(const auto& [pointer,other]:bridge.objects){(void)pointer;require(other->kind!=Kind::Device || other->root==device.root || !other->fullscreen,unavailable);}
         }
         auto native=make_metal_opengl(native_gui_ && target && device.device_type!=4?native_gui_->graphics_view(target):nullptr,width,height);require(bool(native),unavailable);
-        require(native->swap_interval(n(tail+20)==0x80000000U?0:1),unavailable);
+        // 診斷：X64ARM_D3D9_FORCE_IMMEDIATE=1 一律以立即呈現（不等垂直同步）建立，用來量測未被呈現間隔量化的實際幀率；不作成績。
+        static const bool force_immediate=[] {const auto* value=std::getenv("X64ARM_D3D9_FORCE_IMMEDIATE");return value && std::string_view(value)=="1";}();
+        require(native->swap_interval(force_immediate || n(tail+20)==0x80000000U?0:1),unavailable);
         require(native->graphics_samples_supported(87,n(16)?n(16):1),unavailable);
         if(n(tail+4))require(native->graphics_samples_supported(depth_format(n(tail+8)),n(16)?n(16):1),unavailable);
         // FLIP 的前景與全部後景各有實際 backing；呈現只沿用 Metal 的 copy／swap。

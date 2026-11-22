@@ -153,6 +153,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 程式 | x64/x86 | 主要運作核心 | 支援程度 |
 | --- | --- | --- | :---: |
 | 7-Zip | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
+| 七龍珠Z 卡卡洛特 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 不谙世事的猫艾露莎 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 天穗之咲稻姬 | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 古墓奇兵（2013） | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
@@ -183,7 +184,6 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 雙人成行 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | Control | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | FINAL FANTASY XIII | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
-| 七龍珠Z 卡卡洛特 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 死亡擱淺 DIRECTOR'S CUT | x64 | D3D12 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可開啟" title="可開啟"> |
 | 特警 Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可開啟" title="可開啟"> |

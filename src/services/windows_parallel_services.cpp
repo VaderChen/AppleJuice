@@ -467,6 +467,7 @@ std::optional<unsigned> context_service_arguments(std::string_view symbol) noexc
     if(symbol=="WaitForSingleObjectEx")return 3;
     // Sleep 只在 worker 處理 0 毫秒（與 SwitchToThread 同一讓出判斷）；非零的計時睡眠交回協調者。
     if(symbol=="Sleep")return 1;
+    if(symbol=="ReleaseMutex")return 1;
     if(symbol=="SetLastError" || symbol=="TlsGetValue" || symbol=="TlsGetValue2" ||
        symbol=="FlsGetValue" || symbol=="FlsGetValue2" ||
        symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency" ||
@@ -723,6 +724,7 @@ bool WindowsServices::parallel_service_static(GuestAddress address) const noexce
         symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue" ||
         symbol=="InitOnceBeginInitialize" || symbol=="InitOnceExecuteOnce" ||
         symbol=="WakeConditionVariable" || symbol=="WakeAllConditionVariable" || symbol=="SwitchToThread" ||
+        symbol=="ReleaseMutex" ||
         // Sleep：worker 只處理 0 毫秒（與 SwitchToThread 同一讓出判斷），非零的計時睡眠交回協調者。
         //《緋夜傳奇》主執行緒以 Sleep(0) 輪詢，標題場景每秒數萬次原本都經協調者往返。
         (symbol=="Sleep" && parallel_sleep_zero_enabled()) ||
@@ -1297,6 +1299,26 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         const auto origin=runtime_.process_creation_clock_ticks,now=detail::monotonic_ticks();
         const auto elapsed=now>=origin?(now-origin)/10000:0;
         result=elapsed>INT32_MAX?UINT32_MAX:elapsed;
+    }else if(symbol=="ReleaseMutex"){
+        // 共用（具名、跨程序）互斥鎖的無競爭釋放（X64ARM_WORKER_SHARED_MUTEX=0 關閉）：與協調者本地路徑相同的條件——最近 20 ms 內沒有人
+        // 探查而拿不到（SharedMutex::wanted_recently，本程序與其他程序的等待者都會更新），且沒有已登錄等待或等待封包以它為對象。
+        // 釋放會推進 session 共用喚醒，逾期未探查的等待者由各自的協調者重新評估。本程序互斥鎖的狀態在協調者的表格，仍交回協調者。
+        // FINAL FANTASY XIII 戰鬥每幀約 850 組具名互斥鎖取得／釋放，原本每次往返協調者。
+        static const bool shared_mutex=[] {const auto* value=std::getenv("X64ARM_WORKER_SHARED_MUTEX");return !value || std::string_view(value)!="0";}();
+        const auto object=runtime_.wait_objects.find(first);
+        if(!shared_mutex || object==runtime_.wait_objects.end() || object->second.kind!=WaitObject::Kind::Mutex)return false;
+        const auto owned=runtime_.mutex_objects.find(object->second.mutex);
+        if(owned==runtime_.mutex_objects.end() || !owned->second.shared || owned->second.shared->wanted_recently(UINT64_C(20'000'000)))return false;
+        if(!wait_completion_packets_.empty())return false;
+        for(const auto& [id,wait]:registered_waits_){
+            (void)id;const auto other=runtime_.wait_objects.find(wait.target);
+            if(other!=runtime_.wait_objects.end() && other->second.kind==WaitObject::Kind::Mutex && other->second.mutex==object->second.mutex)return false;
+        }
+        {
+            SharedEventLock lock(owned->second.shared->lock_descriptor());
+            if(owned->second.shared->release_locked(tid))return false; // 未持有等錯誤由協調者回報。
+        }
+        result=1;
     }else if(parallel_semaphore_service(symbol)){
         if(!first){
             auto* error=pointer(thread.teb+error_offset,4,2);if(!error)return false;
@@ -1378,6 +1400,17 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             }else return false;
         }else{
             if(!(object->second.access&0x100000U))return false;
+            if(object->second.kind==WaitObject::Kind::Mutex){
+                // 共用互斥鎖：可取得（未被持有、本執行緒遞迴、或擁有者程序已結束）就在命名空間鎖下取得；被別人持有時零逾時回 WAIT_TIMEOUT，
+                // 要阻塞的交回協調者登記等待（探查失敗已更新「有人要」時戳，擁有者下次釋放會走完整路徑）。見 ReleaseMutex 分支。
+                static const bool shared_mutex=[] {const auto* value=std::getenv("X64ARM_WORKER_SHARED_MUTEX");return !value || std::string_view(value)!="0";}();
+                const auto owned=runtime_.mutex_objects.find(object->second.mutex);
+                if(!shared_mutex || owned==runtime_.mutex_objects.end() || !owned->second.shared)return false;
+                SharedEventLock lock(owned->second.shared->lock_descriptor());
+                if(owned->second.shared->available_locked(tid))result=owned->second.shared->acquire_locked(tid)?0x80U:0U;
+                else if(poll)result=0x102;
+                else return false;
+            }else{
             auto& waited=runtime_.wait_state(object->second);
             if(waited.shared_event){
                 // 只讀手動重設事件的共用訊號。會消耗訊號的物件仍由原命名空間鎖保護。
@@ -1396,6 +1429,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
                     if(available)detail::debug_semaphore("w-take",first,available,available-1,tid);
                     if(available)result=0;else if(poll)result=0x102;else return false;
                 }else return false;
+            }
             }
         }
     }else if(parallel_wait_multiple_service(symbol)){
