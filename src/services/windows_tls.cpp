@@ -1,16 +1,26 @@
+#include "ansi_codepage.hpp"
 #include "sandbox_certificate_roots.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "x64arm/http.hpp"
+#include "x64arm/tls_openssl.hpp"
 #include <algorithm>
 #include <chrono>
 #include <array>
 #include <optional>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include <openssl/http.h>
 #include <openssl/x509v3.h>
 
 namespace x64arm {
+// 共用 TLS 政策的對應（WinHTTP 與 Schannel 都依賴這些結果）。
+static_assert(tls_protocol_range(0)->minimum==0x0303 && tls_protocol_range(0)->maximum==0x0304);
+static_assert(tls_protocol_range(0x880)->minimum==0x0301 && tls_protocol_range(0x880)->maximum==0x0303 && tls_protocol_range(0x880)->disabled==tls_protocol_tls11);
+static_assert(!tls_protocol_range(0x20));
+static_assert(tls_certificate_problem_ignored({10},winhttp_certificate_exceptions(0x2000)) && !tls_certificate_problem_ignored({10},winhttp_certificate_exceptions(0x100)));
+static_assert(tls_certificate_problem_ignored({3},schannel_certificate_exceptions(0x1000)) && !tls_certificate_problem_ignored({3},schannel_certificate_exceptions(0x800)));
+static_assert(tls_certificate_problem_ignored({3,false,false},schannel_certificate_exceptions(0x800)) && tls_certificate_problem_ignored({3,true},schannel_certificate_exceptions(0x400)));
+static_assert(!tls_certificate_problem_ignored({23},winhttp_certificate_exceptions(0x3380)));  // 已撤銷永不放行
 namespace {
 constexpr std::uint32_t invalid=0x80090301,unsupported=0x80090302,internal=0x80090304,invalid_token=0x80090308;
 struct SspiBadInput {};
@@ -89,9 +99,18 @@ STACK_OF(X509_CRL)* lookup_crls(const X509_STORE_CTX* store,const X509_NAME* iss
             auto found=session->crls.find(url);
             if(found==session->crls.end()) {
                 if(session->crls.size()>=8 || std::chrono::steady_clock::now()>=session->revocation_deadline)continue;
-                // CRL 的真實性由發行者簽章驗證；下載本身限時、限大小，失敗不放寬撤銷檢查。
-                auto* response=OSSL_HTTP_get(url.c_str(),nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,4096,nullptr,nullptr,1,4U*1024U*1024U,2);
-                std::shared_ptr<X509_CRL> crl(response?d2i_X509_CRL_bio(response,nullptr):nullptr,X509_CRL_free);BIO_free(response);
+                // CRL 的真實性由發行者簽章驗證；下載走與 WinHTTP 相同的宿主 HTTP 傳輸（流量計數、取消、逾時一致），
+                // 限時、限大小，失敗不放寬撤銷檢查。
+                // 每份 CRL 最多 2 秒，整次交握的撤銷查詢合計 10 秒。
+                const auto deadline=std::min(session->revocation_deadline,std::chrono::steady_clock::now()+std::chrono::seconds(2));
+                const auto remaining=static_cast<std::int32_t>(std::max<std::int64_t>(1,std::chrono::duration_cast<std::chrono::milliseconds>(deadline-std::chrono::steady_clock::now()).count()));
+                HttpInput input;input.url=url;input.method="GET";input.max_redirects=2;input.timeouts={remaining,remaining,remaining,remaining};
+                const auto response=fetch_native_http(std::move(input),deadline);
+                std::shared_ptr<X509_CRL> crl;
+                if(!response.error && response.status==200 && !response.body.empty() && response.body.size()<=4U*1024U*1024U) {
+                    const auto* bytes=response.body.data();
+                    crl.reset(d2i_X509_CRL(nullptr,&bytes,static_cast<long>(response.body.size())),X509_CRL_free);
+                }
                 found=session->crls.emplace(url,std::move(crl)).first;ERR_clear_error();
             }
             auto* crl=found->second.get();
@@ -102,20 +121,13 @@ STACK_OF(X509_CRL)* lookup_crls(const X509_STORE_CTX* store,const X509_NAME* iss
     }
     CRL_DIST_POINTS_free(points);return result;
 }
+// 驗證回呼與 WinHTTP／WinINet 的宿主傳輸共用 tls_verify_with_exceptions（同一份 OpenSSL 與 tls_policy）。
 int verify_peer(int valid,X509_STORE_CTX* store) {
     if(valid)return 1;
     auto* ssl=static_cast<SSL*>(X509_STORE_CTX_get_ex_data(store,SSL_get_ex_data_X509_STORE_CTX_idx()));
     auto* session=static_cast<NativeTlsSession*>(SSL_get_app_data(ssl));
     if(!session)return 0;
-    const auto error=X509_STORE_CTX_get_error(store);const auto flags=session->credentials.flags;
-    if(error==X509_V_ERR_UNABLE_TO_GET_CRL) {
-        auto* certificate=X509_STORE_CTX_get_current_cert(store);
-        const bool no_location=X509_get_ext_by_NID(certificate,NID_crl_distribution_points,-1)<0;
-        const auto* chain=X509_STORE_CTX_get0_chain(store);
-        const bool root=(flags&0x400) && X509_STORE_CTX_get_error_depth(store)==sk_X509_num(chain)-1 && X509_check_issued(certificate,certificate)==X509_V_OK;
-        if(root || ((flags&0x800) && no_location) || (flags&0x1000)){X509_STORE_CTX_set_error(store,X509_V_OK);return 1;}
-    }
-    return 0;
+    return tls_verify_with_exceptions(valid,store,schannel_certificate_exceptions(session->credentials.flags));
 }
 std::uint32_t tls_error(SSL* ssl,int code) {
     const auto error=SSL_get_error(ssl,code);
@@ -132,12 +144,11 @@ std::uint32_t tls_error(SSL* ssl,int code) {
 }
 bool initialize_tls(NativeTlsSession& session,std::string_view hostname,ReadOnlyFiles& files) {
     session.context=SSL_CTX_new(TLS_client_method());if(!session.context)return false;
-    const auto protocols=session.credentials.protocols?session.credentials.protocols:0x2800U;
-    int minimum=0,maximum=0;
-    for(const auto [bit,version]:std::array<std::pair<unsigned,int>,4>{{{0x80,TLS1_VERSION},{0x200,TLS1_1_VERSION},{0x800,TLS1_2_VERSION},{0x2000,TLS1_3_VERSION}}})if(protocols&bit){if(!minimum)minimum=version;maximum=version;}
-    if(!minimum || !SSL_CTX_set_min_proto_version(session.context,minimum) || !SSL_CTX_set_max_proto_version(session.context,maximum))return false;
+    // 版本範圍與 WinHTTP 共用 tls_protocol_range；OpenSSL 另可逐版關閉範圍內未啟用的版本。
+    const auto range=tls_protocol_range(session.credentials.protocols);
+    if(!range || !SSL_CTX_set_min_proto_version(session.context,range->minimum) || !SSL_CTX_set_max_proto_version(session.context,range->maximum))return false;
     std::uint64_t disabled=0;
-    if(!(protocols&0x80))disabled|=SSL_OP_NO_TLSv1;if(!(protocols&0x200))disabled|=SSL_OP_NO_TLSv1_1;if(!(protocols&0x800))disabled|=SSL_OP_NO_TLSv1_2;if(!(protocols&0x2000))disabled|=SSL_OP_NO_TLSv1_3;
+    if(range->disabled&tls_protocol_tls11)disabled|=SSL_OP_NO_TLSv1_1;if(range->disabled&tls_protocol_tls12)disabled|=SSL_OP_NO_TLSv1_2;
     SSL_CTX_set_options(session.context,disabled|SSL_OP_NO_COMPRESSION|SSL_OP_NO_RENEGOTIATION);
     if(!SSL_CTX_set_cipher_list(session.context,"HIGH:!aNULL:!eNULL:!MD5:!3DES"))return false;
     const bool verify=!(session.credentials.flags&8);
@@ -180,7 +191,7 @@ std::span<const WindowsServiceDescriptor> tls_service_descriptors() {
 }
 std::optional<std::uint32_t> WindowsServices::invoke_tls(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;std::uint32_t result=0;auto& tls=runtime_.tls;
-    const auto text=[&](unsigned i){return symbol.back()=='W'?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(i)})):read_ansi(memory,arg(i));};
+    const auto text=[&](unsigned i){return symbol.back()=='W'?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(i)})):ansi_to_utf8(read_ansi(memory,arg(i)));};
     const auto expiry=[&](std::uint64_t pointer){if(pointer)memory.store(GuestAddress{pointer},64,INT64_MAX);};
     const auto package_name=[](std::string value){for(auto& c:value)if(c>='A' && c<='Z')c=static_cast<char>(c+32);return value=="schannel" || value=="microsoft unified security protocol provider";};
     if(symbol=="InitSecurityInterfaceW" || symbol=="InitSecurityInterfaceA"){

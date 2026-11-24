@@ -52,8 +52,8 @@ void WindowsServices::initialize_crt_wctype(GuestMemory& memory){
     // 同時建立舊版 CRT 的資料格：_pwctype 指向上述表；_amblksiz 預設 16；版本值與 _get_winver 等同一組常數。
     const auto cell=[&](unsigned offset){return GuestAddress{runtime_base_.value+offset};};
     memory.store(cell(pwctype_offset),x86_?32:64,runtime_base_.value+wctype_offset);memory.store(cell(amblksiz_offset),32,16);
-    memory.store(cell(winver_offset),32,(windows_version_major<<8)|windows_version_minor);memory.store(cell(winmajor_offset),32,windows_version_major);
-    memory.store(cell(winminor_offset),32,windows_version_minor);memory.store(cell(osver_offset),32,windows_version_build);
+    memory.store(cell(winver_offset),32,(compat_version_.major<<8)|compat_version_.minor);memory.store(cell(winmajor_offset),32,compat_version_.major);
+    memory.store(cell(winminor_offset),32,compat_version_.minor);memory.store(cell(osver_offset),32,compat_version_.build);
 }
 std::optional<std::uint32_t> WindowsServices::invoke_crt_runtime_extra(GuestState& entry_state,GuestMemory& entry_memory,const WindowsServiceDescriptor& service){
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);const auto name=service.symbol;
@@ -80,8 +80,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_runtime_extra(GuestStat
             if(name.starts_with("_get_os") || name.starts_with("_get_win")){
                 // errno_t _get_*(unsigned*)：VER_PLATFORM_WIN32_NT、組建號碼、(主版本<<8)|次版本、主版本、次版本。
                 if(!arg(0))return invalid(einval);
-                const std::uint32_t value=name=="_get_osplatform"?2U:name=="_get_osver"?windows_version_build:name=="_get_winver"?(windows_version_major<<8)|windows_version_minor:
-                    name=="_get_winmajor"?windows_version_major:windows_version_minor;
+                const std::uint32_t value=name=="_get_osplatform"?2U:name=="_get_osver"?compat_version_.build:name=="_get_winver"?(compat_version_.major<<8)|compat_version_.minor:
+                    name=="_get_winmajor"?compat_version_.major:compat_version_.minor;
                 memory.store(GuestAddress{arg(0)},32,value);return done(0);
             }
             if(name=="_set_SSE2_enable"){

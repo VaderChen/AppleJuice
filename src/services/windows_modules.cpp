@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/resource_cache.hpp"
 #include "x64arm/startup_profile.hpp"
 #include "x64arm/pe_loader.hpp"
@@ -993,7 +994,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_module(GuestState& state,Gu
             const auto output=full?arg(2):process_path?arg(1):value(1);
             const auto capacity=full?static_cast<std::uint32_t>(memory.load(GuestAddress{arg(3)},32)):static_cast<std::uint32_t>(process_path?arg(2):value(2));
             if(!capacity)throw ModuleError(122,"模組路徑 buffer 為空");if(!output)throw ModuleError(87,"模組路徑指標為空");
-            const auto ansi=utf16_to_utf8(path);const auto size=wide?path.size():ansi.size();result=std::min<std::uint64_t>(size,capacity);
+            const auto ansi=utf16_to_ansi(path);const auto size=wide?path.size():ansi.size();result=std::min<std::uint64_t>(size,capacity);
             if(process_path && size>=capacity)throw ModuleError(122,"程序路徑 buffer 過小");
             const auto count=std::min<std::size_t>(size,capacity-1);if(extended || process_path)result=count;
             if(wide)memory.write(GuestAddress{output},utf16_bytes(path.substr(0,count)));
@@ -1024,7 +1025,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_module(GuestState& state,Gu
             runtime_.dll_directory=std::move(path);runtime_.exclude_current_dll_directory=arg(0)!=0;result=1;
         }else if(symbol.starts_with("GetDllDirectory")) {
             auto path=runtime_.dll_directory;if(!path.empty() && path.back()==u'\\')path.pop_back();
-            const auto ansi=utf16_to_utf8(path);const auto length=wide?path.size():ansi.size();const auto capacity=static_cast<std::uint32_t>(arg(0));
+            const auto ansi=utf16_to_ansi(path);const auto length=wide?path.size():ansi.size();const auto capacity=static_cast<std::uint32_t>(arg(0));
             result=length>=capacity?length+1:length;
             if(capacity>length){if(wide)memory.write(GuestAddress{arg(1)},utf16_bytes(path));else{std::vector<std::uint8_t> bytes(ansi.begin(),ansi.end());bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);}}
             if(path.empty())result=0;

@@ -6,6 +6,7 @@
 // - SHSetUnreadMailCountW／SHGetUnreadMailCountW／SHEnumerateUnreadMailAccountsW：HKCU（或指定的使用者機碼）\Software\Microsoft\Windows\CurrentVersion\UnreadMail\<帳號>
 //   的 MessageCount（DWORD）、TimeStamp（FILETIME 二進位）與 Application（字串）。不指定帳號時取得的是時間戳晚於 pFileTime 的帳號未讀數總和。
 // - ShellExec_RunDLL（A／W；無後綴為 ANSI）：rundll32 進入點；命令列可先接「?十六進位旗標?」作為 SEE_MASK 旗標，接著是檔案（可加引號）與參數，以 ShellExecuteExW 執行。
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
@@ -251,7 +252,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_utilities(GuestState&
             if(name.starts_with("ShellExec_RunDLL")){
                 // (hwnd, hinst, pszCmdLine, nCmdShow)
                 const bool wide=name.ends_with('W');if(!call(2))co_return finish(0);
-                auto line=wide?read_utf16(m,GuestAddress{call(2)},32768):utf8_to_utf16_lossy(read_ansi(m,call(2),32768));
+                auto line=wide?read_utf16(m,GuestAddress{call(2)},32768):ansi_to_utf16_lossy(read_ansi(m,call(2),32768));
                 std::size_t at=line.find_first_not_of(u" \t");if(at==line.npos)co_return finish(0);
                 std::uint32_t mask=0;
                 if(line[at]==u'?'){const auto end=line.find(u'?',at+1);if(end!=line.npos){auto flags=line.substr(at+1,end-at-1);if(flags.starts_with(u"0x") || flags.starts_with(u"0X"))flags.erase(0,2);

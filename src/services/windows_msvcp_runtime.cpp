@@ -2,6 +2,7 @@
 // <complex> 的 _Cosh／_Sinh／_Exp／_Dtest／_Dscale、locale 向量 _Getctype／_Getcvt／_Getcoll、_Getdateorder、
 // 寬字元分類 _Getwctype(s)、大小寫 _Tolower／_Toupper／_Towlower／_Towupper、_Wcrtomb、數值轉換 _Sto*，以及 msvcp140 的 __crt* 包裝與 _To_wide／_To_byte。
 // VC8～VC10 的 _Ctypevec／_Cvtvec／_Collvec 以 LCID 識別 locale，VC11 起改以 locale 名稱；兩者共用同一套語義。
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "windows_locale_data.hpp"
@@ -283,15 +284,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp_runtime(GuestState& s
             if(name=="__crtCompareStringW" || name=="__crtLCMapStringW")arguments.insert(arguments.end(),{0,0,0});
             start_callbacks(state,memory,{{resolve("kernel32.dll",wrapper->target).value,std::move(arguments)}},Continuation::ReturnCallback);return std::nullopt;
         }
-        const auto page_of=[&](std::uint32_t page){return page?page:locale.categories[2].codepage?locale.categories[2].codepage:65001U;};
+        const auto page_of=[&](std::uint32_t page){return page?page:locale.categories[2].codepage?locale.categories[2].codepage:process_ansi_codepage();};
         if(name=="_To_wide" || name=="_To_byte"){
             // 失敗或超過 260 個單位時與 MultiByteToWideChar／WideCharToMultiByte 相同不寫入完整結果；回傳目的指標。
             const auto output=arg(1);
             if(name=="_To_wide"){
-                const auto text=windows_nls_decode(read_ansi(memory,arg(0),65536),65001,false);
+                const auto text=windows_nls_decode(read_ansi(memory,arg(0),65536),process_ansi_codepage(),false);
                 if(text && text->size()<260){memory.write(GuestAddress{output},utf16_bytes(*text));}
             }else {
-                const auto text=read_utf16(memory,GuestAddress{arg(0)},65536);const auto encoded=windows_nls_encode(text,65001,false,"?");
+                const auto text=read_utf16(memory,GuestAddress{arg(0)},65536);const auto encoded=windows_nls_encode(text,process_ansi_codepage(),false,"?");
                 if(encoded && encoded->bytes.size()<260){auto bytes=encoded->bytes;bytes.push_back(0);memory.write(GuestAddress{output},bytes);}
             }
             return done(output);

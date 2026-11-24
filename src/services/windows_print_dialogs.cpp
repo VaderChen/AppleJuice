@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_window_state.hpp"
 #include "x64arm/windows_printing.hpp"
@@ -60,7 +61,7 @@ std::optional<GuiPropertyPage> WindowsServices::read_property_page(GuestMemory& 
     if(!(page.flags&1U)){const auto entry=gui_resource(memory,page.instance,page.resource,5,wide);if(!entry){error=1814;return {};}templ=resource_image(entry,true)->base+memory.load(GuestAddress{entry},32);extent=memory.load(GuestAddress{entry+4},32);}
     const auto layout=gui_dialog_layout(memory,templ,extent);page.width=layout.width;page.height=layout.height;
     if(page.width>4096 || page.height>4096)return {};
-    const auto title=memory.load(GuestAddress{at+8+3*unit},bits);page.title=(page.flags&8U) && title?(wide?read_utf16(memory,GuestAddress{title}):utf8_to_utf16_lossy(read_ansi(memory,title))):layout.title;
+    const auto title=memory.load(GuestAddress{at+8+3*unit},bits);page.title=(page.flags&8U) && title?(wide?read_utf16(memory,GuestAddress{title}):ansi_to_utf16_lossy(read_ansi(memory,title))):layout.title;
     error=0;return page;
 }
 // invoke_property_page 的描述項：登錄與處理函式放在同一個檔案（群組＝路由單位）。
@@ -216,7 +217,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_print_dialog(GuestState& st
         const auto mode=get(layout.mode,true),names=get(layout.names,true);if((data.flags&0x400U) && (mode || names))return finish(invalid);
         for(const auto h:{mode,names})if(h){const auto f=gui_.global_memory.find(h);if(f==gui_.global_memory.end() || !(f->second.flags&2U) || !f->second.address || f->second.locks || f->second.clipboard_owned)return finish(handle_error);}
         if(mode){const auto& block=gui_.global_memory.at(mode);if(block.size<(data.wide?104U:72U))return finish(invalid);const auto size=memory.load(GuestAddress{block.address+(data.wide?68:36)},16);if(size>block.size)return finish(invalid);if(const auto error=read_printer_settings(memory,block.address,data.wide,data.settings))return finish(hresult(error));}
-        if(names){const auto& block=gui_.global_memory.at(names);if(block.size<8)return finish(invalid);const unsigned character=data.wide?2:1;const auto name=[&](unsigned field){const auto offset=memory.load(GuestAddress{block.address+field},16)*character;if(offset<8 || offset>=block.size)throw std::invalid_argument("DEVNAMES 偏移不合法");return data.wide?read_utf16(memory,GuestAddress{block.address+offset},(block.size-offset)/2-1):utf8_to_utf16_lossy(read_ansi(memory,block.address+offset,block.size-offset-1));};if(name(2)!=u"Win64 PDF" || name(4)!=u"FILE:")return finish(hresult(1801));(void)name(0);}
+        if(names){const auto& block=gui_.global_memory.at(names);if(block.size<8)return finish(invalid);const unsigned character=data.wide?2:1;const auto name=[&](unsigned field){const auto offset=memory.load(GuestAddress{block.address+field},16)*character;if(offset<8 || offset>=block.size)throw std::invalid_argument("DEVNAMES 偏移不合法");return data.wide?read_utf16(memory,GuestAddress{block.address+offset},(block.size-offset)/2-1):ansi_to_utf16_lossy(read_ansi(memory,block.address+offset,block.size-offset-1));};if(name(2)!=u"Win64 PDF" || name(4)!=u"FILE:")return finish(hresult(1801));(void)name(0);}
         if(!mode){data.settings.copies=static_cast<unsigned>(get(layout.copies));data.settings.collate=(data.flags&0x10U)!=0;}if(!data.settings.copies || data.settings.copies>99)return finish(invalid);
         if(!native_gui_ || !runtime_.network.external_io)return finish(hresult(50));
         if(pages){if(!get(layout.handles,true))return finish(pointer_error);memory.check(GuestAddress{get(layout.handles,true)},pages*unit,Access::Read);std::set<std::uint64_t> unique;

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_window_state.hpp"
 #include "x64arm/windows_geometry.hpp"
@@ -76,7 +77,7 @@ std::optional<std::uint32_t> WindowsServices::advance_property_sheet(GuestState&
 }
 std::optional<std::uint32_t> WindowsServices::invoke_property_sheet(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const bool wide=service.symbol.ends_with('W');
-    const auto text=[&](std::uint64_t pointer){return pointer?(wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer))):std::u16string{};};
+    const auto text=[&](std::uint64_t pointer){return pointer?(wide?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16_lossy(read_ansi(memory,pointer))):std::u16string{};};
     if(service.symbol.starts_with("DefDlgProc")){
         const auto handle=arg(0);auto& sheet=gui_.property_sheets.at(handle);const auto message=static_cast<std::uint32_t>(arg(1));
         if(message==0x81){arg.return_to(state,1);return std::nullopt;}

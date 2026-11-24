@@ -17,7 +17,8 @@ endif()
 set(X64ARM_FFMPEG_BUILD "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg")
 file(MAKE_DIRECTORY "${X64ARM_FFMPEG_BUILD}")
 # VFW 的 RGB555 壓縮使用同一套 Video 1 後端。H.264 由共用 VideoToolbox 優先解碼。
-set(X64ARM_FFMPEG_DECODERS vc1 wmv1 wmv2 wmv3 wmav1 wmav2 wmapro wmalossless wmavoice msvideo1
+# Cinepak（cvid）供傳統 AVI／VFW 影片（Windows 內建 iccvid 的對應）。ASF 解多工器供 MCI／DirectShow 播放 WMV／WMA 檔案。
+set(X64ARM_FFMPEG_DECODERS vc1 wmv1 wmv2 wmv3 wmav1 wmav2 wmapro wmalossless wmavoice msvideo1 cinepak
     h264 mpeg1video mpeg2video mp2float mp3float)
 list(JOIN X64ARM_FFMPEG_DECODERS "," X64ARM_FFMPEG_DECODER_LIST)
 set(X64ARM_FFMPEG_CFLAGS "")
@@ -42,7 +43,7 @@ set(X64ARM_FFMPEG_FLAGS
   --enable-decoder=${X64ARM_FFMPEG_DECODER_LIST}
   --enable-encoder=msvideo1
   --enable-parser=vc1,mpegvideo,mpegaudio
-  --enable-demuxer=mpegps,mpegvideo,mp3)
+  --enable-demuxer=mpegps,mpegvideo,mp3,asf)
 if(X64ARM_FFMPEG_CFLAGS)
   list(APPEND X64ARM_FFMPEG_FLAGS "--extra-cflags=${X64ARM_FFMPEG_CFLAGS}" "--extra-ldflags=${X64ARM_FFMPEG_LDFLAGS}")
 endif()

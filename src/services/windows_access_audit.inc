@@ -19,7 +19,7 @@
     const auto text=[&](std::uint64_t address)->std::u16string{
         if(!address)return {};
         if(nt)return read_string(address);
-        return ansi?utf8_to_utf16(read_ansi(memory,address,0x10000)):read_utf16(memory,GuestAddress{address},0x8000);};
+        return ansi?ansi_to_utf16(read_ansi(memory,address,0x10000)):read_utf16(memory,GuestAddress{address},0x8000);};
     const auto required_text=[&](std::uint64_t address){if(!address)throw LsaStatus{status_invalid_parameter};return text(address);};
     const auto audit_privilege=[&]{return runtime_.token_objects.at(1).has_privilege(21,true);};
     const auto token_handle=[&](std::uint64_t handle)->const VirtualToken&{

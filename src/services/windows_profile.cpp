@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -54,8 +55,9 @@ struct Profile {
             for(std::size_t i=2;i<bytes.size();i+=2)text.push_back(static_cast<char16_t>(encoding==Encoding::Utf16LE?bytes[i]|(bytes[i+1]<<8):(bytes[i]<<8)|bytes[i+1]));
         }else if(!bytes.empty()) {
             std::size_t begin=0;if(bytes.size()>=3 && bytes[0]==0xef && bytes[1]==0xbb && bytes[2]==0xbf){begin=3;encoding=Encoding::Utf8Bom;}
-            // 此虛擬 Windows 的 ACP 是 UTF-8，A/W API 與現有轉碼服務一致。
-            text=utf8_to_utf16_lossy(std::string_view(reinterpret_cast<const char*>(bytes.data()+begin),bytes.size()-begin));
+            // 沒有 BOM 的檔案依程序 ACP 解碼（ACP 為 UTF-8 時即 UTF-8）；UTF-8 BOM 一律以 UTF-8 解碼。
+            const std::string_view body(reinterpret_cast<const char*>(bytes.data()+begin),bytes.size()-begin);
+            text=begin?utf8_to_utf16_lossy(body):ansi_to_utf16_lossy(body);
         }
         const auto nul=text.find(u'\0');if(nul!=text.npos)text.resize(nul);
         for(std::size_t at=0;at<text.size();){auto end=text.find(u'\n',at);if(end==text.npos)end=text.size();auto line=text.substr(at,end-at);if(!line.empty() && line.back()==u'\r')line.pop_back();lines.push_back(std::move(line));at=end+1;}
@@ -83,7 +85,7 @@ struct Profile {
     std::vector<std::uint8_t> bytes()const{
         std::u16string text;for(const auto& line:lines){text+=line;text+=u"\r\n";}
         if(encoding==Encoding::Utf16LE || encoding==Encoding::Utf16BE){auto output=utf16_bytes(text);output.resize(output.size()-2);output.insert(output.begin(),{0xff,0xfe});if(encoding==Encoding::Utf16BE)for(std::size_t i=0;i<output.size();i+=2)std::swap(output[i],output[i+1]);return output;}
-        const auto encoded=utf16_to_utf8(text);std::vector<std::uint8_t> output;if(encoding==Encoding::Utf8Bom)output={0xef,0xbb,0xbf};output.insert(output.end(),encoded.begin(),encoded.end());return output;
+        const auto encoded=encoding==Encoding::Utf8Bom?utf16_to_utf8(text):utf16_to_ansi(text);std::vector<std::uint8_t> output;if(encoding==Encoding::Utf8Bom)output={0xef,0xbb,0xbf};output.insert(output.end(),encoded.begin(),encoded.end());return output;
     }
 };
 std::vector<std::uint8_t> read_file(const HostFile& file){
@@ -126,10 +128,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_profile(GuestState& state,G
     const bool section=symbol.find("Section")!=symbol.npos && !names;
     // Get／WritePrivateProfileStruct：值為結構各位元組的十六進位文字，末尾兩位是位元組和的低八位元檢查碼。
     const bool structure=symbol.find("Struct")!=symbol.npos;
-    const auto read=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):utf8_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
+    const auto read=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):ansi_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
     const auto copy=[&](std::uint64_t pointer,std::uint32_t capacity,std::u16string text,bool multiple)->std::uint64_t{
         if(!pointer || !capacity)return 0;
-        auto encoded=wide?utf16_bytes(text):[&]{const auto utf8=utf16_to_utf8(text);std::vector<std::uint8_t> b(utf8.begin(),utf8.end());b.push_back(0);return b;}();
+        auto encoded=wide?utf16_bytes(text):[&]{const auto utf8=utf16_to_ansi(text);std::vector<std::uint8_t> b(utf8.begin(),utf8.end());b.push_back(0);return b;}();
         const auto width=wide?2U:1U;const auto length=encoded.size()/width-1;const auto terminators=multiple && capacity>1?2U:1U;
         std::size_t result=length,units=length+1;
         if(multiple && text.empty()){result=0;units=terminators;encoded.resize(units*width);}

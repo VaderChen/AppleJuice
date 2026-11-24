@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_guid.hpp"
 #include "x64arm/unicode.hpp"

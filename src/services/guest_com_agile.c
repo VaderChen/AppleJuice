@@ -97,7 +97,7 @@ EXPORT SHStringFromGUIDW(const unsigned char *guid,unsigned short *dest,int capa
 
 /* ProgID 需要查詢登錄服務，映射時將對應的宿主入口填入唯讀表。 */
 typedef Word (CALL *GuidParser)(const void*,unsigned char*);
-__declspec(dllexport) const volatile Pointer GuestServiceFallbacks[23]={0};
+__declspec(dllexport) const volatile Pointer GuestServiceFallbacks[24]={0};
 /* ASCII 碼元可直接轉換；非 ASCII 使用與宿主服務相同的 Unicode 與 ACP 規則。 */
 static unsigned ascii_case(unsigned unit,int upper){
     unsigned first=upper?'a':'A';
@@ -178,16 +178,40 @@ OEM_EXPORTS(OemToChar,1,A,0)
 OEM_EXPORTS(OemToChar,1,W,1)
 #undef OEM_EXPORTS
 
-/* ACP 與 OEM 在客體預設為 UTF-8；其他碼頁共用 NLS 的 lead-byte 表。 */
+/* ACP／OEMCP（兩者相同）由宿主的 GetACP 決定：UTF-8 沒有前導位元組；DBCS 碼頁第一次遇到非 ASCII 位元組時
+   向宿主 NLS 取得 0x80～0xFF 的前導位元組表並快取。其他明確碼頁共用 NLS 的 lead-byte 表。 */
+typedef int (CALL *Lead)(Word,Word);
+static unsigned short acp_page;          /* 0＝尚未查詢 */
+static unsigned char acp_lead[128];      /* 0x80～0xFF：1＝前導、2＝非前導、0＝尚未查詢 */
+static int ansi_lead(unsigned char byte){
+    if(byte<0x80)return 0;
+    if(!acp_page){typedef Word (CALL *Acp)(void);acp_page=(unsigned short)((Acp)GuestServiceFallbacks[23])();}
+    if(acp_page==65001 || acp_page==1252)return 0;
+    unsigned char* cell=&acp_lead[byte-0x80];
+    if(!*cell)*cell=((Lead)GuestServiceFallbacks[6])(acp_page,byte)?1:2;
+    return *cell==1;
+}
 static int walk_lead(unsigned short page,unsigned char byte){
-    if(page==0 || page==1 || page==3 || page==65001 || page==1252)return 0;
-    typedef int (CALL *Lead)(Word,Word);
+    if(page==0 || page==1 || page==3)return ansi_lead(byte);
+    if(page==65001 || page==1252)return 0;
     return ((Lead)GuestServiceFallbacks[6])(page,byte);
 }
 #define WALK_EXPORT __declspec(dllexport) Pointer CALL
-WALK_EXPORT CharNextA(const unsigned char *p){return (Pointer)p+(*p!=0);}
+WALK_EXPORT CharNextA(const unsigned char *p){return (Pointer)p+(!*p?0:ansi_lead(*p) && p[1]?2:1);}
 WALK_EXPORT CharNextW(const unsigned short *p){return (Pointer)p+(*p?2:0);}
-WALK_EXPORT CharPrevA(Pointer start,Pointer p){return p-(p>start);}
+WALK_EXPORT CharPrevA(Pointer start,Pointer p){
+    if(p<=start)return p;
+    /* UTF-8 逐位元組後退（與既有行為相同）；DBCS 從開頭逐字前進，找到 p 之前最後一個字元邊界。 */
+    if(!acp_page){typedef Word (CALL *Acp)(void);acp_page=(unsigned short)((Acp)GuestServiceFallbacks[23])();}
+    if(acp_page==65001 || acp_page==1252)return p-1;
+    const unsigned char *at=(const unsigned char*)start;
+    for(;;){
+        if(!*at)return (Pointer)at;
+        const unsigned char *next=at+(ansi_lead(*at) && at[1]?2:1);
+        if((Pointer)next>=p)return (Pointer)at;
+        at=next;
+    }
+}
 WALK_EXPORT CharPrevW(Pointer start,Pointer p){return p-(p>start?2:0);}
 WALK_EXPORT CharNextExA(unsigned short page,const unsigned char *p,Word flags){
     (void)flags;

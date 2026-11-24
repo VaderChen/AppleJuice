@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "windows_locale_data.hpp"
@@ -108,7 +109,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_userstring(GuestState& stat
         const unsigned shift = extended ? 1 : 0;
         const auto lead_byte = [&](std::uint64_t byte) {
             const auto page = extended ? static_cast<std::uint16_t>(arg(0)) : 0;
-            if (page == 0 || page == 1 || page == 3 || page == 65001 || page == 1252) return false;
+            if (page == 0 || page == 1 || page == 3) return ansi_lead_byte(static_cast<std::uint8_t>(byte));
+            if (page == 65001 || page == 1252) return false;
             const auto info = windows_nls_codepage(static_cast<std::uint16_t>(page));
             if (!info) { last_error_ = 87; return false; }
             return info->lead[static_cast<std::uint8_t>(byte)] != 0;
@@ -120,9 +122,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_userstring(GuestState& stat
             const auto start = arg(shift), current = arg(shift + 1);
             result = current;
             if (current > start) {
-                const bool pair = extended && current - start >= 2 &&
-                    lead_byte(memory.load(GuestAddress{current - 2}, 8));
-                result -= wide || pair ? 2 : 1;
+                if (!wide && !extended && !process_ansi_is_utf8()) {
+                    // DBCS 的 ACP：從字串開頭逐字前進，找到 current 之前最後一個字元邊界。
+                    auto at = start;
+                    while (true) {
+                        const auto byte = memory.load(GuestAddress{at}, 8);
+                        const auto next = at + (byte && ansi_lead_byte(static_cast<std::uint8_t>(byte)) && memory.load(GuestAddress{at + 1}, 8) ? 2 : 1);
+                        if (!byte || next >= current) break;
+                        at = next;
+                    }
+                    result = at;
+                } else {
+                    const bool pair = extended && current - start >= 2 &&
+                        lead_byte(memory.load(GuestAddress{current - 2}, 8));
+                    result -= wide || pair ? 2 : 1;
+                }
             }
         } else {
             const auto current = arg(shift);

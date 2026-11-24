@@ -12,18 +12,20 @@
 
 namespace x64arm::detail {
 struct ChildPresentationOptions {
-    bool spatial{},interpolation{};
+    bool spatial{},interpolation{},hud{};
     unsigned upscale{1};
     std::string profile;
-    std::array<std::string,4> environment()const{
+    std::array<std::string,5> environment()const{
         return {"X64ARM_AUDIO_ENVIRONMENT="+std::to_string(spatial),
                 "X64ARM_PRESENT_UPSCALE="+std::to_string(upscale),
                 "X64ARM_PRESENT_INTERPOLATION="+std::to_string(interpolation),
+                "X64ARM_METAL_HUD="+std::to_string(hud),
                 "X64ARM_PRESENTATION_PROFILE="+profile};
     }
 };
 
-// 與 Launcher 的 AJPO v1 原子快照共用契約；不更動父程序環境。
+// 與 Launcher 的 AJPO 原子快照共用契約；不更動父程序環境。v1 每筆第 4 位元組是畫面內插（0／1），
+// v2 改為旗標：位元 0 畫面內插、位元 1 效能統計（Metal HUD）。
 // 已登錄的子 EXE 優先，未登錄者沿用啟動器目前設定，孫程序繼續使用同一快照。
 inline std::optional<ChildPresentationOptions> child_presentation_options(const std::filesystem::path& source){
     const auto* file=std::getenv("X64ARM_PRESENTATION_OPTIONS");
@@ -35,7 +37,8 @@ inline std::optional<ChildPresentationOptions> child_presentation_options(const 
     std::vector<unsigned char> data(static_cast<std::size_t>(length));
     stream.seekg(0);
     if(!stream.read(reinterpret_cast<char*>(data.data()),static_cast<std::streamsize>(data.size())))return std::nullopt;
-    if(data[0]!='A' || data[1]!='J' || data[2]!='P' || data[3]!='O' || data[4]!=1 || data[5]>1 || data[6] || data[7])return std::nullopt;
+    if(data[0]!='A' || data[1]!='J' || data[2]!='P' || data[3]!='O' || (data[4]!=1 && data[4]!=2) || data[5]>1 || data[6] || data[7])return std::nullopt;
+    const unsigned flag_limit=data[4]==2?3U:1U;
     const auto count=std::uint32_t{data[8]}|(std::uint32_t{data[9]}<<8)|(std::uint32_t{data[10]}<<16)|(std::uint32_t{data[11]}<<24);
     if(count>4096)return std::nullopt;
     const auto* inherited=std::getenv("X64ARM_PRESENTATION_PROFILE");
@@ -44,6 +47,7 @@ inline std::optional<ChildPresentationOptions> child_presentation_options(const 
     result.spatial=data[5]!=0;
     if(const auto* text=std::getenv("X64ARM_PRESENT_UPSCALE"))result.upscale=std::string_view(text)=="2"?2U:1U;
     if(const auto* text=std::getenv("X64ARM_PRESENT_INTERPOLATION"))result.interpolation=std::string_view(text)=="1";
+    if(const auto* text=std::getenv("X64ARM_METAL_HUD"))result.hud=std::string_view(text)=="1";
     result.profile=inherited_profile;
     std::error_code error;
     auto target=std::filesystem::weakly_canonical(source,error);
@@ -53,15 +57,15 @@ inline std::optional<ChildPresentationOptions> child_presentation_options(const 
     for(std::uint32_t record=0;record<count;++record){
         if(data.size()-at<20)return std::nullopt;
         const auto size=std::size_t{data[at]}|(std::size_t{data[at+1]}<<8);
-        const auto upscale=data[at+2],interpolation=data[at+3];
-        if(!size || size>32768 || size>data.size()-at-20 || (upscale!=1 && upscale!=2) || interpolation>1)return std::nullopt;
+        const auto upscale=data[at+2],flags=data[at+3];
+        if(!size || size>32768 || size>data.size()-at-20 || (upscale!=1 && upscale!=2) || flags>flag_limit)return std::nullopt;
         std::string profile;
         constexpr char hex[]="0123456789abcdef";
         for(std::size_t i=0;i<16;++i){const auto value=data[at+4+i];profile+=hex[value>>4];profile+=hex[value&15];}
         const std::string path(reinterpret_cast<const char*>(data.data()+at+20),size);
         if(path.find('\0')!=path.npos || !std::filesystem::path(path).is_absolute())return std::nullopt;
         const unsigned priority=std::filesystem::path(path)==target?2U:profile==inherited_profile?1U:0U;
-        if(priority>selected){result.upscale=upscale;result.interpolation=interpolation!=0;result.profile=std::move(profile);selected=priority;}
+        if(priority>selected){result.upscale=upscale;result.interpolation=(flags&1U)!=0;result.hud=(flags&2U)!=0;result.profile=std::move(profile);selected=priority;}
         at+=20+size;
     }
     if(at!=data.size())return std::nullopt;

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/unicode.hpp"
@@ -115,9 +116,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_device(GuestState& e
             const auto lz=[&](std::uint64_t handle)->RuntimeState::LzFile*{const auto found=runtime_.lz_files.find(static_cast<std::uint32_t>(handle));return found==runtime_.lz_files.end()?nullptr:&found->second;};
             if(symbol=="LZInit")co_return done(static_cast<std::uint32_t>(co_await initialize(call(0))));
             if(symbol=="LZOpenFileA" || symbol=="LZOpenFileW"){
-                // OpenFile 只有 ANSI 版本；W 版本以 ACP（UTF-8）轉換。找不到時改試最後一字元換成底線的壓縮檔名；唯讀開啟才經 LZInit。
+                // OpenFile 只有 ANSI 版本；W 版本以程序 ACP 轉換，名稱維持 ACP 位元組。找不到時改試最後一字元換成底線的壓縮檔名；唯讀開啟才經 LZInit。
                 if(!call(0) || !call(1))co_return done(static_cast<std::uint32_t>(lz_bad_input));
-                auto name=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{call(0)},260)):read_ansi(memory,call(0),260);
+                auto name=symbol.ends_with('W')?utf16_to_ansi(read_utf16(memory,GuestAddress{call(0)},260)):read_ansi(memory,call(0),260);
                 const auto open=[&](const std::string& path)->service_callback::Task<std::uint64_t>{
                     const auto text=scratch.allocate(path.size()+1);if(!text)co_return UINT32_MAX;
                     std::vector<std::uint8_t> bytes(path.begin(),path.end());bytes.push_back(0);memory.write(GuestAddress{text},bytes);
@@ -177,7 +178,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_device(GuestState& e
             if(symbol=="GetExpandedNameA" || symbol=="GetExpandedNameW"){
                 // 以唯讀開啟來源讀取檔頭：壓縮檔依檔頭補回最後一字元，否則原樣複製；輸出緩衝依文件須能容納 MAX_PATH。
                 const bool wide=symbol.ends_with('W');if(!call(0) || !call(1))co_return done(static_cast<std::uint32_t>(lz_bad_input));
-                const auto name=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{call(0)},260)):read_ansi(memory,call(0),260);
+                const auto name=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{call(0)},260)):ansi_to_utf8(read_ansi(memory,call(0),260));
                 const auto info=scratch.allocate(136+name.size()+1);if(!info)co_return done(static_cast<std::uint32_t>(lz_no_memory));
                 std::vector<std::uint8_t> text(name.begin(),name.end());text.push_back(0);memory.write(GuestAddress{info+136},text);
                 const auto file=static_cast<std::uint32_t>(co_await service_callback::call(api("OpenFile"),{info+136,info,0}));

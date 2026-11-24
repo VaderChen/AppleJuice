@@ -14,7 +14,7 @@
                         const auto input_format=header_at(input);
                         if(input && input_format.empty())co_return finish(0);
                         const auto prior=defaults?m.load(GuestAddress{vars+8},ptr_bits):0;
-                        const auto title=args(5)?utf8_to_utf16_lossy(read_ansi(m,args(5),1024)):u"視訊壓縮";
+                        const auto title=args(5)?ansi_to_utf16_lossy(read_ansi(m,args(5),1024)):u"視訊壓縮";
                         const auto dialog=std::make_shared<vfw::CompressorChoice>();
                         dialog->stream=(options&4)?args(3):0;
                         dialog->quality=defaults?u32(abi.quality()):UINT32_MAX;

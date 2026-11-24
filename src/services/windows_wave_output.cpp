@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/audio.hpp"
 #include "x64arm/unicode.hpp"
@@ -127,7 +128,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_play_sound(GuestState& stat
         }else{
             std::u16string name;
             if(flags&0x100000U){switch(arg(0)){case 0x2a53:name=u"SystemAsterisk";break;case 0x2153:name=u"SystemExclamation";break;case 0x6453:name=u"SystemDefault";break;case 0x4553:name=u"SystemExit";break;case 0x4853:name=u"SystemHand";break;case 0x3f53:name=u"SystemQuestion";break;case 0x5353:name=u"SystemStart";break;case 0x5753:name=u"SystemWelcome";break;default:return finish(false,87);}}
-            else {name=wide?read_utf16(memory,GuestAddress{arg(0)},256):utf8_to_utf16_lossy(read_ansi(memory,arg(0),256));if(name.size()>=256)return finish(false,87);}
+            else {name=wide?read_utf16(memory,GuestAddress{arg(0)},256):ansi_to_utf16_lossy(read_ansi(memory,arg(0),256));if(name.size()>=256)return finish(false,87);}
             if(source!=0x20000U){const auto path=alias_path(name);if(!path.empty())bytes=wave_file(path);}
             if(!alias && bytes.empty())bytes=wave_file(name);
         }
@@ -183,7 +184,7 @@ std::optional<GuestCallback> notification(const WinmmWaveOutput& output,std::uin
 }
 }
 bool WindowsServices::wave_output_waiting()const{
-    if(mci_waiting())return true;
+    if(mci_waiting() || directshow_active())return true;
     for(const auto& [handle,tone]:beep_tones_){(void)handle;if(!tone->finished)return true;}
     if(!wave_callbacks_.empty())return true;
     if(wave_input_waiting())return true;
@@ -191,6 +192,7 @@ bool WindowsServices::wave_output_waiting()const{
 }
 void WindowsServices::poll_wave_output(GuestMemory& memory){
     poll_mci();
+    poll_directshow(memory);
     const auto now=std::chrono::steady_clock::now();
     for(auto it=beep_tones_.begin();it!=beep_tones_.end();){
         const auto handle=it->first;auto& tone=it->second;bool done=tone->finished;
@@ -287,7 +289,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wave_output(GuestState& sta
                 // szPname 上限 MAXPNAMELEN（32）含結尾；WAVE_MAPPER 為 Microsoft Sound Mapper。
                 const auto& host=endpoints[mapper?0:static_cast<std::size_t>(index)].device;
                 auto label=mapper?std::u16string(u"Microsoft Sound Mapper"):host.name.empty()?std::u16string(u"Core Audio"):host.name;if(label.size()>31)label.resize(31);
-                std::vector<std::uint8_t> text;if(wide)text=utf16_bytes(label);else {const auto narrow=utf16_to_utf8(label);text.assign(narrow.begin(),narrow.begin()+static_cast<std::ptrdiff_t>(std::min<std::size_t>(narrow.size(),31)));}
+                std::vector<std::uint8_t> text;if(wide)text=utf16_bytes(label);else {const auto narrow=utf16_to_ansi(label);text.assign(narrow.begin(),narrow.begin()+static_cast<std::ptrdiff_t>(std::min<std::size_t>(narrow.size(),31)));}
                 put(0,1,2);put(2,mapper?2:0x64,2);put(4,0x100,4);std::copy(text.begin(),text.end(),caps.begin()+8);const unsigned at=wide?72:40;
                 put(at,0xfffff,4);put(at+4,!mapper && host.output_channels==1?1:2,2);put(at+8,0xe,4); // 11／22／44／48／96 kHz PCM；左右獨立音量、播放速率。
                 if(d(2))memory.write(GuestAddress{arg(1)},std::span(caps).first(std::min<std::size_t>(caps.size(),d(2))));

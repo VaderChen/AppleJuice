@@ -95,7 +95,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_recent_document(GuestState&
     std::u16string app=gui_.explicit_app_user_model_id.empty()?runtime_.image.path:gui_.explicit_app_user_model_id;const auto bits=static_cast<std::uint8_t>(x86_?32:64);
     if(flags==4 || flags==5 || flags==7){const auto name=memory.load(GuestAddress{object+bits/8},bits);if(!name)return finish(87);app=read_utf16(memory,GuestAddress{name},128);object=memory.load(GuestAddress{object},bits);if(!object)return finish(87);}
     if(flags==1 || flags==5){const auto found=gui_.shell_pidls.find(object);return finish(found==gui_.shell_pidls.end()?87:store_recent_document(found->second,app,false));}
-    if(flags==2 || flags==3)return finish(store_recent_document(flags==3?read_utf16(memory,GuestAddress{object},32767):utf8_to_utf16_lossy(read_ansi(memory,object,32767)),app,false));
+    if(flags==2 || flags==3)return finish(store_recent_document(flags==3?read_utf16(memory,GuestAddress{object},32767):ansi_to_utf16_lossy(read_ansi(memory,object,32767)),app,false));
     if(flags!=4 && flags!=6 && flags!=7 && flags!=8)return finish(87);
     const bool link=flags==6 || flags==7;
     if(!link)if(const auto item=gui_.shell_items.find(object);item!=gui_.shell_items.end())return finish(store_recent_document(item->second.path,app,false));

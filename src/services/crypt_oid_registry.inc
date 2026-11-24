@@ -39,7 +39,7 @@ if(symbol=="CryptRegisterOIDFunction" || symbol=="CryptUnregisterOIDFunction" ||
         if(!arg(3)){result=1;arg.return_to(state,result);return std::nullopt;}
         const auto function=required(arg(1),invalid_argument);const auto oid=oid_text(arg(2),invalid_argument);
         std::vector<std::pair<std::u16string,std::optional<RegistryValue>>> values{{u"Dll",wide_value(read_utf16(memory,GuestAddress{arg(3)},32767))}};
-        if(arg(4))values.emplace_back(u"FuncName",wide_value(utf8_to_utf16(read_ansi(memory,arg(4),1024))));
+        if(arg(4))values.emplace_back(u"FuncName",wide_value(ansi_to_utf16(read_ansi(memory,arg(4),1024))));
         check(crypt_oid_registry_update(u32(0)&65535U,function,oid,values));result=1;
     }else if(symbol=="CryptUnregisterOIDFunction"){
         const auto function=required(arg(1));check(crypt_oid_registry_update(u32(0)&65535U,function,oid_text(arg(2)),{},true));result=1;

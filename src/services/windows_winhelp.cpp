@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/unicode.hpp"
@@ -22,7 +23,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winhelp(GuestState& state,G
         if(request.owner && !gui_.windows.contains(request.owner))return done(1400);
         switch(request.command){case 1:case 3:case 5:case 8:case 9:case 0x101:case 0x105:break;default:return done(50);}
         if(!native_gui_)return done(50);
-        const auto string=[&](std::uint64_t address){return wide?read_utf16(memory,GuestAddress{address},32768):utf8_to_utf16(read_ansi(memory,address,32768));};
+        const auto string=[&](std::uint64_t address){return wide?read_utf16(memory,GuestAddress{address},32768):ansi_to_utf16(read_ansi(memory,address,32768));};
         if(!arg(1))return done(87);auto file=string(arg(1));if(file.empty())return done(87);
         if(file.find(u'>')!=file.npos)return done(50); // 次要視窗須有獨立的尺寸／生命週期，尚未接入。
         if(request.command==0x101 || request.command==0x105){if(!arg(3))return done(87);request.keyword=string(arg(3));if(request.keyword.find(u';')!=request.keyword.npos)return done(50);}

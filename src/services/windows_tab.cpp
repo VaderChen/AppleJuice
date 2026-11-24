@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/raster_surface.hpp"
@@ -105,7 +106,7 @@ std::optional<std::uint64_t> WindowsServices::gui_tab_message(GuestMemory& memor
             // 先驗證所有輸出，避免部份欄位寫入後才遇到壞指標。
             if(mask&1U){pointer=read(text_offset,bits);const auto count=integer(read(count_offset));if(pointer && count>0){
                 if(unicode)text=utf16_bytes(item.text.substr(0,static_cast<std::size_t>(count-1)));
-                else {auto ansi=utf16_to_utf8(item.text);ansi.resize(std::min(ansi.size(),static_cast<std::size_t>(count-1)));text.assign(ansi.begin(),ansi.end());text.push_back(0);}
+                else {auto ansi=utf16_to_ansi(item.text);ansi.resize(std::min(ansi.size(),static_cast<std::size_t>(count-1)));text.assign(ansi.begin(),ansi.end());text.push_back(0);}
                 memory.check(GuestAddress{pointer},text.size(),Access::Write);
             }}
             if(mask&2U)memory.check(GuestAddress{lp+image_offset},4,Access::Write);
@@ -118,7 +119,7 @@ std::optional<std::uint64_t> WindowsServices::gui_tab_message(GuestMemory& memor
         }
         if(insert && tab.items.size()>=65536){last_error_=8;return index_result(-1);}
         GuiTabItem item=insert?GuiTabItem{}:tab.items[static_cast<std::size_t>(index)];if(insert){item.identity=gui_.next_item++;item.data.resize(extra);}
-        if(mask&1U){const auto pointer=read(text_offset,bits);if(pointer==(x86_?UINT32_MAX:UINT64_MAX)){last_error_=87;return insert?index_result(-1):0;}item.text=pointer?(unicode?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer))):std::u16string{};}
+        if(mask&1U){const auto pointer=read(text_offset,bits);if(pointer==(x86_?UINT32_MAX:UINT64_MAX)){last_error_=87;return insert?index_result(-1):0;}item.text=pointer?(unicode?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16_lossy(read_ansi(memory,pointer))):std::u16string{};}
         if(mask&2U)item.image=integer(read(image_offset));
         if(mask&8U)memory.read(GuestAddress{lp+data_offset},item.data);
         if(mask&4U)item.rtl=true;

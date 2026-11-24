@@ -22,6 +22,11 @@ struct AviDevice : DeviceControl {
     Mode mode{Mode::Stopped};
     std::u16string file,alias;
     std::uint64_t position{},anchor{},low{},high{},window{},notify_window{};
+    // MCI_DGV_OPEN_WS 指定的播放視窗樣式（0＝預設）。有 MCI_DGV_OPEN_PARENT 時畫面繪在父視窗的客戶區（WS_CHILD 的子視窗位置）。
+    std::uint32_t style{};
+    // MCI_WINDOW 的 MCI_DGV_WINDOW_STATE（SW_HIDE／SW_MINIMIZE 時不繪製）與 MCI_DGV_WINDOW_TEXT（播放視窗標題）。
+    bool hidden{};
+    std::u16string caption;
     GuiRect source{},target{};
     bool fixed_target{};
     std::uint32_t presentation{};

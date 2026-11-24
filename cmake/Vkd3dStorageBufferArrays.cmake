@@ -108,6 +108,25 @@ x64arm_vkd3d_patch("${X64ARM_VKD3D_SPIRV}"
         vkd3d_spirv_build_op_decorate(builder, struct_id, SpvDecorationBufferBlock, NULL, 0);
         vkd3d_spirv_build_op_member_decorate1(builder, struct_id, 0, SpvDecorationOffset, 0);
 ]=]
+  [=[    /* x64arm: typed UAV buffers stay texel buffers (the view format converts) unless they use atomics, which
+     * D3D allows only on R32 formats; raw/structured buffers and atomic typed UAVs are storage buffers. */
+    x64arm_ssbo = compiler->compile_info.ssbo_uavs && resource_type == VKD3D_SHADER_RESOURCE_BUFFER
+            && (raw || structure_stride || (is_uav && (descriptor->flags & VKD3D_SHADER_DESCRIPTOR_INFO_FLAG_UAV_ATOMICS)));
+    if (x64arm_ssbo)
+    {
+        uint32_t array_type_id, struct_id;
+
+        type_id = spirv_get_type_id(compiler, sampled_type, 1);
+
+        array_type_id = vkd3d_spirv_get_op_type_runtime_array(builder, type_id);
+        vkd3d_spirv_build_op_decorate1(builder, array_type_id, SpvDecorationArrayStride, 4);
+
+        struct_id = vkd3d_spirv_build_op_type_struct(builder, &array_type_id, 1);
+        vkd3d_spirv_build_op_decorate(builder, struct_id, SpvDecorationBufferBlock, NULL, 0);
+        vkd3d_spirv_build_op_member_decorate1(builder, struct_id, 0, SpvDecorationOffset, 0);
+        if (!is_uav)
+            vkd3d_spirv_build_op_member_decorate(builder, struct_id, 0, SpvDecorationNonWritable, NULL, 0);
+]=]
   [=[    if (compiler->compile_info.ssbo_uavs && (is_uav || raw || structure_stride)
             && resource_type == VKD3D_SHADER_RESOURCE_BUFFER)
     {

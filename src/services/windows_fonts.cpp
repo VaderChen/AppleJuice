@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_fonts.hpp"
 #include "x64arm/native_font_data.hpp"
@@ -17,12 +18,45 @@
 
 namespace x64arm {
 std::uint32_t gdi_charset_code_page(std::uint8_t charset){
-    // 字元集→ANSI 碼頁（Windows 字元集對照）；DEFAULT／OEM 沿用本引擎的 ACP／OEMCP（UTF-8）。
+    // 字元集→ANSI 碼頁（Windows 字元集對照）；DEFAULT／OEM 沿用程序的 ACP／OEMCP。
     switch(charset){
-    case 0:return 1252;case 2:return 0;case 77:return 10000;case 128:return 932;case 129:return 949;case 130:return 1361;case 134:return 936;case 136:return 950;
+    // ANSI_CHARSET：程序 ACP 為東亞雙位元組碼頁時依系統的字型關聯（Associated CharSet ANSI(00)）改用該碼頁，
+    // 未指定字元集的字型才能畫出 Big5／Shift-JIS／GBK／韓文字串；其餘地區維持 1252。
+    case 0:{const auto page=process_ansi_codepage();return page==932 || page==936 || page==949 || page==950?page:1252U;}
+    case 2:return 0;case 77:return 10000;case 128:return 932;case 129:return 949;case 130:return 1361;case 134:return 936;case 136:return 950;
     case 161:return 1253;case 162:return 1254;case 163:return 1258;case 177:return 1255;case 178:return 1256;case 186:return 1257;case 204:return 1251;case 222:return 874;case 238:return 1250;
-    default:return 65001;
+    default:return process_ansi_codepage();
     }
+}
+std::u16string gdi_decode_ansi_text(std::string_view bytes,std::uint8_t charset,std::vector<std::uint8_t>* sizes){
+    std::u16string text;if(sizes)sizes->clear();
+    const auto page=process_ansi_is_utf8()?65001U:gdi_charset_code_page(charset);
+    if(page==65001){
+        for(int at=0;at<static_cast<int>(bytes.size());){
+            const auto begin=at;UChar32 cp;U8_NEXT_OR_FFFD(bytes.data(),at,static_cast<int>(bytes.size()),cp);
+            if(cp>0xffff){text.push_back(U16_LEAD(cp));text.push_back(U16_TRAIL(cp));if(sizes){sizes->push_back(static_cast<std::uint8_t>(at-begin));sizes->push_back(0);}}
+            else {text.push_back(static_cast<char16_t>(cp));if(sizes)sizes->push_back(static_cast<std::uint8_t>(at-begin));}
+        }
+        return text;
+    }
+    if(page==0){for(const auto c:bytes){text.push_back(static_cast<unsigned char>(c));if(sizes)sizes->push_back(1);}return text;}
+    const auto info=windows_nls_codepage(page);
+    for(std::size_t at=0;at<bytes.size();){
+        const auto lead=static_cast<unsigned char>(bytes[at]);
+        const std::size_t width=info && info->maximum_character_bytes>1 && info->lead[lead] && at+1<bytes.size()?2U:1U;
+        auto decoded=windows_nls_decode(bytes.substr(at,width),page,false).value_or(std::u16string(1,u'\ufffd'));
+        if(decoded.empty())decoded.push_back(u'\ufffd');
+        for(std::size_t i=0;i<decoded.size();++i){text.push_back(decoded[i]);if(sizes)sizes->push_back(i?0:static_cast<std::uint8_t>(width));}
+        at+=width;
+    }
+    return text;
+}
+// A 版單一字元碼（DBCS 雙位元組碼的高位元組為前導位元組）依字型字元集轉成 Unicode 碼位。
+std::uint32_t gdi_narrow_character(std::uint32_t code,std::uint8_t charset){
+    std::string bytes;if(code>255)bytes.push_back(static_cast<char>(code>>8));bytes.push_back(static_cast<char>(code&255));
+    const auto text=gdi_decode_ansi_text(bytes,charset);if(text.empty())return 0xfffd;
+    if(text.size()>1 && U16_IS_LEAD(text[0]) && U16_IS_TRAIL(text[1]))return static_cast<std::uint32_t>(U16_GET_SUPPLEMENTARY(text[0],text[1]));
+    return text[0];
 }
 bool windows_ui_font_alias(std::u16string_view family){
     constexpr std::u16string_view aliases[]{u"",u"System",u"Segoe UI",u"MS Shell Dlg",u"MS Shell Dlg 2",u"MS Sans Serif",u"Microsoft Sans Serif",u"Tahoma"};
@@ -36,7 +70,7 @@ bool valid_charset(std::uint8_t value){return value==1 || std::any_of(std::begin
 template<class Integer> void number(std::vector<std::uint8_t>& bytes,std::size_t offset,Integer value,unsigned size=4){const auto raw=static_cast<std::uint64_t>(value);for(unsigned i=0;i<size;++i)bytes.at(offset+i)=static_cast<std::uint8_t>(raw>>(i*8));}
 void string(std::vector<std::uint8_t>& bytes,std::size_t offset,std::size_t capacity,std::u16string_view text,bool wide){
     if(wide){auto count=std::min(text.size(),capacity-1);if(count && text[count-1]>=0xd800 && text[count-1]<=0xdbff)--count;for(std::size_t i=0;i<count;++i)number(bytes,offset+i*2,text[i],2);}
-    else {const auto value=utf16_to_utf8(text);auto count=std::min(value.size(),capacity-1);while(count<value.size() && count && (static_cast<unsigned char>(value[count])&0xc0)==0x80)--count;std::copy_n(value.begin(),count,bytes.begin()+static_cast<std::ptrdiff_t>(offset));}
+    else {const auto value=utf16_to_ansi(text);auto count=ansi_prefix_length(value,capacity-1);std::copy_n(value.begin(),count,bytes.begin()+static_cast<std::ptrdiff_t>(offset));}
 }
 FontEnumerationRecord record(const NativeFontFace& face,bool wide,std::uint8_t charset,std::u16string_view script){
     FontEnumerationRecord out;out.logical.resize(wide?348:188);out.metrics.resize(wide?100:96);out.type=face.type;
@@ -88,7 +122,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,Gue
         const bool extended=service.symbol.find("ResourceEx")!=std::string_view::npos;
         const auto flags=extended?static_cast<std::uint32_t>(arg(1)):0U;
         if(!arg(0) || (flags&~0x30U) || (extended && arg(2))){last_error_=87;return finish(0);}
-        const auto path=service.symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+        const auto path=service.symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
         const auto file=filesystem_.open(path);if(file.error){last_error_=file.error;return finish(0);}
         const auto key=std::make_pair(file.key,static_cast<std::uint32_t>(flags));
         if(service.symbol.starts_with("Remove")){
@@ -167,8 +201,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,Gue
                 if(name.starts_with("GetGlyphOutline")){
                     const auto format=static_cast<unsigned>(arg(2)),mode=format&0x7fU;const bool index=(format&0x80)!=0;
                     if(format&~0x1ffU || mode>6 || ((format&0x100) && mode!=2 && mode!=3) || arg(1)>65535 || !arg(3) || !arg(6))return fail(87);
-                    if(!wide && !index && arg(1)>127)return fail(50);
-                    const auto glyph=index?static_cast<std::uint16_t>(arg(1)):native_font_glyph_indices(*face,std::array<std::uint32_t,1>{static_cast<unsigned>(arg(1))})[0];
+                    // A 版字元碼：DBCS 的 ACP 下依字型字元集轉成 Unicode（雙位元組碼的高位元組為前導位元組）；UTF-8 只接受 ASCII。
+                    const bool narrow_dbcs=!wide && !index && !process_ansi_is_utf8();
+                    if(!wide && !index && !narrow_dbcs && arg(1)>127)return fail(50);
+                    const auto character=narrow_dbcs?gdi_narrow_character(static_cast<std::uint32_t>(arg(1)),model.charset):static_cast<std::uint32_t>(arg(1));
+                    const auto glyph=index?static_cast<std::uint16_t>(arg(1)):native_font_glyph_indices(*face,std::array<std::uint32_t,1>{character})[0];
                     std::array<double,4> matrix{};for(unsigned i=0;i<4;++i)matrix[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(6)+i*4},32))/65536.0*(i<2?sx:sy);
                     const auto native=native_gdi_glyph(*face,glyph,matrix,mode==1?1:mode>=4?2:0);const auto& box=native.bounds;
                     const auto width=static_cast<unsigned>(box[2]-box[0]),height=static_cast<unsigned>(box[3]-box[1]);
@@ -190,10 +227,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,Gue
                 }
                 const bool extent=name.starts_with("GetTextExtent"),extent_ex=name=="GetTextExtentExPointI",indexed=extent || name.ends_with('I'),abc=name.starts_with("GetCharABC");
                 const auto first=static_cast<unsigned>(arg(1));const auto count=extent || indexed?static_cast<unsigned>(arg(2)):arg(2)>=arg(1) && arg(2)<=65535?static_cast<unsigned>(arg(2)-arg(1)+1):UINT32_MAX;
-                if(count>65536 || (!extent && !indexed && !wide && arg(2)>127))return fail(87);
+                const bool narrow_dbcs=!extent && !indexed && !wide && !process_ansi_is_utf8();
+                if(count>65536 || (!extent && !indexed && !wide && !narrow_dbcs && arg(2)>127))return fail(87);
                 std::vector<std::uint16_t> glyphs(count);
                 if(indexed){const auto pointer=arg(extent?1:3);if(extent && count && !pointer)return fail(87);if(!pointer && (first>65535 || count>65536-first))return fail(87);for(unsigned i=0;i<count;++i)glyphs[i]=pointer?static_cast<std::uint16_t>(memory.load(GuestAddress{pointer+i*2},16)):static_cast<std::uint16_t>(first+i);}
-                else {std::vector<std::uint32_t> characters(count);for(unsigned i=0;i<count;++i)characters[i]=first+i;glyphs=native_font_glyph_indices(*face,characters);}
+                else {std::vector<std::uint32_t> characters(count);for(unsigned i=0;i<count;++i)characters[i]=narrow_dbcs?gdi_narrow_character(first+i,model.charset):first+i;glyphs=native_font_glyph_indices(*face,characters);}
                 const auto metrics=native_font_glyph_metrics(*face,glyphs);const auto output=arg(extent?(extent_ex?6:3):(indexed?4:3));if(!output)return fail(87);
                 std::vector<std::int32_t> advances(count);for(unsigned i=0;i<count;++i){const auto value=std::round(metrics[i][1]*sx);if(value>INT32_MAX)return fail(534);advances[i]=static_cast<std::int32_t>(value);}
                 if(extent){if(extent_ex && static_cast<std::int32_t>(arg(3))<0)return fail(87);std::int64_t total=0;unsigned fit=0;std::vector<std::uint8_t> distances(count*4);
@@ -299,7 +337,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,Gue
     if(extended){memory.check(GuestAddress{arg(1)},wide?92:60,Access::Read);charset=static_cast<std::uint8_t>(memory.load(GuestAddress{arg(1)+23},8));if(memory.load(GuestAddress{arg(1)+27},8) || !valid_charset(charset)){last_error_=87;return finish(0);}}
     if(arg(1)){const auto pointer=arg(1)+(extended?28U:0U);std::string narrow;bool terminated=false;
         for(unsigned i=0;i<32;++i){const auto value=memory.load(GuestAddress{pointer+i*(wide?2U:1U)},wide?16:8);if(!value){terminated=true;break;}if(wide)family.push_back(static_cast<char16_t>(value));else narrow.push_back(static_cast<char>(value));}
-        if(!terminated){last_error_=87;return finish(0);}if(!wide)family=utf8_to_utf16_lossy(narrow);}
+        if(!terminated){last_error_=87;return finish(0);}if(!wide)family=ansi_to_utf16_lossy(narrow);}
     if(!runtime_.network.external_io)throw HostCallFault("原生字型列舉不支援 deterministic compare");
     if(!handles(GuestAddress{arg(2)}))memory.check(GuestAddress{arg(2)},1,Access::Execute);
     FontEnumeration operation;operation.callback=arg(2);operation.parameter=arg(3);operation.thread=threads_.current;

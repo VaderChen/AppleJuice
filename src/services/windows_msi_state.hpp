@@ -1,11 +1,12 @@
 #pragma once
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/msi_query.hpp"
 #include "x64arm/unicode.hpp"
 
 namespace x64arm {
 namespace msi_api {
-inline std::u16string input(const GuestMemory& memory,std::uint64_t address,bool wide){return address?(wide?read_utf16(memory,GuestAddress{address},1048576):utf8_to_utf16(read_ansi(memory,address))):std::u16string{};}
+inline std::u16string input(const GuestMemory& memory,std::uint64_t address,bool wide){return address?(wide?read_utf16(memory,GuestAddress{address},1048576):ansi_to_utf16(read_ansi(memory,address))):std::u16string{};}
 inline std::uint32_t output(GuestMemory& memory,std::u16string_view text,bool wide,std::uint64_t buffer,std::uint64_t size){
     if(!size)return buffer?87U:0U;memory.check(GuestAddress{size},4,Access::Write);const auto capacity=memory.load(GuestAddress{size},32);
     const auto bytes=wide?std::string{}:utf16_to_utf8(text);const auto length=wide?text.size():bytes.size();

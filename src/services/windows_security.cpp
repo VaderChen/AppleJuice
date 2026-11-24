@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "system_object_identity.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
@@ -630,7 +631,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
                 if(allocated){for(unsigned i=0;i<count;++i)sddl_put(bytes,8+i*4,u32(2+i));allocate(bytes,arg(10));}
                 else{memory.write(GuestAddress{arg(0)},bytes);result=1;}
             }else if(symbol.starts_with("ConvertStringSidToSid")){
-                if(!arg(0))throw SddlError{87};const auto text=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));allocate(sddl_sid(text),arg(1));
+                if(!arg(0))throw SddlError{87};const auto text=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));allocate(sddl_sid(text),arg(1));
             }else if(symbol=="CreateWellKnownSid"){
                 if(!arg(3))throw SddlError{87};const auto bytes=well_known_sid(u32(0),arg(1)?read_sid(memory,arg(1)):std::vector<std::uint8_t>{});
                 const auto capacity=memory.load(GuestAddress{arg(3)},32);memory.store(GuestAddress{arg(3)},32,bytes.size());if(!arg(2) || capacity<bytes.size())throw SddlError{122};memory.write(GuestAddress{arg(2)},bytes);result=1;
@@ -672,7 +673,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
     }else if(symbol.starts_with("ConvertStringSecurityDescriptorToSecurityDescriptor")){
         if(!arg(0) || !arg(2))fail(87);else if(u32(1)!=1)fail(1305);
         else {try {
-            const auto text=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));const auto bytes=sddl_descriptor(text,machine_account_domain());
+            const auto text=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));const auto bytes=sddl_descriptor(text,machine_account_domain());
             memory.check(GuestAddress{arg(2)},x86_?4:8,Access::Write);if(arg(3))memory.check(GuestAddress{arg(3)},4,Access::Write);
             const auto pointer=allocate_heap(memory,bytes.size());if(!pointer)fail(8);else {memory.write(GuestAddress{pointer},bytes);runtime_.local_allocations.insert(pointer);memory.store(GuestAddress{arg(2)},x86_?32:64,pointer);if(arg(3))memory.store(GuestAddress{arg(3)},32,bytes.size());result=1;}
         }catch(const SddlError& error){fail(error.code);}}
@@ -771,7 +772,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
                symbol == "LookupAccountSidA" || symbol == "LookupAccountSidW") {
         const bool wide = symbol.back() == 'W', by_sid = symbol.starts_with("LookupAccountSid");
         const auto text = [&](std::uint64_t address) {
-            return wide ? utf16_to_utf8(read_utf16(memory, GuestAddress{address}, 1024)) : read_ansi(memory, address, 1024);
+            return wide ? utf16_to_utf8(read_utf16(memory, GuestAddress{address}, 1024)) : ansi_to_utf8(read_ansi(memory, address, 1024));
         };
         const auto encoded = [&](std::string_view value) {
             if (wide) return utf16_bytes(utf8_to_utf16(value));
@@ -820,7 +821,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
         // 長度以字元計：成功時回不含 NUL 的長度，緩衝區不足時回含 NUL 的需要長度並設 ERROR_INSUFFICIENT_BUFFER。
         const bool wide = symbol.back() == 'W', display = symbol.starts_with("LookupPrivilegeDisplayName");
         const auto text = [&](std::uint64_t address) {
-            return wide ? utf16_to_utf8(read_utf16(memory, GuestAddress{address}, 1024)) : read_ansi(memory, address, 1024);
+            return wide ? utf16_to_utf8(read_utf16(memory, GuestAddress{address}, 1024)) : ansi_to_utf8(read_ansi(memory, address, 1024));
         };
         constexpr unsigned count_index = 3U, output_index = 2U;
         if (!arg(1) || !arg(count_index)) fail(87);
@@ -852,7 +853,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
     } else if (symbol == "LookupPrivilegeValueA" || symbol == "LookupPrivilegeValueW") {
         const bool wide = symbol.back() == 'W';
         const auto text = [&](std::uint64_t address) {
-            return wide ? utf16_to_utf8(read_utf16(memory, GuestAddress{address}, 1024)) : read_ansi(memory, address, 1024);
+            return wide ? utf16_to_utf8(read_utf16(memory, GuestAddress{address}, 1024)) : ansi_to_utf8(read_ansi(memory, address, 1024));
         };
         if (!arg(1) || !arg(2)) fail(87);
         else if (arg(0) && !text(arg(0)).empty()) fail(50); // 遠端安全性授權服務未映射。
@@ -1160,7 +1161,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_object_security(GuestState&
         if(named){
             if(call(1)!=1)throw SddlError{50};if(!call(0))throw SddlError{87};
             if(!runtime_.network.external_io)throw SddlError{50};
-            const auto name=api.ends_with('W')?read_utf16(memory,GuestAddress{call(0)},256):utf8_to_utf16(read_ansi(memory,call(0),256));
+            const auto name=api.ends_with('W')?read_utf16(memory,GuestAddress{call(0)},256):ansi_to_utf16(read_ansi(memory,call(0),256));
             const auto error=NamedPipe::security(mapping_session(),name,[&](int fd){operation(fd,nullptr,true);});if(error)throw SddlError{error};
         }else{
         std::vector<std::uint8_t>* local{};int native=-1,lock=-1;

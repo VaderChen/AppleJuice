@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "crt_os_error.hpp"
@@ -290,7 +291,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,Gue
         const auto code=static_cast<std::uint32_t>(print?memory.load(GuestAddress{runtime_.errno_cell},32):arg(0));
         std::string message(crt_message(code));
         if(print) {
-            const auto prefix=arg(0)?wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0)):std::string{};
+            const auto prefix=arg(0)?wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0))):std::string{};
             if(!prefix.empty())message=prefix+": "+message;message+='\n';
             const auto written=write_standard_output(2,std::span(reinterpret_cast<const std::uint8_t*>(message.data()),message.size()));
             if(written.error)memory.store(GuestAddress{runtime_.errno_cell},32,written.error==109?32:9);
@@ -353,7 +354,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,Gue
             bool found=false;
             std::uint32_t missing=1813;
             if(flags&0x400){
-                text=wide?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16(read_ansi(memory,arg(1)));
+                text=wide?read_utf16(memory,GuestAddress{arg(1)}):ansi_to_utf16(read_ansi(memory,arg(1)));
                 found=true;
             }else if(flags&0x800){
                 const auto language=static_cast<std::uint16_t>(arg(3));
@@ -393,7 +394,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,Gue
                                width==255?UINT32_MAX:width,65536,false,formatted);
                 text=std::move(formatted);
                 auto bytes=wide?utf16_bytes(text):std::vector<std::uint8_t>{};
-                if (!wide) {const auto narrow=utf16_to_utf8(text);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
+                if (!wide) {const auto narrow=utf16_to_ansi(text);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
                 const auto length=bytes.size()/(wide?2:1)-1;
                 if (bytes.size()>131072) fail(234);
                 else if (flags&0x100) {

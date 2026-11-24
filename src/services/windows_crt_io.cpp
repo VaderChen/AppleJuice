@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "crt_c_locale.hpp"
@@ -560,14 +561,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
         }
     }else if(symbol=="_creat" || symbol=="_wcreat") {
         if(!arg(0) || (u32(1)&~0x180U))error(22);
-        else {CrtFile file;file.readable=file.writable=true;file.text=true;const auto path=symbol=="_wcreat"?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));open(path,std::move(file),2,((u32(1)&~runtime_.crt_umask)&0x80)?0x80U:1U);result=result?runtime_.streams.at(result).descriptor:UINT32_MAX;}
+        else {CrtFile file;file.readable=file.writable=true;file.text=true;const auto path=symbol=="_wcreat"?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));open(path,std::move(file),2,((u32(1)&~runtime_.crt_umask)&0x80)?0x80U:1U);result=result?runtime_.streams.at(result).descriptor:UINT32_MAX;}
     }else if(symbol=="freopen" || symbol=="_wfreopen") {
         const auto base=runtime_base_.value+0x800;const auto original=arg(2)==base+48?base+128:arg(2)==base+96?base+256:arg(2);const auto stream=crt_stream(original);
         const bool standard=original>=base && original<=base+256 && (original-base)%128==0;
         if(!arg(0) || !arg(1) || (!standard && !runtime_.streams.contains(stream)))error(22,0);
         else {
-            const auto path=symbol=="_wfreopen"?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
-            const auto mode=symbol=="_wfreopen"?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(1)},32)):read_ansi(memory,arg(1),32);
+            const auto path=symbol=="_wfreopen"?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
+            const auto mode=symbol=="_wfreopen"?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(1)},32)):ansi_to_utf8(read_ansi(memory,arg(1),32));
             close(stream,!standard);runtime_.crt_redirects.erase(original);
             const auto parsed=crt_lowio::stream_mode(mode);
             if(!parsed)error(22,0);
@@ -645,7 +646,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
         }
     } else if(symbol=="_fdopen" || symbol=="_wfdopen") {
         result=fd_stream(u32(0));
-        const auto mode=!arg(1)?std::string{}:symbol=="_wfdopen"?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(1)},32)):read_ansi(memory,arg(1),32);
+        const auto mode=!arg(1)?std::string{}:symbol=="_wfdopen"?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(1)},32)):ansi_to_utf8(read_ansi(memory,arg(1),32));
         const auto parsed=crt_lowio::stream_mode(mode);
         if(!result)error(9,0);
         else if(!parsed)error(22,0);
@@ -695,7 +696,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
                 return 0xc0000417U;
             }
         }else {
-            const auto path=symbol.starts_with("_w")?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(first)})):read_ansi(memory,arg(first));
+            const auto path=symbol.starts_with("_w")?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(first)})):ansi_to_utf8(read_ansi(memory,arg(first)));
             CrtFile file;file.readable=(flags_value&3)!=1;file.writable=(flags_value&3)!=0;file.append=(flags_value&8)!=0;file.text=!(translation&0x8000);
             file.lowio_extended=crt_lowio::with_mode(file.lowio_extended,translation&0x70000U);
             file.noinherit=(flags_value&0x80)!=0;
@@ -731,8 +732,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
             }
         }
         if(!arg(first) || (!cpp && !arg(first+1))){error(22,secure?22:0);if(current_invalid_parameter_handler()){start_callbacks(state,memory,{{current_invalid_parameter_handler(),{0,0,0,0,0}}},Continuation::Return,result);return std::nullopt;}arg.return_to(state,result);return {};}
-        const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(first)})):read_ansi(memory,arg(first));
-        const auto mode=cpp?cpp_mode:wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(first+1)},32)):read_ansi(memory,arg(first+1),32);
+        const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(first)})):ansi_to_utf8(read_ansi(memory,arg(first)));
+        const auto mode=cpp?cpp_mode:wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(first+1)},32)):ansi_to_utf8(read_ansi(memory,arg(first+1),32));
         const auto share=secure?0x10U:(cpp || symbol.ends_with("fsopen"))?u32(2):0x40U;
         const auto parsed=crt_lowio::stream_mode(mode);
         if(!parsed || (share!=0x10 && share!=0x20 && share!=0x30 && share!=0x40))error(22,0);

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "webbrowser_abi.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
@@ -230,7 +231,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole(GuestState& state,Guest
         const auto parsed=[&](std::uint32_t status){return done(shell_parse?static_cast<std::uint32_t>(status==0):status);};
         const bool rpc=name.starts_with("Uuid");if(!arg(1))return parsed(rpc?87:e_invalidarg);memory.check(GuestAddress{arg(1)},16,Access::Write);
         if(!arg(0)){if(name=="CLSIDFromProgID")return parsed(e_invalidarg);memory.write(GuestAddress{arg(1)},OleGuid{});return parsed(0);}
-        auto text=name=="GUIDFromStringA"?utf8_to_utf16_lossy(read_ansi(memory,arg(0))):name=="UuidFromStringA"?utf8_to_utf16(read_ansi(memory,arg(0))):read_utf16(memory,GuestAddress{arg(0)});auto value=name=="CLSIDFromProgID"?std::optional<OleGuid>{}:parse_windows_guid(text,!rpc);
+        auto text=name=="GUIDFromStringA"?ansi_to_utf16_lossy(read_ansi(memory,arg(0))):name=="UuidFromStringA"?ansi_to_utf16(read_ansi(memory,arg(0))):read_utf16(memory,GuestAddress{arg(0)});auto value=name=="CLSIDFromProgID"?std::optional<OleGuid>{}:parse_windows_guid(text,!rpc);
         if(!value && (name=="CLSIDFromProgID" || (clsid_string && !text.empty() && text.front()!=u'{'))){
             if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
             RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return parsed(0x80040150U);

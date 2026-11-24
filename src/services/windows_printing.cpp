@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/native_pdf.hpp"
 #include "x64arm/windows_printing.hpp"
@@ -218,7 +219,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_printing(GuestState& state,
             const unsigned unit=x86_?4:8,size=x86_?20:40;
             if(info){memory.check(GuestAddress{info},size,Access::Read);if(memory.load(GuestAddress{info},32)!=size)return failure(87);}
             const auto pointer=[&](unsigned field){return info?memory.load(GuestAddress{info+field*unit},static_cast<std::uint8_t>(unit*8)):0;};
-            const auto read=[&](std::uint64_t address){return address?(name.ends_with('W')?read_utf16(memory,GuestAddress{address}):utf8_to_utf16(read_ansi(memory,address))):std::u16string{};};
+            const auto read=[&](std::uint64_t address){return address?(name.ends_with('W')?read_utf16(memory,GuestAddress{address}):ansi_to_utf16(read_ansi(memory,address))):std::u16string{};};
             const auto type=read(pointer(3));if((!type.empty() && type!=u"RAW" && type!=u"EMF") || (info && memory.load(GuestAddress{info+4*unit},32)))return failure(50);
             std::u16string title=legacy?std::u16string{}:read(pointer(1));
             if(legacy){
@@ -283,7 +284,7 @@ struct PrinterBuffer {
     PrinterBuffer(unsigned size,std::uint64_t address,bool x86,bool unicode):bytes(size),base(address),unit(x86?4:8),wide(unicode){}
     void put(std::size_t offset,std::uint64_t value,unsigned size=4){for(unsigned i=0;i<size;++i)bytes.at(offset+i)=static_cast<std::uint8_t>(value>>(i*8));}
     void data(unsigned field,std::span<const std::uint8_t> value){while(bytes.size()%unit)bytes.push_back(0);const auto offset=bytes.size();bytes.insert(bytes.end(),value.begin(),value.end());put(field,base+offset,unit);}
-    void text(unsigned field,std::u16string_view value){std::vector<std::uint8_t> encoded;if(wide){for(const auto c:value){encoded.push_back(static_cast<std::uint8_t>(c));encoded.push_back(static_cast<std::uint8_t>(c>>8));}encoded.push_back(0);encoded.push_back(0);}else{const auto narrow=utf16_to_utf8(value);encoded.assign(narrow.begin(),narrow.end());encoded.push_back(0);}data(field,encoded);}
+    void text(unsigned field,std::u16string_view value){std::vector<std::uint8_t> encoded;if(wide){for(const auto c:value){encoded.push_back(static_cast<std::uint8_t>(c));encoded.push_back(static_cast<std::uint8_t>(c>>8));}encoded.push_back(0);encoded.push_back(0);}else{const auto narrow=utf16_to_ansi(value);encoded.assign(narrow.begin(),narrow.end());encoded.push_back(0);}data(field,encoded);}
 };
 }
 std::vector<std::uint8_t> printer_devmode(bool wide,const PrinterSettings& device){
@@ -321,7 +322,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
     const auto d=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto fail=[&](unsigned error){last_error_=error;return finish(name.starts_with("DocumentProperties") || name.starts_with("DeviceCapabilities")?UINT32_MAX:name=="FindFirstPrinterChangeNotification"?(x86_?UINT32_MAX:UINT64_MAX):0);};
-    const auto string=[&](std::uint64_t at){return at?(wide?read_utf16(memory,GuestAddress{at}):utf8_to_utf16(read_ansi(memory,at))):std::u16string{};};
+    const auto string=[&](std::uint64_t at){return at?(wide?read_utf16(memory,GuestAddress{at}):ansi_to_utf16(read_ansi(memory,at))):std::u16string{};};
     const auto datatype=[&](std::u16string value){for(auto& c:value)if(c>=u'a' && c<=u'z')c-=32;return value;};
     const auto printer_name=[&](std::uint64_t at){auto value=string(at);for(auto& c:value)if(c>=u'A' && c<=u'Z')c+=32;return value==u"win64 pdf";};
     const bool available=native_gui_ && runtime_.network.external_io;
@@ -557,7 +558,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_printer_data(GuestState& st
         struct Release {WindowsServices& self;GuestMemory& m;GuestState& s;std::vector<std::uint64_t>& blocks;~Release(){for(const auto block:blocks)(void)self.free_heap(m,block,s);}} release{*this,m,s,blocks};
         const auto scratch=[&](std::size_t size)->std::uint64_t{const auto block=allocate_heap(m,std::max<std::size_t>(size,1));if(!block)throw std::bad_alloc{};m.fill(GuestAddress{block},0,std::max<std::size_t>(size,1));blocks.push_back(block);return block;};
         const auto put_text=[&](std::u16string_view text){const auto bytes=utf16_bytes(text);const auto block=scratch(bytes.size());m.write(GuestAddress{block},bytes);return block;};
-        const auto string=[&](std::uint64_t at){return at?(wide?read_utf16(m,GuestAddress{at}):utf8_to_utf16(read_ansi(m,at))):std::u16string{};};
+        const auto string=[&](std::uint64_t at){return at?(wide?read_utf16(m,GuestAddress{at}):ansi_to_utf16(read_ansi(m,at))):std::u16string{};};
         const auto api=[&](std::string_view symbol,std::vector<std::uint64_t> arguments)->service_callback::Task<std::uint32_t>{
             co_return static_cast<std::uint32_t>(co_await service_callback::call_value(resolve("advapi32.dll",symbol).value,std::move(arguments)));};
         const auto handle=printing_?printing_->handles.find(call(0)):decltype(printing_->handles.end()){};

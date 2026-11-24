@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include <set>
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
@@ -467,7 +468,8 @@ std::optional<CrtLocaleCategory> windows_crt_locale(std::u16string_view input){
     std::u16string language(input);std::optional<std::uint32_t> page;
     if(const auto dot=language.rfind(u'.');dot!=language.npos){
         const auto suffix=key(language.substr(dot+1));language.resize(dot);
-        if(suffix==u"utf-8" || suffix==u"utf8" || suffix==u"acp" || suffix==u"ocp")page=65001;
+        if(suffix==u"utf-8" || suffix==u"utf8")page=65001;
+        else if(suffix==u"acp" || suffix==u"ocp")page=process_ansi_codepage();
         else {
             if(suffix.empty())return {};std::uint32_t number=0;
             for(const auto c:suffix){if(c<u'0' || c>u'9' || number>UINT32_MAX/10U || number*10U>UINT32_MAX-(c-u'0'))return {};number=number*10U+c-u'0';}
@@ -1253,7 +1255,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             const bool wide=name=="_wsetlocale";
             if(arg(1)){
                 std::u16string text;
-                try{text=wide?read_utf16(memory,GuestAddress{arg(1)},4095):utf8_to_utf16(read_ansi(memory,arg(1),4095));}
+                try{text=wide?read_utf16(memory,GuestAddress{arg(1)},4095):ansi_to_utf16(read_ansi(memory,arg(1),4095));}
                 catch(const std::invalid_argument&){return returned(0);}
                 auto replacement=current;replacement.storage=0;
                 // 無效 locale 字串只回傳 NULL；只有 category 的參數錯誤改 errno。
@@ -1280,7 +1282,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             std::u16string result;bool equal=true;for(unsigned i=2;i<6;++i)equal&=categories[i]==categories[1];
             if(category || equal)result=label(categories[category?category:1]);
             else {static constexpr std::u16string_view names[]{u"",u"LC_COLLATE",u"LC_CTYPE",u"LC_MONETARY",u"LC_NUMERIC",u"LC_TIME"};for(unsigned i=1;i<6;++i){if(i>1)result+=u';';result+=names[i];result+=u'=';result+=label(categories[i]);}}
-            const auto narrow=utf16_to_utf8(result);const auto bytes=utf16_bytes(result);if(narrow.size()+1>4096 || bytes.size()>4096-256)return error(22);
+            const auto narrow=utf16_to_ansi(result);const auto bytes=utf16_bytes(result);if(narrow.size()+1>4096 || bytes.size()>4096-256)return error(22);
             memory.write(GuestAddress{query},{reinterpret_cast<const std::uint8_t*>(narrow.data()),narrow.size()});memory.store(GuestAddress{query+narrow.size()},8,0);memory.write(GuestAddress{query+4096},bytes);return returned(query+(wide?4096:0));
         }
         if(name=="_free_locale" || name=="__free_locale"){
@@ -1301,7 +1303,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
                 if(current){original=current_crt_locale(state,memory);object.categories=original->categories;}object.legacy=name.starts_with("__x64arm_");
                 if(!current){
                     const bool wide=name.find("wcreate")!=name.npos;
-                    const auto text=wide?read_utf16(memory,GuestAddress{arg(1)},255):utf8_to_utf16(read_ansi(memory,arg(1),255));
+                    const auto text=wide?read_utf16(memory,GuestAddress{arg(1)},255):ansi_to_utf16(read_ansi(memory,arg(1),255));
                     const auto locale=windows_crt_locale(text);if(!locale)return error(22);
                     for(unsigned i=1;i<6;++i)if(!category || category==i)object.categories[i]=*locale;
                 }
@@ -1312,7 +1314,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         }
         if(name=="_setmbcp"){
             const auto requested=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(0)));
-            const auto page=requested==-4?current_crt_locale(state,memory).categories[2].codepage:requested==-3 || requested==-2?65001U:static_cast<std::uint32_t>(requested);
+            const auto page=requested==-4?current_crt_locale(state,memory).categories[2].codepage:requested==-3 || requested==-2?process_ansi_codepage():static_cast<std::uint32_t>(requested);
             const auto settings=windows_crt_codepage(page);if(!settings)return error(22,UINT32_MAX);
             const auto address=crt_mbc_address(memory,current_crt_locale(state,memory),x86_);
             crt_mbc_assign(memory,address,*settings);

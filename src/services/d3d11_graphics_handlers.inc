@@ -1198,7 +1198,7 @@
                 std::string source_name="shader";
                 std::vector<std::uint8_t> source;
                 if(file){
-                    source_name=symbol.ends_with('W') || compile_file?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+                    source_name=symbol.ends_with('W') || compile_file?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
                     const auto opened=filesystem_.open_reader(source_name);
                     if(opened.error)throw texture_image::Error(0x80070000U|opened.error,"無法讀取 shader 檔案");
                     const auto info=opened.file->information();
@@ -1211,7 +1211,7 @@
                     if(!found)throw texture_image::Error(0x80070716U,"找不到 shader RCDATA 資源");
                     const auto size=memory.load(GuestAddress{found+4},32);require(size>0 && size<=16*1024*1024);
                     source=read_bytes(memory,resource_image(found,true)->base+memory.load(GuestAddress{found},32),size);
-                    if(arg(2))source_name=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(2)})):read_ansi(memory,arg(2));
+                    if(arg(2))source_name=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(2)})):ansi_to_utf8(read_ansi(memory,arg(2)));
                 }else{
                     require(arg(1)>0 && arg(1)<=16*1024*1024);source=read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1)));
                     if(arg(2))source_name=read_ansi(memory,arg(2));

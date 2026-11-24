@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "service_callback_task.hpp"
 #include "windows_msi_state.hpp"
 #include <algorithm>
@@ -171,7 +172,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msi_query(GuestState& state
     };
     const auto write_guid=[&](const std::u16string& packed,std::uint64_t out)->bool{
         const auto guid=unpacked_guid(packed);if(!guid)return false;
-        if(wide)memory.write(GuestAddress{out},utf16_bytes(*guid));else{auto narrow=utf16_to_utf8(*guid);std::vector<std::uint8_t> bytes(narrow.begin(),narrow.end());bytes.push_back(0);memory.write(GuestAddress{out},bytes);}
+        if(wide)memory.write(GuestAddress{out},utf16_bytes(*guid));else{auto narrow=utf16_to_ansi(*guid);std::vector<std::uint8_t> bytes(narrow.begin(),narrow.end());bytes.push_back(0);memory.write(GuestAddress{out},bytes);}
         return true;
     };
     try{
@@ -234,7 +235,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msi_query(GuestState& state
             if(!owner_product)return done(static_cast<std::uint32_t>(-1));
             const auto product_text=*unpacked_guid(*owner_product);
             auto product_bytes=wide?utf16_bytes(product_text):std::vector<std::uint8_t>{};
-            if(!wide){const auto narrow=utf16_to_utf8(product_text);product_bytes.assign(narrow.begin(),narrow.end());product_bytes.push_back(0);}
+            if(!wide){const auto narrow=utf16_to_ansi(product_text);product_bytes.assign(narrow.begin(),narrow.end());product_bytes.push_back(0);}
             const auto target=resolve("msi.dll",wide?"MsiGetComponentPathW":"MsiGetComponentPathA").value;
             const auto component_at=args(0),buffer=args(1),count=args(2);
             return nested_continuation(state,memory,"MsiLocateComponent",

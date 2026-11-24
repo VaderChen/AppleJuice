@@ -9,7 +9,7 @@
                 require(size<=512U*1024U*1024U);bytes=read(arg(index),static_cast<std::size_t>(size));
             }else{
                 require(arg(index));
-                const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(index)})):read_ansi(memory,arg(index));
+                const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(index)})):ansi_to_utf8(read_ansi(memory,arg(index)));
                 const auto opened=filesystem_.open_reader(d3dx_path(path));
                 if(opened.error && std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3dx9 texture] open error=%u path=%s\n",opened.error,path.c_str());
                 require(!opened.error,0x80070000U|opened.error);const auto meta=opened.file->information();

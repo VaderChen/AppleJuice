@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "system_object_identity.hpp"
 #include "x64arm/windows_services.hpp"
 #include "windows_forced_thread_stop.hpp"
@@ -799,7 +800,7 @@ void WindowsServices::configure_native_startup(GuestMemory& memory,const NativeP
     for(unsigned i=4;i<=5;++i){
         const auto index=i==5?0U:1U;
         runtime_.native_startup_text[index]=memory.load(GuestAddress{parameters+layout.strings[i]+layout.unit},bits);
-        const auto ansi=utf16_to_utf8(text(native.strings[i]));std::vector<std::uint8_t> bytes(ansi.begin(),ansi.end());bytes.push_back(0);
+        const auto ansi=utf16_to_ansi(text(native.strings[i]));std::vector<std::uint8_t> bytes(ansi.begin(),ansi.end());bytes.push_back(0);
         runtime_.native_startup_text[index+2]=runtime_allocate(memory,bytes);
     }
     runtime_.startup_reserved2=native.strings[7];runtime_.startup_reserved2_pointer_bytes=layout.unit;
@@ -2416,7 +2417,7 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
     const auto text = [&](std::uint64_t pointer) {
         return !pointer ? std::u16string{}
                : wide   ? read_utf16(memory, GuestAddress{pointer})
-                        : utf8_to_utf16(read_ansi(memory, pointer));
+                        : ansi_to_utf16(read_ansi(memory, pointer));
     };
     const auto application = text(arg(0));
     auto command = text(arg(1));
@@ -2748,7 +2749,7 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
                     // 其他宿主選項照常承襲，避免改變共用效能／圖形設定。
                     std::vector<char *> environment;
                     const auto presentation=detail::child_presentation_options(host);
-                    std::array<std::string,4> presentation_environment;
+                    std::array<std::string,5> presentation_environment;
                     if(presentation)presentation_environment=presentation->environment();
                     for (auto item = environ; item && *item; ++item) {
                         const std::string_view value(*item);
@@ -2758,15 +2759,15 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
                             continue;
                         if(presentation && (value.starts_with("X64ARM_AUDIO_ENVIRONMENT=") ||
                             value.starts_with("X64ARM_PRESENT_UPSCALE=") || value.starts_with("X64ARM_PRESENT_INTERPOLATION=") ||
-                            value.starts_with("X64ARM_PRESENTATION_PROFILE=")))continue;
+                            value.starts_with("X64ARM_METAL_HUD=") || value.starts_with("X64ARM_PRESENTATION_PROFILE=")))continue;
                         environment.push_back(*item);
                     }
                     if(presentation){
                         for(auto& value:presentation_environment)environment.push_back(value.data());
                         if(std::getenv("X64ARM_TRACE_PROCESS_PROTOCOL"))
-                            std::fprintf(stderr,"child_presentation_options spatial=%u upscale=%u interpolation=%u profile=%s\n",
+                            std::fprintf(stderr,"child_presentation_options spatial=%u upscale=%u interpolation=%u hud=%u profile=%s\n",
                                 static_cast<unsigned>(presentation->spatial),presentation->upscale,
-                                static_cast<unsigned>(presentation->interpolation),presentation->profile.c_str());
+                                static_cast<unsigned>(presentation->interpolation),static_cast<unsigned>(presentation->hud),presentation->profile.c_str());
                     }
                     // 測試可為每個子程序明確提供獨立腳本；不重播父程序的控制通道。
                     std::vector<std::string> automation_environment;

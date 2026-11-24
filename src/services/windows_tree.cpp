@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_gui_abi.hpp"
 #include "x64arm/unicode.hpp"
@@ -86,7 +87,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_tree(GuestState& state,
             const auto at=operation.buffer+abi.notify_size;const auto returned=static_cast<std::uint32_t>(memory.load(GuestAddress{at},32));const bool retain=(returned&0x1000U)!=0;
             if((request.mask&1U) && item->callback_subitems.contains(0)){
                 const auto pointer=memory.load(GuestAddress{at+abi.tree_text},abi.bits);
-                item->text=pointer?(window.list_unicode?read_utf16(memory,GuestAddress{pointer},65535):utf8_to_utf16_lossy(read_ansi(memory,pointer,65535))):std::u16string{};
+                item->text=pointer?(window.list_unicode?read_utf16(memory,GuestAddress{pointer},65535):ansi_to_utf16_lossy(read_ansi(memory,pointer,65535))):std::u16string{};
                 item->resolved_subitems.insert(0);if(retain)item->callback_subitems.erase(0);
             }
             for(const auto [bit,offset,original,slot]:std::array<std::tuple<unsigned,unsigned,std::int32_t*,unsigned>,3>{{

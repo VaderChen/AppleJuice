@@ -77,7 +77,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_dib_transfer(GuestState& st
         if(get || set){
             const auto found=gui_.bitmaps.find(arg(1));if(found==gui_.bitmaps.end())throw DibError{6};auto& bitmap=found->second;
             if(get && !gui_.contexts.contains(arg(0)) && !gui_.dc_objects.contains(arg(0)))throw DibError{6};
-            if(std::any_of(gui_.contexts.begin(),gui_.contexts.end(),[&](const auto& item){return item.second.bitmap==arg(1);}))throw DibError{87};
+            // SetDIBits 仍要求點陣圖未選入 DC。GetDIBits 的文件也這麼寫，但 Windows 實際上照常讀回（舊程式常在點陣圖選入記憶體 DC、
+            // 畫完文字後直接 GetDIBits 取回圖層；三國志 VIII 的動態文字因此全部空白），讀取不設此限。
+            if(set && std::any_of(gui_.contexts.begin(),gui_.contexts.end(),[&](const auto& item){return item.second.bitmap==arg(1);}))throw DibError{87};
             if(!arg(5) || d(6)>1)throw DibError{87};if(d(6))throw DibError{50};
             const auto header=memory.load(GuestAddress{arg(5)},32);const bool core=header==12;
             if(get && !arg(4) && (header==12 || header==40 || header==108 || header==124) && !memory.load(GuestAddress{arg(5)+(core?10:14)},16)){

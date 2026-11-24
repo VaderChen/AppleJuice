@@ -505,6 +505,8 @@ struct GuiWindow {
     bool links_initialized{};std::int32_t link_pressed{-1};
     std::vector<GuiDraw> drawing;
     bool visible{}, invalid{true}, destroying{}, initial_size_pending{};
+    // CreateWindowEx 帶 WS_VISIBLE：建立期間（WM_NCCREATE～WM_SIZE／WM_MOVE）樣式不含 WS_VISIBLE，之後才顯示，與 Windows 相同。
+    bool show_after_create{};
     // ShowOwnedPopups(FALSE) 經 WM_SHOWWINDOW 隱藏的擁有者彈出視窗，等待 SW_PARENTOPENING 恢復。
     bool owned_popup_hidden{};
     bool paint_frame{},paint_erase{},internal_paint{};
@@ -549,6 +551,7 @@ struct GuiWindow {
     std::optional<GuiCalendar> calendar;
     std::uint64_t list_header{},header_list{};
     std::uint32_t list_extended_style{},list_callback_mask{};
+    std::uint32_t list_background{0xffffffU}; // LVM_SETBKCOLOR；0xffffffff（CLR_NONE）表示不清除、露出父視窗。
     std::array<std::uint64_t,3> list_image_lists{};
     std::vector<GuiIcon> list_icons{};
     bool list_unicode{true};
@@ -1565,6 +1568,9 @@ public:
     virtual bool webview_create(std::uint64_t,std::uint64_t) {return false;}
     virtual void webview_destroy(std::uint64_t) {}
     virtual std::optional<std::array<std::int32_t,2>> list_hit_test(std::uint64_t,std::int32_t,std::int32_t){return {};}
+    // 自繪清單（LVS_OWNERDRAWFIXED）：目前可見的列範圍［first,last），以及指定列在控制項客戶區的矩形（左、上、右、下）。
+    virtual std::optional<std::array<std::int32_t,2>> list_visible_rows(std::uint64_t){return {};}
+    virtual std::optional<std::array<std::int32_t,4>> list_row_rect(std::uint64_t,std::int32_t){return {};}
     virtual bool webview_loading(std::uint64_t) {return false;}
     virtual void webview_visible(std::uint64_t,bool) {}
     virtual void webview_bounds(std::uint64_t,const std::array<std::int32_t,4>&) {}
@@ -1581,7 +1587,17 @@ public:
 };
 GuiFont gui_font(const GuiState&,std::uint64_t font_handle);
 // 字型字元集對應的 ANSI 碼頁（windows_fonts.cpp）；SYMBOL_CHARSET 回 0，代表位元組直接對應字碼。
+// Windows NT 的 user32 對高 16 位元為 0 的 HWND 只以低 16 位元（handle 表索引）比對：舊程式以 WORD 保存或傳遞
+// （例如 MCI 的 dwCallback）的 HWND 仍指向原視窗。本引擎的視窗 handle 從 0x10000 起算，≤0xFFFF 的值不會是真實視窗；
+// 找不到完全相符的視窗時，以低 16 位元唯一相符的現存視窗代替（HWND_BROADCAST 0xFFFF 除外）。
+std::uint64_t gui_expand_short_window(const struct GuiState& gui,std::uint64_t handle);
+// CreateWindowEx 的 WS_VISIBLE 延到 WM_SIZE／WM_MOVE 之後（預設開啟；X64ARM_CREATE_SHOW_LATE=0 關閉，供對照）。
+inline bool gui_create_show_late(){static const bool enabled=[]{const char* value=std::getenv("X64ARM_CREATE_SHOW_LATE");return !value || value[0]!='0';}();return enabled;}
 std::uint32_t gdi_charset_code_page(std::uint8_t charset);
+// GDI 的 A 版文字（TextOutA、ExtTextOutA 等）：程序 ACP 為 UTF-8 時以 UTF-8 解碼；否則依 DC 字型字元集的碼頁
+// （DEFAULT／OEM 為程序 ACP，SYMBOL 逐位元組對應）解碼。sizes 回傳每個 UTF-16 單位對應的來源位元組數（代理字元對的第二單位為 0）。
+std::u16string gdi_decode_ansi_text(std::string_view bytes,std::uint8_t charset,std::vector<std::uint8_t>* sizes=nullptr);
+std::uint32_t gdi_narrow_character(std::uint32_t code,std::uint8_t charset);
 GuiFontMetrics fallback_font_metrics(const GuiFont&);
 std::shared_ptr<NativeGui> make_native_gui(const std::filesystem::path& snapshot);
 }

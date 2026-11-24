@@ -17,7 +17,7 @@ bool WindowsServices::invoke_remote_gui_message(GuestState& state,GuestMemory& m
     const bool post=symbol=="PostMessageA" || symbol=="PostMessageW";
     if(!post && symbol!="SendMessageA" && symbol!="SendMessageW")return false;
     const WindowsCall call(state,memory,service);
-    const GuiMessage message{call(0),call(2),call(3),static_cast<std::uint32_t>(call(1))};
+    const GuiMessage message{gui_expand_short_window(gui_,call(0)),call(2),call(3),static_cast<std::uint32_t>(call(1))};
     const auto pending=std::find_if(gui_.sent_messages.begin(),gui_.sent_messages.end(),[&](const auto& item){
         const auto& request=item.second;
         return request.remote_sequence && !request.remote_server && request.sender==threads_.current &&

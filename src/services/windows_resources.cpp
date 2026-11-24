@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "gui_window_menu.hpp"
 #include "windows_input_layout.hpp"
 #include "windows_display_identity.hpp"
@@ -355,7 +356,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
     const auto copy_text=[&](std::uint64_t pointer,std::uint32_t capacity,std::u16string_view text){
         if(!capacity)return UINT64_C(0);
         if(wide){const auto count=std::min<std::size_t>(capacity-1,text.size());memory.write(GuestAddress{pointer},utf16_bytes(text.substr(0,count)));return static_cast<std::uint64_t>(count);}
-        const auto ansi=utf16_to_utf8(text);const auto count=std::min<std::size_t>(capacity-1,ansi.size());std::vector<std::uint8_t> bytes(ansi.begin(),ansi.begin()+static_cast<std::ptrdiff_t>(count));bytes.push_back(0);memory.write(GuestAddress{pointer},bytes);return static_cast<std::uint64_t>(count);
+        const auto ansi=utf16_to_ansi(text);const auto count=std::min<std::size_t>(capacity-1,ansi.size());std::vector<std::uint8_t> bytes(ansi.begin(),ansi.begin()+static_cast<std::ptrdiff_t>(count));bytes.push_back(0);memory.write(GuestAddress{pointer},bytes);return static_cast<std::uint64_t>(count);
     };
     const auto publish_display_mode=[&](const DisplayMode& previous,const DisplayMode& selected){
         gui_.display_mode=selected;
@@ -673,7 +674,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
             if(image && (d(2)!=0 || (d(5)&~0xa050U))){fail(50);return {};}
             if(image && (d(5)&0x10U)){
                 if(arg(0) || arg(1)<=65535){fail(87);return {};}
-                const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(1)})):read_ansi(memory,arg(1));
+                const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(1)})):ansi_to_utf8(read_ansi(memory,arg(1)));
                 const auto file=filesystem_.open(path);
                 if(file.error){fail(file.error);return {};}
                 try{return decode_bitmap_file(*file.bytes);}
@@ -807,7 +808,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
         }catch(const MemoryFault&){result=native && operation!="SetDisplayConfig"?0xc0000005U:998U;}
     }
     else if(symbol.starts_with("EnumDisplayDevices")){
-        auto device=native_devices || native_modes?native_device:arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16(read_ansi(memory,arg(0)))):std::u16string{};
+        auto device=native_devices || native_modes?native_device:arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)}):ansi_to_utf16(read_ansi(memory,arg(0)))):std::u16string{};
         for(auto& c:device)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
         const unsigned stride=wide?2:1,size=wide?840:424;
         // lpDevice 為 NULL 時依 iDevNum 列舉各顯示器的轉接輸出 \\.\DISPLAYn；指定裝置時回報其唯一的監視器。
@@ -833,7 +834,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
         const auto native=native_gui_?native_gui_->current_display_mode():std::optional<GuiDisplayMode>{};
         const std::array<std::uint32_t,4> original{native?native->width:1440U,native?native->height:900U,32U,native?(native->refresh_numerator+native->refresh_denominator/2)/native->refresh_denominator:60U};
         auto selected=mode?gui_.display_mode.value_or(original):gui_.display_registry_mode.value_or(original);
-        auto device=native_change?native_device:extended && arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16(read_ansi(memory,arg(0)))):std::u16string{};
+        auto device=native_change?native_device:extended && arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)}):ansi_to_utf16(read_ansi(memory,arg(0)))):std::u16string{};
         for(auto& c:device)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
         if(job_ui_restrictions()&0x10U){last_error_=5;result=static_cast<std::uint32_t>(-1);}
         else if(extended && (arg(2) || arg(4) || (!device.empty() && device!=u"\\\\.\\display1")))result=static_cast<std::uint32_t>(-5);
@@ -860,7 +861,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
         }
     }else if(symbol.starts_with("EnumDisplaySettings")){
         const auto native=native_gui_?native_gui_->current_display_mode():std::optional<GuiDisplayMode>{};
-        auto device=native_devices || native_modes?native_device:arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16(read_ansi(memory,arg(0)))):std::u16string{};
+        auto device=native_devices || native_modes?native_device:arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)}):ansi_to_utf16(read_ansi(memory,arg(0)))):std::u16string{};
         for(auto& c:device)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
         const auto& monitors=gui_monitors();const auto index=device.empty()?1:display_device_index(device);
         const unsigned name_bytes=wide?64:32,total=wide?220:156,pixels=wide?168:104;

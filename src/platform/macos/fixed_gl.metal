@@ -107,10 +107,10 @@ fragment PixelStencil fragment_pixels_stencil(O in [[stage_in]],texture2d<float>
 // D3D9 原始 XYZ 頂點由 GPU 依 world、view、projection 順序轉換。
 struct FixedV {float4 position,color,texcoord,secondary;};
 vertex O fixed_vertex_main(const device FixedV* vertices [[buffer(0)]],constant float4x4* matrices [[buffer(1)]],constant float2& viewport [[buffer(2)]],uint id [[vertex_id]]){
- float4 position=matrices[0]*vertices[id].position;
- position=matrices[1]*position;position=matrices[2]*position;
+ // 視空間 z 供霧化使用（D3D9 的頂點霧以 world×view 後的 z 為距離）。
+ float4 eye=matrices[1]*(matrices[0]*vertices[id].position);float4 position=matrices[2]*eye;
  position.x+=position.w/viewport.x;position.y-=position.w/viewport.y;
  // 沿用既有 D3D9 → GL → Metal 的半像素與深度轉換。
  position.z=2*position.z-position.w;position.z=(position.z+position.w)*0.5;
- O out;out.secondary=vertices[id].secondary;out.position=position;out.color=clamp(vertices[id].color,0.0f,1.0f);out.texcoord=vertices[id].texcoord;out.eyeZ=0;out.point=1;out.stipple=0;return out;
+ O out;out.secondary=vertices[id].secondary;out.position=position;out.color=clamp(vertices[id].color,0.0f,1.0f);out.texcoord=vertices[id].texcoord;out.eyeZ=eye.z;out.point=1;out.stipple=0;return out;
 }

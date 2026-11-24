@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 
 namespace x64arm {
 namespace {
@@ -64,6 +65,17 @@ std::vector<GuestCallback> WindowsServices::activate_gui_window(std::uint64_t ha
     };
     if(previous!=handle){
         const auto old=gui_.windows.find(previous),current=gui_.windows.find(handle);
+        // WM_ACTIVATEAPP：啟用移到另一個執行緒（含程序第一次啟用）時，先通知舊執行緒的頂層視窗停用、
+        // 新執行緒的頂層視窗啟用（lParam 為另一方的執行緒識別碼），再送 WM_NCACTIVATE／WM_ACTIVATE。
+        // 依此設定「程式在前景」旗標的遊戲，沒有它會停在 WaitMessage 不更新畫面。
+        const auto old_thread=old!=gui_.windows.end()?std::optional<std::uint64_t>{old->second.thread}:std::nullopt;
+        const auto new_thread=current!=gui_.windows.end()?std::optional<std::uint64_t>{current->second.thread}:std::nullopt;
+        if(old_thread!=new_thread){
+            const auto old_id=old_thread?thread_identifier(*old_thread):0U,new_id=new_thread?thread_identifier(*new_thread):0U;
+            const auto targets=gui_broadcast_targets();
+            if(old_thread)for(const auto target:targets)if(gui_.windows.at(target).thread==*old_thread)notify(target,0x1c,0,new_id);
+            if(new_thread)for(const auto target:targets)if(gui_.windows.at(target).thread==*new_thread)notify(target,0x1c,1,old_id);
+        }
         notify(previous,0x86,0,handle);
         notify(previous,6,old!=gui_.windows.end() && old->second.show_command==2?0x10000U:0U,handle);
         notify(handle,0x86,1,previous);

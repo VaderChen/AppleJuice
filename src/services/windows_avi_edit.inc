@@ -62,7 +62,7 @@
                         if(!wide){std::array<std::uint8_t,76> fields;m.read(GuestAddress{data},fields);m.write(GuestAddress{tmp},fields);}
                     }
                     if(rename || !wide){
-                        const auto text=wide?read_utf16(m,GuestAddress{data}):utf8_to_utf16_lossy(read_ansi(m,data+(rename?0:76),rename?32767:64));
+                        const auto text=wide?read_utf16(m,GuestAddress{data}):ansi_to_utf16_lossy(read_ansi(m,data+(rename?0:76),rename?32767:64));
                         m.fill(GuestAddress{tmp+76},0,128);
                         m.write(GuestAddress{tmp+76},utf16_bytes(text.substr(0,63)));data=tmp;
                     }else size=args(2);

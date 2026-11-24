@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
@@ -231,7 +232,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dde(GuestState& state,Guest
             const auto codepage=u32(2);const bool wide=symbol.ends_with('W');
             if(codepage && codepage!=1200 && codepage!=1004)return fail(dml_invalid);
             const bool unicode=codepage==1200 || (!codepage && wide);
-            auto text=unicode?read_utf16(memory,GuestAddress{arg(1)},256):utf8_to_utf16_lossy(read_ansi(memory,arg(1),512));
+            auto text=unicode?read_utf16(memory,GuestAddress{arg(1)},256):ansi_to_utf16_lossy(read_ansi(memory,arg(1),512));
             if(text.size()>255)return fail(dml_invalid);
             const auto key=fold(text);
             if(const auto found=dde.atoms.find(key);found!=dde.atoms.end()){++dde.strings.at(found->second).references;result=found->second;return finish();}

@@ -8,7 +8,7 @@
             const auto guest_text=[&](const std::u16string& value){const auto at=scratch.text(value);if(!at)throw std::bad_alloc{};return at;};
             const auto block=[&](std::size_t size){const auto at=scratch.allocate(size);if(!at)throw std::bad_alloc{};memory.fill(GuestAddress{at},0,size);return at;};
             const auto wide_arg=[&](unsigned index){return arg(index)?read_utf16(memory,GuestAddress{arg(index)},32768):std::u16string{};};
-            const auto ansi_arg=[&](unsigned index){return arg(index)?utf8_to_utf16_lossy(read_ansi(memory,arg(index),32768)):std::u16string{};};
+            const auto ansi_arg=[&](unsigned index){return arg(index)?ansi_to_utf16_lossy(read_ansi(memory,arg(index),32768)):std::u16string{};};
             const auto error_code=[&](std::uint32_t error)->std::optional<std::uint32_t>{last_error_=error;return finish(error);};
             const auto current_process=invalid_handle;
             // 目前程序權杖（TOKEN_QUERY 8、TOKEN_ADJUST_PRIVILEGES 0x20）。
@@ -118,7 +118,7 @@
                     const auto catalog_info=block(524);memory.store(GuestAddress{catalog_info},32,524);
                     if(call_host("wintrust.dll","CryptCATCatalogInfoFromContext",{info,catalog_info,0})){
                         const auto path=read_utf16(memory,GuestAddress{catalog_info+4},260);auto bytes=narrow?std::vector<std::uint8_t>{}:utf16_bytes(path);
-                        if(narrow){const auto ansi=utf16_to_utf8(path);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
+                        if(narrow){const auto ansi=utf16_to_ansi(path);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
                         if(bytes.size()>260U*(narrow?1U:2U))error=122;else{memory.check(GuestAddress{arg(2)},bytes.size(),Access::Write);memory.write(GuestAddress{arg(2)},bytes);}
                     }else error=last_error_;
                 }

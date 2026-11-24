@@ -43,7 +43,7 @@
             const bool preprocess=symbol.starts_with("D3DXPreprocessShader");const unsigned out_at=(preprocess?3:4)+shift,errors_at=out_at+1;
             output(out_at);if(arg(errors_at))output(errors_at);require(!arg(2+shift),unavailable);
             const auto load_source=[&](const std::string& path){const auto opened=filesystem_.open_reader(d3dx_path(path));require(!opened.error,0x80070000U|opened.error);const auto info=opened.file->information();require(!info.error && info.metadata.size<=16U*1024U*1024U);std::vector<std::uint8_t> data(info.metadata.size);const auto io=opened.file->read(data,0);require(!io.error && io.bytes==data.size());return data;};
-            const auto name=file?(symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0))):std::string{"memory"};
+            const auto name=file?(symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)))):std::string{"memory"};
             // FromResource 與記憶體版本同形（模組＋資源名稱取代資料指標＋長度）。
             auto source=file?load_source(name):symbol.find("FromResource")!=symbol.npos?d3dx_resource_bytes(arg(0),arg(1),10,symbol.ends_with('W')):read(arg(0),u(1));
             std::vector<std::pair<std::string,std::string>> macros;if(arg(1+shift))for(unsigned i=0;i<1024;++i){const auto at=arg(1+shift)+i*ps*2;const auto key=memory.load(GuestAddress{at},pb);if(!key)break;require(i<1023);const auto value=memory.load(GuestAddress{at+ps},pb);macros.emplace_back(read_ansi(memory,key),value?read_ansi(memory,value):std::string{});}
@@ -82,7 +82,7 @@
             shader_handled=true;mesh_handled=true;const bool file=symbol.find("FromFile")!=symbol.npos;const unsigned shift=file?0:1;output(6+shift);if(arg(7+shift))output(7+shift);if(arg(8+shift))output(8+shift);
             require(arg(3+shift) && arg(4+shift));require(!arg(2+shift),unavailable);
             const auto load_source=[&](const std::string& path){const auto opened=filesystem_.open_reader(d3dx_path(path));require(!opened.error,0x80070000U|opened.error);const auto info=opened.file->information();require(!info.error && info.metadata.size<=16U*1024U*1024U);std::vector<std::uint8_t> data(info.metadata.size);const auto io=opened.file->read(data,0);require(!io.error && io.bytes==data.size());return data;};
-            const auto name=file?(symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0))):std::string{"memory"};
+            const auto name=file?(symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)))):std::string{"memory"};
             // FromResource 與記憶體版本同形（模組＋資源名稱取代資料指標＋長度）。
             auto source=file?load_source(name):symbol.find("FromResource")!=symbol.npos?d3dx_resource_bytes(arg(0),arg(1),10,symbol.ends_with('W')):read(arg(0),u(1));
             std::vector<std::pair<std::string,std::string>> macros;if(arg(1+shift))for(unsigned i=0;i<1024;++i){const auto at=arg(1+shift)+i*ps*2;const auto key=memory.load(GuestAddress{at},pb);if(!key)break;require(i<1023);const auto value=memory.load(GuestAddress{at+ps},pb);macros.emplace_back(read_ansi(memory,key),value?read_ansi(memory,value):std::string{});}

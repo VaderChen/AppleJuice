@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_geometry.hpp"
@@ -18,7 +19,7 @@ std::int32_t coordinate(std::int64_t value){
     return static_cast<std::int32_t>(value);
 }
 struct InputText {std::u16string text;std::vector<std::size_t> source_end;std::size_t units{};};
-InputText read_text(GuestMemory& memory,std::uint64_t address,int count,bool wide){
+InputText read_text(GuestMemory& memory,std::uint64_t address,int count,bool wide,std::uint8_t charset){
     InputText result;std::string bytes;bool terminated=count>=0;
     for(unsigned i=0;i<(count<0?65536U:static_cast<unsigned>(count));++i){
         const auto c=memory.load(GuestAddress{address+std::uint64_t{i}*(wide?2:1)},wide?16:8);
@@ -29,6 +30,12 @@ InputText read_text(GuestMemory& memory,std::uint64_t address,int count,bool wid
     if(!terminated)throw HostCallFault("GDI 文字缺少結尾 NUL 或超過 65536 個單位");
     if(wide)return result;
     result.units=bytes.size();
+    // DBCS 的 ACP：與 ExtTextOutA 相同依字型字元集解碼，保留每個 UTF-16 單位對應的原始 byte 結尾。
+    if(!process_ansi_is_utf8()){
+        std::vector<std::uint8_t> sizes;result.text=gdi_decode_ansi_text(bytes,charset,&sizes);std::size_t at=0;
+        for(const auto size:sizes){at+=size;result.source_end.push_back(at);}
+        return result;
+    }
     // ACP 是 UTF-8；另保留每個 UTF-16 單位對應的原始 byte 結尾，供 uiLengthDrawn 使用。
     for(std::size_t at=0;at<bytes.size();){
         const auto first=static_cast<unsigned char>(bytes[at]);unsigned size=1;std::uint32_t code=first;
@@ -171,7 +178,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_text(GuestState& state,
     const auto font=gui_font(gui_,dc.font),metrics_font=(flags&internal)?gui_font(gui_,0xb00d):font;
     const auto metrics=native_gui_?native_gui_->font_metrics(metrics_font).value_or(fallback_font_metrics(metrics_font)):fallback_font_metrics(metrics_font);
     const Measure measure=[&](std::u16string_view text){if(native_gui_)if(const auto width=native_gui_->text_width(font,std::u16string(text)))return *width;return coordinate(static_cast<std::int64_t>(text.size())*metrics.average_width);};
-    const auto input=read_text(memory,pointer,count,wide);
+    const auto input=read_text(memory,pointer,count,wide,font.charset);
     const bool drawing=!extent && !(flags&calculate);
     if(drawing && !input.text.empty() && !gui_.emf_recorders.contains(arg(0)) && !raster_surface(memory,arg(0)))return finish(0,50);
     const auto emit=[&](GuiDraw draw,const std::optional<GuiRect>& rect){clip_text(draw,dc,rect);if(!raster_draw(memory,arg(0),draw))throw HostCallFault("GDI 文字沒有可用的繪製表面");};
@@ -230,7 +237,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_text(GuestState& state,
     }
     // 先驗證寫回範圍，避免無效 MODIFYSTRING 緩衝區在部分繪製後才失敗。
     std::vector<std::uint8_t> replacement;
-    if(modified!=input.text){if(wide)replacement=utf16_bytes(modified);else{const auto bytes=utf16_to_utf8(modified);replacement.assign(bytes.begin(),bytes.end());replacement.push_back(0);}if(replacement.size()>(input.units+4)*(wide?2U:1U))return finish(0,50);memory.check(GuestAddress{pointer},replacement.size(),Access::Write);}
+    if(modified!=input.text){if(wide)replacement=utf16_bytes(modified);else{const auto bytes=utf16_to_ansi(modified);replacement.assign(bytes.begin(),bytes.end());replacement.push_back(0);}if(replacement.size()>(input.units+4)*(wide?2U:1U))return finish(0,50);memory.check(GuestAddress{pointer},replacement.size(),Access::Write);}
     for(const auto& item:prepared){draw_line(item.value.text,item.x,item.y,item.layout,clipping,flags&prefixonly);
         if(!(flags&(noprefix|hideprefix))){for(const auto& run:item.layout.runs){
             const auto shape=native_gui_?native_shape_text(font,run.text,flags&rtl,true):NativeTextShape{};

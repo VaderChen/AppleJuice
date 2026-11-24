@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "gui_message_contract.hpp"
 #include "shared_window_order.hpp"
 #include "service_callback_task.hpp"
@@ -594,7 +595,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_user(GuestState& sta
         }
         if(name=="GetFileTitleA" || name=="GetFileTitleW"){
             const bool wide=name.ends_with('W');if(!arg(0) || !arg(1))return finish(0xffff);
-            const auto path=wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16_lossy(read_ansi(memory,arg(0),32767));
+            const auto path=wide?read_utf16(memory,GuestAddress{arg(0)}):ansi_to_utf16_lossy(read_ansi(memory,arg(0),32767));
             // 與 comdlg32 相同：萬用字元、空字串或以分隔符結尾皆屬無效名稱，回傳負值。
             if(path.empty() || path.find_first_of(u"*[]")!=std::u16string::npos || path.back()==u'/' || path.back()==u'\\' || path.back()==u':')return finish(0xffff);
             const auto split=path.find_last_of(u"/\\:");const auto title=split==std::u16string::npos?path:path.substr(split+1);

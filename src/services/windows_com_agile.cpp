@@ -52,7 +52,8 @@ void WindowsServices::initialize_guest_com_agile(GuestMemory& memory){
                 {"user32.dll","CharToOemA"}, {"user32.dll","CharToOemW"},
                 {"user32.dll","OemToCharA"}, {"user32.dll","OemToCharW"},
                 {"user32.dll","CharToOemBuffA"}, {"user32.dll","CharToOemBuffW"},
-                {"user32.dll","OemToCharBuffA"}, {"user32.dll","OemToCharBuffW"}
+                {"user32.dll","OemToCharBuffA"}, {"user32.dll","OemToCharBuffW"},
+                {"kernel32.dll","GetACP"}
             };
             if(mapping.bytes.size()-at<std::size(targets)*unit || (mapping.permissions&permission(Access::Execute)))
                 throw std::logic_error("常駐服務慢路徑表的區段不正確");

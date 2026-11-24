@@ -110,6 +110,36 @@ NSFont* native_gui_font(const x64arm::GuiFont& model) {
     }
     if(!font && face.length)font=[manager fontWithFamily:face traits:traits weight:model.weight >= 600 ? 9 : 5 size:requested];
     if (!font && face.length) font = [NSFont fontWithName:face size:requested];
+    // 中日韓 Windows 字型名稱（細明體、標楷體、ＭＳ ゴシック等）在 macOS 沒有同名字型：依字型風格對應到系統內建的同類字型族；
+    // 沒有名稱或名稱不明時依 lfCharSet（BIG5、GB2312、SHIFTJIS、HANGEUL）選對應語系的預設字型族。
+    if(!font){
+        NSString* lower=face.lowercaseString;
+        NSArray<NSString*>* families=nil;
+        static NSDictionary<NSString*,NSArray<NSString*>*>* map=@{
+            @"細明體":@[@"LiSong Pro",@"Songti TC"],@"新細明體":@[@"LiSong Pro",@"Songti TC"],@"mingliu":@[@"LiSong Pro",@"Songti TC"],
+            @"pmingliu":@[@"LiSong Pro",@"Songti TC"],@"mingliu_hkscs":@[@"LiSong Pro",@"Songti TC"],@"細明體_hkscs":@[@"LiSong Pro",@"Songti TC"],
+            @"標楷體":@[@"BiauKai",@"Kaiti TC"],@"dfkai-sb":@[@"BiauKai",@"Kaiti TC"],@"kaiu":@[@"BiauKai",@"Kaiti TC"],
+            @"微軟正黑體":@[@"PingFang TC"],@"microsoft jhenghei":@[@"PingFang TC"],@"microsoft jhenghei ui":@[@"PingFang TC"],
+            @"宋体":@[@"Songti SC"],@"新宋体":@[@"Songti SC"],@"simsun":@[@"Songti SC"],@"nsimsun":@[@"Songti SC"],
+            @"黑体":@[@"PingFang SC"],@"simhei":@[@"PingFang SC"],@"微软雅黑":@[@"PingFang SC"],@"microsoft yahei":@[@"PingFang SC"],
+            @"楷体":@[@"Kaiti SC"],@"kaiti":@[@"Kaiti SC"],@"楷体_gb2312":@[@"Kaiti SC"],@"仿宋":@[@"STFangsong",@"Songti SC"],@"fangsong":@[@"STFangsong",@"Songti SC"],
+            @"ｍｓ 明朝":@[@"Hiragino Mincho ProN"],@"ｍｓ ｐ明朝":@[@"Hiragino Mincho ProN"],@"ms mincho":@[@"Hiragino Mincho ProN"],@"ms pmincho":@[@"Hiragino Mincho ProN"],
+            @"ｍｓ ゴシック":@[@"Hiragino Sans"],@"ｍｓ ｐゴシック":@[@"Hiragino Sans"],@"ms gothic":@[@"Hiragino Sans"],@"ms pgothic":@[@"Hiragino Sans"],
+            @"ms ui gothic":@[@"Hiragino Sans"],@"meiryo":@[@"Hiragino Sans"],@"メイリオ":@[@"Hiragino Sans"],@"meiryo ui":@[@"Hiragino Sans"],@"yu gothic":@[@"Hiragino Sans"],@"游ゴシック":@[@"Hiragino Sans"],
+            @"굴림":@[@"Apple SD Gothic Neo"],@"gulim":@[@"Apple SD Gothic Neo"],@"돋움":@[@"Apple SD Gothic Neo"],@"dotum":@[@"Apple SD Gothic Neo"],
+            @"바탕":@[@"AppleMyungjo",@"Apple SD Gothic Neo"],@"batang":@[@"AppleMyungjo",@"Apple SD Gothic Neo"],@"맑은 고딕":@[@"Apple SD Gothic Neo"],@"malgun gothic":@[@"Apple SD Gothic Neo"]};
+        if(lower.length)families=map[lower];
+        if(!families){
+            switch(model.charset){
+            case 136:families=@[@"PingFang TC"];break;case 134:families=@[@"PingFang SC"];break;
+            case 128:families=@[@"Hiragino Sans"];break;case 129:case 130:families=@[@"Apple SD Gothic Neo"];break;default:break;
+            }
+        }
+        for(NSString* family in families){
+            font=[manager fontWithFamily:family traits:traits weight:model.weight >= 600 ? 9 : 5 size:requested];
+            if(font)break;
+        }
+    }
     if (!font) font = fixed ? [NSFont monospacedSystemFontOfSize:requested weight:model.weight >= 600 ? NSFontWeightBold : NSFontWeightRegular]
         : [NSFont systemFontOfSize:requested weight:model.weight >= 600 ? NSFontWeightBold : NSFontWeightRegular];
     if (traits) font = [manager convertFont:font toHaveTrait:traits];

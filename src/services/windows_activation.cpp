@@ -1,6 +1,7 @@
 // 啟用內容（activation context）家族：kernel32 的 *ActCtx* 與 ntdll 的 Rtl*ActivationContext* 共用同一份每執行緒堆疊與錯誤判定，
 // 前者回 BOOL＋last error，後者回 NTSTATUS。沙箱尚未建立 SxS manifest／assembly 重導向，只有預設（NULL）內容：
 // CreateActCtx 不回假內容，查詢與 section 搜尋依預設內容回報「沒有對應鍵」。x86 的 ULONG_PTR／HANDLE／SIZE_T 與 ACTCTX 版面依位元數處理。
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -137,7 +138,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_activation(GuestState& stat
             return fail(50); // SxS manifest／assembly redirection 尚未建立，不能回假 context。
         }
         if(!source)return fail(87);
-        const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{source})):read_ansi(memory,source);
+        const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{source})):ansi_to_utf8(read_ansi(memory,source));
         const auto file=filesystem_.open(path);return fail(file.error?file.error:50);
     }
     if(symbol=="ActivateActCtx")return win32(activate(arg(0),arg(1)));

@@ -27,7 +27,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_lines(GuestState& s
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto fail=[&](std::uint32_t error){last_error_=error;return finish(0);};
-    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer},32768):utf8_to_utf16(read_ansi(memory,pointer,32768));};
+    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer},32768):ansi_to_utf16(read_ansi(memory,pointer,32768));};
     if(name=="ExtensionApiVersion"){
         // EXT_API_VERSION {MajorVersion, MinorVersion, Revision（EXT_API_VERSION_NUMBER64）, Reserved}，DbgHelp 持有的靜態區塊。
         if(!dbghelp_extension_version_){const auto block=allocate_heap(memory,8);if(!block)return finish(0);

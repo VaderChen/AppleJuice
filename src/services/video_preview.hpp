@@ -23,5 +23,15 @@ public:
     virtual std::uint64_t frame_at(std::uint64_t time)const{return std::min<std::uint64_t>(time/interval(),frames());}
     bool visual()const{return width()!=0 && height()!=0;}
 };
+// 沒有載入檔案的影片裝置（MCI 只以裝置型別開啟）：長度 0、無畫面與聲音，時間換算以 15 fps 計。
+class EmptyVideoPreview final : public VideoPreview {
+public:
+    std::uint64_t interval()const override{return 666667;}
+    unsigned width()const override{return 0;}
+    unsigned height()const override{return 0;}
+    std::size_t frames()const override{return 0;}
+    std::optional<AudioTrack> take_audio() override{return std::nullopt;}
+    std::optional<GuiBitmap> at(std::size_t) override{return std::nullopt;}
+};
 
 }

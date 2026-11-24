@@ -49,7 +49,7 @@ if(symbol=="CertCompareIntegerBlob" || symbol=="CertCompareCertificate" || symbo
             else if(type>=3 && type<=10 && type!=11)for(const auto byte:value)text.push_back(static_cast<char16_t>(byte));}
         const auto end=text.find(u'\0');if(end!=text.npos)text.resize(end);
         std::vector<std::uint8_t> bytes;std::size_t length=0;
-        if(wide){bytes=utf16_bytes(text);length=text.size()+1;}else{const auto narrow=utf16_to_utf8(text);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);length=bytes.size();}
+        if(wide){bytes=utf16_bytes(text);length=text.size()+1;}else{const auto narrow=utf16_to_ansi(text);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);length=bytes.size();}
         if(!arg(2) || !u32(3))result=length;
         else{const std::size_t room=std::min<std::size_t>(u32(3),length),width=wide?2:1;std::vector<std::uint8_t> out(bytes.begin(),bytes.begin()+static_cast<std::ptrdiff_t>(room*width));
             std::fill(out.end()-static_cast<std::ptrdiff_t>(width),out.end(),0);memory.write(GuestAddress{arg(2)},out);result=room;}

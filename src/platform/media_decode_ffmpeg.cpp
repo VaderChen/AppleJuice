@@ -240,6 +240,52 @@ bool video1_fourcc(std::uint32_t fourcc){
     }
 }
 
+bool cinepak_fourcc(std::uint32_t fourcc){
+    return upper_fourcc(fourcc)==make_fourcc('C','V','I','D');
+}
+bool dib_codec_fourcc(std::uint32_t fourcc){return video1_fourcc(fourcc) || cinepak_fourcc(fourcc);}
+
+namespace {
+// Cinepak：FFmpeg 輸出 RGB24（由上而下、R,G,B），轉成 DIB 的 B,G,R（32 位元另補 X）由下而上、每列 4 位元組對齊。
+class CinepakDecoder final : public DibVideoDecoder {
+public:
+    CinepakDecoder(unsigned width,unsigned height,unsigned depth):depth_(depth){
+        if(!width || !height || width>16384 || height>16384 || std::uint64_t{width}*height>32U*1024*1024)
+            throw std::invalid_argument("Cinepak 的畫面尺寸無效");
+        if(depth!=24 && depth!=32)throw std::invalid_argument("Cinepak 只支援 24／32 位元輸出");
+        state_=std::make_unique<Codec>(AV_CODEC_ID_CINEPAK,std::vector<std::uint8_t>{},[=](AVCodecContext& context){
+            context.width=context.coded_width=static_cast<int>(width);
+            context.height=context.coded_height=static_cast<int>(height);
+            context.bits_per_coded_sample=24;
+        });
+    }
+    std::vector<std::uint8_t> decode(std::span<const std::uint8_t> packet,bool key) override{
+        std::vector<std::uint8_t> output;
+        const auto& format=*state_->context;
+        state_->send(packet,INT64_MIN,key,[&](const AVFrame& frame){
+            if(frame.width!=format.width || frame.height!=format.height || frame.format!=AV_PIX_FMT_RGB24)return;
+            const auto bytes=depth_/8U;
+            const auto stride=((static_cast<std::size_t>(frame.width)*depth_+31)/32)*4;
+            output.assign(stride*static_cast<std::size_t>(frame.height),0);
+            for(int y=0;y<frame.height;++y){
+                const auto* in=frame.data[0]+std::ptrdiff_t{y}*frame.linesize[0];
+                auto* out=output.data()+stride*static_cast<std::size_t>(frame.height-1-y);
+                for(std::size_t x=0;x<static_cast<std::size_t>(frame.width);++x){out[x*bytes]=in[x*3+2];out[x*bytes+1]=in[x*3+1];out[x*bytes+2]=in[x*3];}
+            }
+        });
+        return output;
+    }
+private:
+    unsigned depth_;
+    std::unique_ptr<Codec> state_;
+};
+}
+std::unique_ptr<DibVideoDecoder> open_dib_decoder(std::uint32_t fourcc,unsigned width,unsigned height,unsigned depth,std::span<const std::uint8_t> palette){
+    if(video1_fourcc(fourcc))return std::make_unique<Video1Decoder>(width,height,depth,palette);
+    if(cinepak_fourcc(fourcc))return std::make_unique<CinepakDecoder>(width,height,depth);
+    throw std::invalid_argument("不支援的 DIB 視訊編碼");
+}
+
 namespace {
 void validate_video1_size(unsigned width,unsigned height){
     if(width<4 || height<4 || width>16384 || height>16384 || (width&3) || (height&3) ||

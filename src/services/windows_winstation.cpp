@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/unicode.hpp"
@@ -122,7 +123,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winstation(GuestState& stat
             std::uint64_t result=1;
             for(const auto& name:names){
                 std::vector<std::uint8_t> bytes;
-                if(wide)bytes=utf16_bytes(name);else{const auto ansi=utf16_to_utf8(name);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
+                if(wide)bytes=utf16_bytes(name);else{const auto ansi=utf16_to_ansi(name);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
                 const auto text=allocate_heap(m,bytes.size());if(!text){last_error_=8;co_return finish(0);}
                 blocks.push_back(text);m.write(GuestAddress{text},bytes);
                 result=static_cast<std::uint32_t>(co_await service_callback::call(callback,{text,parameter}));
@@ -137,7 +138,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winstation(GuestState& stat
     std::uint64_t result=0;const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
     if((symbol.starts_with("CreateDesktop") || symbol=="SwitchDesktop") && (job_ui_restrictions()&0x40U)){fail(5);arg.return_to(state,result);return std::nullopt;}
     const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
-    const auto string=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):utf8_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
+    const auto string=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):ansi_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
     const auto station=gui_.user_handles.at(gui_.station_handle).object;
     const auto handle=gui_.user_handles.find(service.arguments?arg(0):0);
     const auto open=[&](std::uint64_t object,std::uint32_t access,bool inherit){result=runtime_.allocate_wait_handle();gui_.user_handles.emplace(result,GuiUserHandle{object,access});if(inherit)runtime_.handle_flags[result]=1;};
@@ -261,7 +262,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winstation(GuestState& stat
             const auto number=[&](std::uint32_t value){for(unsigned i=0;i<4;++i)bytes.push_back(static_cast<std::uint8_t>(value>>(i*8)));};
             bool valid=true;
             if(d(1)==1){number(runtime_.handle_flags[arg(0)]&1);number(0);number(object.flags);}
-            else if(d(1)==2 || d(1)==3){const auto text=d(1)==2?object.name:desktop?u"Desktop":u"WindowStation";if(wide)bytes=utf16_bytes(text);else{const auto ansi=utf16_to_utf8(text);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}}
+            else if(d(1)==2 || d(1)==3){const auto text=d(1)==2?object.name:desktop?u"Desktop":u"WindowStation";if(wide)bytes=utf16_bytes(text);else{const auto ansi=utf16_to_ansi(text);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}}
             else if(d(1)==6 && desktop)number(handle->second.object==gui_.input_desktop);
             else{fail(d(1)==4 || d(1)==5?50:87);valid=false;}
             if(valid){if(arg(4))memory.store(GuestAddress{arg(4)},32,bytes.size());if(d(3)<bytes.size())fail(122);else if(!arg(2) && !bytes.empty())fail(87);else{memory.write(GuestAddress{arg(2)},bytes);result=1;}}

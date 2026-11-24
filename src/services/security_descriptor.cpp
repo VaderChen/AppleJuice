@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/security_descriptor.hpp"
 #include "x64arm/security_access.hpp"
 #include "x64arm/unicode.hpp"
@@ -285,7 +286,7 @@ Bytes read_trustee(const GuestMemory& memory, std::uint64_t address, bool x86, b
     if (memory.load(GuestAddress{address},bits) || memory.load(GuestAddress{address+layout.unit},32) || form>4)
         throw SddlError{50}; // 多重 trustee（impersonation）尚未映射。
     const auto text=[&](std::uint64_t pointer) {
-        return wide?utf16_to_utf8(read_utf16(memory,GuestAddress{pointer},1024)):read_ansi(memory,pointer,1024);
+        return wide?utf16_to_utf8(read_utf16(memory,GuestAddress{pointer},1024)):ansi_to_utf8(read_ansi(memory,pointer,1024));
     };
     if (form==0) return read_sid(memory,name);
     if (form==1) return resolve(text(name));

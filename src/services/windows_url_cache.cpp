@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/url_cache.hpp"
 #include "x64arm/registry_store.hpp"
@@ -57,7 +58,7 @@ void WindowsServices::release_url_cache()noexcept{
 std::optional<std::uint32_t> WindowsServices::invoke_url_cache(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(!runtime_.network.external_io)throw HostCallFault("比較模式不執行持久 URL 快取 I/O");
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');const unsigned width=wide?2:1;std::uint64_t result=0;
-    const auto d=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};const auto text=[&](std::uint64_t pointer){if(!pointer)return std::u16string{};return wide?read_utf16(memory,GuestAddress{pointer},4096):utf8_to_utf16(read_ansi(memory,pointer,16384));};
+    const auto d=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};const auto text=[&](std::uint64_t pointer){if(!pointer)return std::u16string{};return wide?read_utf16(memory,GuestAddress{pointer},4096):ansi_to_utf16(read_ansi(memory,pointer,16384));};
     const auto emit=[&](const Entry& entry,std::uint64_t out,std::uint64_t size_pointer){if(!size_pointer)throw CacheError{87};memory.check(GuestAddress{size_pointer},4,Access::Read);memory.check(GuestAddress{size_pointer},4,Access::Write);const auto bytes=url_cache::information(entry,wide,x86_,out);const auto capacity=memory.load(GuestAddress{size_pointer},32);memory.store(GuestAddress{size_pointer},32,bytes.size());if(!out || capacity<bytes.size())throw CacheError{122};memory.check(GuestAddress{out},bytes.size(),Access::Write);memory.write(GuestAddress{out},bytes);};
     auto& local=url_cache_state();
     try{

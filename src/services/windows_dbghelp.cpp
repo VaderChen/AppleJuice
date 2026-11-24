@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
@@ -174,7 +175,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp(GuestState& state,G
     const bool wide=name.ends_with('W') || name.ends_with("W64");
     std::uint64_t result=0;
     const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
-    const auto text=[&](std::uint64_t address){return wide?read_utf16(memory,GuestAddress{address},32768):utf8_to_utf16(read_ansi(memory,address,32768));};
+    const auto text=[&](std::uint64_t address){return wide?read_utf16(memory,GuestAddress{address},32768):ansi_to_utf16(read_ansi(memory,address,32768));};
     const auto default_path=[&]{
         auto path=runtime_.current_directory;
         for(const auto* key:{u"_nt_symbol_path",u"_nt_alternate_symbol_path"}){
@@ -324,7 +325,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp(GuestState& state,G
         }else if(name.starts_with("SymSetSearchPath")){
             found->second.search_path=arg(1)?text(arg(1)):default_path();result=1;
         }else if(name.starts_with("SymGetSearchPath")){
-            const auto& path=found->second.search_path;const auto ansi=utf16_to_utf8(path);
+            const auto& path=found->second.search_path;const auto ansi=utf16_to_ansi(path);
             const auto count=wide?path.size():ansi.size();
             if(!arg(1))fail(87);
             else if(static_cast<std::uint32_t>(arg(2))<=count)fail(122);

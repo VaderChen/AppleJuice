@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "vidpn_ownership.hpp"
 #include "mouse_move_history.hpp"
 #include "gui_window_menu.hpp"
@@ -788,7 +789,7 @@ std::uint64_t WindowsServices::find_gui_window(GuestMemory& memory,const Windows
             if((length&1) || (length && !buffer))return false;
             key=read_utf16_counted(memory,GuestAddress{buffer},length/2);
         }else if(is_class && p<=65535)atom=p;
-        else key=symbol.ends_with('W')?read_utf16(memory,GuestAddress{p}):utf8_to_utf16_lossy(read_ansi(memory,p));
+        else key=symbol.ends_with('W')?read_utf16(memory,GuestAddress{p}):ansi_to_utf16_lossy(read_ansi(memory,p));
         return true;
     };
     if(!read_key(arg(extended?2:0),true,cls) || !read_key(arg(extended?3:1),false,caption) || (cls && cls->empty()))return 0;

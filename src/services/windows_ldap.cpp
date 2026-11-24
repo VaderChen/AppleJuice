@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "ldap_api.hpp"
@@ -118,7 +119,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ldap(GuestState& state,Gues
     const bool wide=name.ends_with('W');const unsigned pointer=x86_?4U:8U;const std::uint8_t bits=x86_?32:64;
     const auto ptr=[&](std::uint64_t at){return memory.load(GuestAddress{at},bits);};
     // A 版字串以程序 ACP（UTF-8，GetACP＝65001）交換；協定上一律為 UTF-8。
-    const auto text=[&](std::uint64_t at){return at?(wide?utf16_to_utf8(read_utf16(memory,GuestAddress{at})):read_ansi(memory,at)):std::string{};};
+    const auto text=[&](std::uint64_t at){return at?(wide?utf16_to_utf8(read_utf16(memory,GuestAddress{at})):ansi_to_utf8(read_ansi(memory,at))):std::string{};};
     const auto error=[&](unsigned code,bool null=false){last_error_=code;return done(null?0:code);};
     const auto allocate=[&](std::size_t size){const auto p=allocate_heap(memory,size);if(!p)throw std::bad_alloc();return p;};
     const auto string=[&](const char* value){

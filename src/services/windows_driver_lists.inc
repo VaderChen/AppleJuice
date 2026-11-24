@@ -54,7 +54,7 @@
                 std::vector<std::uint8_t> bytes(written);
                 const auto put=[&](std::size_t at,std::uint64_t value,unsigned length){for(unsigned i=0;i<length;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(8*i));};
                 const auto text=[&](std::size_t at,const std::u16string& value,std::size_t limit){
-                    std::vector<std::uint8_t> encoded_text;if(wide)encoded_text=utf16_bytes(value.substr(0,limit-1));else {const auto narrow=utf16_to_utf8(value);encoded_text.assign(narrow.begin(),narrow.begin()+static_cast<std::ptrdiff_t>(std::min(narrow.size(),limit-1)));}
+                    std::vector<std::uint8_t> encoded_text;if(wide)encoded_text=utf16_bytes(value.substr(0,limit-1));else {const auto narrow=utf16_to_ansi(value);encoded_text.assign(narrow.begin(),narrow.begin()+static_cast<std::ptrdiff_t>(std::min(narrow.size(),limit-1)));}
                     std::copy(encoded_text.begin(),encoded_text.end(),bytes.begin()+static_cast<std::ptrdiff_t>(at));};
                 put(0,structure,4);put(4,driver->date,8);put(12,first,4);put(16,compat,4);
                 text(section_at,driver->section,256);text(file_at,driver->filename,260);text(description_at,driver->description,256);

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/machine_shutdown.hpp"
 #include "x64arm/security_descriptor.hpp"
@@ -45,7 +46,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shutdown(GuestState& state,
             if(!arg(index))return std::u16string{};
             if(wide)return read_utf16(memory,GuestAddress{arg(index)},limit);
             // Windows 環境字串與 GetACP 沿用目前共用 UTF-8 ACP。
-            try{return utf8_to_utf16(read_ansi(memory,arg(index),limit));}
+            try{return ansi_to_utf16(read_ansi(memory,arg(index),limit));}
             catch(const HostCallFault&){throw SecurityDescriptorError{87};}
         };
         if(!exit_windows){

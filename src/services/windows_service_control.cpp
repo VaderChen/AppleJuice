@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_service_control.hpp"
 #include "x64arm/unicode.hpp"
@@ -93,7 +94,7 @@ std::vector<ServiceCatalogEntry> WindowsServices::service_catalog_entries(){
 std::optional<std::uint32_t> WindowsServices::invoke_service_catalog(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');std::uint64_t result=0;
     const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
-    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer,32767));};
+    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16_lossy(read_ansi(memory,pointer,32767));};
     const auto find=[&](std::uint64_t handle){auto found=service_control_handles_.find(handle);return found!=service_control_handles_.end() && found->second.owner==process_id()?found:service_control_handles_.end();};
     try {
         if(name.starts_with("GetServiceDisplayName") || name.starts_with("GetServiceKeyName")){
@@ -249,11 +250,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_service_control(GuestState&
         name=="QueryServiceObjectSecurity" || name=="SetServiceObjectSecurity" || name=="ServiceMainDispatch";
     if(name.starts_with("OpenService") && arg(1) && runtime_.network.external_io){
         RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
-        if(!transaction.error){const auto label=wide?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16_lossy(read_ansi(memory,arg(1),32767));const auto found=runtime_.registry.keys.find(guest_service::path(label));guest=found!=runtime_.registry.keys.end() && guest_service::installed(found->second);}
+        if(!transaction.error){const auto label=wide?read_utf16(memory,GuestAddress{arg(1)}):ansi_to_utf16_lossy(read_ansi(memory,arg(1),32767));const auto found=runtime_.registry.keys.find(guest_service::path(label));guest=found!=runtime_.registry.keys.end() && guest_service::installed(found->second);}
     }
     if(guest)return invoke_guest_service(state,memory,service);
     const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
-    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer,32767));};
+    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16_lossy(read_ansi(memory,pointer,32767));};
     const auto find=[&](std::uint64_t handle){auto found=service_control_handles_.find(handle);return found!=service_control_handles_.end() && found->second.owner==process_id()?found:service_control_handles_.end();};
     const auto readable_token=[&](){initialize_tokens();const auto id=effective_token_id();const auto& token=runtime_.token_objects.at(id);return (token.type!=2 || token.level!=0) && token_user_sid_string(id)!="S-1-5-7";};
     try {

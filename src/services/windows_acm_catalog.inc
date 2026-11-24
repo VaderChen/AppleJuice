@@ -100,7 +100,7 @@ if(name.starts_with("acmDriver") || name.starts_with("acmFormatTag") || name.sta
         return out;};
     const auto text_bytes=[&](std::vector<std::uint8_t>& bytes,std::size_t at,std::u16string_view text,unsigned chars){
         if(wide_out){for(std::size_t i=0;i+1<chars && i<text.size();++i)put(bytes,at+i*2,text[i],2);return;}
-        auto narrow=utf16_to_utf8(text);if(narrow.size()>=chars)narrow.resize(chars-1);std::copy(narrow.begin(),narrow.end(),bytes.begin()+static_cast<std::ptrdiff_t>(at));};
+        auto narrow=utf16_to_ansi(text);if(narrow.size()>=chars)narrow.resize(chars-1);std::copy(narrow.begin(),narrow.end(),bytes.begin()+static_cast<std::ptrdiff_t>(at));};
     // 依呼叫端 cbStruct 寫入（至多完整大小），並回寫實際大小。
     const auto write_struct=[&](std::uint64_t address,std::vector<std::uint8_t> bytes){
         const auto size=std::min<std::size_t>(memory.load(GuestAddress{address},32),bytes.size());put(bytes,0,size,4);memory.write(GuestAddress{address},std::span(bytes).first(size));};

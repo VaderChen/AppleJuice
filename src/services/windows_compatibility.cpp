@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "mapi_property_tag.h"
 #include "mapi_restriction.hpp"
 #include "x64arm/network_files.hpp"
@@ -455,8 +456,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         static_assert(virtual_firmware::type==virtual_firmware::Type::Bios,"UEFI 韌體需要變數存放區");
         const WindowsCall call(state,memory,service);const bool wide=module_api.ends_with('W');
         try{
-            if(call(0))(void)(wide?read_utf16(memory,GuestAddress{call(0)}):utf8_to_utf16(read_ansi(memory,call(0))));
-            const auto guid=call(1)?(wide?read_utf16(memory,GuestAddress{call(1)}):utf8_to_utf16(read_ansi(memory,call(1)))):std::u16string{};
+            if(call(0))(void)(wide?read_utf16(memory,GuestAddress{call(0)}):ansi_to_utf16(read_ansi(memory,call(0))));
+            const auto guid=call(1)?(wide?read_utf16(memory,GuestAddress{call(1)}):ansi_to_utf16(read_ansi(memory,call(1)))):std::u16string{};
             const auto hex=[](char16_t c){return (c>=u'0' && c<=u'9') || (c>=u'a' && c<=u'f') || (c>=u'A' && c<=u'F');};
             bool valid=guid.size()==38 && guid.front()==u'{' && guid.back()==u'}';
             for(std::size_t i=1;valid && i<37;++i)valid=(i==9 || i==14 || i==19 || i==24)?guid[i]==u'-':hex(guid[i]);
@@ -696,7 +697,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     }else if(symbol.starts_with("StrCmp") || symbol.starts_with("StrStr")){
         const bool wide=symbol.ends_with('W'),compare=symbol.starts_with("StrCmp");
         const bool logical=symbol=="StrCmpLogicalW";const bool ignore=logical || symbol.find('I')!=symbol.npos,bounded=symbol.find('N')!=symbol.npos;
-        const auto decode=[](std::string_view bytes){const auto value=windows_nls_decode(bytes,65001,false);if(!value)throw HostCallFault("Shell 字串碼頁轉換失敗");return *value;};
+        const auto decode=[](std::string_view bytes){const auto value=windows_nls_decode(bytes,process_ansi_codepage(),false);if(!value)throw HostCallFault("Shell 字串碼頁轉換失敗");return *value;};
         // N 比較沿用 CompareString 的明確長度契約；搜尋的 N 則限制匹配起點。
         const auto read=[&](std::uint64_t pointer,std::int32_t count){
             if(count<0)return wide?read_utf16(memory,GuestAddress{pointer}):decode(read_ansi(memory,pointer));
@@ -724,12 +725,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             }else {
                 const auto text=read_ansi(memory,arg(0)),pattern=read_ansi(memory,arg(1));
                 const auto decoded=decode(pattern);
-                // ACP 為 UTF-8；保留原始位元組位移，且不把多位元組字元中段當成起點。
+                // 依程序 ACP 解碼；保留原始位元組位移，且不把多位元組字元中段當成起點。
                 if(!pattern.empty())for(std::size_t at=0;at<text.size() && pattern.size()<=text.size()-at;){
                     const auto candidate=decode(std::string_view(text).substr(at,pattern.size()));
                     if(windows_nls_compare(candidate,decoded,0x409,ignore?1:0)==0){result=arg(0)+at;break;}
                     const auto tail=std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(text.data()+at),text.size()-at);
-                    const auto character=windows_crt_decode(tail,65001);at+=character.status==CrtDecodedCharacter::Status::Complete?character.bytes:1;
+                    const auto character=windows_crt_decode(tail,process_ansi_codepage());at+=character.status==CrtDecodedCharacter::Status::Complete?character.bytes:1;
                 }
             }
         }
@@ -797,7 +798,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             const auto account=security::resolve_account(sid,runtime_.token_objects.at(1).user.sid);
             if(!account){fail(1332);arg.return_to(state,result);return std::nullopt;}
             const auto value=utf8_to_utf16(extended && !account->domain.empty()?std::string(account->domain)+"\\"+std::string(account->name):std::string(account->name));
-            const auto text=utf16_to_utf8(value);const auto count=(wide?value.size():text.size())+1;
+            const auto text=utf16_to_ansi(value);const auto count=(wide?value.size():text.size())+1;
             const auto capacity=memory.load(GuestAddress{size},32);memory.check(GuestAddress{size},4,Access::Write);
             if(!buffer || capacity<count){memory.store(GuestAddress{size},32,count);fail(extended?234:122);}
             else {if(wide)memory.write(GuestAddress{buffer},utf16_bytes(value));else {std::vector<std::uint8_t> bytes(text.begin(),text.end());bytes.push_back(0);memory.write(GuestAddress{buffer},bytes);}memory.store(GuestAddress{size},32,extended?count-1:count);result=1;}
@@ -805,10 +806,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     }
     else if(symbol.starts_with("GetLocaleInfo"))return invoke_locale(state,memory,service);
     else if(symbol=="IsValidCodePage") result=dword(0)>3 && windows_nls_codepage(dword(0)).has_value();
-    else if(symbol=="GetOEMCP") result=65001;
+    else if(symbol=="GetOEMCP") result=process_ansi_codepage();
     else if(symbol=="GetCPInfo" || symbol=="GetCPInfoExA" || symbol=="GetCPInfoExW") {
         const bool extended=symbol!="GetCPInfo",wide=symbol.ends_with('W');
-        const auto page=dword(0)==0 || dword(0)==1 || dword(0)==3?65001U:dword(0)==2?10000U:dword(0);
+        const auto page=dword(0)==2?10000U:resolve_ansi_alias(dword(0));
         const auto info=windows_nls_codepage(page);const auto output=arg(extended?2:1);
         if(!info || !output)fail(87);
         else if(extended && dword(1))fail(1004);
@@ -887,16 +888,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         // 此環境未啟用網域、Terminal Services、快速使用者切換或特殊裝置套件。
         result=dword(0)==1 || dword(0)==7 || dword(0)==8 || dword(0)==20 || (dword(0)==30 && x86_);
     }
-    else if (symbol == "GetVersion") result=(windows_version_build<<16)|(windows_version_minor<<8)|windows_version_major;
+    // GetVersion／GetVersionEx／VerifyVersionInfo 依主程式清單的相容版本（compat_version_）；ntdll 的 Rtl 版本維持真實版本。
+    else if (symbol == "GetVersion") result=(compat_version_.build<<16)|(compat_version_.minor<<8)|compat_version_.major;
     else if (symbol == "RtlGetVersion" || symbol == "GetVersionExA" || symbol == "GetVersionExW") {
         const auto size=memory.load(GuestAddress{arg(0)},32);
         const bool ansi=symbol=="GetVersionExA", native=symbol=="RtlGetVersion";const auto base_size=ansi?148U:276U;
         if (size != base_size && size != base_size+8U) {if (native) result=0xc000000d;else fail(87);}
         else {
             std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));memory.write(GuestAddress{arg(0)},bytes);
-            memory.store(GuestAddress{arg(0)},32,size);memory.store(GuestAddress{arg(0)+4},32,windows_version_major);
-            memory.store(GuestAddress{arg(0)+8},32,windows_version_minor);
-            memory.store(GuestAddress{arg(0)+12},32,windows_version_build);memory.store(GuestAddress{arg(0)+16},32,2);
+            const auto version=native?CompatibilityVersion{windows_version_major,windows_version_minor,windows_version_build}:compat_version_;
+            memory.store(GuestAddress{arg(0)},32,size);memory.store(GuestAddress{arg(0)+4},32,version.major);
+            memory.store(GuestAddress{arg(0)+8},32,version.minor);
+            memory.store(GuestAddress{arg(0)+12},32,version.build);memory.store(GuestAddress{arg(0)+16},32,2);
             if (size==base_size+8U) memory.store(GuestAddress{arg(0)+base_size+6U},8,1);
             result=native?0:1;
         }
@@ -964,7 +967,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             const auto wanted=memory.load(GuestAddress{arg(0)+offset},index==7?8:index==6?16:32);
             if(index==6){if(op!=6 && op!=7)error=87;else if(wanted)error=1150;}
             else if(op<1 || op>5)error=87;
-            else if(!compare(index==7?1U:index==3?2U:windows_version_build,wanted,op))error=1150;
+            else if(!compare(index==7?1U:index==3?2U:(native?windows_version_build:compat_version_.build),wanted,op))error=1150;
         }
         // major/minor/SP 是同一版本 tuple；不同的高階值決定結果，不再比較低階。
         unsigned direction=0;bool matches=true;
@@ -977,7 +980,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             else if((direction==4 || direction==5) && (requested==2 || requested==3))op=direction;
             const auto offset=index==1?4U:index==0?8U:index==5?extra:extra+2U;
             const auto wanted=memory.load(GuestAddress{arg(0)+offset},index<=1?32:16);
-            const std::uint64_t actual=index==1?windows_version_major:index==0?windows_version_minor:0U;
+            const std::uint64_t actual=index==1?(native?windows_version_major:compat_version_.major):index==0?(native?windows_version_minor:compat_version_.minor):0U;
             matches=compare(actual,wanted,op);
             if(actual!=wanted)break;
         }
@@ -1089,7 +1092,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         const auto pointer = current ? 0 : crt ? arg(1) : arg(0);
         std::u16string path;bool device=false;
         try {
-            auto input=pointer ? (wide ? read_utf16(memory,GuestAddress{pointer}) : utf8_to_utf16(read_ansi(memory,pointer))) : std::u16string{};
+            auto input=pointer ? (wide ? read_utf16(memory,GuestAddress{pointer}) : ansi_to_utf16(read_ansi(memory,pointer))) : std::u16string{};
             if(drive_query && drive)path=full_windows_environment_path(std::u16string{static_cast<char16_t>(u'A'+drive-1),u':'},runtime_.current_directory,runtime_.environment);
             else if(current || (crt && input.empty())) path=runtime_.current_directory;
             else {
@@ -1100,7 +1103,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         catch (const std::invalid_argument&) { if (crt) { memory.store(GuestAddress{runtime_.errno_cell}, 32, 22); result = 0; } else fail(123); arg.return_to(state, result); return std::nullopt; }
         std::vector<std::uint8_t> bytes;
         if (wide) bytes = utf16_bytes(path);
-        else { const auto text = utf16_to_utf8(path); bytes.assign(text.begin(), text.end()); bytes.push_back(0); }
+        else { const auto text = utf16_to_ansi(path); bytes.assign(text.begin(), text.end()); bytes.push_back(0); }
         const auto count = bytes.size() / (wide ? 2U : 1U);
         if (crt && !destination) {
             // NULL buffer 至少配置要求的字元數；不足以容納路徑時擴大，沿用 CRT heap／free。
@@ -1116,7 +1119,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             memory.write(GuestAddress{destination}, bytes); result = crt ? destination : count - 1;
             if (!crt && !current && arg(3)) {
                 const auto part=windows_path_file_part(path,device);
-                const auto offset=part==path.npos?0:wide?part*2:utf16_to_utf8(path.substr(0,part)).size();
+                const auto offset=part==path.npos?0:wide?part*2:utf16_to_ansi(path.substr(0,part)).size();
                 memory.store(GuestAddress{arg(3)},x86_?32:64,part==path.npos?0:destination+offset);
             }
         }
@@ -1301,7 +1304,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     } else if (symbol.starts_with("CreateMutex") || symbol.starts_with("OpenMutex")) {
         const bool create=symbol.starts_with("Create"),extended=symbol.starts_with("CreateMutexEx");
         bool valid=true,inherit=!create && arg(1);const auto named=arg(create && extended?1:2);
-        auto name=named?(symbol.ends_with('W')?read_utf16(memory,GuestAddress{named}):utf8_to_utf16(read_ansi(memory,named))):std::u16string{};
+        auto name=named?(symbol.ends_with('W')?read_utf16(memory,GuestAddress{named}):ansi_to_utf16(read_ansi(memory,named))):std::u16string{};
         if(name.size()>=260){fail(206);valid=false;}
         // 私有命名空間別名與 BaseNamedObjects 下的子目錄（物件命名空間）轉成既有具名物件名稱。
         if(valid && !name.empty())if(const auto code=win32_namespace_object_name(name,create)){fail(code);valid=false;}
@@ -1356,7 +1359,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     } else if(symbol.starts_with("CreateEvent") || symbol.starts_with("OpenEvent")) {
         const bool create=symbol.starts_with("Create"),extended=symbol.starts_with("CreateEventEx");bool valid=true,inherit=!create && arg(1);
         const bool exclusive=service.family=="internal-nt-event" && (dword(create?4:3)&0x20U);
-        const auto name_at=arg(create?(extended?1:3):2);auto name=name_at?(symbol.ends_with('W')?read_utf16(memory,GuestAddress{name_at}):utf8_to_utf16(read_ansi(memory,name_at))):std::u16string{};
+        const auto name_at=arg(create?(extended?1:3):2);auto name=name_at?(symbol.ends_with('W')?read_utf16(memory,GuestAddress{name_at}):ansi_to_utf16(read_ansi(memory,name_at))):std::u16string{};
         // 私有命名空間別名與 BaseNamedObjects 下的子目錄（物件命名空間）轉成既有具名物件名稱。
         if(!name.empty())if(const auto code=win32_namespace_object_name(name,create)){fail(code);valid=false;}
         if(name.starts_with(u"Local\\"))name.erase(0,6);
@@ -1622,7 +1625,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
                 if(type==30 || type==31){
                     const auto text=[&](std::uint64_t value){
                         return type==31?read_utf16(memory,GuestAddress{pointer(value)},SIZE_MAX):
-                            windows_nls_decode(read_ansi(memory,pointer(value),SIZE_MAX),65001,false).value();
+                            windows_nls_decode(read_ansi(memory,pointer(value),SIZE_MAX),process_ansi_codepage(),false).value();
                     };
                     const auto hay=text(a),needle=text(b);
                     if(relation && dword(1)==6)return windows_regex_search(hay,needle);
@@ -1812,14 +1815,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         const bool wide=symbol.ends_with('W'),ignore_case=symbol.starts_with("lstrcmpi");
         const bool mapi=symbol=="MapiCompareW";
         const auto a=arg(mapi?1:0),b=arg(mapi?2:1);
-        auto left=a?(wide?read_utf16(memory,GuestAddress{a}):utf8_to_utf16_lossy(read_ansi(memory,a))):std::u16string{};
-        auto right=b?(wide?read_utf16(memory,GuestAddress{b}):utf8_to_utf16_lossy(read_ansi(memory,b))):std::u16string{};
+        auto left=a?(wide?read_utf16(memory,GuestAddress{a}):ansi_to_utf16_lossy(read_ansi(memory,a))):std::u16string{};
+        auto right=b?(wide?read_utf16(memory,GuestAddress{b}):ansi_to_utf16_lossy(read_ansi(memory,b))):std::u16string{};
         if(ignore_case){for(auto& c:left)c=unicode_case_unit(c,true);for(auto& c:right)c=unicode_case_unit(c,true);}
         const int order=left<right?-1:left>right?1:0;
         result=static_cast<std::uint32_t>(mapi?order+2:order);
     } else if ((symbol.starts_with("GetShortPathName") || symbol.starts_with("GetLongPathName"))) {
         const bool wide=symbol.ends_with('W'),short_path=symbol.starts_with("GetShortPathName");
-        auto path=!arg(0)?std::u16string{}:wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16_lossy(read_ansi(memory,arg(0)));
+        auto path=!arg(0)?std::u16string{}:wide?read_utf16(memory,GuestAddress{arg(0)}):ansi_to_utf16_lossy(read_ansi(memory,arg(0)));
         if(!arg(0))fail(87);
         else if(path.empty())fail(short_path?161:3);
         else if(path.find_first_of(u"*?",path.starts_with(u"\\\\?\\")?4:0)!=path.npos)fail(123);
@@ -1850,7 +1853,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
                     at+=spelling.size();
                 }
             }
-            const auto ansi=utf16_to_utf8(path);
+            const auto ansi=utf16_to_ansi(path);
             if(!error)error=filesystem_.information(ansi).error;
             if(error)fail(error);
             else {
@@ -1955,7 +1958,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         if(wide && arg(0)==arg(1)){fail(487);}
         else if(!arg(0) || !arg(1)){fail(87);}
         else {
-            // 與 GetACP/GetOEMCP 及 CP_ACP/CP_OEMCP 相同的虛擬 UTF-8 碼頁。
+            // 與 GetACP/GetOEMCP 及 CP_ACP/CP_OEMCP 相同的程序碼頁。
             // 先完成輸入快照，ANSI 同址或部分重疊時也不會破壞未讀資料。
             const auto count=counted?dword(2):0U;
             if(count>1048576)throw HostCallFault("OEM 轉換超過上限");
@@ -1965,16 +1968,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
                 auto text=counted?read_utf16_counted(memory,GuestAddress{arg(0)},count):read_utf16(memory,GuestAddress{arg(0)});
                 if(!counted)text.push_back(0);
                 capacity=text.size()*sizeof(char16_t);
-                const auto bytes=utf16_to_utf8_lossy(text);
+                const auto bytes=process_ansi_is_utf8()?utf16_to_utf8_lossy(text):utf16_to_ansi(text);
                 output.assign(bytes.begin(),bytes.end());
             }else{
                 std::string bytes;
                 if(counted){bytes.resize(count);memory.read(GuestAddress{arg(0)},{reinterpret_cast<std::uint8_t*>(bytes.data()),bytes.size()});}
                 else {bytes=read_ansi(memory,arg(0));bytes.push_back(0);}
-                if(wide){const auto text=utf8_to_utf16_lossy(bytes);output=utf16_bytes(text);output.resize(text.size()*2);}
+                if(wide){const auto text=process_ansi_is_utf8()?utf8_to_utf16_lossy(bytes):ansi_to_utf16(bytes);output=utf16_bytes(text);output.resize(text.size()*2);}
                 else {
                     capacity=bytes.size();
-                    const auto converted=utf16_to_utf8(utf8_to_utf16_lossy(bytes));
+                    // OEM 與 ANSI 同一碼頁：UTF-8 時清理無效序列，DBCS 碼頁原樣複製。
+                    const auto converted=process_ansi_is_utf8()?utf16_to_utf8(utf8_to_utf16_lossy(bytes)):bytes;
                     output.assign(converted.begin(),converted.end());
                 }
             }
@@ -1987,7 +1991,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     } else if (symbol == "WideCharToMultiByte" || symbol == "MultiByteToWideChar") {
         const bool wide = symbol == "WideCharToMultiByte";
         const auto count = sint(3), capacity = sint(5); const auto codepage = dword(0),flags=dword(1);
-        const auto page=codepage==0 || codepage==1 || codepage==3?65001U:codepage;
+        const auto page=resolve_ansi_alias(codepage);
         const auto page_info=windows_nls_codepage(page);
         const bool legacy_composition=codepage==0 || codepage==3 || codepage==1252;
         const bool multibyte=page!=65001 && page!=1252;
@@ -1997,8 +2001,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         // 依舊碼頁寫法帶 lpDefaultChar／lpUsedDefaultChar 與上述旗標（舊版 MSVC STL 的 _Wcrtomb 以地區碼頁、&defused 逐字轉換，
         // std::codecvt／wstring_convert 都經過它）。文件規定明確 CP_UTF8 帶這兩個指標要回 ERROR_INVALID_PARAMETER，但在 ACP=65001 的系統上
         // 兩種用法無法區分，因此 WideCharToMultiByte 的 65001 比照別名接受；lpUsedDefaultChar 在發生替換時設為 TRUE。
-        const bool ansi_alias=codepage==0 || codepage==1 || codepage==3 || (wide && codepage==65001);
-        const auto allowed_flags=wide?(codepage==1252?0x480U:multibyte && page!=54936?0x400U:ansi_alias?0x6f0U:0x80U):(legacy_composition?0xfU:multibyte && page!=54936?0xbU:8U);
+        const bool ansi_alias=codepage==0 || codepage==1 || codepage==3 || (wide && codepage==65001 && process_ansi_is_utf8());
+        const auto allowed_flags=wide?(codepage==1252?0x480U:multibyte && page!=54936?(ansi_alias?0x670U:0x400U):ansi_alias?0x6f0U:0x80U):(legacy_composition?0xfU:multibyte && page!=54936?0xbU:8U);
         if (!page_info) fail(87);
         else if(page==65000 && wide && (arg(6) || arg(7)))fail(87);
         else if(page==65000 && flags)fail(1004);
@@ -2059,8 +2063,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         }
     } else if (symbol == "AreFileApisANSI") result = 1;
     else if(symbol=="IsDBCSLeadByteEx"){
-        const auto page=dword(0)==0 || dword(0)==1 || dword(0)==3?65001U:dword(0);const auto info=windows_nls_codepage(page);
-        if(!info)fail(87);else result=info->lead[static_cast<std::uint8_t>(arg(1))];
+        const auto page=resolve_ansi_alias(dword(0));const auto info=windows_nls_codepage(page);
+        if(!info)fail(87);else result=info->maximum_character_bytes>1 && info->lead[static_cast<std::uint8_t>(arg(1))];
     }
     else if (symbol == "IsWow64Process" || symbol == "IsWow64Process2") {
         std::array<std::uint64_t,5> information{};

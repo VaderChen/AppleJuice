@@ -9,7 +9,7 @@
             if(arg(texture_entry.status_arg))memory.check(GuestAddress{arg(texture_entry.status_arg)},4,Access::Write);
             std::vector<std::uint8_t> source;
             if(texture_entry.file){
-                const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(texture_entry.source_arg)})):read_ansi(memory,arg(texture_entry.source_arg));
+                const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(texture_entry.source_arg)})):ansi_to_utf8(read_ansi(memory,arg(texture_entry.source_arg)));
                 const auto opened=filesystem_.open_reader(path);if(opened.error)throw texture_image::Error(0x80070000U|opened.error,"無法讀取紋理檔案");
                 const auto metadata=opened.file->information();if(metadata.error)throw texture_image::Error(0x80070000U|metadata.error,"無法取得紋理檔案大小");require(metadata.metadata.size<=512U*1024U*1024U);
                 source.resize(static_cast<std::size_t>(metadata.metadata.size));const auto io=opened.file->read(source,0);if(io.error || io.bytes!=source.size())throw texture_image::Error(0x80070000U|(io.error?io.error:38U),"紋理檔案讀取未完成");

@@ -17,7 +17,8 @@ if(name=="HashData" || name.starts_with("UrlHash")){
     }else{
         // (pszUrl, pbHash, cbHash)
         if(!arg(0) || !arg(1) || !u32(2) || u32(2)>256)return done(invalid_argument);
-        const auto text=name.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)},0x10000)):read_ansi(memory,arg(0),0x40000);
+        // UrlHashA 雜湊 ACP 位元組；W 版先以 ACP 轉成多位元組再雜湊。
+        const auto text=name.ends_with('W')?utf16_to_ansi(read_utf16(memory,GuestAddress{arg(0)},0x10000)):read_ansi(memory,arg(0),0x40000);
         input.assign(text.begin(),text.end());output=arg(1);count=u32(2);
     }
     std::vector<std::uint8_t> hash(count);

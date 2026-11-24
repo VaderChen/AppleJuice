@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_metafile.hpp"
 #include "x64arm/windows_geometry.hpp"
@@ -55,7 +56,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_metafile(GuestState& state,
             if(arg(0) && !valid_dc(arg(0)))return fail(6);
             GuiMetafile meta;
             // 磁碟 EMF：與 CreateMetaFile 相同，建立時即建立（截斷）檔案，CloseEnhMetaFile 時寫出。
-            if(arg(1)){meta.file=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16(read_ansi(memory,arg(1)));if(meta.file.empty())return fail(3);if(!write_guest_file(state,memory,meta.file,{}))return finish(0);}if(arg(2)){meta.frame=rect(arg(2));if(gui_rect_empty(*meta.frame))return fail(87);}
+            if(arg(1)){meta.file=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)}):ansi_to_utf16(read_ansi(memory,arg(1)));if(meta.file.empty())return fail(3);if(!write_guest_file(state,memory,meta.file,{}))return finish(0);}if(arg(2)){meta.frame=rect(arg(2));if(gui_rect_empty(*meta.frame))return fail(87);}
             if(arg(3)){const bool wide=name.ends_with('W');bool zero=false,done=false;std::string narrow;
                 for(unsigned i=0;i<32768;++i){const auto c=memory.load(GuestAddress{arg(3)+i*(wide?2:1)},wide?16:8);if(wide)meta.description.push_back(static_cast<char16_t>(c));else narrow.push_back(static_cast<char>(c));if(!c && zero){done=true;break;}zero=!c;}
                 if(!done)return fail(87);if(!wide)meta.description=utf8_to_utf16_lossy(narrow);
@@ -74,7 +75,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_metafile(GuestState& state,
         }
         if(name.starts_with("GetEnhMetaFile") && (name.ends_with("FileA") || name.ends_with("FileW"))){
             // 磁碟 EMF：與 GetMetaFile 共用讀檔流程，再依 SetEnhMetaFileBits 的驗證匯入。
-            if(!arg(0))return fail(87);const auto path=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16(read_ansi(memory,arg(0)));
+            if(!arg(0))return fail(87);const auto path=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)}):ansi_to_utf16(read_ansi(memory,arg(0)));
             auto bytes=read_guest_file(state,memory,path,88,16*1024*1024);if(!bytes)return finish(0);
             const auto handle=import_enhanced_metafile(std::move(*bytes));if(!handle)return fail(13);return finish(*handle);
         }
@@ -109,7 +110,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_metafile(GuestState& state,
         const auto handle=arg(name=="PlayEnhMetaFile" || name=="EnumEnhMetaFile"?1:0);const auto found=gui_.metafiles.find(handle);if(found==gui_.metafiles.end())return fail(6);const auto& meta=found->second;
         if(name=="DeleteEnhMetaFile"){gui_.metafiles.erase(found);return finish(1);}
         if(name.starts_with("CopyEnhMetaFile")){
-            if(arg(1) && !write_guest_file(state,memory,name.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16(read_ansi(memory,arg(1))),meta.bytes))return finish(0);
+            if(arg(1) && !write_guest_file(state,memory,name.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)}):ansi_to_utf16(read_ansi(memory,arg(1))),meta.bytes))return finish(0);
             const auto copy=gui_.next_object++;gui_.metafiles.emplace(copy,meta);return finish(copy);}
         if(name=="GetEnhMetaFilePixelFormat"){
             // ENHMETAHEADER 延伸 1：cbPixelFormat（88）、offPixelFormat（92）；沒有像素格式回 0，緩衝區不足只複製可容納的部分。

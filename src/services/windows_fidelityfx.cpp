@@ -190,6 +190,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_fidelityfx(GuestState& stat
         const bool recorded=d3d12_record(memory,list,[u,color,motion,depth,exposure,output,use_exposure](NativeGraphics& native,const std::function<std::shared_ptr<GraphicsResource>(std::uint64_t)>& resource_of){
             auto upscale=u;upscale.color=GraphicsView{resource_of(color)};upscale.motion=GraphicsView{resource_of(motion)};upscale.depth=GraphicsView{resource_of(depth)};
             upscale.output=GraphicsView{resource_of(output)};if(use_exposure)upscale.exposure=GraphicsView{resource_of(exposure)};
+            game_upscaler_dispatched();
             try{native.graphics_temporal_upscale(upscale);}
             catch(const std::exception& error){static std::atomic<unsigned> reported{0};if(reported.fetch_add(1)<4)std::fprintf(stderr,"[fidelityfx] MetalFX 升頻失敗：%s\n",error.what());}
         });

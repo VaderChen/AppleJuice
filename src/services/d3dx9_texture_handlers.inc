@@ -7,7 +7,7 @@
             if(u(1)!=4)desc.format=28;
             const auto data=texture_image::encode(desc,u(1),[&](unsigned index){auto surface=get(texture->subresources.at(index),texture->kind==Kind::VolumeTexture?Kind::Volume:Kind::Surface);require(!surface->mapped);read_surface(*surface);if(u(1)==4)return surface->pixels;return texture_image::transform(surface->pixels,native_format(surface->format),{surface->width,surface->height,surface->depth},{0,0,0,surface->width,surface->height,surface->depth},28,{surface->width,surface->height,surface->depth},1);});
             if(to_memory)store_pointer(arg(0),blob(data)->root);
-            else {const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));const auto file=filesystem_.open_host(d3dx_path(path),0x40000000U,2,0x80,1);require(!file.error,0x80070000U|file.error);const auto written=file.file->write(data,0);require(!written.error && written.bytes==data.size(),0x80070000U|(written.error?written.error:29U));}
+            else {const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));const auto file=filesystem_.open_host(d3dx_path(path),0x40000000U,2,0x80,1);require(!file.error,0x80070000U|file.error);const auto written=file.file->write(data,0);require(!written.error && written.bytes==data.size(),0x80070000U|(written.error?written.error:29U));}
         }else if(symbol=="D3DXFilterTexture"){
             // (pBaseTexture, pPalette, SrcLevel, MipFilter)：自 SrcLevel 起逐級縮小產生後續 mip，與載入檔案時的 mip 產生共用 transform；
             // D3DX_DEFAULT 的 SrcLevel 為 0、MipFilter 為 BOX。調色盤只作用於 P8 類格式，共用像素轉換不支援該類格式，故不讀取。
@@ -36,7 +36,7 @@
             GraphicsResourceDesc desc;desc.dimension=volume?4:3;desc.width=size[0];desc.height=size[1];desc.depth=size[2];desc.layers=1;desc.levels=1;desc.format=u(1)==4?source_format:28;
             const auto data=texture_image::encode(desc,u(1),[&](unsigned){if(u(1)==4 && whole)return surface->pixels;return texture_image::transform(surface->pixels,source_format,{surface->width,surface->height,surface->depth},box,desc.format,size,1);});
             if(to_memory)store_pointer(arg(0),blob(data)->root);
-            else {const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));const auto file=filesystem_.open_host(d3dx_path(path),0x40000000U,2,0x80,1);require(!file.error,0x80070000U|file.error);const auto written=file.file->write(data,0);require(!written.error && written.bytes==data.size(),0x80070000U|(written.error?written.error:29U));}
+            else {const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));const auto file=filesystem_.open_host(d3dx_path(path),0x40000000U,2,0x80,1);require(!file.error,0x80070000U|file.error);const auto written=file.file->write(data,0);require(!written.error && written.bytes==data.size(),0x80070000U|(written.error?written.error:29U));}
         }else if(symbol=="D3DXCheckTextureRequirements" || symbol=="D3DXCheckCubeTextureRequirements" || symbol=="D3DXCheckVolumeTextureRequirements"){
             // 依 make_texture 的限制調整：尺寸為 0 或 D3DX_DEFAULT 時取另一邊或 256，上限 16384（體積 2048），立方體為正方形；
             // mip 層數為 0 或 D3DX_DEFAULT 時取完整鏈，否則不超過完整鏈；格式 D3DFMT_UNKNOWN 或不支援時依是否含 alpha 取 A8R8G8B8／X8R8G8B8。

@@ -30,7 +30,7 @@ inline std::optional<FrameLayout> frame_layout(View header){
     f.top_down=signed_height>INT32_MAX;f.height=f.top_down?0U-signed_height:signed_height;
     f.depth=word(header,12)>>16;f.compression=word(header,16);
     if(!f.width || !f.height || f.width>16384 || f.height>16384 || std::uint64_t(f.width)*f.height>32U*1024*1024)return {};
-    const bool video1=media::video1_fourcc(f.compression);
+    const bool video1=media::video1_fourcc(f.compression),cinepak=media::cinepak_fourcc(f.compression);
     if(f.raw()){
         if(f.depth!=1 && f.depth!=4 && f.depth!=8 && f.depth!=16 && f.depth!=24 && f.depth!=32)return {};
         f.stride=((f.width*f.depth+31)/32)*4;
@@ -43,11 +43,12 @@ inline std::optional<FrameLayout> frame_layout(View header){
     }else if(f.compression!=1 && f.compression!=2 && f.compression!=4 && f.compression!=5 &&
              (f.compression|0x20202020U)!=fourcc('m','j','p','g') &&
              (f.compression|0x20202020U)!=fourcc('j','p','e','g') &&
-             (f.compression|0x20202020U)!=fourcc('p','n','g',' ') && !video1 &&
+             (f.compression|0x20202020U)!=fourcc('p','n','g',' ') && !video1 && !cinepak &&
              !media::video_decoder_available(f.compression))return {};
     const bool rle=f.compression==1 || f.compression==2;
     if(rle && f.depth!=(f.compression==1?8U:4U))return {};
     if(video1 && (f.top_down || (f.width&3) || (f.height&3) || (f.depth!=8 && f.depth!=16)))return {};
+    if(cinepak && (f.top_down || (f.depth!=24 && f.depth!=32)))return {};
     if((f.raw() && f.depth<=8) || rle || (video1 && f.depth==8)){
         if((size-word(header,0))/4>(1U<<f.depth))return {};
         for(auto at=std::size_t(word(header,0));at<size;at+=4){
@@ -62,10 +63,13 @@ inline Bytes uncompressed_frame_header(View source){
     put(dib,20,0);
     return dib;
 }
-inline std::unique_ptr<media::Video1Decoder> open_video1(View format,const FrameLayout& layout){
+// Video 1／Cinepak 等 DIB 輸出解碼器：8 位元格式的色表接在 BITMAPINFOHEADER 之後。
+inline std::unique_ptr<media::DibVideoDecoder> open_dib_decoder(View format,const FrameLayout& layout){
     const auto palette=layout.depth==8?format.subspan(word(format,0)):View{};
-    return std::make_unique<media::Video1Decoder>(layout.width,layout.height,layout.depth,palette);
+    try{return media::open_dib_decoder(layout.compression,layout.width,layout.height,layout.depth,palette);}
+    catch(const std::invalid_argument& error){throw std::runtime_error(error.what());}
 }
+inline std::unique_ptr<media::DibVideoDecoder> open_video1(View format,const FrameLayout& layout){return open_dib_decoder(format,layout);}
 inline Bytes frame_output(View input,const FrameLayout& source,const Bytes& requested){
     Bytes out=requested;
     if(out.empty()){

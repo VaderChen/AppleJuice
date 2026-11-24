@@ -51,7 +51,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry_hive(GuestState& s
         if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
         auto& registry=runtime_.registry;RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_,save || connect);
         if(transaction.error)return finish(transaction.error);initialize_registry_views(registry);initialize_tokens();
-        const auto string=[&](std::uint64_t pointer){return !pointer?std::u16string{}:wide?read_utf16(memory,GuestAddress{pointer},32768):utf8_to_utf16(read_ansi(memory,pointer,32768));};
+        const auto string=[&](std::uint64_t pointer){return !pointer?std::u16string{}:wide?read_utf16(memory,GuestAddress{pointer},32768):ansi_to_utf16(read_ansi(memory,pointer,32768));};
         if(connect){
             if(!arg(2))return finish(87);memory.check(GuestAddress{arg(2)},x86_?4U:8U,Access::Write);
             const auto root=static_cast<std::uint32_t>(arg(1));const bool encoding=arg(1)==root || arg(1)==(UINT64_C(0xffffffff00000000)|root);

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_calendar.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -168,7 +169,7 @@ std::optional<std::uint64_t> gui_calendar_message(GuestMemory& memory,GuiWindow&
     if((c.picker && (m==0x1003 || m==0x1004)) || (!c.picker && (m==0x1011 || m==0x1012))){const bool get=m==(c.picker?0x1003U:0x1011U);if(get){if(lp){if(c.range_flags&1U)gui_date_write(memory,lp,c.minimum);if(c.range_flags&2U)gui_date_write(memory,lp+16,c.maximum);}return c.range_flags;}
         if(wp&~3U || (wp && !lp))return 0;GuiSystemTime minimum{},maximum{};if(wp&1U){minimum=read_date(memory,lp);if(!gui_date_valid(minimum,c.picker))return 0;if(!c.picker && !gui_date_valid(minimum,true))std::copy(c.today.begin()+4,c.today.end(),minimum.begin()+4);minimum=gui_date_normalize(minimum,true);}if(wp&2U){maximum=read_date(memory,lp+16);if(!gui_date_valid(maximum,c.picker))return 0;if(!c.picker && !gui_date_valid(maximum,true))std::copy(c.today.begin()+4,c.today.end(),maximum.begin()+4);maximum=gui_date_normalize(maximum,true);}if(wp==3 && stamp(minimum,c.picker)>stamp(maximum,c.picker))return 0;clear_input(c);if(c.picker)++c.picker_revision;c.range_flags=wp;c.minimum=minimum;c.maximum=maximum;if(!in_range(c,c.value)){auto d=(wp&1U) && stamp(c.value,c.picker)<stamp(minimum,c.picker)?minimum:maximum;select(c,d,false);}if(!in_range(c,c.last))c.last=c.value;return 1;
     }
-    if(c.picker && (m==0x1005 || m==0x1032)){auto format=lp?(m==0x1032?read_utf16(memory,GuestAddress{lp},65535):utf8_to_utf16_lossy(read_ansi(memory,lp,65535))):std::u16string{};clear_input(c);c.format=std::move(format);return 1;}
+    if(c.picker && (m==0x1005 || m==0x1032)){auto format=lp?(m==0x1032?read_utf16(memory,GuestAddress{lp},65535):ansi_to_utf16_lossy(read_ansi(memory,lp,65535))):std::u16string{};clear_input(c);c.format=std::move(format);return 1;}
     if((c.picker && (m==0x1006 || m==0x1007)) || (!c.picker && (m==0x100a || m==0x100b))){if(wp>=c.colors.size())return UINT32_MAX;const auto old=c.colors[wp];if(m==0x1006 || m==0x100a)c.colors[wp]=static_cast<std::uint32_t>(lp)&0xffffffU;return old;}
     if(c.picker && m==0x1008)return c.open?c.month_window:0;
     if(c.picker && m==0x1009){c.month_font=msg.wparam;return 0;}if(c.picker && m==0x100a)return c.month_font?c.month_font:w.font;

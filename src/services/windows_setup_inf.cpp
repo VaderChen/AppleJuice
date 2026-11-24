@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/unicode.hpp"
@@ -231,7 +232,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_setup_inf(GuestState& state
     const auto fail=[&](std::uint32_t error,std::uint64_t value=0){last_error_=error;return finish(value);};
     const auto succeed=[&](std::uint64_t value=1){last_error_=0;return finish(value);};
     const auto invalid_handle=x86_?std::uint64_t{UINT32_MAX}:UINT64_MAX;
-    const auto read_text=[&](std::uint64_t pointer)->std::u16string{if(!pointer)return {};return wide?read_utf16(memory,GuestAddress{pointer},32768):utf8_to_utf16(read_ansi(memory,pointer,32768));};
+    const auto read_text=[&](std::uint64_t pointer)->std::u16string{if(!pointer)return {};return wide?read_utf16(memory,GuestAddress{pointer},32768):ansi_to_utf16(read_ansi(memory,pointer,32768));};
     const auto environment_value=[&](std::u16string_view key){for(const auto& [entry_key,entry]:runtime_.environment)if(fold(entry_key)==fold(std::u16string(key)))return entry.second;return std::u16string{};};
     const auto full_path=[&](const std::u16string& path){return full_windows_environment_path(path,runtime_.current_directory,runtime_.environment);};
     const auto exists=[&](const std::u16string& path){const auto info=filesystem_.information(utf16_to_utf8(path));return !info.error && !(info.metadata.attributes&0x10U);};
@@ -315,14 +316,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_setup_inf(GuestState& state
         return std::nullopt;
     };
     const auto section_exists=[&](State::Handle& handle,std::uint32_t section){for(std::size_t file=0;file<handle.files.size();++file)if(lines_of(handle,file,section))return true;return false;};
-    const auto encoded=[&](std::u16string_view text){std::vector<std::uint8_t> bytes;if(wide)bytes=utf16_bytes(text);else {const auto ansi=utf16_to_utf8(std::u16string(text));bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}return bytes;};
+    const auto encoded=[&](std::u16string_view text){std::vector<std::uint8_t> bytes;if(wide)bytes=utf16_bytes(text);else {const auto ansi=utf16_to_ansi(std::u16string(text));bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}return bytes;};
     // 文字輸出：所需長度（含 NUL，A 為位元組）寫入 RequiredSize；緩衝區為 NULL 且大小為 0 時只回報長度。
     const auto output=[&](std::uint64_t buffer,std::uint64_t size,std::uint64_t required_at,std::vector<std::uint8_t> bytes)->std::optional<std::uint32_t>{
         const auto required=wide?bytes.size()/2:bytes.size();if(required_at){memory.check(GuestAddress{required_at},4,Access::Write);memory.store(GuestAddress{required_at},32,required);}
         if(!buffer){if(size)return fail(87);return succeed();}
         if(static_cast<std::uint32_t>(size)<required)return fail(122);memory.write(GuestAddress{buffer},bytes);return succeed();
     };
-    const auto multi=[&](const std::vector<std::u16string>& items){std::u16string text;for(const auto& item:items){text+=item;text.push_back(0);}if(items.empty())text.push_back(0);std::vector<std::uint8_t> bytes;if(wide){bytes=utf16_bytes(text);}else {const auto ansi=utf16_to_utf8(text);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}return bytes;};
+    const auto multi=[&](const std::vector<std::u16string>& items){std::u16string text;for(const auto& item:items){text+=item;text.push_back(0);}if(items.empty())text.push_back(0);std::vector<std::uint8_t> bytes;if(wide){bytes=utf16_bytes(text);}else {const auto ansi=utf16_to_ansi(text);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}return bytes;};
     const auto open_handle=[&](State::File file){std::uint64_t value=0;while(!value || handles.contains(value)){value=allocate_heap(memory,16);if(!value)throw Failure{8};}State::Handle handle;handle.files.push_back(std::move(file));handles.emplace(value,std::move(handle));return value;};
     const auto version_value=[&](const State::Handle& handle,const State::File& file,std::u16string_view key)->std::optional<std::u16string>{
         const auto found=file.sections.find(u"version");if(found==file.sections.end())return std::nullopt;

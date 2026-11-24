@@ -1,6 +1,9 @@
 #include "x64arm/windows_services.hpp"
 #include "crt_program_data.hpp"
 #include "x64arm/windows_version.hpp"
+#include "process_manifest.hpp"
+#include "ansi_codepage.hpp"
+#include "resource_directory.hpp"
 #include "x64arm/interpreter.hpp"
 #include "service_callback_task.hpp"
 #include "guest_crt_state.h"
@@ -296,6 +299,7 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {crt_extra_service_descriptors(), false, "crt_extra_service_descriptors", &WindowsServices::invoke_crt_extra},
             {crt_console_read_service_descriptors(), false, "crt_console_read_service_descriptors", &WindowsServices::invoke_crt_console_read},
             {com_moniker_service_descriptors(), true, "com_moniker_service_descriptors", &WindowsServices::invoke_com_monikers},
+            {directshow_service_descriptors(), true, "directshow_service_descriptors", &WindowsServices::invoke_directshow},
             {ole_advise_service_descriptors(), true, "ole_advise_service_descriptors", &WindowsServices::invoke_ole_advise},
             {crt_mbcs_service_descriptors(), false, "crt_mbcs_service_descriptors", &WindowsServices::invoke_crt_mbcs},
             {crt_runtime_extra_service_descriptors(), false, "crt_runtime_extra_service_descriptors", &WindowsServices::invoke_crt_runtime_extra},
@@ -860,9 +864,13 @@ __attribute__((always_inline)) inline CrtBufferOutput format_buffer_output(const
 std::u16string render_message_insert(GuestMemory& memory,std::u16string_view pattern,bool wide_strings,
                                      std::span<const std::uint64_t> values){
     // FormatMessage 的窄字串使用客體 ACP，不依賴呼叫端的 CRT locale。
-    static const CrtLocaleCategory locale=[]{
+    static thread_local CrtLocaleCategory locale=[]{
         CrtLocaleCategory value;value.codepage=65001;value.maximum_character_bytes=4;return value;
     }();
+    if(locale.codepage!=process_ansi_codepage()){
+        if(auto page=windows_nls_codepage(process_ansi_codepage()))locale=std::move(*page);
+        else {locale=CrtLocaleCategory{};locale.codepage=65001;locale.maximum_character_bytes=4;}
+    }
     const unsigned unit=memory.execution_mode()==ExecutionMode::X86?4U:8U;
     const auto next=[&](unsigned,unsigned,FormatArgumentKind){
         if(values.empty())throw FormatError{22};
@@ -953,6 +961,7 @@ void WindowsServices::initialize_runtime(GuestMemory& memory, std::u16string_vie
     memory.store(GuestAddress{runtime_base_.value+136},x86_?32:64,runtime_.ctype_table+2);
     // _dstbias 的 CRT 初始值（夏令與標準時間差 -3600 秒）；__dstbias 回傳此格。
     memory.store(GuestAddress{runtime_base_.value+160},32,static_cast<std::uint32_t>(-3600));
+    resolve_compat_version(memory); // CRT 的 _winver／_winmajor 等與 GetVersionEx 同一相容版本
     initialize_crt_wctype(memory);
     initialize_crt_multibyte(memory,runtime_base_.value,runtime_.crt_multibyte_codepage);
     initialize_crt_lowio(memory);
@@ -1013,6 +1022,7 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
         }
         memory.store(GuestAddress{peb_base_.value+8},32,runtime_.image.base);
         memory.store(GuestAddress{peb_base_.value+0x18},32,process_heap);
+        resolve_compat_version(memory);
         memory.store(GuestAddress{peb_base_.value+0xa4},32,windows_version_major);memory.store(GuestAddress{peb_base_.value+0xa8},32,windows_version_minor);
         memory.store(GuestAddress{peb_base_.value+0xac},16,windows_version_build);memory.store(GuestAddress{peb_base_.value+0xb0},32,2);
         if(initial_thread){
@@ -1043,7 +1053,9 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
     memory.store(GuestAddress{peb_base_.value + 0x10}, 64, runtime_.image.base);
     memory.store(GuestAddress{peb_base_.value + 0x30}, 64, process_heap); // ProcessHeap
     memory.store(GuestAddress{peb_base_.value + 0xb8}, 32, std::max(1U, runtime_.processor_count)); // NumberOfProcessors
-    // OSMajorVersion／OSMinorVersion／OSBuildNumber／OSPlatformId：與 RtlGetVersion 相同來源（自行讀 PEB 的版本檢查與防護層會用）。
+    // OSMajorVersion／OSMinorVersion／OSBuildNumber／OSPlatformId：PEB 維持真實版本（ntdll 的 RtlGetVersion 讀這裡）；
+    // 依主程式清單回報的相容版本只套用在 kernel32 的 GetVersion／GetVersionEx／VerifyVersionInfo 與 CRT 版本變數。
+    resolve_compat_version(memory);
     memory.store(GuestAddress{peb_base_.value + 0x118}, 32, windows_version_major);memory.store(GuestAddress{peb_base_.value + 0x11c}, 32, windows_version_minor);
     memory.store(GuestAddress{peb_base_.value + 0x120}, 16, windows_version_build);memory.store(GuestAddress{peb_base_.value + 0x124}, 32, 2);
     // RTL_USER_PROCESS_PARAMETERS64：供靜態 CRT 與原生 Win32 程式讀取程序資料。
@@ -2291,7 +2303,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
         if (finished.value >> 32) return finish_process(state, memory, static_cast<std::uint32_t>(finished.value));
         complete_call(state,memory,0); return std::nullopt;
     }
-    if (finished.continuation == Continuation::GuiModalSystemFilter || finished.continuation == Continuation::GuiModalFilter || finished.continuation == Continuation::GuiModalInit || finished.continuation == Continuation::GuiModalDispatch || finished.continuation == Continuation::GuiModalEnd || finished.continuation == Continuation::GuiDialogInit || finished.continuation == Continuation::GuiNcCreate || finished.continuation == Continuation::GuiCreate || finished.continuation == Continuation::GuiDestroy || finished.continuation == Continuation::GuiDestroyDefault)
+    if (finished.continuation == Continuation::GuiModalSystemFilter || finished.continuation == Continuation::GuiModalFilter || finished.continuation == Continuation::GuiModalInit || finished.continuation == Continuation::GuiModalDispatch || finished.continuation == Continuation::GuiModalEnd || finished.continuation == Continuation::GuiDialogInit || finished.continuation == Continuation::GuiNcCreate || finished.continuation == Continuation::GuiCreate || finished.continuation == Continuation::GuiCreateShow || finished.continuation == Continuation::GuiDestroy || finished.continuation == Continuation::GuiDestroyDefault)
         return resume_gui(state, memory, finished, callback_value);
     if (finished.continuation == Continuation::GuiMenuInit || finished.continuation == Continuation::GuiMenuFinish) return resume_menu(state, memory, finished, callback_value);
     if(finished.continuation==Continuation::GuiGrayString)return resume_gray_string(state,memory,finished,callback_value);
@@ -2533,8 +2545,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
     else if (symbol == "GetCommandLineA") result = runtime_.command_ansi;
     else if (symbol == "GetCurrentThreadId") result = thread_identifier(threads_.current);
     else if (symbol == "GetCurrentProcessId" || symbol=="_getpid") result = process_id();
-    else if (symbol == "IsDBCSLeadByte") result = 0; // 本程序的 ANSI code page 為 UTF-8，沒有 DBCS lead byte。
-    else if (symbol == "GetACP") result = 65001;
+    else if (symbol == "IsDBCSLeadByte") result = ansi_lead_byte(static_cast<std::uint8_t>(arg(0))); // UTF-8 ACP 沒有 DBCS lead byte
+    else if (symbol == "GetACP") result = process_ansi_codepage();
     else if (symbol == "GetModuleHandleA" || symbol == "GetModuleHandleW") { if (arg(0)) fail(126); else result = runtime_.image.base; }
     else if (symbol == "GetStartupInfoA" || symbol == "GetStartupInfoW") {
         const auto size=x86_ ? 68U : 104U; memory.write(GuestAddress{arg(0)}, std::vector<std::uint8_t>(size)); memory.store(GuestAddress{arg(0)}, 32, size);
@@ -3167,4 +3179,45 @@ void WindowsServices::audit_runtime_services(std::ostream& out) {
     }
     out<<"],\"abi_conflicts\":"<<conflicts<<",\"route_overrides\":"<<mismatches<<"}\n";
 }
+
+// 主程式內嵌清單（RT_MANIFEST，ID 1）的 supportedOS 決定 GetVersion(Ex) 等看到的版本：Windows 10／11 → 10.0、只到 8.1 → 6.3.9600、
+// 未宣告 → 6.2.9200。只讀映像的資源目錄；目錄或清單格式不合法時視同未宣告，與 Windows 載入器相同不中止程序。
+// X64ARM_OS_VERSION_SHIM=0 一律回報真實版本供對照。
+void WindowsServices::resolve_compat_version(const GuestMemory& memory){
+    compat_version_={windows_version_major,windows_version_minor,windows_version_build};
+    static const bool enabled=[]{const auto* value=std::getenv("X64ARM_OS_VERSION_SHIM");return !value || std::string_view(value)!="0";}();
+    if(!runtime_.image.base || !runtime_.image.size)return;
+    // 主程式資源（類型、ID）的第一個語言項目：回傳資料與該項目的語言 ID。
+    const auto resource=[&](std::uint64_t type,std::uint64_t id,std::uint16_t& language)->std::vector<std::uint8_t>{
+        try{
+            const std::uint64_t keys[]{type,id};
+            const auto found=find_resource_entry(memory,runtime_.image.base,runtime_.image.size,keys,true);
+            if(!found.present || found.depth!=2 || !found.directory)return {};
+            const auto count=memory.load(GuestAddress{found.address+12},16)+memory.load(GuestAddress{found.address+14},16);
+            if(!count)return {};
+            language=static_cast<std::uint16_t>(memory.load(GuestAddress{found.address+16},32));
+            const auto target=memory.load(GuestAddress{found.address+16+4},32);
+            if(target&0x80000000U)return {};
+            const auto entry=found.root+target;
+            const auto rva=memory.load(GuestAddress{entry},32),size=memory.load(GuestAddress{entry+4},32);
+            if(!size || size>1024U*1024U || rva+size>runtime_.image.size)return {};
+            std::vector<std::uint8_t> bytes(size);memory.read(GuestAddress{runtime_.image.base+rva},bytes);return bytes;
+        }catch(const std::exception&){return {};}
+    };
+    std::uint16_t manifest_language{},version_language{};
+    const auto manifest=resource(24,1,manifest_language);
+    // ANSI 碼頁：診斷覆寫 X64ARM_ANSI_CODEPAGE（數字），否則清單宣告 UTF-8 時為 65001，再依版本資源語言。
+    std::uint32_t page=0;
+    if(const auto* forced=std::getenv("X64ARM_ANSI_CODEPAGE");forced && *forced && std::string_view(forced)!="auto"){
+        char* end=nullptr;const auto value=std::strtoul(forced,&end,10);if(end && !*end)page=static_cast<std::uint32_t>(value);
+    }
+    if(!page && !manifest.empty())page=process_manifest::active_codepage(manifest);
+    if(!page){const auto version=resource(16,1,version_language);if(!version.empty())page=ansi_codepage_for_language(version_resource_language(version,version_language));}
+    set_process_ansi_codepage(page?page:65001U);
+    if(!enabled)return;
+    const unsigned supported=manifest.empty()?0U:process_manifest::supported_os(manifest);
+    if(supported>=100)return;
+    compat_version_=supported>=81?CompatibilityVersion{6,3,9600}:CompatibilityVersion{6,2,9200};
+}
+
 }

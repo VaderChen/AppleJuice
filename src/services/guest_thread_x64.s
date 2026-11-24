@@ -249,8 +249,10 @@ entry TryAcquireSRWLockShared
 slow_end TryAcquireSRWLockShared
 // 臨界區段（字組協定與服務層共用，見 windows_threads.cpp）：LockCount＝-1 未持有；持有時低 30 位元為遞迴次數−1、
 // bit30 表示宿主有等待者；0x7fffffff 為未持有但有等待者。OwningThread 為 TEB ClientId.UniqueThread（gs:[0x48]）。
-// 只在無等待者時以 lock cmpxchg 取得／完全釋放，遞迴由持有者遞增／遞減。loader lock（PEB+0x800）、有等待者的釋放、
-// 遞迴上限、非持有者解鎖與未持有但有等待者一律以原參數尾跳原服務。只使用 RAX／RDX 與旗標，RCX 保持原值。
+// 取得：未持有（-1）時 CAS 成 0；未持有但有等待者（0x7fffffff）時與 Windows（Vista 以後）的不公平臨界區段相同直接搶得，
+// CAS 成 0x40000000 保留等待者位元（服務層 critical_acquire 同一協定，被喚醒的等待者發現已被取得就繼續等）。
+// 遞迴由持有者遞增／遞減；有等待者的完全釋放、loader lock（PEB+0x800）、遞迴上限與非持有者解鎖以原參數尾跳原服務。
+// 只使用 RAX／RDX 與旗標（多處理器自旋另用 R8），RCX 保持原值。
 .macro critical_loader_lock
     mov rax, qword ptr gs:[0x60]
     add rax, 0x800
@@ -270,6 +272,13 @@ entry EnterCriticalSection
     mov dword ptr [rcx + 12], 1
     ret
 2:
+    // 未持有但有等待者：搶得並保留等待者位元（不公平鎖，避免每次交接都經宿主喚醒形成鎖護送）。
+    cmp eax, 0x7fffffff
+    jne 7f
+    mov edx, 0x40000000
+    lock cmpxchg dword ptr [rcx + 8], edx
+    je 5b
+7:
     mov edx, dword ptr gs:[0x48]
     cmp qword ptr [rcx + 16], rdx
     jne 3f
@@ -281,17 +290,24 @@ entry EnterCriticalSection
     lock inc dword ptr [rcx + 8]
     ret
 3:
-    // 他人持有：多處理器（PEB NumberOfProcessors>1）時先有界自旋等字組回到 -1（與 Windows 臨界區段自旋相同用意），
-    // 逾量才進原服務登記等待；單處理器直接進服務。只讀字組，不設等待位元。
+    // 他人持有：多處理器（PEB NumberOfProcessors>1）時先有界自旋等字組回到未持有（-1，或有等待者的 0x7fffffff），
+    // 逾量才進原服務登記等待；單處理器直接進服務。自旋期間不設等待位元。
     mov rdx, qword ptr gs:[0x60]
     cmp dword ptr [rdx + 0xb8], 1
     jbe 1f
     mov r8d, 4000
 4:
     pause
-    cmp dword ptr [rcx + 8], -1
+    mov eax, dword ptr [rcx + 8]
+    cmp eax, -1
+    je 8f
+    cmp eax, 0x7fffffff
     jne 6f
-    mov eax, -1
+    mov edx, 0x40000000
+    lock cmpxchg dword ptr [rcx + 8], edx
+    je 5b
+    jmp 6f
+8:
     xor edx, edx
     lock cmpxchg dword ptr [rcx + 8], edx
     je 5b
@@ -344,8 +360,18 @@ entry TryEnterCriticalSection
     mov eax, 1
     ret
 2:
+    // 未持有但有等待者：與 EnterCriticalSection 相同直接搶得並保留等待者位元。
     cmp eax, 0x7fffffff
-    je 1f
+    jne 7f
+    mov edx, 0x40000000
+    lock cmpxchg dword ptr [rcx + 8], edx
+    jne 4f
+    mov eax, dword ptr gs:[0x48]
+    mov qword ptr [rcx + 16], rax
+    mov dword ptr [rcx + 12], 1
+    mov eax, 1
+    ret
+7:
     mov edx, dword ptr gs:[0x48]
     cmp qword ptr [rcx + 16], rdx
     jne 4f

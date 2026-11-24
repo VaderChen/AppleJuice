@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -353,7 +354,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         const auto access=static_cast<std::uint32_t>(arg(2)),options=static_cast<std::uint32_t>(arg(3));
         if(!arg(0) || !arg(1) || static_cast<std::uint32_t>(arg(4)) || (options&~1U) || (access&0x300U)==0x300U)return done(87);
         if(access&~0xf30f033fU)return done(50);
-        const auto source=symbol.ends_with("W")?read_utf16(memory,GuestAddress{arg(0)},32768):utf8_to_utf16(read_ansi(memory,arg(0),32768));if(source.empty())return done(87);
+        const auto source=symbol.ends_with("W")?read_utf16(memory,GuestAddress{arg(0)},32768):ansi_to_utf16(read_ansi(memory,arg(0),32768));if(source.empty())return done(87);
         if(registry.handles.size()>=4096)return done(8);memory.check(GuestAddress{arg(1)},x86_?4:8,Access::Write);memory.store(GuestAddress{arg(1)},x86_?32:64,0);
         std::u16string root;std::uint32_t status=0;
         try{status=load_app_hive(source,(options&1U)!=0,root);}catch(const registry_hive::Error& error){status=error.code;}
@@ -407,7 +408,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     const auto modified=[&](const std::u16string& path){changed=true;registry.modified_times[path]=runtime_.system_filetime();};
     const bool wide=symbol.ends_with("W");
     const auto name=[&](std::uint64_t pointer) {
-        auto value=pointer?(wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16(read_ansi(memory,pointer,32768))):std::u16string{};
+        auto value=pointer?(wide?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16(read_ansi(memory,pointer,32768))):std::u16string{};
         for(auto& c:value)c=unicode_case_unit(c,false);
         return value;
     };
@@ -432,14 +433,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         if(arg(3) || (arg(1) && !arg(2)))return done(87);
         const auto capacity=arg(2)?memory.load(GuestAddress{arg(2)},32):0;
         const auto class_item=registry.classes.find(handle.path);const auto class_name=class_item==registry.classes.end()?std::u16string{}:class_item->second;
-        const auto class_text=wide?std::string{}:utf16_to_utf8(class_name);const auto class_length=wide?class_name.size():class_text.size();
+        const auto class_text=wide?std::string{}:utf16_to_ansi(class_name);const auto class_length=wide?class_name.size():class_text.size();
         std::uint64_t subkeys=0,maxkey=0,maxclass=0,maxname=0,maxdata=0;
         for(const auto& path:registry_subkeys(registry,handle)){
-            ++subkeys;const auto display=registry.display_names.contains(path)?registry.display_names.at(path):path.substr(path.find_last_of(u'\\')+1);maxkey=std::max<std::uint64_t>(maxkey,wide?display.size():utf16_to_utf8(display).size());
-            if(const auto item=registry.classes.find(path);item!=registry.classes.end())maxclass=std::max<std::uint64_t>(maxclass,wide?item->second.size():utf16_to_utf8(item->second).size());
+            ++subkeys;const auto display=registry.display_names.contains(path)?registry.display_names.at(path):path.substr(path.find_last_of(u'\\')+1);maxkey=std::max<std::uint64_t>(maxkey,wide?display.size():utf16_to_ansi(display).size());
+            if(const auto item=registry.classes.find(path);item!=registry.classes.end())maxclass=std::max<std::uint64_t>(maxclass,wide?item->second.size():utf16_to_ansi(item->second).size());
         }
         const auto& values=registry.keys.at(handle.path);
-        for(const auto& [entry,value]:values){maxname=std::max<std::uint64_t>(maxname,wide?entry.size():utf16_to_utf8(entry).size());std::uint64_t size=value.bytes.size();if(!wide && (value.type==1 || value.type==2 || value.type==7) && !(size%2)){std::u16string text;for(std::size_t i=0;i<value.bytes.size();i+=2)text.push_back(static_cast<char16_t>(value.bytes[i]|(static_cast<unsigned>(value.bytes[i+1])<<8)));size=utf16_to_utf8(text).size();}maxdata=std::max(maxdata,size);}
+        for(const auto& [entry,value]:values){maxname=std::max<std::uint64_t>(maxname,wide?entry.size():utf16_to_ansi(entry).size());std::uint64_t size=value.bytes.size();if(!wide && (value.type==1 || value.type==2 || value.type==7) && !(size%2)){std::u16string text;for(std::size_t i=0;i<value.bytes.size();i+=2)text.push_back(static_cast<char16_t>(value.bytes[i]|(static_cast<unsigned>(value.bytes[i+1])<<8)));size=utf16_to_ansi(text).size();}maxdata=std::max(maxdata,size);}
         for(unsigned i:{2U,4U,5U,6U,7U,8U,9U,10U})if(arg(i))memory.check(GuestAddress{arg(i)},4,Access::Write);
         if(arg(11))memory.check(GuestAddress{arg(11)},8,Access::Write);
         if(arg(1) && capacity)memory.check(GuestAddress{arg(1)},wide?2:1,Access::Write);
@@ -454,11 +455,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         if(!arg(2) || !arg(3) || arg(4) || (arg(6) && !arg(7)))return done(87);
         const auto& values=registry.keys.at(handle.path);const auto index=static_cast<std::uint32_t>(arg(1));if(index>=values.size())return done(259);
         const auto item=std::next(values.begin(),index);const auto& value=item->second;const auto& display=value.display_name.empty()?item->first:value.display_name;
-        const auto text=utf16_to_utf8(display);const auto length=wide?display.size():text.size();const auto capacity=memory.load(GuestAddress{arg(3)},32),data_capacity=arg(7)?memory.load(GuestAddress{arg(7)},32):0;
+        const auto text=utf16_to_ansi(display);const auto length=wide?display.size():text.size();const auto capacity=memory.load(GuestAddress{arg(3)},32),data_capacity=arg(7)?memory.load(GuestAddress{arg(7)},32):0;
         auto data=value.bytes;
         if(!wide && (value.type==1 || value.type==2 || value.type==7)){
             if(data.size()%2)return done(13);std::u16string chars;for(std::size_t i=0;i<data.size();i+=2)chars.push_back(static_cast<char16_t>(data[i]|(static_cast<unsigned>(data[i+1])<<8)));
-            const auto converted=utf16_to_utf8(chars);data.assign(converted.begin(),converted.end());
+            const auto converted=utf16_to_ansi(chars);data.assign(converted.begin(),converted.end());
         }
         memory.check(GuestAddress{arg(3)},4,Access::Write);if(arg(5))memory.check(GuestAddress{arg(5)},4,Access::Write);if(arg(7))memory.check(GuestAddress{arg(7)},4,Access::Write);
         const bool name_fits=capacity>length,data_fits=!arg(6) || data_capacity>=data.size();
@@ -475,7 +476,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         if(!(handle.access&8))return done(5);std::vector<std::u16string> children;const auto physical_children=registry_subkeys(registry,handle);
         for(const auto& path:physical_children)children.push_back(registry.display_names.contains(path)?registry.display_names.at(path):path.substr(path.find_last_of(u'\\')+1));
         const auto index=static_cast<std::uint32_t>(arg(1));if(index>=children.size())return done(259);
-        const auto text=utf16_to_utf8(children[index]);const auto size=wide?children[index].size():text.size();const auto capacity=extended?memory.load(GuestAddress{arg(3)},32):arg(3);if(capacity<=size)return done(234);
+        const auto text=utf16_to_ansi(children[index]);const auto size=wide?children[index].size():text.size();const auto capacity=extended?memory.load(GuestAddress{arg(3)},32):arg(3);if(capacity<=size)return done(234);
         if(extended && arg(5) && !memory.load(GuestAddress{arg(6)},32))return done(234);
         if(!arg(2))return done(87);
         memory.check(GuestAddress{arg(2)},(size+1)*(wide?2:1),Access::Write);
@@ -550,7 +551,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         const auto access=set_key_value?2U:legacy?0x02000000U:static_cast<std::uint32_t>(arg(create?5:3));
         const auto output=set_key_value?0:arg(legacy?2:create?7:4),disposition=create && !legacy && !set_key_value?arg(8):0;
         std::u16string requested_class;
-        if(create && !legacy && !set_key_value && arg(3)){requested_class=wide?read_utf16(memory,GuestAddress{arg(3)},32768):utf8_to_utf16(read_ansi(memory,arg(3),32768));if(requested_class.size()>32767)return done(87);}
+        if(create && !legacy && !set_key_value && arg(3)){requested_class=wide?read_utf16(memory,GuestAddress{arg(3)},32768):ansi_to_utf16(read_ansi(memory,arg(3),32768));if(requested_class.size()>32767)return done(87);}
         if((!legacy && !set_key_value && static_cast<std::uint32_t>(arg(2))) || (!output && !set_key_value) || (access&0x300)==0x300)return done(87);
         if((access&~0xf30f033fU) || (create && !legacy && !set_key_value && static_cast<std::uint32_t>(arg(4))>1))return done(50);
         if(output)memory.check(GuestAddress{output},x86_?4:8,Access::Write);if(disposition)memory.check(GuestAddress{disposition},4,Access::Write);
@@ -580,7 +581,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
             created_descriptors.emplace(created,registry_creation_descriptor(parent_descriptor,created==path?explicit_descriptor:security::SecurityDescriptor{}));
         }
         const auto granted=created_descriptors.contains(path)?object_security_access(created_descriptors.at(path),access&~0x300U,{0x20019U,0x20006U,0x20019U,0xf003fU}):registry_security_access(path,access);
-        if(create){const auto requested=arg(1)?(wide?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16(read_ansi(memory,arg(1)))):std::u16string{};const auto original=registry_view_path(registry_logical_path(handle)+(requested.empty()?std::u16string{}:u"\\"+requested),view);for(const auto& parent:paths){const auto inserted=registry.keys.try_emplace(parent).second;if(inserted)mutations.emplace_back(parent.substr(0,parent.find_last_of(u'\\')),1);const auto pos=parent.find_last_of(u'\\')+1;registry.display_names.try_emplace(parent,original.substr(pos,parent.size()-pos));}}
+        if(create){const auto requested=arg(1)?(wide?read_utf16(memory,GuestAddress{arg(1)}):ansi_to_utf16(read_ansi(memory,arg(1)))):std::u16string{};const auto original=registry_view_path(registry_logical_path(handle)+(requested.empty()?std::u16string{}:u"\\"+requested),view);for(const auto& parent:paths){const auto inserted=registry.keys.try_emplace(parent).second;if(inserted)mutations.emplace_back(parent.substr(0,parent.find_last_of(u'\\')),1);const auto pos=parent.find_last_of(u'\\')+1;registry.display_names.try_emplace(parent,original.substr(pos,parent.size()-pos));}}
         if(create && !existed){for(const auto& created:paths)if(!registry.modified_times.contains(created))modified(created);modified(handle.path);}
         if(create && !existed){if(volatile_key)for(const auto& created:paths)if(created_descriptors.contains(created))registry.volatile_keys.insert(created);
             if(!requested_class.empty())registry.classes[path]=std::move(requested_class);}
@@ -608,13 +609,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         std::vector<std::uint8_t> data=legacy_set?std::move(legacy_data):std::vector<std::uint8_t>(size);
         if(!legacy_set && size)memory.read(GuestAddress{arg(4)},data);
         if(!wide && (type==1 || type==2 || type==7)) {
-            const auto converted=utf8_to_utf16(std::string(data.begin(),data.end()));data.clear();
+            const auto converted=ansi_to_utf16(std::string(data.begin(),data.end()));data.clear();
             for(const auto c:converted){data.push_back(static_cast<std::uint8_t>(c));data.push_back(static_cast<std::uint8_t>(c>>8));}
         }
         const auto found=values.find(value_name);const auto previous=found==values.end()?0:found->second.bytes.size();
         if(registry.bytes-previous+data.size()>output_limit || (found==values.end() && registry.values>=4096))return done(8);
         registry.bytes=registry.bytes-previous+data.size();if(found==values.end())++registry.values;
-        const auto pointer=legacy_set?0:arg(set_key_value?2:1);const auto original=pointer?(wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16(read_ansi(memory,pointer))):std::u16string{};
+        const auto pointer=legacy_set?0:arg(set_key_value?2:1);const auto original=pointer?(wide?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16(read_ansi(memory,pointer))):std::u16string{};
         const auto display=found==values.end()?(original==value_name?std::u16string{}:original):found->second.display_name;
         values[value_name]={type,std::move(data),display};modified(handle.path);mutations.emplace_back(handle.path,4U);return done(0);
     }
@@ -651,7 +652,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     if(!wide && (type==1 || type==2 || type==7)) {
         if(data.size()%2)return done(13);std::u16string text;
         for(std::size_t i=0;i<data.size();i+=2)text.push_back(static_cast<char16_t>(data[i]|(static_cast<unsigned>(data[i+1])<<8)));
-        const auto converted=utf16_to_utf8(text);data.assign(converted.begin(),converted.end());
+        const auto converted=utf16_to_ansi(text);data.assign(converted.begin(),converted.end());
     }
     const auto capacity=size_out?memory.load(GuestAddress{size_out},32):0;
     if(type_out)memory.check(GuestAddress{type_out},4,Access::Write);if(size_out)memory.check(GuestAddress{size_out},4,Access::Write);

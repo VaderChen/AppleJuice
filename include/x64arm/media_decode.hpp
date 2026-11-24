@@ -27,14 +27,28 @@ struct CompressedAudio {
 bool video_decoder_available(std::uint32_t fourcc);
 bool audio_decoder_available(std::uint16_t format_tag);
 bool video1_fourcc(std::uint32_t fourcc);
+// Cinepak（cvid）：Windows 內建 iccvid 的傳統 VFW 視訊，24／32 位元輸出。
+bool cinepak_fourcc(std::uint32_t fourcc);
+// 解碼成來源位元深度 DIB 列（由下而上、每列 4 位元組對齊）的傳統 VFW 視訊：Video 1 與 Cinepak。
+bool dib_codec_fourcc(std::uint32_t fourcc);
 inline constexpr unsigned video1_default_key_rate=15;
 
+// DIB 輸出的視訊解碼器：AVI 預覽、AVIFile 取影格與 VFW 解壓縮共用。
+class DibVideoDecoder {
+public:
+    virtual ~DibVideoDecoder()=default;
+    // 回傳完整影格的 DIB 列；資料不完整或解碼失敗時回傳空陣列。
+    virtual std::vector<std::uint8_t> decode(std::span<const std::uint8_t> packet,bool key)=0;
+};
+// 依 biCompression 建立解碼器（palette 為 8 位元格式的 RGBQUAD 色表）；不支援時丟出 std::invalid_argument。
+std::unique_ptr<DibVideoDecoder> open_dib_decoder(std::uint32_t fourcc,unsigned width,unsigned height,unsigned depth,std::span<const std::uint8_t> palette);
+
 // Video 1 的點陣圖以 DIB 順序輸出，保留 PAL8 索引或 RGB555 的原始位元。
-class Video1Decoder {
+class Video1Decoder final : public DibVideoDecoder {
 public:
     Video1Decoder(unsigned width,unsigned height,unsigned depth,std::span<const std::uint8_t> palette);
-    ~Video1Decoder();
-    std::vector<std::uint8_t> decode(std::span<const std::uint8_t> packet,bool key);
+    ~Video1Decoder() override;
+    std::vector<std::uint8_t> decode(std::span<const std::uint8_t> packet,bool key) override;
 private:
     struct State;
     std::unique_ptr<State> state_;

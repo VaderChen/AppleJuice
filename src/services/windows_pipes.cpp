@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "windows_file_copy.hpp"
 #include "default_pipe_acl.hpp"
@@ -746,7 +747,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
     };
     const auto text = [&]() {
         return symbol.ends_with('W') ? read_utf16(memory, GuestAddress{arg(0)}, 256)
-                                     : utf8_to_utf16(read_ansi(memory, arg(0), 256));
+                                     : ansi_to_utf16(read_ansi(memory, arg(0), 256));
     };
     if ((symbol == "CancelIo" || symbol == "CancelIoEx") && runtime_.network.sockets.contains(arg(0)))
         return invoke_network_extension(state, memory, service);

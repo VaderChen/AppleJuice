@@ -6,7 +6,7 @@ if(const bool groups=symbol=="CreateUrlCacheGroup" || symbol=="DeleteUrlCacheGro
     Transaction transaction(runtime_.registry,registry_file_);auto& registry=runtime_.registry;auto metadata=url_cache::load_metadata(registry);
     const auto find_group=[&](std::uint64_t id)->url_cache::Group&{for(auto& group:metadata.groups)if(group.id==id)return group;throw CacheError{2};};
     const auto all_entries=[&]{std::vector<Entry> entries;const auto index=registry.keys.find(url_cache::index);if(index!=registry.keys.end())for(const auto& [name,value]:index->second){(void)name;auto entry=url_cache::decode(value.bytes);if(entry.type)entries.push_back(std::move(entry));}return entries;};
-    const auto encoded=[&](std::u16string_view value,std::size_t limit){std::vector<std::uint8_t> bytes;if(wide){bytes=utf16_bytes(value);}else {const auto ansi=utf16_to_utf8(std::u16string(value));bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}if(limit && bytes.size()>limit*width)throw CacheError{87};return bytes;};
+    const auto encoded=[&](std::u16string_view value,std::size_t limit){std::vector<std::uint8_t> bytes;if(wide){bytes=utf16_bytes(value);}else {const auto ansi=utf16_to_ansi(std::u16string(value));bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}if(limit && bytes.size()>limit*width)throw CacheError{87};return bytes;};
     // 內建容器：Content、Cookies、History，前綴與 FindFirstUrlCacheEntry 的搜尋樣式一致。
     std::vector<url_cache::Container> containers{{u"Content",u"",directory,metadata.quota,0,0},{u"Cookies",u"Cookie:",directory,metadata.quota,0,0},{u"History",u"Visited:",directory,metadata.quota,0,0}};
     for(const auto& item:metadata.containers)containers.push_back(item);

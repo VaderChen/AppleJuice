@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_userdraw.hpp"
 #include "service_callback_task.hpp"
@@ -29,7 +30,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_legacy(GuestState& s
         // 清單方塊（LB_*）與下拉方塊（CB_*）兩組訊息；控制項經客體 SendMessage，保留子類別化的視窗程序。
         const bool combo=symbol.find("ComboBox")!=symbol.npos,wide=symbol.ends_with('W'),select=symbol.starts_with("DlgDirSelect");
         std::u16string spec;
-        if(!select && arg(1))spec=wide?read_utf16(memory,GuestAddress{arg(1)},260):utf8_to_utf16_lossy(read_ansi(memory,arg(1),260));
+        if(!select && arg(1))spec=wide?read_utf16(memory,GuestAddress{arg(1)},260):ansi_to_utf16_lossy(read_ansi(memory,arg(1),260));
         return nested_continuation(state,memory,"DlgDir",[this,service,combo,wide,select,spec](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
             const WindowsCall call(s,m,service);
             const auto entry=[&](std::string_view dll,std::string_view target){const auto stub=host_service_stub(dll,target);return stub.value?stub.value:resolve(dll,target).value;};

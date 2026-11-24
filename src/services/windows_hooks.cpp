@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "guest_counted_string.hpp"
@@ -27,7 +28,7 @@ bool WindowsServices::enter_gui_hook(GuestState& state,GuestMemory& memory,GuiHo
         const auto source=memory.load(GuestAddress{lparam},64);std::array<std::uint8_t,80> data{};memory.read(GuestAddress{source},data);
         const auto target=allocate_gui_scratch(memory,frame.scratch,data);
         for(const auto offset:{56U,64U}){const auto pointer=memory.load(GuestAddress{source+offset},64);if(pointer<=65535)continue;
-            const auto text=frame.wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer));std::uint64_t encoded;
+            const auto text=frame.wide?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16_lossy(read_ansi(memory,pointer));std::uint64_t encoded;
             if(hook.wide)encoded=allocate_gui_scratch(memory,frame.scratch,utf16_bytes(text));else {const auto utf8=utf16_to_utf8(text);std::vector<std::uint8_t> bytes(utf8.begin(),utf8.end());bytes.push_back(0);encoded=allocate_gui_scratch(memory,frame.scratch,bytes);}
             memory.store(GuestAddress{target+offset},64,encoded);
         }

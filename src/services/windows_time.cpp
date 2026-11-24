@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/security_descriptor.hpp"
 #include "x64arm/system_performance.hpp"
@@ -499,7 +500,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
             }else if(!arg(0)){code=87;bad=true;}
             else if(runtime_.descriptors.size()+3U>=8192)code=4;
             else {
-                const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+                const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
                 const auto info=filesystem_.information(path);
                 if(info.error)code=info.error;
                 else if((info.metadata.attributes&0x11U))code=5;

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_keyboard.hpp"
 #include "x64arm/windows_pointer.hpp"
@@ -129,7 +130,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_user_session(GuestState& st
             }else{
                 if(extended && !previous){arg.return_to(state,0);return std::nullopt;}
                 const auto buffer=arg(extended?1:0);
-                if(buffer)text=symbol.ends_with('A')?utf8_to_utf16(read_ansi(memory,buffer,16)):read_utf16(memory,GuestAddress{buffer},16);
+                if(buffer)text=symbol.ends_with('A')?ansi_to_utf16(read_ansi(memory,buffer,16)):read_utf16(memory,GuestAddress{buffer},16);
             }
             std::uint32_t identifier=0;bool valid=text.size()==8;
             for(const auto c:text){const int digit=c>=u'0' && c<=u'9'?c-u'0':c>=u'a' && c<=u'f'?c-u'a'+10:c>=u'A' && c<=u'F'?c-u'A'+10:-1;if(digit<0)valid=false;identifier=identifier*16+static_cast<unsigned>(digit<0?0:digit);}

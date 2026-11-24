@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "gui_message_contract.hpp"
 #include "gui_window_menu.hpp"
 #include "gui_message_metadata.hpp"
@@ -21,6 +22,13 @@
 
 namespace x64arm::detail {void peek_idle_invalidate() noexcept;}
 namespace x64arm {
+std::uint64_t gui_expand_short_window(const GuiState& gui,std::uint64_t handle){
+    if(!handle || handle>=0xffff || gui.windows.contains(handle))return handle;
+    std::uint64_t found=0;
+    for(const auto& [window,state]:gui.windows){(void)state;if((window&0xffffU)==handle){if(found)return handle;found=window;}}
+    return found?found:handle;
+}
+
 namespace {
 std::uint64_t automation_raw_device(const RawInputState& state,bool keyboard){
     // 視窗自動化模擬已列舉的系統鍵鼠；SendInput 仍由它自己的服務決定封包來源。
@@ -347,6 +355,18 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
         if(step!=gui_.cursor_animation_step && (!native_gui_ || !interactive_station() || native_gui_->set_cursor(&icon.animation_frames.at(icon.animation_sequence[step]),gui_.cursor_count>=0)))gui_.cursor_animation_step=step;
     }
     trace.next("appbars");poll_appbars();
+    // MCI 播放（影片依時間繪製、MM_MCINOTIFY 完成通知）與待派送的 wave／影片回呼原本只在完整排程輪詢；以 PeekMessage 迴圈等
+    // 開場影片結束的程式（三國志 VII）一直停在訊息幫浦裡，完整排程不會發生。這裡依同一間隔推進（X64ARM_RESIDENT_MEDIA_POLL_MS，預設 10，0 關閉）。
+    {
+        static const std::uint64_t media_poll_ticks=[] {const auto* value=std::getenv("X64ARM_RESIDENT_MEDIA_POLL_MS");
+            return (value && *value?std::strtoull(value,nullptr,10):UINT64_C(10))*10000U;}();
+        static std::uint64_t last_media_poll=0;
+        if(media_poll_ticks && (mci_waiting() || directshow_active() || !wave_callbacks_.empty())){
+            const auto now=detail::monotonic_ticks();
+            // 影片時鐘與 MCI 完成判定依客體時鐘；PeekMessage 的常駐路徑不一定經過時鐘同步，先與 API 入口相同地同步一次。
+            if(now-last_media_poll>=media_poll_ticks){last_media_poll=now;trace.next("media");retired(memory,0);poll_wave_output(memory);}
+        }
+    }
     trace.next("power");poll_power_notifications(memory);
     trace.next("dinput");poll_dinput();
     trace.next("joystick_capture");poll_joystick_captures();
@@ -632,14 +652,24 @@ std::optional<std::uint32_t> WindowsServices::resume_gui(GuestState& state, Gues
     } else if ((frame.continuation == Continuation::GuiNcCreate && !value) || (frame.continuation == Continuation::GuiCreate && signed32(value) == -1)) {
         auto callbacks=revoke_gui_drop_targets(memory,handle);erase_window(handle);start_callbacks(state,memory,std::move(callbacks),Continuation::Return,0);return std::nullopt;
     } else if (gui_.windows.at(handle).style & 0x10000000U) {
+        // 非模態對話框（WM_INITDIALOG 之後）等已帶 WS_VISIBLE 的視窗；CreateWindowEx 建立中的視窗此時樣式不含 WS_VISIBLE。
         gui_.windows.at(handle).visible = true;
         if (native_gui_) show_native_window(handle, true);
         invalidate_window(handle);
     }
+    // WS_VISIBLE 在 WM_SIZE／WM_MOVE 之後才套用（CreateWindowEx 最後的 ShowWindow）；建立期間 IsWindowVisible 為 FALSE。
+    const auto show_created=[&](std::uint64_t window_handle){
+        auto& window=gui_.windows.at(window_handle);if(!window.show_after_create)return;
+        window.show_after_create=false;window.style|=0x10000000U;window.visible=true;
+        if(native_gui_)show_native_window(window_handle,true);
+        invalidate_window(window_handle);
+    };
+    if(frame.continuation==Continuation::GuiCreateShow){show_created(handle);complete_call(state,memory,result);return std::nullopt;}
     if(frame.continuation==Continuation::GuiCreate){auto& window=gui_.windows.at(handle);const auto proc=window.procedure;
-        if(window.initial_size_pending && !window.visible){complete_call(state,memory,result);return std::nullopt;}
+        if(window.initial_size_pending && !window.show_after_create && !window.visible){complete_call(state,memory,result);return std::nullopt;}
         window.initial_size_pending=false;
-        start_callbacks(state,memory,{{proc,{handle,5,0,(window.width&65535U)|((window.height&65535U)<<16)}},{proc,{handle,3,0,gui_move_lparam(window)}}},Continuation::Return,result);return std::nullopt;}
+        start_callbacks(state,memory,{{proc,{handle,5,0,(window.width&65535U)|((window.height&65535U)<<16)}},{proc,{handle,3,0,gui_move_lparam(window)}}},Continuation::GuiCreateShow,result);return std::nullopt;}
+    if(gui_.windows.contains(handle))show_created(handle);
     complete_call(state,memory,result); return std::nullopt;
 }
 bool WindowsServices::dispatch_gui_modal_message(GuestState& state,GuestMemory& memory,std::uint64_t handle,const GuiMessage& msg) {
@@ -764,7 +794,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
             refresh_gui_areas();
             call.return_to(state,0);return std::nullopt;
         }
-        const auto window=gui_.windows.find(call(0));
+        const auto window=gui_.windows.find(gui_expand_short_window(gui_,call(0)));
         const auto target=window!=gui_.windows.end()?window->second.thread:call(0)?0:threads_.current;
         if(gui_.exiting_message_threads.contains(target)){
             call.return_to(state,post?1:0);return std::nullopt;
@@ -800,7 +830,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
     const WindowsCall arg(state, memory, service); const auto symbol = service.symbol;
     const auto dword = [&](unsigned index) { return static_cast<std::uint32_t>(arg(index)); };
     const bool wide = symbol.ends_with('W');
-    const auto string = [&](std::uint64_t pointer) { return !pointer ? std::u16string{} : wide ? read_utf16(memory, GuestAddress{pointer}) : utf8_to_utf16_lossy(read_ansi(memory, pointer)); };
+    const auto string = [&](std::uint64_t pointer) { return !pointer ? std::u16string{} : wide ? read_utf16(memory, GuestAddress{pointer}) : ansi_to_utf16_lossy(read_ansi(memory, pointer)); };
     const auto fail = [&](std::uint32_t code) { last_error_ = code; };
     const auto dispatch = [&](const GuiMessage& msg, Continuation continuation = Continuation::ReturnCallback, std::uint64_t value = 0) {
         if(msg.message==15)detail::trace_gui_lifecycle("PaintDispatch",gui_,process_id(),threads_.current,msg.window);
@@ -874,6 +904,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                 if(!window.parent && !window.owner && gui_.process_default_layout)window.ex_style|=0x400000U;
                 if(window.parent && gui_.windows.contains(window.parent) && (gui_.windows.at(window.parent).ex_style&0x500000U)==0x400000U)window.ex_style|=0x400000U;
                 window.initial_size_pending=(window.style&0xc0000000U)==0;
+                if(gui_create_show_late() && (window.style&0x10000000U)){window.style&=~0x10000000U;window.show_after_create=true;}
                 const bool combo=window.control_class==u"combobox" || window.control_class==u"comboboxex32";
                 if(combo)window.combo_drop_height=height>24?height-24:100;
                 bool owned_menu=false;
@@ -994,7 +1025,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
             else {start_callbacks(state,memory,{{resolve("user32.dll",wide?"SendMessageW":"SendMessageA").value,{arg(0),arg(1),arg(2),arg(3)}}},Continuation::GuiSendTimeout);return std::nullopt;}
         }
     } else if (symbol.starts_with("SendMessage") || symbol.starts_with("PostMessage")) {
-        GuiMessage msg{arg(0),arg(2),arg(3),static_cast<std::uint32_t>(arg(1))};if(!msg.window)msg.thread=threads_.current;
+        GuiMessage msg{gui_expand_short_window(gui_,arg(0)),arg(2),arg(3),static_cast<std::uint32_t>(arg(1))};if(!msg.window)msg.thread=threads_.current;
         if(msg.window==0xffff){
             // HWND_BROADCAST：本程序的所有頂層視窗各收一份（同 SendMessageTimeout 的範圍）；SendMessage 回傳最後一個結果。
             const auto targets=gui_broadcast_targets();
@@ -1170,10 +1201,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                 }
                 else if(const auto control=gui_control_message(memory,{handle,arg(2),arg(3),dword(1)},wide))result=*control;
                 else if (dword(1) == 12) { window.title = string(arg(3)); present_gui(handle); result = 1; }
-                else if(dword(1)==14)result=wide?window.title.size():utf16_to_utf8(window.title).size();
+                else if(dword(1)==14)result=wide?window.title.size():utf16_to_ansi(window.title).size();
                 else if(dword(1)==13 && dword(2)){
                     if(wide){const auto text=window.title.substr(0,dword(2)-1);memory.write(GuestAddress{arg(3)},utf16_bytes(text));result=text.size();}
-                    else {auto text=utf16_to_utf8(window.title);text.resize(std::min<std::size_t>(text.size(),dword(2)-1));result=text.size();text.push_back(0);memory.write(GuestAddress{arg(3)},std::span(reinterpret_cast<const std::uint8_t*>(text.data()),text.size()));}
+                    else {auto text=utf16_to_ansi(window.title);text.resize(ansi_prefix_length(text,dword(2)-1));result=text.size();text.push_back(0);memory.write(GuestAddress{arg(3)},std::span(reinterpret_cast<const std::uint8_t*>(text.data()),text.size()));}
                 }
             } else if (symbol == "GetClientRect") {
                 memory.write(GuestAddress{arg(1)}, std::array<std::uint8_t, 16>{}); memory.store(GuestAddress{arg(1) + 8}, 32, window.width); memory.store(GuestAddress{arg(1) + 12}, 32, window.height); result = 1;

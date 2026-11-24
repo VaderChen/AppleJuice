@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/unicode.hpp"
@@ -361,7 +362,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mdi(GuestState& state,Guest
             else {fallback();return std::nullopt;}
         } else if(message==7)call("SetFocus",{client});
         else if(message==5)call("SetWindowPos",{client,0,0,0,found->second.width,found->second.height,0x14});
-        else if(message==12){mdi.frame_title=lp?(wide?read_utf16(memory,GuestAddress{lp}):utf8_to_utf16_lossy(read_ansi(memory,lp))):std::u16string{};refresh_mdi(client,&memory);result=1;}
+        else if(message==12){mdi.frame_title=lp?(wide?read_utf16(memory,GuestAddress{lp}):ansi_to_utf16_lossy(read_ansi(memory,lp))):std::u16string{};refresh_mdi(client,&memory);result=1;}
         else if(message==0x86){if(mdi.active)send(mdi.active,0x86,wp,lp);call(wide?"DefWindowProcW":"DefWindowProcA",{handle,message,wp,lp});start_callbacks(state,memory,std::move(callbacks),Continuation::ReturnCallback);return std::nullopt;}
         else if(message==0x10){for(const auto child:mdi.children)call("DestroyWindow",{child});call(wide?"DefWindowProcW":"DefWindowProcA",{handle,message,wp,lp});start_callbacks(state,memory,std::move(callbacks),Continuation::ReturnCallback);return std::nullopt;}
         else if(message==0x120 && (wp&65535)==u'-' && mdi.active) {
@@ -386,7 +387,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mdi(GuestState& state,Guest
             memory.store(GuestAddress{lp+16},32,word(-static_cast<std::int32_t>(inset.left)));memory.store(GuestAddress{lp+20},32,word(-static_cast<std::int32_t>(inset.top)));
             memory.store(GuestAddress{lp+24},32,112);memory.store(GuestAddress{lp+28},32,inset.top+inset.bottom+1);
             memory.store(GuestAddress{lp+32},32,8192);memory.store(GuestAddress{lp+36},32,8192);
-        } else if(message==12){child.title=lp?(wide?read_utf16(memory,GuestAddress{lp}):utf8_to_utf16_lossy(read_ansi(memory,lp))):std::u16string{};present_gui(handle);refresh_mdi(client,&memory);result=1;}
+        } else if(message==12){child.title=lp?(wide?read_utf16(memory,GuestAddress{lp}):ansi_to_utf16_lossy(read_ansi(memory,lp))):std::u16string{};present_gui(handle);refresh_mdi(client,&memory);result=1;}
         else if(message==0x86){child.mdi_active=wp!=0;present_gui(handle);result=1;}
         else if(message==3 || message==5) {
             if(message==5 && mdi.active==handle){mdi.maximized=wp==2;if(wp==1)activate(next_mdi_child(client,handle,false));}

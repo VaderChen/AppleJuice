@@ -70,7 +70,7 @@ if(service.symbol=="#15" || service.symbol=="#186" || service.symbol=="SHGetImag
         if(symbol.starts_with("SHGetNewLinkInfo")){
             // (pszLinkTo, pszDir, pszName[MAX_PATH] 輸出, pfMustCopy, uFlags)；SHGNLI_PIDL 1、PREFIXNAME 2、NOUNIQUE 4、NOLNK 8、NOLOCNAME 0x10、USEURLEXT 0x20。
             const bool wide=symbol.ends_with('W');const auto flags=static_cast<std::uint32_t>(call(4));
-            const auto read=[&](std::uint64_t at){return wide?read_utf16(m,GuestAddress{at},32768):utf8_to_utf16_lossy(read_ansi(m,at,32768));};
+            const auto read=[&](std::uint64_t at){return wide?read_utf16(m,GuestAddress{at},32768):ansi_to_utf16_lossy(read_ansi(m,at,32768));};
             if(!call(0) || !call(1) || !call(2) || !call(3))co_return finish(0);
             std::u16string target;
             if(flags&1U){const auto buffer=scratch.allocate(520);if(!buffer)co_return finish(0);
@@ -111,7 +111,7 @@ if(service.symbol=="#15" || service.symbol=="#186" || service.symbol=="SHGetImag
                 }
             }
             if(result.size()>=260)co_return finish(0);
-            if(wide)m.write(GuestAddress{call(2)},utf16_bytes(result));else{auto ansi=utf16_to_utf8(result);if(ansi.size()>=260)co_return finish(0);ansi.push_back(0);m.write(GuestAddress{call(2)},std::span(reinterpret_cast<const std::uint8_t*>(ansi.data()),ansi.size()));}
+            if(wide)m.write(GuestAddress{call(2)},utf16_bytes(result));else{auto ansi=utf16_to_ansi(result);if(ansi.size()>=260)co_return finish(0);ansi.push_back(0);m.write(GuestAddress{call(2)},std::span(reinterpret_cast<const std::uint8_t*>(ansi.data()),ansi.size()));}
             co_return finish(1);
         }
         // SHGetSetFolderCustomSettings(pfcs, pszPath, dwReadWrite)：FCS_READ 1、FCS_FORCEWRITE 2、FCS_WRITE 3（只寫入尚未設定的值）。

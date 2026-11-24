@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/resource_usage.hpp"
 #include "x64arm/unicode.hpp"
@@ -553,8 +554,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
         if(deadline<=runtime_.clock_ticks)return 10060;
         thread.wait={};thread.wait.kind=ThreadWaitKind::SocketSelect;thread.wait.deadline=deadline;thread.wait.handles={arg(0)};thread.wait.socket_events={POLLIN};thread.wait.alertable=true;thread.status=ThreadStatus::Waiting;schedule(state,memory);return std::nullopt;
     };
-    const auto read_text=[&](std::uint64_t pointer){return wide?utf16_to_utf8(read_utf16(memory,GuestAddress{pointer})):read_ansi(memory,pointer,4096);};
-    const auto encoded_text=[&](std::string_view text){if(wide)return utf16_bytes(utf8_to_utf16(text));std::vector<std::uint8_t> bytes(text.begin(),text.end());bytes.push_back(0);return bytes;};
+    const auto read_text=[&](std::uint64_t pointer){return wide?utf16_to_utf8(read_utf16(memory,GuestAddress{pointer})):ansi_to_utf8(read_ansi(memory,pointer,4096));};
+    const auto encoded_text=[&](std::string_view text){if(wide)return utf16_bytes(utf8_to_utf16(text));const auto ansi=utf8_to_ansi(text);std::vector<std::uint8_t> bytes(ansi.begin(),ansi.end());bytes.push_back(0);return bytes;};
     // 對客體仍是同步 API；等待時只暫停呼叫執行緒，由宿主工作執行緒解析。
     const auto resolver=[&](socket_database::Query query){
         auto found=network.resolvers.find(threads_.current);

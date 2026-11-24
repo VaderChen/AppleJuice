@@ -29,6 +29,13 @@ inline SandboxCertificateRoots sandbox_certificate_roots(Files& files) {
     if(!count || (error && ERR_GET_REASON(error)!=PEM_R_NO_START_LINE)){result.error=13;return result;}
     result.pem.push_back('\n');result.pem.append(reinterpret_cast<const char*>(bytes.data()),bytes.size());return result;
 }
+// 經宿主 HTTP 傳輸（WinHTTP／WinINet／urlmon、PAC）的請求帶入與 Schannel 相同的沙箱信任根。
+// 自訂信任根檔讀取失敗時 HTTPS 請求失敗（與 Schannel 相同）；HTTP 請求仍保留內建信任根，重新導向到 HTTPS 時不會改用宿主憑證。
+template<class Files>
+inline std::uint32_t assign_sandbox_certificate_roots(Files& files,std::string& target,bool secure) {
+    auto roots=sandbox_certificate_roots(files);if(roots.error && secure)return roots.error;
+    target=std::move(roots.pem);return 0;
+}
 inline bool add_certificate_root_pem(X509_STORE* store,std::string_view pem) {
     if(pem.size()>INT_MAX)return false;
     std::unique_ptr<BIO,decltype(&BIO_free)> input(BIO_new_mem_buf(pem.data(),static_cast<int>(pem.size())),BIO_free);if(!input)return false;

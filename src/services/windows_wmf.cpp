@@ -1,6 +1,7 @@
 // Windows 中繼檔（WMF）家族（gdi32）：CreateMetaFileA／W、CloseMetaFile、PlayMetaFile、PlayMetaFileRecord、EnumMetaFile、
 // GetWinMetaFileBits（EMF→WMF，含內嵌 EMF 註解）、SetWinMetaFileBits（WMF→EMF）、GdiIsMetaFileDC、GdiIsMetaPrintDC、GdiIsPlayMetafileDC。
 // 錄製沿用 EMF 錄製 DC（emf_recorders）的 GuiDraw 串流；播放依 MS-WMF 記錄呼叫既有 GDI 服務，物件 handle 存在呼叫端的 handle table。
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "windows_locale_data.hpp"
@@ -480,7 +481,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_windows_metafile(GuestState
         }
         if(name.starts_with("CreateMetaFile")){
             GuiMetafile meta;wmf_begin(meta,arg(0)!=0);
-            if(arg(0)){meta.file=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16(read_ansi(memory,arg(0)));if(meta.file.empty())return fail(3);
+            if(arg(0)){meta.file=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)}):ansi_to_utf16(read_ansi(memory,arg(0)));if(meta.file.empty())return fail(3);
                 // 與 Windows 相同，建立時即建立（截斷）檔案，路徑錯誤立即失敗。
                 if(!write_guest_file(state,memory,meta.file,{}))return finish(0);}
             const auto handle=gui_.next_object++;gui_.emf_recorders.emplace(handle,std::move(meta));

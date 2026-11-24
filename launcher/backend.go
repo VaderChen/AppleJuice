@@ -58,6 +58,8 @@ type Settings struct {
 	PresentUpscale bool `json:"presentUpscale,omitempty"`
 	// 畫面內插：每兩張畫面之間由系統生成一張中間畫面（X64ARM_PRESENT_INTERPOLATION=1）。
 	PresentInterpolation bool `json:"presentInterpolation,omitempty"`
+	// 效能 HUD：只在這個程式的視窗顯示 Metal 效能 HUD（X64ARM_METAL_HUD=1）；引擎不套用全域的 MTL_HUD_ENABLED。
+	PerformanceHUD bool `json:"performanceHud,omitempty"`
 }
 type GlobalSettings struct {
 	SpatialHeadphones    bool              `json:"spatialHeadphones"`
@@ -1006,6 +1008,10 @@ func (a *App) Start(id string, settings Settings, cols, rows uint16) (Snapshot, 
 	}
 	if p.PresentInterpolation {
 		environment = append(environment, "X64ARM_PRESENT_INTERPOLATION=1")
+	}
+	// 未開啟時不帶變數：引擎預設不顯示 HUD，並忽略全域的 MTL_HUD_ENABLED。
+	if p.PerformanceHUD {
+		environment = append(environment, "X64ARM_METAL_HUD=1")
 	}
 	cmd.Env = environment
 	r := &execution{id: runID, status: "running", cmd: cmd, diagnostics: diagnostics, usagePath: usagePath, output: make(chan []byte, 64), input: make(chan string, 32), done: make(chan struct{}), cancel: make(chan struct{})}

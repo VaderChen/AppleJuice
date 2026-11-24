@@ -1,4 +1,5 @@
 #pragma once
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/esent_database.hpp"
 #include "x64arm/unicode.hpp"
@@ -21,7 +22,7 @@ inline std::int32_t format_error(const esent::Error& error){
     }return -1206;
 }
 inline std::u16string input(const GuestMemory& memory,std::uint64_t address,bool wide){
-    return address?(wide?read_utf16(memory,GuestAddress{address},32768):utf8_to_utf16(read_ansi(memory,address))):std::u16string{};
+    return address?(wide?read_utf16(memory,GuestAddress{address},32768):ansi_to_utf16(read_ansi(memory,address))):std::u16string{};
 }
 inline std::u16string folded(std::u16string text){for(auto& c:text)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);return text;}
 inline void writable(GuestMemory& memory,std::uint64_t address,std::size_t size){require(address!=0);memory.check(GuestAddress{address},size,Access::Write);}

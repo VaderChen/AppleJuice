@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -98,7 +99,7 @@ std::optional<std::uint64_t> WindowsServices::gui_syslink_message(GuestMemory& m
     const auto m=msg.message,wp=static_cast<std::uint32_t>(msg.wparam);const auto lp=msg.lparam;
     const auto update=[&](std::uint64_t result)->std::optional<std::uint64_t>{present_gui(msg.window);return result;};
     const auto focus=[&](std::int32_t index){for(std::size_t n=0;n<window.links.size();++n)window.links[n].state=(window.links[n].state&~1U)|(static_cast<std::int32_t>(n)==index?1U:0U);window.selection=index;};
-    if(m==0xc){window.title=lp?(wide?read_utf16(memory,GuestAddress{lp}):utf8_to_utf16_lossy(read_ansi(memory,lp))):std::u16string{};parse_gui_syslink(window);return update(1);}
+    if(m==0xc){window.title=lp?(wide?read_utf16(memory,GuestAddress{lp}):ansi_to_utf16_lossy(read_ansi(memory,lp))):std::u16string{};parse_gui_syslink(window);return update(1);}
     if(m==1)return update(0);
     if(m==0x701){const auto layout=layout_gui_syslink(window,wp);if(lp){memory.check(GuestAddress{lp},8,Access::Write);memory.store(GuestAddress{lp},32,layout.width);memory.store(GuestAddress{lp+4},32,layout.height);}return layout.height;}
     if(m==0x700){

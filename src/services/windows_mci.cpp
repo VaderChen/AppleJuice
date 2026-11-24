@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
@@ -80,6 +81,8 @@ std::span<const WindowsServiceDescriptor> mci_service_descriptors(){
 MciState& WindowsServices::mci_state(){if(!mci_)mci_=std::make_shared<MciState>();return *mci_;}
 
 void WindowsServices::notify_mci(std::uint32_t id,std::uint64_t window,std::uint32_t status){
+    static const bool trace=std::getenv("X64ARM_TRACE_MCI")!=nullptr;
+    if(trace)std::fprintf(stderr,"[mci-notify] id=%u window=0x%llx status=%u local=%d\n",id,static_cast<unsigned long long>(window),status,gui_.windows.contains(window)?1:0);
     if(window)wave_callbacks_.push_back({resolve("user32.dll","PostMessageW").value,{window,0x3b9,status,id}});
 }
 void WindowsServices::complete_mci_transport(std::uint32_t id,std::uint32_t notification){
@@ -114,8 +117,16 @@ void WindowsServices::poll_mci(){
         if(complete)finished.emplace_back(id,failed?8U:1U);
     }
     for(const auto& [id,item]:mci_->videos){
+        // 診斷：X64ARM_TRACE_MCI=1 時每 100 次輪詢列出影片自動繪製的條件（前 40 筆；=2 不限筆數並附客體時鐘）。
+        static const auto* trace_setting=std::getenv("X64ARM_TRACE_MCI");static const bool trace_mci=trace_setting!=nullptr;
+        static const unsigned trace_limit=trace_setting && std::string_view(trace_setting)=="2"?UINT32_MAX:40U;static unsigned traced=0,polls=0;
+        if(trace_mci && traced<trace_limit && !(polls++%100)){++traced;
+            if(trace_limit==UINT32_MAX)std::fprintf(stderr,"[mci-video-clock] ticks=%llu ended=%d\n",static_cast<unsigned long long>(runtime_.clock_ticks),item->ended(runtime_.clock_ticks)?1:0);
+            std::fprintf(stderr,"[mci-video] id=%u mode=%d visual=%d presentation=%u hidden=%d window=0x%llx exists=%d pending=%d frame=%llu presented=%llu length=%llu callbacks=%zu\n",id,static_cast<int>(item->mode),
+                item->clip->visual()?1:0,item->presentation,item->hidden?1:0,static_cast<unsigned long long>(item->window),gui_.windows.contains(item->window)?1:0,item->paint_pending?1:0,
+                static_cast<unsigned long long>(item->current(runtime_.clock_ticks)),static_cast<unsigned long long>(item->presented_frame),static_cast<unsigned long long>(item->length()),wave_callbacks_.size());}
         if(item->ended(runtime_.clock_ticks))finished.emplace_back(id,1);
-        if(!item->clip->visual() || !item->presentation || !item->window || !gui_.windows.contains(item->window) ||
+        if(!item->clip->visual() || !item->presentation || item->hidden || !item->window || !gui_.windows.contains(item->window) ||
            item->paint_pending || wave_callbacks_.size()>=64)continue;
         const auto frame=std::min(item->current(runtime_.clock_ticks),item->length()-1);
         if(frame==item->presented_frame)continue;
@@ -177,9 +188,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_mci(GuestState& state,Guest
     const unsigned p=x86_?4:8,bits=p*8;
     const auto message=installable?static_cast<std::uint32_t>(arg(2)):0;
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
-    const auto string=[&](std::uint64_t address){if(!address)throw mci::Error(mci::missing_parameter);auto text=wide?read_utf16(memory,GuestAddress{address},32768):utf8_to_utf16_lossy(read_ansi(memory,address,32768));if(text.size()>=32768)throw mci::Error(mci::out_of_range);return text;};
+    const auto string=[&](std::uint64_t address){if(!address)throw mci::Error(mci::missing_parameter);auto text=wide?read_utf16(memory,GuestAddress{address},32768):ansi_to_utf16_lossy(read_ansi(memory,address,32768));if(text.size()>=32768)throw mci::Error(mci::out_of_range);return text;};
     const auto write_string=[&](std::uint64_t output,std::uint32_t capacity,std::u16string_view value){
-        const auto encoded=wide?std::string{}:utf16_to_utf8(value);
+        const auto encoded=wide?std::string{}:utf16_to_ansi(value);
         const auto bytes=wide?utf16_bytes(value):std::vector<std::uint8_t>(encoded.begin(),encoded.end());
         const auto count=wide?value.size()+1:bytes.size()+1;if(!output || !capacity)throw mci::Error(mci::missing_parameter);
         if(capacity<count)throw mci::Error(mci::out_of_range);
@@ -485,7 +496,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_mci(GuestState& state,Guest
             return finish(0);
         }
         throw mci::Error(mci::unrecognized);
-    }catch(const mci::Error& error){return finish(name.starts_with("mciGet") || (installable && message<0x800)?0:error.code);}
+    }catch(const mci::Error& error){
+        // 診斷：X64ARM_TRACE_MCI=1 時列出失敗的 MCI 命令；MCI_OPEN 另列裝置型別（字串或型別 ID）與元素檔名。
+        static const bool trace_mci=std::getenv("X64ARM_TRACE_MCI")!=nullptr;
+        if(trace_mci && name.starts_with("mciSendCommand"))try{
+            const auto msg=static_cast<std::uint32_t>(arg(1)),open_flags=static_cast<std::uint32_t>(arg(2));const auto block_at=arg(3);
+            std::string detail;
+            if(msg==0x803 && block_at){
+                const unsigned width=x86_?4U:8U;const auto pointer=[&](unsigned at){return memory.load(GuestAddress{block_at+at},static_cast<std::uint8_t>(width*8));};
+                const auto type=pointer(width+4),element=pointer(2*width+4);
+                if(open_flags&0x2000U)detail+=(open_flags&0x1000U)?" type_id="+std::to_string(type):" type="+(type?utf16_to_utf8(string(type)):std::string("null"));
+                if((open_flags&0x200U) && element)detail+=" element="+utf16_to_utf8(string(element));
+            }
+            std::fprintf(stderr,"[mci] %.*s device=%llu message=0x%x flags=0x%x error=%u%s\n",static_cast<int>(name.size()),name.data(),static_cast<unsigned long long>(arg(0)),msg,open_flags,error.code,detail.c_str());
+        }catch(...){}
+        return finish(name.starts_with("mciGet") || (installable && message<0x800)?0:error.code);}
     catch(const MemoryFault&){return finish(name.starts_with("mciGet") || (installable && message<0x800)?0:mci::missing_parameter);}
     catch(const std::bad_alloc&){return finish(name.starts_with("mciGet") || (installable && message<0x800)?0:mci::memory);}
 }
@@ -604,7 +629,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mci_string(GuestState& stat
         std::u16string result;std::uint32_t error=0,automatic=0;bool asynchronous=false;
         try{
             if(!call(0))throw mci::Error(mcis::missing_command);
-            const auto text=wide?read_utf16(m,GuestAddress{call(0)},32768):utf8_to_utf16_lossy(read_ansi(m,call(0),32768));
+            const auto text=wide?read_utf16(m,GuestAddress{call(0)},32768):ansi_to_utf16_lossy(read_ansi(m,call(0),32768));
             const auto tokens=mcis::tokenize(text);if(tokens.empty())throw mci::Error(mcis::missing_command);
             const auto verb=fold(tokens[0]);if(tokens.size()<2)throw mci::Error(mcis::missing_device);
             const auto& name=tokens[1];const auto folded=fold(name);
@@ -828,7 +853,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mci_string(GuestState& stat
         if(!error && call(1)){
             const auto capacity=static_cast<std::uint32_t>(call(2));
             if(wide){if(capacity<result.size()+1)error=mcis::param_overflow;else m.write(GuestAddress{call(1)},utf16_bytes(result));}
-            else{const auto encoded=utf16_to_utf8(result);if(capacity<encoded.size()+1)error=mcis::param_overflow;
+            else{const auto encoded=utf16_to_ansi(result);if(capacity<encoded.size()+1)error=mcis::param_overflow;
                 else {m.write(GuestAddress{call(1)},std::vector<std::uint8_t>(encoded.begin(),encoded.end()));m.store(GuestAddress{call(1)+encoded.size()},8,0);}}
         }
         co_return finish(error);

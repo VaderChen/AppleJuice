@@ -411,6 +411,17 @@ void MetalGl::graphics_capture(const GraphicsDraw& draw){
         if(end==filter || *end || !count || count>UINT32_MAX)throw std::invalid_argument("擷取非索引 draw 頂點數不合法");
         if(draw.indexed || draw.count!=count)return;
     }
+    // X64ARM_GRAPHICS_CAPTURE_TARGET_FORMAT=<DXGI 格式編號>[:<寬度>]：只擷取任一 render target（view 或資源格式）為此格式
+    //（且資源寬度相符）的 draw，用來找出寫入特定中繼目標（例如字形圖集）的繪製。
+    static const char* const target_filter=std::getenv("X64ARM_GRAPHICS_CAPTURE_TARGET_FORMAT");
+    if(const char* filter=target_filter;filter && *filter){
+        char* end=nullptr;const auto format=std::strtoul(filter,&end,10);unsigned long width=0;
+        if(end!=filter && *end==':'){const char* text=end+1;width=std::strtoul(text,&end,10);if(end==text)end=nullptr;}
+        if(end==filter || !end || *end)throw std::invalid_argument("擷取 render target 格式篩選不合法");
+        const bool matched=std::any_of(draw.targets.begin(),draw.targets.end(),[&](const GraphicsView& target){
+            return target.resource && (target.format==format || target.resource->desc.format==format) && (!width || target.resource->desc.width==width);});
+        if(!matched)return;
+    }
     static std::atomic<std::uint64_t> serial{};const auto id=serial.fetch_add(1,std::memory_order_relaxed);
     if(const auto* request_path=request_file;request_path && *request_path){
         // 明確啟用的即時診斷：檔案為「請求編號 張數」，新編號才觸發，

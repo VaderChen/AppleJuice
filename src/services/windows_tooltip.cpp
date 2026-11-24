@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_gui_abi.hpp"
 #include "x64arm/windows_geometry.hpp"
@@ -32,7 +33,7 @@ auto identify_tool(GuiTooltip& tip,const GuestMemory& memory,std::uint64_t point
 void copy_text(GuestMemory& memory,std::uint64_t pointer,std::u16string_view value,bool wide,std::uint64_t capacity){
     if(!pointer || !capacity)return;
     if(wide){memory.write(GuestAddress{pointer},utf16_bytes(std::u16string(value.substr(0,static_cast<std::size_t>(capacity-1)))));return;}
-    auto text=utf16_to_utf8(std::u16string(value));text.resize(std::min<std::size_t>(text.size(),static_cast<std::size_t>(capacity-1)));
+    auto text=utf16_to_ansi(std::u16string(value));text.resize(ansi_prefix_length(text,static_cast<std::size_t>(capacity-1)));
     std::vector<std::uint8_t> bytes(text.begin(),text.end());bytes.push_back(0);memory.write(GuestAddress{pointer},bytes);
 }
 void write_tool(GuestMemory& memory,std::uint64_t pointer,const TooltipAbi& abi,const GuiTooltipTool& tool,bool wide){
@@ -40,7 +41,7 @@ void write_tool(GuestMemory& memory,std::uint64_t pointer,const TooltipAbi& abi,
     memory.check(GuestAddress{pointer},static_cast<std::size_t>(size),Access::Write);
     if(tool.callback)memory.store(GuestAddress{pointer+abi.text()},abi.bits,UINT64_MAX);
     else if(tool.text_pointer && tool.text_pointer<=65535)memory.store(GuestAddress{pointer+abi.text()},abi.bits,tool.text_pointer);
-    else if(output && output!=(abi.unit==4?UINT32_MAX:UINT64_MAX))copy_text(memory,output,tool.text,wide,wide?tool.text.size()+1:utf16_to_utf8(tool.text).size()+1);
+    else if(output && output!=(abi.unit==4?UINT32_MAX:UINT64_MAX))copy_text(memory,output,tool.text,wide,wide?tool.text.size()+1:utf16_to_ansi(tool.text).size()+1);
     memory.store(GuestAddress{pointer+4},32,tool.flags);memory.store(GuestAddress{pointer+abi.owner()},abi.bits,tool.owner);memory.store(GuestAddress{pointer+abi.id()},abi.bits,tool.id);
     for(unsigned i=0;i<4;++i)memory.store(GuestAddress{pointer+abi.rect()+i*4},32,static_cast<std::uint32_t>(tool.rectangle[i]));
     memory.store(GuestAddress{pointer+abi.instance()},abi.bits,tool.instance);
@@ -66,7 +67,7 @@ std::uint64_t hit_tool(const GuiState& gui,const GuiTooltip& tip,std::uint64_t s
 
 std::u16string WindowsServices::gui_tooltip_text(GuestMemory& memory,std::uint64_t instance,std::uint64_t pointer,bool wide){
     if(!pointer || pointer==(x86_?UINT32_MAX:UINT64_MAX))return {};
-    if(pointer>65535)return wide?read_utf16(memory,GuestAddress{pointer},32768):utf8_to_utf16_lossy(read_ansi(memory,pointer,32768));
+    if(pointer>65535)return wide?read_utf16(memory,GuestAddress{pointer},32768):ansi_to_utf16_lossy(read_ansi(memory,pointer,32768));
     const auto module=instance?instance:runtime_.image.base;const auto resource=gui_resource(memory,module,(pointer>>4)+1,6,true);
     const auto image=resource_image(module);if(!resource || !image)return {};
     auto address=image->base+memory.load(GuestAddress{resource},32);const auto size=memory.load(GuestAddress{resource+4},32);
@@ -177,7 +178,7 @@ std::optional<std::uint64_t> WindowsServices::gui_tooltip_message(GuestMemory& m
     }
     if(code==first+31){if(!lp)return 0;memory.check(GuestAddress{lp},16,Access::Read);memory.check(GuestAddress{lp},16,Access::Write);
         for(unsigned i=0;i<4;++i){const auto delta=static_cast<std::int64_t>(tip.margin[i])+4;const auto result=static_cast<std::int64_t>(signed32(memory.load(GuestAddress{lp+i*4},32)))+((i<2) == (wp!=0)?-delta:delta);memory.store(GuestAddress{lp+i*4},32,static_cast<std::uint32_t>(std::clamp<std::int64_t>(result,INT32_MIN,INT32_MAX)));}return 1;}
-    if(code==first+32 || code==first+33){if(wp>6 && !gui_.icons.contains(wp))return 0;tip.title=lp?(code==first+33?read_utf16(memory,GuestAddress{lp},100):utf8_to_utf16_lossy(read_ansi(memory,lp,400))):std::u16string{};tip.icon=tip.title.empty()?0:wp;return refresh(1);}
+    if(code==first+32 || code==first+33){if(wp>6 && !gui_.icons.contains(wp))return 0;tip.title=lp?(code==first+33?read_utf16(memory,GuestAddress{lp},100):ansi_to_utf16_lossy(read_ansi(memory,lp,400))):std::u16string{};tip.icon=tip.title.empty()?0:wp;return refresh(1);}
     if(code==first+35){if(!lp)return 0;const auto offset=x86_?12U:16U;if(memory.load(GuestAddress{lp},32)!=offset+abi.unit)return 0;
         const auto capacity=memory.load(GuestAddress{lp+8},32),pointer=memory.load(GuestAddress{lp+offset},abi.bits);copy_text(memory,pointer,tip.title,true,capacity);memory.store(GuestAddress{lp+4},32,tip.icon);return 0;}
     if(code==0x113 && wp==tip.timer){gui_.timers.erase({message.window,tip.timer});if(window.visible){tip.suppressed=true;++tip.revision;hide_gui_tooltip(message.window);}return 0;}

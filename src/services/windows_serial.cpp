@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/serial.hpp"
@@ -65,7 +66,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_serial(GuestState& state,Gu
                 if(!setting && memory.load(GuestAddress{arg(2)},32)<52){
                     memory.store(GuestAddress{arg(2)},32,52);return 122;
                 }
-                const auto port_name=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},64):utf8_to_utf16(read_ansi(memory,arg(0),64));
+                const auto port_name=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},64):ansi_to_utf16(read_ansi(memory,arg(0),64));
                 const auto number=serial_port(port_name);
                 if(!number)return driver?1010:2;
                 if(!driver){
@@ -106,7 +107,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_serial(GuestState& state,Gu
         if(name.starts_with("BuildCommDCB")){
             if(!arg(0) || !arg(1))fail(87);
             else {
-                const auto definition=name.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)},4096)):read_ansi(memory,arg(0),4096);
+                const auto definition=name.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)},4096)):ansi_to_utf8(read_ansi(memory,arg(0),4096));
                 std::array<std::uint8_t,28> settings{};memory.read(GuestAddress{arg(1)},settings);std::optional<bool> timeout;
                 if(!serial_definition(definition,settings,timeout))fail(87);
                 else {
@@ -122,7 +123,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_serial(GuestState& state,Gu
             }
         }else if(name=="CreateFileA" || name=="CreateFileW"){
             result=x86_?UINT32_MAX:UINT64_MAX;
-            const auto path=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},256):utf8_to_utf16(read_ansi(memory,arg(0),256));
+            const auto path=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},256):ansi_to_utf16(read_ansi(memory,arg(0),256));
             const auto number=serial_port(path);const auto security=synchronization_security(memory,arg(3),x86_);
             const auto error=[&](std::uint32_t e){last_error_=e;};
             if(!number || d(2) || d(4)!=3 || arg(6) || !(d(1)&0xc0000000U) || (d(1)&~0xc0000000U) || (d(5)&~0x40000080U))error(87);

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
@@ -185,7 +186,7 @@ std::span<const WindowsServiceDescriptor> eventlog_service_descriptors(){
 std::optional<std::uint32_t> WindowsServices::invoke_eventlog(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.family=="wevtapi.dll" || service.family=="internal-evt-subscription")return invoke_wevtapi(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');std::uint64_t result=0;
-    const auto text=[&](std::uint64_t address,std::size_t maximum){if(!address)throw EventError{87};return wide?read_utf16(memory,GuestAddress{address},maximum):utf8_to_utf16(read_ansi(memory,address,maximum));};
+    const auto text=[&](std::uint64_t address,std::size_t maximum){if(!address)throw EventError{87};return wide?read_utf16(memory,GuestAddress{address},maximum):ansi_to_utf16(read_ansi(memory,address,maximum));};
     const auto log_directory=[&]{return registry_file_.empty()?std::filesystem::path(mapping_session()):registry_file_.parent_path();};
     // 讀取器的紀錄：備份檔讀取器使用開啟時的快照，其餘讀取沙箱中的事件記錄檔。
     const auto reader_records=[&](const LegacyEventReader& reader){return reader.from_backup?reader.backup:read_records(log_directory()/record_filename(reader.channel),reader.channel);};

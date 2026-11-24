@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -13,12 +14,12 @@ bool text_items(const GuiWindow& window) {
 }
 std::vector<std::uint8_t> encoded_text(std::u16string_view text,bool wide) {
     if(wide)return utf16_bytes(text);
-    const auto ansi=utf16_to_utf8(text);std::vector<std::uint8_t> bytes(ansi.begin(),ansi.end());bytes.push_back(0);return bytes;
+    const auto ansi=utf16_to_ansi(text);std::vector<std::uint8_t> bytes(ansi.begin(),ansi.end());bytes.push_back(0);return bytes;
 }
 std::u16string bounded_text(const GuestMemory& memory,std::uint64_t address,std::uint64_t count,bool wide) {
     if(wide){auto text=read_utf16_counted(memory,GuestAddress{address},static_cast<std::size_t>(count));const auto end=text.find(u'\0');if(end!=std::u16string::npos)text.resize(end);return text;}
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(count));memory.read(GuestAddress{address},bytes);
-    std::string text(bytes.begin(),bytes.end());const auto end=text.find('\0');if(end!=std::string::npos)text.resize(end);return utf8_to_utf16_lossy(text);
+    std::string text(bytes.begin(),bytes.end());const auto end=text.find('\0');if(end!=std::string::npos)text.resize(end);return ansi_to_utf16_lossy(text);
 }
 }
 std::uint64_t WindowsServices::gui_window_procedure(std::uint64_t handle,bool wide) {
@@ -65,13 +66,13 @@ bool WindowsServices::begin_gui_text_thunk(GuestState& state,GuestMemory& memory
     try {
         auto& active=gui_text_thunks_.at(token);auto converted=message;
         if(active.kind==GuiTextThunk::Kind::Input){
-            if(message.lparam){const auto text=source_wide?read_utf16(memory,GuestAddress{message.lparam}):utf8_to_utf16_lossy(read_ansi(memory,message.lparam));
+            if(message.lparam){const auto text=source_wide?read_utf16(memory,GuestAddress{message.lparam}):ansi_to_utf16_lossy(read_ansi(memory,message.lparam));
                 converted.lparam=allocate_gui_scratch(memory,active.scratch,encoded_text(text,target_wide));}
         }else if(active.kind==GuiTextThunk::Kind::Creation){
             const auto size=x86_?48U:80U;std::vector<std::uint8_t> bytes(size);memory.read(GuestAddress{message.lparam},bytes);active.buffer=allocate_gui_scratch(memory,active.scratch,bytes);converted.lparam=active.buffer;
             for(const auto offset:{x86_?36U:56U,x86_?40U:64U}){
                 const auto original=memory.load(GuestAddress{message.lparam+offset},x86_?32:64);if(original<=65535)continue;
-                const auto text=source_wide?read_utf16(memory,GuestAddress{original}):utf8_to_utf16_lossy(read_ansi(memory,original));
+                const auto text=source_wide?read_utf16(memory,GuestAddress{original}):ansi_to_utf16_lossy(read_ansi(memory,original));
                 const auto address=allocate_gui_scratch(memory,active.scratch,encoded_text(text,target_wide));memory.store(GuestAddress{active.buffer+offset},x86_?32:64,address);
             }
         }else if(active.kind==GuiTextThunk::Kind::Item){
@@ -115,7 +116,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_text_thunk(GuestState& 
                 returned=text.size();if(terminated && (operation.capacity || operation.kind==GuiTextThunk::Kind::Item))memory.write(GuestAddress{operation.message.lparam},utf16_bytes(text));
                 else if(!terminated){auto bytes=utf16_bytes(text);bytes.resize(text.size()*2);memory.write(GuestAddress{operation.message.lparam},bytes);}
             }else {
-                auto bytes=utf16_to_utf8(text);if(bytes.size()>maximum){auto end=static_cast<std::size_t>(maximum);while(end && (static_cast<unsigned char>(bytes[end])&0xc0U)==0x80U)--end;bytes.resize(end);}
+                auto bytes=utf16_to_ansi(text);if(bytes.size()>maximum)bytes.resize(ansi_prefix_length(bytes,static_cast<std::size_t>(maximum)));
                 returned=bytes.size();if(terminated && (operation.capacity || operation.kind==GuiTextThunk::Kind::Item))bytes.push_back(0);
                 if(!bytes.empty())memory.write(GuestAddress{operation.message.lparam},std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(bytes.data()),bytes.size()});
             }

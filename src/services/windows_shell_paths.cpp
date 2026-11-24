@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
@@ -33,7 +34,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_paths(GuestState& sta
     const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto u32=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
     const auto host=[&](std::string_view symbol,std::initializer_list<std::uint64_t> args){return nested_service(state,memory,"kernel32.dll",symbol,args)&UINT32_MAX;};
-    const auto read=[&](std::uint64_t at)->std::u16string{if(!at)return {};return narrow?utf8_to_utf16_lossy(read_ansi(memory,at,32768)):read_utf16(memory,GuestAddress{at},32768);};
+    const auto read=[&](std::uint64_t at)->std::u16string{if(!at)return {};return narrow?ansi_to_utf16_lossy(read_ansi(memory,at,32768)):read_utf16(memory,GuestAddress{at},32768);};
     // 寫回 NUL 結尾字串（A：UTF-8），capacity 以單位計且含 NUL；放不下時回 false。
     const auto write=[&](std::uint64_t at,const std::u16string& text,std::size_t capacity=260)->bool{
         if(narrow){const auto bytes=utf16_to_utf8_lossy(text);if(bytes.size()>=capacity)return false;std::vector<std::uint8_t> data(bytes.begin(),bytes.end());data.push_back(0);memory.write(GuestAddress{at},data);return true;}
@@ -263,7 +264,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_paths(GuestState& sta
             const auto finish=[&](std::uint32_t hr){call.return_to(s,hr);return std::optional<std::uint32_t>{};};
             GuestScratch scratch(*this,m,s);
             if(!call(2))co_return finish(0x80070057U);
-            auto path=service.symbol.ends_with('A')?utf8_to_utf16_lossy(read_ansi(m,call(2),32768)):read_utf16(m,GuestAddress{call(2)},32768);
+            auto path=service.symbol.ends_with('A')?ansi_to_utf16_lossy(read_ansi(m,call(2),32768)):read_utf16(m,GuestAddress{call(2)},32768);
             const auto flags=static_cast<std::uint32_t>(call(3));
             if(path.empty() || (flags&3U)==3U)co_return finish(0x80070057U);
             std::replace(path.begin(),path.end(),u'/',u'\\');

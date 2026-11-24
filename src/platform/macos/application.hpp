@@ -9,6 +9,8 @@
 #include <charconv>
 #include <cstdio>
 #include <cstring>
+#include <array>
+#include <cstdint>
 
 namespace x64arm {
 // X64ARM_PRESENT_UPSCALE=2：整個客體畫面以 2 倍顯示。客體看到的是實體螢幕一半大小的虛擬顯示器（除非另以
@@ -51,6 +53,14 @@ inline NSScreen* native_background_display(){
         if(!result)throw std::runtime_error("找不到非焦點螢幕，已停止背景 GUI 啟動");
         std::fprintf(stderr,"gui_background_display=%u active_display=%u no_activate=1\n",[result.deviceDescription[@"NSScreenNumber"] unsignedIntValue],[active.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);return result;
     }();return selected;
+}
+// 客體座標的基準螢幕：背景螢幕（含指定桌面所在螢幕）模式以該螢幕左上為客體桌面原點，其餘以選單列所在的主螢幕左上為原點。
+// GUI 視窗、螢幕清單、游標與系統匣事件共用這個基準，客體座標才能一致換算回原生位置。
+inline NSScreen* native_coordinate_screen(){return native_background_display()?:NSScreen.screens.firstObject?:NSScreen.mainScreen;}
+// 原生（Cocoa 全域、y 向上）座標 → 客體 Windows 虛擬桌面座標（基準螢幕左上為原點、y 向下）。
+inline std::array<std::int32_t,2> native_guest_point(NSPoint point){
+    const auto screen=native_coordinate_screen();
+    return {static_cast<std::int32_t>(point.x-screen.frame.origin.x),static_cast<std::int32_t>(NSMaxY(screen.frame)-point.y)};
 }
 
 inline void prepare_native_application() {

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "windows_etw_support.hpp"
@@ -80,7 +81,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_etw_consumer(GuestState& st
             const auto file=memory.load(GuestAddress{arg(0)},static_cast<std::uint8_t>(shape.unit*8)),logger=memory.load(GuestAddress{arg(0)+shape.unit},static_cast<std::uint8_t>(shape.unit*8));
             const auto mode=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+shape.unit*2+12},32));if(mode&~0x10001100U)return fail(87);
             const bool realtime=(mode&0x100U)!=0,wide=name.ends_with('W');if((file && logger) || (realtime?(!logger || file):(!file || logger)))return fail(161);
-            const auto source=wide?read_utf16(memory,GuestAddress{realtime?logger:file}):utf8_to_utf16(read_ansi(memory,realtime?logger:file,32767));etw::Result result;
+            const auto source=wide?read_utf16(memory,GuestAddress{realtime?logger:file}):ansi_to_utf16(read_ansi(memory,realtime?logger:file,32767));etw::Result result;
             if(realtime){const auto session=runtime_.traces.find_session(source);const auto found=etw_sessions_.find(session);if(found==etw_sessions_.end())return fail(4201);
                 if(!etw_session_access(found->second))return fail(5);result=runtime_.traces.open_realtime(source);}
             else{const auto opened=filesystem_.open_reader(utf16_to_utf8(source));if(opened.error)return fail(opened.error);if(opened.metadata.size>512U*1024U*1024U)return fail(8);

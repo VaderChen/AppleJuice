@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "gui_cursor_bounds.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
@@ -286,7 +287,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
     if(service.family=="internal-menu-loop")return advance_menu_idle(state,memory,state.reg(Gpr::Rax));
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');
     const auto d=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
-    const auto read=[&](std::uint64_t address){return address?(wide?read_utf16(memory,GuestAddress{address}):utf8_to_utf16_lossy(read_ansi(memory,address))):std::u16string{};};
+    const auto read=[&](std::uint64_t address){return address?(wide?read_utf16(memory,GuestAddress{address}):ansi_to_utf16_lossy(read_ansi(memory,address))):std::u16string{};};
     std::uint64_t result=0;
     const auto fail=[&](std::uint32_t error,std::uint64_t value=0){last_error_=error;result=value;};
     if(symbol=="NtUserCallTwoParam"){
@@ -593,7 +594,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
                         if((mask&0x10) && (item.flags&(4|0x100|separator))){memory.store(GuestAddress{p+text},bits,(item.flags&4)?item.bitmap:(item.flags&0x100)?item.data:0);memory.store(GuestAddress{p+count},32,0);}
                         else {
                             const auto target=memory.load(GuestAddress{p+text},bits),capacity=memory.load(GuestAddress{p+count},32);
-                            const auto narrow=wide?std::string{}:utf16_to_utf8(item.text);const auto length=wide?item.text.size():narrow.size();
+                            const auto narrow=wide?std::string{}:utf16_to_ansi(item.text);const auto length=wide?item.text.size():narrow.size();
                             auto copied=length;
                             if(target){copied=capacity?std::min(length,static_cast<std::size_t>(capacity-1)):0;
                                 if(capacity){memory.check(GuestAddress{target},(copied+1)*(wide?2:1),Access::Write);for(std::size_t i=0;i<copied;++i)memory.store(GuestAddress{target+i*(wide?2:1)},wide?16:8,wide?item.text[i]:static_cast<unsigned char>(narrow[i]));memory.store(GuestAddress{target+copied*(wide?2:1)},wide?16:8,0);}
@@ -690,7 +691,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
                 if(item.flags&popup){const auto nested=gui_.menus.find(item.id);result=(item.flags&0xff)|((nested==gui_.menus.end()?0:nested->second.size()&0xff)<<8);}
             }else if(symbol.starts_with("GetMenuString")){
                 const auto capacity=signed32(arg(3));
-                const auto text=wide?std::string{}:utf16_to_utf8(item.text);
+                const auto text=wide?std::string{}:utf16_to_ansi(item.text);
                 const auto length=wide?item.text.size():text.size();
                 if(!arg(2) || !capacity)result=length;
                 else if(capacity<0)fail(87);

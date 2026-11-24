@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/unicode.hpp"
@@ -137,7 +138,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_version_install(GuestState&
     const auto scratch=[&](std::size_t size)->std::uint64_t{const auto block=allocate_heap(m,std::max<std::size_t>(size,2));if(!block)throw std::bad_alloc{};m.fill(GuestAddress{block},0,std::max<std::size_t>(size,2));blocks.push_back(block);return block;};
     const auto api=[&](std::string_view dll,std::string_view symbol,std::vector<std::uint64_t> arguments)->service_callback::Task<std::uint64_t>{
         co_return co_await service_callback::call_value(resolve(dll,symbol).value,std::move(arguments));};
-    const auto text=[&](std::uint64_t pointer){return !pointer?std::u16string{}:wide?read_utf16(m,GuestAddress{pointer},32768):utf8_to_utf16_lossy(read_ansi(m,pointer,32768));};
+    const auto text=[&](std::uint64_t pointer){return !pointer?std::u16string{}:wide?read_utf16(m,GuestAddress{pointer},32768):ansi_to_utf16_lossy(read_ansi(m,pointer,32768));};
     const auto guest=[&](std::u16string_view value){const auto bytes=utf16_bytes(value);const auto block=scratch(bytes.size());m.write(GuestAddress{block},bytes);return block;};
     const auto join=[](std::u16string directory,std::u16string_view name){if(!directory.empty() && directory.back()!=u'\\' && directory.back()!=u'/')directory.push_back(u'\\');return directory+std::u16string(name);};
     const auto fold=[](std::u16string value){for(auto& c:value)c=unicode_case_unit(c,false);while(!value.empty() && (value.back()==u'\\' || value.back()==u'/'))value.pop_back();return value;};
@@ -240,7 +241,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_version(GuestState& state,G
     const bool extended=service.symbol.starts_with("GetFileVersionInfo") && service.symbol.find("Ex")!=std::string_view::npos;
     const auto arg=[&](unsigned index){return call(index+(extended?1U:0U));};
     if(extended && (call(0)&~UINT64_C(7))){last_error_=87;call.return_to(state,0);return std::nullopt;}
-    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer));};
+    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16_lossy(read_ansi(memory,pointer));};
     const auto read_version=[&](const std::u16string& requested){
         std::vector<std::u16string> candidates;
         if(requested.find_first_of(u"\\/:")==requested.npos){if(!runtime_.application_directory.empty())candidates.push_back(runtime_.application_directory+requested);if(!runtime_.dll_directory.empty())candidates.push_back(runtime_.dll_directory+requested);candidates.push_back(u"C:\\Windows\\System32\\"+requested);if(!runtime_.exclude_current_dll_directory)candidates.push_back(requested);}else candidates.push_back(requested);
@@ -348,7 +349,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_version(GuestState& state,G
                 }
             }
             auto bytes=wide?utf16_bytes(description):std::vector<std::uint8_t>{};
-            if(!wide){const auto ansi=utf16_to_utf8(description);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
+            if(!wide){const auto ansi=utf16_to_ansi(description);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
             const unsigned unit=wide?2U:1U;
             auto count=bytes.size()/unit;
             if(arg(3)){

@@ -122,7 +122,7 @@
             if(!administrator())return failed(5);
             std::u16string source;try{source=normalized_windows_path(read(arg(0)),runtime_.current_directory);}catch(const std::invalid_argument&){return failed(87);}
             const auto style=static_cast<std::uint32_t>(arg(3));const auto staged=driver_store::stage_package(filesystem_,source,style);
-            const auto ansi=utf16_to_utf8(staged.published);const auto length=(wide?staged.published.size():ansi.size())+1;
+            const auto ansi=utf16_to_ansi(staged.published);const auto length=(wide?staged.published.size():ansi.size())+1;
             const auto leaf=wide?staged.published.find_last_of(u'\\')+1:ansi.find_last_of('\\')+1;
             if(arg(6))memory.store(GuestAddress{arg(6)},32,length);
             const bool fits=arg(4) && arg(5)>=length;

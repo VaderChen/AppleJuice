@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "debug_semaphore.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_security_attributes.hpp"
@@ -36,7 +37,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_sync_object(GuestState& sta
     } else {
         const bool create=api.starts_with("Create"),extended=api.find("Ex")!=std::string_view::npos;
         const auto name_pointer=arg(create?(timer?(extended?1U:2U):3U):2U);
-        auto name=name_pointer?(api.ends_with('W')?read_utf16(memory,GuestAddress{name_pointer},261):utf8_to_utf16(read_ansi(memory,name_pointer,1041))):std::u16string{};
+        auto name=name_pointer?(api.ends_with('W')?read_utf16(memory,GuestAddress{name_pointer},261):ansi_to_utf16(read_ansi(memory,name_pointer,1041))):std::u16string{};
         if(name.size()>=260)error=206;
         // 私有命名空間別名與 BaseNamedObjects 下的子目錄（物件命名空間）轉成既有具名物件名稱。
         if(!error)error=win32_namespace_object_name(name,create);

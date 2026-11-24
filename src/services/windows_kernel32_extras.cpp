@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/crypto.hpp"
 #include "x64arm/unicode.hpp"
@@ -110,7 +111,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_kernel32_extra(GuestState& 
             const bool wide=name.ends_with('W');if(!arg(0) || !arg(4))return fail(error_invalid_parameter);
             if(arg(1) && !u32(2))return fail(error_invalid_parameter);
             std::u16string text;
-            if(wide)text=read_utf16(memory,GuestAddress{arg(0)},260);else text=utf8_to_utf16_lossy(read_ansi(memory,arg(0),260));
+            if(wide)text=read_utf16(memory,GuestAddress{arg(0)},260);else text=ansi_to_utf16_lossy(read_ansi(memory,arg(0),260));
             GuestScratch temporary(*this,memory,state);const auto string=temporary.allocate(16+text.size()*2+2+16+256);if(!string)return fail(8);
             const auto buffer=string+16,oem=buffer+text.size()*2+2,oem_buffer=oem+16,spaces=oem_buffer+250;
             memory.write(GuestAddress{buffer},utf16_bytes(text));

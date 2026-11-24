@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/gpu_memory.hpp"
@@ -371,7 +372,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
     if(machine_variant && !machine_valid(arg(service.arguments-1)))return finish(49);
     // 已提升的系統管理員權杖：裝置啟用／停用與類別屬性寫入共用。
     const auto administrator=[&]{initialize_tokens();return elevated_administrator(runtime_.token_objects.at(effective_token_id()));};
-    const auto read=[&](std::uint64_t pointer){return pointer?(wide?read_utf16(memory,GuestAddress{pointer},32768):utf8_to_utf16(read_ansi(memory,pointer,32768))):std::u16string{};};
+    const auto read=[&](std::uint64_t pointer){return pointer?(wide?read_utf16(memory,GuestAddress{pointer},32768):ansi_to_utf16(read_ansi(memory,pointer,32768))):std::u16string{};};
     if(name=="DevFreeObjects" || name=="DevFreeObjectProperties"){
         // (count, pointer)：只釋放 DevGetObjects／DevGetObjectProperties 配置的區塊；NULL 或其他指標不處理。
         if(arg(1) && device_configuration_ && device_configuration_->query_blocks.erase(arg(1)))(void)free_heap(memory,arg(1),state);
@@ -476,7 +477,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
             const auto failed=[&](std::uint32_t error){last_error_=error;return finish(0);};
             if(!arg(0) || arg(1) || arg(2) || (!arg(3) && arg(4)))return failed(87);
             // GetNativeSystemInfo 對兩種客體 ABI 都回報 AMD64；WOW64 程序同樣查詢原生驅動套件。
-            const auto path=driver_store::stored_inf(filesystem_,read(arg(0)),false);const auto ansi=utf16_to_utf8(path);
+            const auto path=driver_store::stored_inf(filesystem_,read(arg(0)),false);const auto ansi=utf16_to_ansi(path);
             const auto length=(wide?path.size():ansi.size())+1;if(length>260)return failed(206);
             if(arg(5))memory.store(GuestAddress{arg(5)},32,length);if(!arg(3) || arg(4)<length)return failed(122);
             auto bytes=wide?utf16_bytes(path):std::vector<std::uint8_t>(ansi.begin(),ansi.end());if(!wide)bytes.push_back(0);memory.write(GuestAddress{arg(3)},bytes);return finish(1);
@@ -587,7 +588,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
             if(!arg(1) || !arg(2))return finish(3);if(arg(3))return finish(4);
             std::map<std::u16string,std::u16string> enumerators;for(const auto& [handle,node]:nodes){(void)handle;if(!node.pending_set && !node.enumerator.empty())enumerators.try_emplace(folded(node.enumerator),node.enumerator);}
             const auto index=static_cast<std::uint32_t>(arg(0));if(index>=enumerators.size())return finish(37);
-            const auto& text=std::next(enumerators.begin(),static_cast<std::ptrdiff_t>(index))->second;const auto ansi=utf16_to_utf8(text);const auto required=(wide?text.size():ansi.size())+1;
+            const auto& text=std::next(enumerators.begin(),static_cast<std::ptrdiff_t>(index))->second;const auto ansi=utf16_to_ansi(text);const auto required=(wide?text.size():ansi.size())+1;
             const auto capacity=memory.load(GuestAddress{arg(2)},32);memory.check(GuestAddress{arg(2)},4,Access::Write);memory.store(GuestAddress{arg(2)},32,required);if(capacity<required)return finish(26);
             auto bytes=wide?utf16_bytes(text):std::vector<std::uint8_t>(ansi.begin(),ansi.end());if(!wide)bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);return finish(0);
         }
@@ -597,7 +598,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
             const auto path=folded(read(arg(0)));std::array<std::uint8_t,16> guid{};memory.read(GuestAddress{arg(1)},guid);
             const auto found=std::find_if(nodes.begin(),nodes.end(),[&](const auto& item){return !item.second.pending_set && !item.second.interface_path.empty() && folded(item.second.interface_path)==path;});
             if(found==nodes.end() || !supports_interface(found->second,guid))return finish(55);
-            const auto& text=found->second.interface_path;const auto ansi=utf16_to_utf8(text);const auto required=(wide?text.size():ansi.size())+1;
+            const auto& text=found->second.interface_path;const auto ansi=utf16_to_ansi(text);const auto required=(wide?text.size():ansi.size())+1;
             const auto capacity=memory.load(GuestAddress{arg(3)},32);memory.check(GuestAddress{arg(3)},4,Access::Write);memory.store(GuestAddress{arg(3)},32,required);
             if(!arg(2) || capacity<required)return finish(26);auto bytes=wide?utf16_bytes(text):std::vector<std::uint8_t>(ansi.begin(),ansi.end());if(!wide)bytes.push_back(0);memory.write(GuestAddress{arg(2)},bytes);return finish(0);
         }
@@ -702,7 +703,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
         }
         if(name=="CM_Get_Device_ID_Size"){if(!arg(0))return finish(3);if(arg(2))return finish(4);memory.store(GuestAddress{arg(0)},32,node.id.size());return finish(0);}
         if(name=="CM_Get_Device_IDA" || name=="CM_Get_Device_IDW"){
-            if(!arg(1))return finish(3);if(arg(3))return finish(4);const auto ansi=utf16_to_utf8(node.id);if(arg(2)<=(wide?node.id.size():ansi.size()))return finish(26);
+            if(!arg(1))return finish(3);if(arg(3))return finish(4);const auto ansi=utf16_to_ansi(node.id);if(arg(2)<=(wide?node.id.size():ansi.size()))return finish(26);
             auto bytes=wide?utf16_bytes(node.id):std::vector<std::uint8_t>(ansi.begin(),ansi.end());if(!wide)bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);return finish(0);
         }
         if(name.starts_with("CM_Get_DevNode_Registry_Property")){

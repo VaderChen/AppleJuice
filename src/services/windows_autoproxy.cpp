@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "sandbox_certificate_roots.hpp"
 #include <algorithm>
 
 namespace x64arm {
@@ -131,6 +132,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_autoproxy(GuestState& state
                         if(input.flags&~0x1d000fU)throw Error{50};
                         if(!(input.flags&3) || ((input.flags&12)==12) || (input.flags&1?(!input.detect_flags || (input.detect_flags&~3U)):input.detect_flags!=0) || (input.flags&2?!script:script!=0) || memory.load(GuestAddress{arg(2)+8+unit},bits) || memory.load(GuestAddress{arg(2)+8+2*unit},32))throw Error{87};
                         input.script_url=script?utf16_to_utf8(read_utf16(memory,GuestAddress{script})):std::string{};
+                        // PAC 下載與其他 WinHTTP 請求共用沙箱信任根（自動偵測得到的 URL 也一樣帶入）。
+                        if(assign_sandbox_certificate_roots(filesystem_,input.http.certificate_roots,input.script_url.starts_with("https:")))throw Error{12175};
                         if(!handle.callback || !(handle.callback_flags&0x1200000U))throw Error{87};
                         if(!runtime_.network.external_io)throw HostCallFault("比較模式不執行自動代理外部查詢");
                         auto task=start_native_autoproxy(std::move(input));if(!task)throw Error{50};

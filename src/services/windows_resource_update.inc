@@ -91,7 +91,7 @@ struct Image {
 std::optional<std::uint32_t> WindowsServices::invoke_resource_update(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');
     const auto finish=[&](std::uint64_t value,std::uint32_t error=0){if(error)last_error_=error;arg.return_to(state,value);return std::optional<std::uint32_t>{};};
-    const auto text=[&](std::uint64_t at){return wide?read_utf16(memory,GuestAddress{at},32767):utf8_to_utf16_lossy(read_ansi(memory,at,32767));};
+    const auto text=[&](std::uint64_t at){return wide?read_utf16(memory,GuestAddress{at},32767):ansi_to_utf16_lossy(read_ansi(memory,at,32767));};
     try{
         if(symbol.starts_with("Begin")){
             if(!arg(0))return finish(0,87);if(resource_updates_.size()>=128)return finish(0,8);refresh_file_security_context();

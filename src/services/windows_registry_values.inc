@@ -38,7 +38,7 @@ std::uint32_t WindowsServices::query_registry_multiple_values(GuestMemory& memor
             if((length&1U) || length>maximum || (length && !data))return 87;
             name.reserve(static_cast<std::size_t>(length/2));
             for(std::uint64_t at=0;at<length;at+=2){const auto c=static_cast<char16_t>(memory.load(GuestAddress{data+at},16));if(!c)return 87;name.push_back(c);}
-        }else if(name_pointer)name=wide?read_utf16(memory,GuestAddress{name_pointer},32768):utf8_to_utf16(read_ansi(memory,name_pointer,32768));
+        }else if(name_pointer)name=wide?read_utf16(memory,GuestAddress{name_pointer},32768):ansi_to_utf16(read_ansi(memory,name_pointer,32768));
         for(auto& c:name)c=unicode_case_unit(c,false);
         const auto found=values.find(name);if(found==values.end())return 2;
         Item item;item.value=&found->second;
@@ -48,7 +48,7 @@ std::uint32_t WindowsServices::query_registry_multiple_values(GuestMemory& memor
             if(data.size()>limit*2U)return 8;
             std::u16string chars;chars.reserve(data.size()/2);
             for(std::size_t at=0;at<data.size();at+=2)chars.push_back(static_cast<char16_t>(data[at]|(std::uint32_t{data[at+1]}<<8)));
-            const auto converted=utf16_to_utf8(chars);item.converted.assign(converted.begin(),converted.end());item.encoded=true;
+            const auto converted=utf16_to_ansi(chars);item.converted.assign(converted.begin(),converted.end());item.encoded=true;
         }
         const auto size=item.bytes().size();const auto offset=native?(required+3U)&~UINT64_C(3):required;
         if(offset>limit || size>limit-offset)return 8;

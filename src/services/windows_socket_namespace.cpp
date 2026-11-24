@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "iphelper_legacy.hpp"
 #include "x64arm/socket_namespace.hpp"
@@ -27,7 +28,7 @@ constexpr std::uint32_t query_flags=0xbfff; // 回傳欄位、階層、清快取
 std::optional<std::uint32_t> WindowsServices::invoke_socket_namespace(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& descriptor){
     const WindowsCall call(state,memory,descriptor);const auto symbol=descriptor.symbol;auto& network=runtime_.network;const bool wide=symbol.ends_with('W');const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;std::uint64_t result=0;
     const auto d=[&](unsigned n){return static_cast<std::uint32_t>(call(n));};
-    const auto text=[&](std::uint64_t pointer){return !pointer?std::u16string{}:wide?read_utf16(memory,GuestAddress{pointer},4096):utf8_to_utf16(read_ansi(memory,pointer,16384));};
+    const auto text=[&](std::uint64_t pointer){return !pointer?std::u16string{}:wide?read_utf16(memory,GuestAddress{pointer},4096):ansi_to_utf16(read_ansi(memory,pointer,16384));};
     const auto read=[&](std::uint64_t pointer,unsigned size){std::vector<std::uint8_t> data(size);memory.read(GuestAddress{pointer},data);return data;};
     const auto parse=[&](std::uint64_t base,bool setting,Record& record,std::vector<std::pair<std::uint32_t,std::uint32_t>>& protocols){
         if(!base)throw Error{10014};memory.check(GuestAddress{base},x86_?60:120,Access::Read);if(memory.load(GuestAddress{base},32)!=(x86_?60:120))throw Error{10022};
@@ -138,7 +139,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_socket_namespace(GuestState
             std::vector<ServiceClass> classes;{Transaction transaction(runtime_.registry,registry_file_);classes=load_classes(runtime_.registry);}
             const auto found=std::find_if(classes.begin(),classes.end(),[&](const auto& item){return item.id==id;});if(found==classes.end())throw Error{10109};
             std::vector<std::uint8_t> output;
-            if(by_id){if(wide)output=utf16_bytes(found->name);else {const auto narrow=utf16_to_utf8(found->name);output.assign(narrow.begin(),narrow.end());output.push_back(0);}}
+            if(by_id){if(wide)output=utf16_bytes(found->name);else {const auto narrow=utf16_to_ansi(found->name);output.assign(narrow.begin(),narrow.end());output.push_back(0);}}
             else output=class_information(*found,wide,x86_,buffer,namespace_id);
             const auto capacity=memory.load(GuestAddress{size_at},32);memory.store(GuestAddress{size_at},32,output.size());
             if(!buffer || capacity<output.size())throw Error{10014};if(x86_ && buffer>UINT32_MAX-output.size())throw Error{10014};

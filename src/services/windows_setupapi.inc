@@ -139,7 +139,7 @@
                     for(unsigned i=0;i<5;++i)put(pointer_at+i*pointer_size,pointers[i],pointer_size);
                     put(header-4,params.reserved,4);
                     std::vector<std::uint8_t> path;
-                    if(wide)path=utf16_bytes(params.driver_path);else{const auto narrow=utf16_to_utf8(params.driver_path);path.assign(narrow.begin(),narrow.end());path.push_back(0);}
+                    if(wide)path=utf16_bytes(params.driver_path);else{const auto narrow=utf16_to_ansi(params.driver_path);path.assign(narrow.begin(),narrow.end());path.push_back(0);}
                     path.resize(std::min<std::size_t>(path.size(),path_bytes));std::copy(path.begin(),path.end(),bytes.begin()+header);
                     memory.write(GuestAddress{arg(2)},bytes);return finish(1);
                 }
@@ -147,7 +147,7 @@
                 params.flags=static_cast<std::uint32_t>(field(4,4));params.flags_ex=static_cast<std::uint32_t>(field(8,4));
                 params.parent=field(pointer_at,pointer_size);params.handler=field(pointer_at+pointer_size,pointer_size);params.context=field(pointer_at+2*pointer_size,pointer_size);
                 params.queue=field(pointer_at+3*pointer_size,pointer_size);params.class_reserved=field(pointer_at+4*pointer_size,pointer_size);params.reserved=static_cast<std::uint32_t>(field(header-4,4));
-                params.driver_path=wide?read_utf16_counted(memory,GuestAddress{arg(2)+header},259):utf8_to_utf16_lossy(read_ansi(memory,arg(2)+header,259));
+                params.driver_path=wide?read_utf16_counted(memory,GuestAddress{arg(2)+header},259):ansi_to_utf16_lossy(read_ansi(memory,arg(2)+header,259));
                 if(const auto nul=params.driver_path.find(u'\0');nul!=std::u16string::npos)params.driver_path.resize(nul);
                 if((params.flags&8U) && (!params.queue || params.queue==(x86_?UINT32_MAX:UINT64_MAX)))return failed(87);
                 info.device_install.insert_or_assign(key,std::move(params));return finish(1);

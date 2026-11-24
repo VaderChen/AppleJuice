@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/security_descriptor.hpp"
@@ -206,7 +207,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_transactions(GuestState& st
         }
         // 以下為 TxF 檔案作業：只驗證並排入交易，提交前不改動磁碟。
         const bool wide=symbol.back()=='W';
-        const auto path=[&](unsigned i){return wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(i)})):read_ansi(memory,arg(i),32767);};
+        const auto path=[&](unsigned i){return wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(i)})):ansi_to_utf8(read_ansi(memory,arg(i),32767));};
         const bool moving=symbol.starts_with("MoveFileTransacted"),creating=symbol.starts_with("CreateDirectoryTransacted");
         const bool attributes=symbol.starts_with("GetFileAttributesTransacted"),finding=symbol.starts_with("FindFirstFileTransacted"),
             opening=symbol.starts_with("CreateFileTransacted"),linking=symbol.starts_with("CreateHardLinkTransacted");

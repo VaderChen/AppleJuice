@@ -8,6 +8,7 @@
 // - IBinding：Abort、SetPriority／GetPriority、GetBindResult；Suspend／Resume 與 Windows 相同回 E_NOTIMPL。
 // - CopyStgMedium：依 tymed 複製 HGLOBAL、檔名、IStream／IStorage（加參考）、HBITMAP、METAFILEPICT 與 HENHMETAFILE，pUnkForRelease 加參考。
 // - CopyBindInfo／ReleaseBindInfo：BINDINFO（x86 84、x64 128 位元組）的深層複製與釋放（字串為 CoTaskMem、STGMEDIUM 走 CopyStgMedium／ReleaseStgMedium、pUnk 參考計數）。
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
@@ -147,7 +148,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_url_download(GuestState& st
             const bool to_file=name.starts_with("URLDownloadToFile"),to_cache=name.starts_with("URLDownloadToCacheFile"),blocking=name.starts_with("URLOpenBlockingStream");
             const unsigned callback_index=to_cache?5U:(to_file || blocking)?4U:3U;const auto callback=call(callback_index);
             if(!call(1))co_return finish(e_invalidarg);
-            const auto read_text=[&](std::uint64_t at){return wide?read_utf16(m,GuestAddress{at},32768):utf8_to_utf16_lossy(read_ansi(m,at,32768));};
+            const auto read_text=[&](std::uint64_t at){return wide?read_utf16(m,GuestAddress{at},32768):ansi_to_utf16_lossy(read_ansi(m,at,32768));};
             const auto url=read_text(call(1));if(url.empty())co_return finish(e_invalidarg);
             if(to_file && !call(2))co_return finish(e_invalidarg);
             if(to_cache && (!call(2) || !static_cast<std::uint32_t>(call(3))))co_return finish(e_outofmemory);

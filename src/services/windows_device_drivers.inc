@@ -26,7 +26,7 @@ if(service.family=="psapi.dll" && (service.symbol=="EnumDeviceDrivers" || servic
             const auto count=std::min<std::size_t>(text.size(),size-1);auto bytes=utf16_bytes(std::u16string_view(text).substr(0,count));
             memory.write(GuestAddress{arg(1)},bytes);return finish(count);
         }
-        auto narrow=utf16_to_utf8(text);if(narrow.size()>size-1)narrow.resize(size-1);narrow.push_back(0);
+        auto narrow=utf16_to_ansi(text);if(narrow.size()>size-1)narrow.resize(size-1);narrow.push_back(0);
         memory.write(GuestAddress{arg(1)},std::span(reinterpret_cast<const std::uint8_t*>(narrow.data()),narrow.size()));return finish(narrow.size()-1);
     }catch(const MemoryFault&){return finish(0,998);}catch(const std::bad_alloc&){return finish(0,8);}
 }

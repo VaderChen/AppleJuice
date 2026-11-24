@@ -30,7 +30,7 @@
                     std::uint64_t file=0;
                     if(args(3)){
                         if(service.symbol.ends_with('W'))file=args(3);
-                        else file=scratch.text(utf8_to_utf16_lossy(read_ansi(m,args(3),32767)));
+                        else file=scratch.text(ansi_to_utf16_lossy(read_ansi(m,args(3),32767)));
                         if(!file)co_return finish(0);
                     }
                     const auto parent=args(0),instance=args(1)?args(1):runtime_.image.base;
@@ -93,7 +93,7 @@
                 };
                 const auto text=[&](std::uint64_t pointer,bool wide){
                     if(!pointer)return std::u16string{};
-                    return wide?read_utf16(m,GuestAddress{pointer},32767):utf8_to_utf16_lossy(read_ansi(m,pointer,32767));
+                    return wide?read_utf16(m,GuestAddress{pointer},32767):ansi_to_utf16_lossy(read_ansi(m,pointer,32767));
                 };
                 const auto copy=[&](std::u16string_view data,bool wide){
                     const auto maximum=std::min<std::uint64_t>(wp,32768);

@@ -49,8 +49,13 @@ include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dTextureBuffers.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dShaderIsolation.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dNativeLowPrecision.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dStorageBufferArrays.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dTypedUavTexelBuffers.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dSm51ResourceArrays.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dDxilResourceHandles.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dDxilDescriptorHeap.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dDxilForwardHandles.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dSsaUseValidation.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dDxilSm6Ops.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dLlvmLifetime.cmake")
 # 舊版 shader model 的 PSIZE 使用特殊暫存器；SM4+ 已改為可與其他
 # semantic 共用的輸出暫存器，必須保留真正的 component mask。

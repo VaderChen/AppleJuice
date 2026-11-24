@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_calendar.hpp"
@@ -421,6 +422,8 @@ bool WindowsServices::gui_native_control_message(GuestMemory& memory,const GuiMe
         enqueue_gui_message({w.parent,(static_cast<std::uint64_t>(notification)<<16)|(w.id&65535),msg.window,0x111});return true;
     }
     if(gui_control_class(found->second)!=u"syslistview32")return false;
+    // 自繪清單的原生捲動：各列位置改變，重新逐列繪製。
+    if(msg.message==0x10042){if(found->second.style&0x400U)invalidate_window(msg.window);return true;}
     if(msg.message<0x10005 || msg.message>0x10009)return false;
     auto& w=found->second;const auto row=static_cast<std::int32_t>(msg.wparam);
     const auto notify=[&](std::int32_t code,std::int32_t item,std::uint32_t subitem,std::uint32_t before=0,std::uint32_t after=0){
@@ -441,7 +444,17 @@ bool WindowsServices::gui_native_control_message(GuestMemory& memory,const GuiMe
             if(before!=item.state)notify(-101,static_cast<std::int32_t>(i),0,before,item.state);
         }
         w.selection=row>=0 && static_cast<std::size_t>(row)<w.items.size()?row:-1;gui_.focus=msg.window;present_gui(msg.window);
-    }else if(msg.message==0x10006){
+        if(w.style&0x400U)invalidate_window(msg.window); // 自繪清單：選取狀態改變後重畫各列
+    }
+    // 子類別化的清單：程式自己的視窗程序會先看到滑鼠訊息（Windows 的清單是收到 WM_LBUTTONDOWN／WM_LBUTTONDBLCLK 後才產生通知）。
+    // 原生表格吃掉了滑鼠事件，這裡補送對應的客戶區滑鼠訊息給清單的視窗程序；內建程序未被取代時不送。
+    if((msg.message==0x10006 || msg.message==0x10009) && msg.has_point && w.procedure && stock_gui_class(w.procedure).empty()){
+        const auto point=(static_cast<std::uint64_t>(static_cast<std::uint16_t>(msg.point[1]))<<16)|static_cast<std::uint16_t>(msg.point[0]);
+        const auto post=[&](std::uint32_t code,std::uint64_t keys){GuiMessage mouse{msg.window,keys,point,code};mouse.thread=w.thread;enqueue_gui_message(std::move(mouse));};
+        post(msg.message==0x10006?0x203U:0x201U,1);post(0x202,0);
+    }
+    if(msg.message==0x10005){}
+    else if(msg.message==0x10006){
         notify(-16,-1,0);notify(-3,row,static_cast<std::uint32_t>(msg.lparam));
         if(row>=0 && static_cast<std::size_t>(row)<w.items.size()){const auto before=w.items[static_cast<std::size_t>(row)].state;notify(-114,row,static_cast<std::uint32_t>(msg.lparam),before,before|0x20U);}
     }else if(msg.message==0x10009)notify(-2,row,static_cast<std::uint32_t>(msg.lparam));
@@ -477,7 +490,7 @@ void WindowsServices::finish_gui_control_notify(GuestMemory& memory,const GuiMes
     if(item==w.items.end())return;
     const auto mask=memory.load(GuestAddress{msg.lparam+header},32),pointer=memory.load(GuestAddress{msg.lparam+header+abi.list_text},abi.bits);
     if((mask&1) && pointer && pointer!=(x86_?UINT32_MAX:UINT64_MAX)){
-        const auto text=request.wide?read_utf16(memory,GuestAddress{pointer},2048):utf8_to_utf16_lossy(read_ansi(memory,pointer,2048));
+        const auto text=request.wide?read_utf16(memory,GuestAddress{pointer},2048):ansi_to_utf16_lossy(read_ansi(memory,pointer,2048));
         set_list_text(*item,request.subitem,text);
         if(mask&0x1000){item->callback_subitems.erase(request.subitem);item->stored_subitems.insert(request.subitem);}
     }else if(mask&1)set_list_text(*item,request.subitem,{});
@@ -663,7 +676,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_control_api(GuestState& sta
                 for(std::uint32_t i=0;i<d(7);++i){
                     const auto at=arg(6)+i*stride;GuiToolbarButton button;button.image=signed_value(memory.load(GuestAddress{at},32));button.command=signed_value(memory.load(GuestAddress{at+4},32));
                     button.state=static_cast<std::uint8_t>(memory.load(GuestAddress{at+8},8));button.style=static_cast<std::uint8_t>(memory.load(GuestAddress{at+9},8));button.data=old_buttons?0:memory.load(GuestAddress{at+abi.toolbar_data},abi.bits);
-                    const auto text=old_buttons?0:memory.load(GuestAddress{at+abi.toolbar_string},abi.bits);button.string_value=text;if(text>65535 && text!=(x86_?UINT32_MAX:UINT64_MAX))button.text=utf8_to_utf16_lossy(read_ansi(memory,text));window.toolbar_buttons.push_back(std::move(button));
+                    const auto text=old_buttons?0:memory.load(GuestAddress{at+abi.toolbar_string},abi.bits);button.string_value=text;if(text>65535 && text!=(x86_?UINT32_MAX:UINT64_MAX))button.text=ansi_to_utf16_lossy(read_ansi(memory,text));window.toolbar_buttons.push_back(std::move(button));
                 }
                 std::optional<GuiBitmap> bitmap;
                 if(arg(5) && arg(4)!=(x86_?UINT32_MAX:UINT64_MAX)){
@@ -677,7 +690,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_control_api(GuestState& sta
                 }
                 layout_gui_toolbar(window);
                 if(bitmap){GuiImageList list;list.width=static_cast<std::int32_t>(window.toolbar_bitmap_width);list.height=static_cast<std::int32_t>(window.toolbar_bitmap_height);(void)bitmap_images(list,*bitmap,nullptr,bitmap->pixels.front(),false,-1);const auto images=gui_.next_object++;window.list_image_lists[0]=images;window.list_icons=list.images;gui_.image_lists.emplace(images,std::move(list));}
-            }else {window.title=arg(1)?symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16_lossy(read_ansi(memory,arg(1))):std::u16string{};window.status_parts.push_back({window.title,-1,0});}
+            }else {window.title=arg(1)?symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)}):ansi_to_utf16_lossy(read_ansi(memory,arg(1))):std::u16string{};window.status_parts.push_back({window.title,-1,0});}
             result=allocate_gui_window();gui_.windows.emplace(result,std::move(window));if(native_gui_)native_gui_->create(result,gui_.windows.at(result));
         }
     }else throw HostCallFault("尚未實作此 common control API");
@@ -742,11 +755,11 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
     if(w.combo_owner && (m==0xc || m==0xd || m==0xe || m==0x30 || m==0x31 || m==0xc5 || (gui_control_class(w)==u"combobox" && m>=0x140 && m<=0x164))){
         auto forwarded=msg;forwarded.window=w.combo_owner;return gui_control_message(memory,forwarded,wide);
     }
-    const auto read=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):utf8_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
+    const auto read=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):ansi_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
     const auto write=[&](std::uint64_t p,const std::u16string& text,std::uint64_t capacity){
         if(!capacity)return UINT64_C(0);
         if(wide){auto value=text.substr(0,static_cast<std::size_t>(capacity-1));memory.write(GuestAddress{p},utf16_bytes(value));return static_cast<std::uint64_t>(value.size());}
-        auto value=utf16_to_utf8(text);value.resize(std::min<std::size_t>(value.size(),static_cast<std::size_t>(capacity-1)));std::vector<std::uint8_t> bytes(value.begin(),value.end());bytes.push_back(0);memory.write(GuestAddress{p},bytes);return static_cast<std::uint64_t>(value.size());
+        auto value=utf16_to_ansi(text);value.resize(ansi_prefix_length(value,static_cast<std::size_t>(capacity-1)));std::vector<std::uint8_t> bytes(value.begin(),value.end());bytes.push_back(0);memory.write(GuestAddress{p},bytes);return static_cast<std::uint64_t>(value.size());
     };
     const auto update=[&](std::uint64_t result)->std::optional<std::uint64_t>{present_gui(msg.window);return result;};
     if(cls==u"msctls_updown32"){
@@ -827,7 +840,7 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
     }
     if(m==0xc){w.title=read(lp);if(gui_control_class(w)==u"comboboxex32"){w.combo_edit_changed=false;w.combo_edit_item.text=w.title;}if(gui_control_class(w)==u"button" && (w.style&15U)==11)invalidate_window(msg.window);return update(1);}
     if(m==0xd)return write(lp,w.title,wp);
-    if(m==0xe)return wide?w.title.size():utf16_to_utf8(w.title).size();
+    if(m==0xe)return wide?w.title.size():utf16_to_ansi(w.title).size();
     if(m==0x87){ // WM_GETDLGCODE；owner-draw 不能被當成普通 default pushbutton 改寫樣式。
         if(cls==u"msctls_trackbar32")return 1;
         if(cls==u"edit")return 0x89U|(((w.calendar_owner || w.header_owner) && (wp==13 || wp==27))?4U:0U);
@@ -855,7 +868,7 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
             if(!edit_item && (index>(insert?w.items.size():w.items.empty()?0:w.items.size()-1) || (!insert && w.items.empty()) || (insert && w.items.size()>=65536)))return insert?UINT64_MAX:0;
             if(get){
                 const auto& item=edit_item?w.combo_edit_item:w.items[index];
-                if(mask&1U){if(item.callback_subitems.contains(0))throw HostCallFault("ComboBoxEx 同步文字回呼尚未提供");const auto target=memory.load(GuestAddress{lp+abi.combo_text},abi.bits);const auto capacity=static_cast<std::int32_t>(memory.load(GuestAddress{lp+abi.combo_capacity},32));if(capacity>0){if(unicode)memory.write(GuestAddress{target},utf16_bytes(item.text.substr(0,static_cast<std::size_t>(capacity-1))));else {auto text=utf16_to_utf8(item.text);text.resize(std::min(text.size(),static_cast<std::size_t>(capacity-1)));std::vector<std::uint8_t> bytes(text.begin(),text.end());bytes.push_back(0);memory.write(GuestAddress{target},bytes);}}}
+                if(mask&1U){if(item.callback_subitems.contains(0))throw HostCallFault("ComboBoxEx 同步文字回呼尚未提供");const auto target=memory.load(GuestAddress{lp+abi.combo_text},abi.bits);const auto capacity=static_cast<std::int32_t>(memory.load(GuestAddress{lp+abi.combo_capacity},32));if(capacity>0){if(unicode)memory.write(GuestAddress{target},utf16_bytes(item.text.substr(0,static_cast<std::size_t>(capacity-1))));else {auto text=utf16_to_ansi(item.text);text.resize(ansi_prefix_length(text,static_cast<std::size_t>(capacity-1)));std::vector<std::uint8_t> bytes(text.begin(),text.end());bytes.push_back(0);memory.write(GuestAddress{target},bytes);}}}
                 if(mask&2U)memory.store(GuestAddress{lp+abi.combo_image},32,static_cast<std::uint32_t>(item.image));
                 if(mask&4U)memory.store(GuestAddress{lp+abi.combo_selected},32,static_cast<std::uint32_t>(item.selected_image));
                 if(mask&8U)memory.store(GuestAddress{lp+abi.combo_overlay},32,static_cast<std::uint32_t>(item.overlay));
@@ -863,7 +876,7 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
                 if(mask&32U)memory.store(GuestAddress{lp+abi.combo_data},abi.bits,item.data);return 1;
             }
             GuiItem item=insert?GuiItem{}:edit_item?w.combo_edit_item:w.items[index];if(insert)item.handle=gui_.next_item++;
-            if(mask&1U){const auto pointer=memory.load(GuestAddress{lp+abi.combo_text},abi.bits);if(pointer==(x86_?UINT32_MAX:UINT64_MAX)){item.callback_subitems.insert(0);item.text.clear();}else {item.callback_subitems.erase(0);item.text=pointer?(unicode?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer))):std::u16string{};}}
+            if(mask&1U){const auto pointer=memory.load(GuestAddress{lp+abi.combo_text},abi.bits);if(pointer==(x86_?UINT32_MAX:UINT64_MAX)){item.callback_subitems.insert(0);item.text.clear();}else {item.callback_subitems.erase(0);item.text=pointer?(unicode?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16_lossy(read_ansi(memory,pointer))):std::u16string{};}}
             if(mask&2U)item.image=static_cast<std::int32_t>(memory.load(GuestAddress{lp+abi.combo_image},32));
             if(mask&4U)item.selected_image=static_cast<std::int32_t>(memory.load(GuestAddress{lp+abi.combo_selected},32));
             if(mask&8U)item.overlay=static_cast<std::int32_t>(memory.load(GuestAddress{lp+abi.combo_overlay},32));
@@ -878,7 +891,7 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
     if(gui_control_class(w)==u"toolbarwindow32"){
         if(m==1)return update(0);
         const auto command=[&](std::uint32_t id){return std::find_if(w.toolbar_buttons.begin(),w.toolbar_buttons.end(),[&](const auto& button){return static_cast<std::uint32_t>(button.command)==id;});};
-        const auto string=[&](std::uint64_t pointer,bool unicode){return unicode?read_utf16(memory,GuestAddress{pointer},32768):utf8_to_utf16_lossy(read_ansi(memory,pointer,32768));};
+        const auto string=[&](std::uint64_t pointer,bool unicode){return unicode?read_utf16(memory,GuestAddress{pointer},32768):ansi_to_utf16_lossy(read_ansi(memory,pointer,32768));};
         const auto refresh_strings=[&]{for(auto& button:w.toolbar_buttons)if(button.string_value<w.toolbar_strings.size())button.text=w.toolbar_strings[static_cast<std::size_t>(button.string_value)];};
         const auto button_at=[&](std::uint64_t address,bool unicode){
             memory.check(GuestAddress{address},abi.toolbar_size,Access::Read);GuiToolbarButton button;
@@ -952,11 +965,11 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
                 for(std::uint64_t i=0;i<=(lp&15);++i){if(address>end || end-address<2)throw HostCallFault("工具列字串資源截斷");const auto count=memory.load(GuestAddress{address},16);address+=2;if(count>(end-address)/2)throw HostCallFault("工具列字串資源截斷");if(i==(lp&15)){std::u16string text;for(std::uint64_t n=0;n<count;++n)text.push_back(static_cast<char16_t>(memory.load(GuestAddress{address+n*2},16)));strings.push_back(std::move(text));}address+=count*2;}
                 if(!strings.front().empty()){const auto text=strings.front();const auto delimiter=text.front();strings.clear();std::size_t start=1;for(std::size_t n=1;n<=text.size();++n)if(n==text.size() || text[n]==delimiter){if(n>start)strings.push_back(text.substr(start,n-start));start=n+1;}}
             }else{
-                auto address=lp;for(unsigned n=0;n<4096;++n){const auto text=string(address,m==0x44d);if(text.empty())break;strings.push_back(text);address+=(m==0x44d?text.size()*2:utf16_to_utf8(text).size())+(m==0x44d?2:1);if(n==4095)throw HostCallFault("工具列字串清單未終止");}
+                auto address=lp;for(unsigned n=0;n<4096;++n){const auto text=string(address,m==0x44d);if(text.empty())break;strings.push_back(text);address+=(m==0x44d?text.size()*2:utf16_to_ansi(text).size())+(m==0x44d?2:1);if(n==4095)throw HostCallFault("工具列字串清單未終止");}
             }
             if(strings.size()>65536-w.toolbar_strings.size())return UINT64_MAX;const auto first=w.toolbar_strings.size();w.toolbar_strings.insert(w.toolbar_strings.end(),strings.begin(),strings.end());refresh_strings();return update(first);
         }
-        if(m==0x42d || m==0x44b){const auto button=command(wp);if(button==w.toolbar_buttons.end())return UINT64_MAX;const bool unicode=m==0x44b;const auto size=unicode?button->text.size():utf16_to_utf8(button->text).size();if(lp){const bool previous=wide;wide=unicode;write(lp,button->text,size+1);wide=previous;}return size;}
+        if(m==0x42d || m==0x44b){const auto button=command(wp);if(button==w.toolbar_buttons.end())return UINT64_MAX;const bool unicode=m==0x44b;const auto size=unicode?button->text.size():utf16_to_ansi(button->text).size();if(lp){const bool previous=wide;wide=unicode;write(lp,button->text,size+1);wide=previous;}return size;}
         if(m==0x41f || m==0x420){const auto width=static_cast<std::uint16_t>(lp),height=static_cast<std::uint16_t>(lp>>16);if(!width || !height || width>4096 || height>4096)return 0;if(m==0x41f){w.toolbar_requested_width=width;w.toolbar_requested_height=height;}else {w.toolbar_bitmap_width=width;w.toolbar_bitmap_height=height;}return update(1);}
         if(m==0x43a)return w.toolbar_button_width|(static_cast<std::uint64_t>(w.toolbar_button_height)<<16);
         if(m==0x430 || m==0x436 || m==0x434){const auto index=m==0x430?0U:m==0x436?1U:2U;const auto previous=w.list_image_lists[index];if(lp && !gui_.image_lists.contains(lp))return 0;w.list_image_lists[index]=lp;return update(previous);}
@@ -1010,7 +1023,7 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
             const auto field=[&](unsigned at,unsigned bits,std::uint64_t value){if(at+bits/8>size)throw HostCallFault("REBARBANDINFO 欄位超出 cbSize");if(get){memory.store(GuestAddress{lp+at},static_cast<std::uint8_t>(bits),value);return value;}return memory.load(GuestAddress{lp+at},static_cast<std::uint8_t>(bits));};
             if(mask&1)band.style=static_cast<std::uint32_t>(field(8,32,band.style));
             if(mask&2){band.foreground=static_cast<std::uint32_t>(field(12,32,band.foreground));band.background=static_cast<std::uint32_t>(field(16,32,band.background));}
-            if(mask&4){const auto pointer=memory.load(GuestAddress{lp+abi.rebar_text},abi.bits);if(get){const auto capacity=memory.load(GuestAddress{lp+abi.rebar_capacity},32);const bool previous=wide;wide=unicode;write(pointer,band.text,capacity);wide=previous;}else band.text=pointer?(unicode?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer))):std::u16string{};}
+            if(mask&4){const auto pointer=memory.load(GuestAddress{lp+abi.rebar_text},abi.bits);if(get){const auto capacity=memory.load(GuestAddress{lp+abi.rebar_capacity},32);const bool previous=wide;wide=unicode;write(pointer,band.text,capacity);wide=previous;}else band.text=pointer?(unicode?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16_lossy(read_ansi(memory,pointer))):std::u16string{};}
             if(mask&8)band.image=static_cast<std::int32_t>(field(abi.rebar_image,32,static_cast<std::uint32_t>(band.image)));
             if(mask&16){band.child=field(abi.rebar_child,abi.bits,band.child);if(!get && band.child){if(!gui_.windows.contains(band.child))return 0;auto ancestor=msg.window;for(unsigned depth=0;ancestor && depth<64;++depth){if(ancestor==band.child)return 0;const auto node=gui_.windows.find(ancestor);ancestor=node==gui_.windows.end()?0:node->second.parent;}if(ancestor)return 0;}}
             if(mask&32){band.min_width=static_cast<std::uint32_t>(field(abi.rebar_min_width,32,band.min_width));band.min_height=static_cast<std::uint32_t>(field(abi.rebar_min_height,32,band.min_height));if(size>=abi.rebar_integral+4){band.height=static_cast<std::uint32_t>(field(abi.rebar_height,32,band.height));band.max_height=static_cast<std::uint32_t>(field(abi.rebar_max_height,32,band.max_height));band.integral=static_cast<std::uint32_t>(field(abi.rebar_integral,32,band.integral));}}
@@ -1050,14 +1063,14 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
         if(m==0x406){if(lp)memory.check(GuestAddress{lp},std::min<std::size_t>(wp,w.status_parts.size())*4,Access::Write);for(std::size_t n=0;lp && n<std::min<std::size_t>(wp,w.status_parts.size());++n)memory.store(GuestAddress{lp+n*4},32,static_cast<std::uint32_t>(w.status_parts[n].edge));return w.status_parts.size();}
         if(m==0x401 || m==0x40b){
             const auto index=wp&255U;auto* part=part_at(index);if(!part || (index==255 && (wp&0x1000U)))return 0;
-            const auto flags=wp&0xff00U;const auto text=(flags&0x1000U)?std::u16string{}:lp?(m==0x40b?read_utf16(memory,GuestAddress{lp},65535):utf8_to_utf16_lossy(read_ansi(memory,lp,65535))):std::u16string{};
+            const auto flags=wp&0xff00U;const auto text=(flags&0x1000U)?std::u16string{}:lp?(m==0x40b?read_utf16(memory,GuestAddress{lp},65535):ansi_to_utf16_lossy(read_ansi(memory,lp,65535))):std::u16string{};
             if(!(flags&0x1000U) && part->flags==flags && part->text==text)return 1; // owner-draw 的資料指標相同仍可能有新內容。
             part->text=text;part->flags=flags;part->data=(flags&0x1000U)?lp:0;return changed(1);
         }
         if(m==0x402 || m==0x403 || m==0x40c || m==0x40d){
             const auto* part=part_at(wp&255U);if(!part)return 0;const bool getting=m==0x402 || m==0x40d;
             if(getting && (part->flags&0x1000U))return part->data;
-            const bool unicode=m==0x40c || m==0x40d;const auto size=std::min<std::size_t>(65535,unicode?part->text.size():utf16_to_utf8(part->text).size());
+            const bool unicode=m==0x40c || m==0x40d;const auto size=std::min<std::size_t>(65535,unicode?part->text.size():utf16_to_ansi(part->text).size());
             if(getting && lp){const bool previous=wide;wide=unicode;write(lp,part->text,size+1);wide=previous;}return size|(static_cast<std::uint64_t>(part->flags)<<16);
         }
         if(m==0x409){if(w.status_simple==(wp!=0))return 0;w.status_simple=wp!=0;return changed(0);}if(m==0x40e)return w.status_simple?1:0;
@@ -1068,7 +1081,7 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
         if(m==0x40f || m==0x414){auto* part=part_at(wp);if(!part)return m==0x414?UINT64_MAX:0;if(m==0x414)return part->icon_handle;if(lp && !gui_.icons.contains(lp))return 0;part->icon_handle=lp;part->icon=lp?gui_.icons.at(lp):GuiIcon{};return changed(1);}
         if(m>=0x410 && m<=0x413){
             auto* part=part_at(wp&65535U);if(!part)return 0;const bool unicode=m==0x411 || m==0x413;
-            if(m==0x410 || m==0x411){part->tooltip=lp?(unicode?read_utf16(memory,GuestAddress{lp}):utf8_to_utf16_lossy(read_ansi(memory,lp))):std::u16string{};return update(0);}
+            if(m==0x410 || m==0x411){part->tooltip=lp?(unicode?read_utf16(memory,GuestAddress{lp}):ansi_to_utf16_lossy(read_ansi(memory,lp))):std::u16string{};return update(0);}
             const bool previous=wide;wide=unicode;if(lp)write(lp,part->tooltip,wp>>16);wide=previous;return 0;
         }
         if(m==0x2001){const auto previous=w.status_background;w.status_background=static_cast<std::uint32_t>(lp);return changed(previous);}
@@ -1193,11 +1206,11 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
         const auto notify=[&](std::int32_t code,std::int32_t row,std::uint32_t subitem=0,std::uint32_t before=0,std::uint32_t after=0,const GuiItem* removed=nullptr){
             list_notification(gui_,memory,[&]{return runtime_allocate(memory,{},notify_bytes);},msg.window,code,row,subitem,before,after,removed);
         };
-        const auto text_read=[&](std::uint64_t pointer,bool unicode){return !pointer?std::u16string{}:unicode?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer));};
+        const auto text_read=[&](std::uint64_t pointer,bool unicode){return !pointer?std::u16string{}:unicode?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16_lossy(read_ansi(memory,pointer));};
         const auto text_write=[&](std::uint64_t pointer,std::u16string_view text,std::int32_t capacity,bool unicode){
             if(capacity<=0)return UINT64_C(0);
             if(unicode){auto size=std::min(text.size(),static_cast<std::size_t>(capacity-1));if(size && size<text.size() && text[size-1]>=0xd800 && text[size-1]<=0xdbff)--size;const auto value=text.substr(0,size);memory.write(GuestAddress{pointer},utf16_bytes(value));return static_cast<std::uint64_t>(value.size());}
-            auto value=utf16_to_utf8(text);auto size=std::min(value.size(),static_cast<std::size_t>(capacity-1));while(size && size<value.size() && (static_cast<unsigned char>(value[size])&0xc0U)==0x80U)--size;value.resize(size);std::vector<std::uint8_t> bytes(value.begin(),value.end());bytes.push_back(0);memory.write(GuestAddress{pointer},bytes);return static_cast<std::uint64_t>(value.size());
+            auto value=utf16_to_ansi(text);auto size=ansi_prefix_length(value,static_cast<std::size_t>(capacity-1));value.resize(size);std::vector<std::uint8_t> bytes(value.begin(),value.end());bytes.push_back(0);memory.write(GuestAddress{pointer},bytes);return static_cast<std::uint64_t>(value.size());
         };
         const auto set_state=[&](std::size_t index,std::uint32_t state,std::uint32_t mask){
             auto& item=w.items[index];const auto before=item.state;item.state=(before&~mask)|(state&mask);
@@ -1309,6 +1322,25 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
         }
         if(m==0x101c){if(wp>=w.columns.size())return 0;const auto order=w.columns[wp].order;w.columns.erase(w.columns.begin()+wp);for(auto& column:w.columns)if(column.order>order){--column.order;++column.revision;}return update(1);}
         if(m==0x101d)return wp<w.columns.size()?static_cast<std::uint32_t>(w.columns[wp].width):0;
+        // LVM_GETITEMRECT（0x100e，RECT.left 為 LVIR_*）與 LVM_GETSUBITEMRECT（0x1038，RECT.top 為子項目、left 為 LVIR_*）：報表檢視的列與儲存格矩形。
+        // 列的垂直位置取原生表格（含捲動）；沒有原生表格或該列不在畫面上時以固定列高推算。欄的水平位置依顯示順序累加欄寬。
+        if((m==0x100e || m==0x1038) && (w.style&3U)==1){
+            if(wp>=w.items.size() || !lp)return 0;memory.check(GuestAddress{lp},16,Access::Write);
+            const auto code=static_cast<std::uint32_t>(memory.load(GuestAddress{lp},32)),subitem=m==0x1038?static_cast<std::uint32_t>(memory.load(GuestAddress{lp+4},32)):0U;
+            if(code>3)return 0;
+            std::array<std::int32_t,4> row{0,static_cast<std::int32_t>(wp)*17+((w.style&0x4000U)?0:17),0,0};row[3]=row[1]+17;
+            if(native_gui_)if(const auto native=native_gui_->list_row_rect(msg.window,static_cast<std::int32_t>(wp)))row=*native;
+            std::vector<std::size_t> order(w.columns.size());for(std::size_t n=0;n<order.size();++n)order[n]=n;
+            std::stable_sort(order.begin(),order.end(),[&](auto a,auto b){return w.columns[a].order<w.columns[b].order;});
+            std::int32_t left=row[0],total=0,cell_left=row[0],cell_right=row[0];bool found_column=false;
+            for(const auto index:order){const auto width=std::max(0,w.columns[index].width);
+                if(!found_column && static_cast<std::uint32_t>(w.columns[index].subitem)==subitem){cell_left=left+total;cell_right=cell_left+width;found_column=true;}
+                total+=width;}
+            std::array<std::int32_t,4> result{left,row[1],left+total,row[3]};
+            if(m==0x1038 || code==2){if(!found_column && m==0x1038)return 0;if(found_column){result[0]=cell_left;result[2]=cell_right;}}
+            if(code==1){result[2]=result[0];} // 報表檢視沒有圖示時圖示矩形為空
+            for(unsigned n=0;n<4;++n)memory.store(GuestAddress{lp+n*4},32,static_cast<std::uint32_t>(result[n]));return 1;
+        }
         const auto text_width=[&](const std::u16string& text){
             if(native_gui_)if(const auto advances=native_gui_->text_advances(w.control_font,text);advances && !advances->empty())return advances->back();
             const auto metrics=fallback_font_metrics(w.control_font);std::int64_t width=0;for(std::size_t i=0;i<text.size();++i){auto c=text[i];if(c>=0xd800 && c<=0xdbff && i+1<text.size() && text[i+1]>=0xdc00 && text[i+1]<=0xdfff){++i;width+=metrics.average_width*2;}else width+=metrics.average_width*((c>=0x2e80 && c<=0xa4cf) || (c>=0xac00 && c<=0xd7ff)?2:1);}return static_cast<std::int32_t>(std::min<std::int64_t>(width,INT32_MAX));
@@ -1327,8 +1359,10 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
         if(m==0x1013)return wp<w.items.size()?update(1):0;
         if(m==0x1023)return w.text_color;
         if(m==0x1024){w.text_color=static_cast<std::uint32_t>(lp);return update(1);}
-        if(m==0x1000 || m==0x1025)return 0xffffff;
-        if(m==0x1001 || m==0x1026)return update(1);
+        if(m==0x1000)return w.list_background;
+        if(m==0x1025)return 0xffffff;
+        if(m==0x1001){w.list_background=static_cast<std::uint32_t>(lp);return update(1);}
+        if(m==0x1026)return update(1);
         if(m==0x1030 || m==0x1051)throw HostCallFault("ListView 排序需要 guest compare callback");
     }
     if(gui_control_class(w)==u"listbox" || gui_control_class(w)==u"combobox" || gui_control_class(w)==u"comboboxex32"){
@@ -1379,7 +1413,7 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
         if(!combo && m==0x1b2)return std::max<std::uint64_t>(1,w.height/16); // LB_GETLISTBOXINFO：每欄可見的項目數（列高 16）
         if(is(0x188,0x147))return static_cast<std::uint64_t>(static_cast<std::int64_t>(w.selection));
         if(is(0x186,0x14e)){if(multiple)return UINT64_MAX;w.selection=index<count?static_cast<std::int32_t>(wp):-1;if(combo)w.title=w.selection>=0?w.items[index].text:std::u16string{};return update(static_cast<std::uint64_t>(static_cast<std::int64_t>(w.selection)));}
-        if(is(0x18a,0x149))return index<count?(strings?(wide?w.items[index].text.size():utf16_to_utf8(w.items[index].text).size()):abi.unit):UINT64_MAX;
+        if(is(0x18a,0x149))return index<count?(strings?(wide?w.items[index].text.size():utf16_to_ansi(w.items[index].text).size()):abi.unit):UINT64_MAX;
         if(is(0x189,0x148)){if(index>=count)return UINT64_MAX;if(strings)return write(lp,w.items[index].text,1048576);memory.store(GuestAddress{lp},abi.bits,w.items[index].data);return abi.unit;}
         if(is(0x18f,0x14c) || is(0x1a2,0x158) || is(0x18c,0x14d)){
             if(!count || (wp!=UINT32_MAX && index>=count) || (multiple && is(0x18c,0x14d)))return UINT64_MAX;
@@ -1450,7 +1484,7 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
             if(mask&2U)item.image=signed32(memory.load(GuestAddress{entry+abi.tree_image},32));
             if(mask&32U)item.selected_image=signed32(memory.load(GuestAddress{entry+abi.tree_selected},32));
             if(mask&64U)item.tree_children=signed32(memory.load(GuestAddress{entry+abi.tree_children},32));
-            if(mask&1U){const auto pointer=memory.load(GuestAddress{entry+abi.tree_text},abi.bits);if(pointer==(x86_?UINT32_MAX:UINT64_MAX))item.callback_subitems.insert(0);else if(pointer)item.text=m==0x1132?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer));}
+            if(mask&1U){const auto pointer=memory.load(GuestAddress{entry+abi.tree_text},abi.bits);if(pointer==(x86_?UINT32_MAX:UINT64_MAX))item.callback_subitems.insert(0);else if(pointer)item.text=m==0x1132?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16_lossy(read_ansi(memory,pointer));}
             if(special==0xffff0001U || special==0xffff0003U){
                 for(std::size_t i=0;i<w.items.size();++i)if(w.items[i].parent==item.parent && (special==0xffff0001U || item.text<w.items[i].text)){at=i;break;}
             }else if(after && special!=0xffff0002U && special!=0xffff0000U){const auto found_item=lookup(after);if(found_item==w.items.end() || found_item->parent!=item.parent)return 0;at=static_cast<std::size_t>(found_item-w.items.begin())+1;}
@@ -1465,10 +1499,10 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
             if(mask&8U){const auto sm=memory.load(GuestAddress{lp+abi.tree_mask},32);if(set)item->state=static_cast<std::uint32_t>((item->state&~sm)|(memory.load(GuestAddress{lp+abi.tree_state},32)&sm));else memory.store(GuestAddress{lp+abi.tree_state},32,item->state&sm);}
             for(const auto [bit,offset,value,slot]:std::array<std::tuple<unsigned,unsigned,std::int32_t*,unsigned>,3>{{{2,abi.tree_image,&item->image,0},{32,abi.tree_selected,&item->selected_image,1},{64,abi.tree_children,&item->tree_children,2}}})if(mask&bit){if(set){*value=signed32(memory.load(GuestAddress{lp+offset},32));item->resolved_subitems.erase(slot+1);item->tree_display[slot]=slot==2?0:-2;}else {const auto output=bit==64 && *value==-2?(std::any_of(w.items.begin(),w.items.end(),[&](const auto& child){return child.parent==item->handle;})?1:0):*value==-1?item->tree_display[slot]:*value;memory.store(GuestAddress{lp+offset},32,static_cast<std::uint32_t>(output));}}
             if(mask&1U){const auto pointer=memory.load(GuestAddress{lp+abi.tree_text},abi.bits);
-                if(set){item->resolved_subitems.erase(0);if(pointer==(x86_?UINT32_MAX:UINT64_MAX)){item->callback_subitems.insert(0);item->text.clear();}else {item->callback_subitems.erase(0);item->text=pointer?(unicode?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer))):std::u16string{};}}
+                if(set){item->resolved_subitems.erase(0);if(pointer==(x86_?UINT32_MAX:UINT64_MAX)){item->callback_subitems.insert(0);item->text.clear();}else {item->callback_subitems.erase(0);item->text=pointer?(unicode?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16_lossy(read_ansi(memory,pointer))):std::u16string{};}}
                 else {const auto capacity=signed32(memory.load(GuestAddress{lp+abi.tree_capacity},32));if(pointer && capacity>0){
                     if(unicode){auto count=std::min(item->text.size(),static_cast<std::size_t>(capacity-1));if(count && count<item->text.size() && item->text[count-1]>=0xd800 && item->text[count-1]<=0xdbff)--count;memory.write(GuestAddress{pointer},utf16_bytes(item->text.substr(0,count)));}
-                    else {auto text=utf16_to_utf8(item->text);auto count=std::min(text.size(),static_cast<std::size_t>(capacity-1));while(count && count<text.size() && (static_cast<unsigned char>(text[count])&0xc0U)==0x80U)--count;std::vector<std::uint8_t> bytes(text.begin(),text.begin()+static_cast<std::ptrdiff_t>(count));bytes.push_back(0);memory.write(GuestAddress{pointer},bytes);}
+                    else {auto text=utf16_to_ansi(item->text);auto count=ansi_prefix_length(text,static_cast<std::size_t>(capacity-1));std::vector<std::uint8_t> bytes(text.begin(),text.begin()+static_cast<std::ptrdiff_t>(count));bytes.push_back(0);memory.write(GuestAddress{pointer},bytes);}
                 }}
             }
             if(set){++item->revision;invalidate_window(msg.window);return update(1);}return 1;

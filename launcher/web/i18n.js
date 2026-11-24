@@ -256,6 +256,11 @@ const translations = {
     "フレーム補間",
     "프레임 보간"
   ],
+  "效能 HUD": [
+    "Performance HUD",
+    "パフォーマンス HUD",
+    "성능 HUD"
+  ],
   "允許程式寫入上述資料夾": [
     "Allow the app to write to these folders",
     "これらのフォルダーへの書き込みを許可",

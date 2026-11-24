@@ -5,6 +5,7 @@
 // - 符號路徑以 ';' 分隔：一般目錄直接找同名檔；srv*／symsrv*／cache* 元素中的本機目錄依符號存放區版面（檔名\索引\檔名）尋找，
 //   網址元素（http／https）不連線。
 // - 家目錄預設為 dbghelp.dll 所在的系統目錄；檔案系統唯讀時改用 CSIDL_COMMON_APPDATA。
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/windows_system_paths.hpp"
@@ -178,9 +179,9 @@ bool starts_fold(std::u16string_view text,std::u16string_view prefix){return tex
 std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_files(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const auto name=service.symbol;const bool wide=name.ends_with('W');
     const unsigned unit=wide?2U:1U;
-    const auto read_text=[wide](const GuestMemory& m,std::uint64_t pointer){return wide?read_utf16(m,GuestAddress{pointer},32768):utf8_to_utf16(read_ansi(m,pointer,32768));};
+    const auto read_text=[wide](const GuestMemory& m,std::uint64_t pointer){return wide?read_utf16(m,GuestAddress{pointer},32768):ansi_to_utf16(read_ansi(m,pointer,32768));};
     const auto encode=[wide](const std::u16string& text){
-        if(wide)return utf16_bytes(text);auto narrow=utf16_to_utf8(text);std::vector<std::uint8_t> bytes(narrow.begin(),narrow.end());bytes.push_back(0);return bytes;};
+        if(wide)return utf16_bytes(text);auto narrow=utf16_to_ansi(text);std::vector<std::uint8_t> bytes(narrow.begin(),narrow.end());bytes.push_back(0);return bytes;};
     // 開檔並取得索引：找不到檔案等開檔錯誤原樣回傳，格式不符為 ERROR_BAD_FORMAT。
     const auto index_of=[this](const std::u16string& path,std::uint32_t& error)->std::optional<FileIndex>{
         const auto opened=filesystem_.open(utf16_to_utf8(normalized_windows_path(path,runtime_.current_directory)));

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_window_state.hpp"
 #include "x64arm/windows_gui_abi.hpp"
@@ -93,7 +94,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_busy(GuestState& state,
             const auto owner=gui_.windows.find(window->second.owner);data.owner_enabled=owner==gui_.windows.end() || owner->second.enabled;
             if(data.dialog_output)memory.store(GuestAddress{data.dialog_output},abi.bits,handle);
             const auto caption=pointer(p,1);
-            if(caption)window->second.title=wide?read_utf16(memory,GuestAddress{caption}):utf8_to_utf16_lossy(read_ansi(memory,caption));
+            if(caption)window->second.title=wide?read_utf16(memory,GuestAddress{caption}):ansi_to_utf16_lossy(read_ansi(memory,caption));
             for(const auto& [id,disabled]:{std::pair{2U,(data.flags&9U)!=0},std::pair{604U,(data.flags&2U)!=0},std::pair{600U,(data.flags&4U)!=0}}){
                 const auto child=gui_child(handle,id);if(child){gui_set_window_enabled(gui_.windows.at(child),!disabled);present_gui(child);}
             }
@@ -114,7 +115,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_busy(GuestState& state,
         const auto flags=memory.load(GuestAddress{p+4},32),owner=pointer(p,0),caption=pointer(p,1),hook=pointer(p,2);
         const auto instance=pointer(p,4),name=pointer(p,5),resource=pointer(p,6),task=pointer(p,7),output=pointer(p,8);
         error=104;if(owner && !gui_.windows.contains(owner)){fail(error);return std::nullopt;}
-        error=105;const auto title=caption?(wide?read_utf16(memory,GuestAddress{caption}):utf8_to_utf16_lossy(read_ansi(memory,caption))):std::u16string{u"Busy"};
+        error=105;const auto title=caption?(wide?read_utf16(memory,GuestAddress{caption}):ansi_to_utf16_lossy(read_ansi(memory,caption))):std::u16string{u"Busy"};
         error=106;if(hook && !handles(GuestAddress{hook}))memory.check(GuestAddress{hook},1,Access::Execute);
         error=107;if(instance && !resource_image(instance)){fail(error);return std::nullopt;}
         error=108;if(name>=65536){if(wide)(void)read_utf16(memory,GuestAddress{name});else (void)read_ansi(memory,name);}
@@ -240,7 +241,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_common_dialog(GuestState& s
     if(size!=abi.size && !(file && size==abi.legacy_size)){fail(1);return std::nullopt;}
     memory.check(GuestAddress{p},size,Access::Write);
     const auto load=[&](unsigned offset,unsigned width=0){return memory.load(GuestAddress{p+offset},static_cast<std::uint8_t>(width?width:abi.bits));};
-    const auto read=[&](std::uint64_t address){return address?(wide?read_utf16(memory,GuestAddress{address}):utf8_to_utf16_lossy(read_ansi(memory,address))):std::u16string{};};
+    const auto read=[&](std::uint64_t address){return address?(wide?read_utf16(memory,GuestAddress{address}):ansi_to_utf16_lossy(read_ansi(memory,address))):std::u16string{};};
     data.flags=static_cast<std::uint32_t>(load(abi.flags,32));
     // 模板尚未經共用解析器接入，明確回報而不忽略呼叫者的 UI 契約。
     if(data.flags&(file?0xc0U:data.kind==Kind::Font?0x30U:0x60U)){fail(2);return std::nullopt;}
@@ -256,8 +257,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_common_dialog(GuestState& s
     std::u16string initial_face,initial_file;
     // 固定陣列和 lpstrFile 必須在宣告容量內終止；先驗證再建立原生視窗。
     try {
-        if(data.kind==Kind::Font && (data.flags&0x40))initial_face=wide?read_utf16(memory,GuestAddress{load(abi.font)+28},31):utf8_to_utf16_lossy(read_ansi(memory,load(abi.font)+28,31));
-        if(file)initial_file=wide?read_utf16(memory,GuestAddress{load(abi.file)},load(abi.file_capacity,32)-1):utf8_to_utf16_lossy(read_ansi(memory,load(abi.file),load(abi.file_capacity,32)-1));
+        if(data.kind==Kind::Font && (data.flags&0x40))initial_face=wide?read_utf16(memory,GuestAddress{load(abi.font)+28},31):ansi_to_utf16_lossy(read_ansi(memory,load(abi.font)+28,31));
+        if(file)initial_file=wide?read_utf16(memory,GuestAddress{load(abi.file)},load(abi.file_capacity,32)-1):ansi_to_utf16_lossy(read_ansi(memory,load(abi.file),load(abi.file_capacity,32)-1));
     }catch(const HostCallFault&){fail(file?0x3002:2);return std::nullopt;}catch(const std::invalid_argument&){fail(file?0x3002:2);return std::nullopt;}
     // Headless 回傳使用者取消；原生模式才建立可操作的共用對話框。
     if(!native_gui_ && !data.hook){arg.return_to(state,0);return std::nullopt;}
@@ -292,7 +293,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_common_dialog(GuestState& s
         row(410,u"目錄",data.directory,15);add(414,u"button",u"前往",480,50,90,28);add(415,u"button",u"工作目錄",20,50,120,28);add(416,u"button",u"C:\\",150,50,90,28);add(417,u"button",u"上一層",250,50,90,28);
         add(412,u"listbox",{},20,90,550,205,1);row(411,u"檔案名稱",initial,315);
         add(0,u"static",u"檔案類型",20,355,130,26);const auto filter=add(413,u"combobox",{},160,355,410,28,3);auto& filters=gui_.windows.at(filter);
-        auto at=load(abi.filter);for(unsigned i=0;at && i<128;++i){const auto label=read(at);if(label.empty())break;at+=(wide?label.size():utf16_to_utf8(label).size())*(wide?2:1)+(wide?2:1);const auto pattern=read(at);at+=(wide?pattern.size():utf16_to_utf8(pattern).size())*(wide?2:1)+(wide?2:1);data.filters.push_back(pattern);filters.items.push_back({gui_.next_item++,0,0,label,0});}
+        auto at=load(abi.filter);for(unsigned i=0;at && i<128;++i){const auto label=read(at);if(label.empty())break;at+=(wide?label.size():utf16_to_ansi(label).size())*(wide?2:1)+(wide?2:1);const auto pattern=read(at);at+=(wide?pattern.size():utf16_to_utf8(pattern).size())*(wide?2:1)+(wide?2:1);data.filters.push_back(pattern);filters.items.push_back({gui_.next_item++,0,0,label,0});}
         if(filters.items.empty()){data.filters.push_back(u"*");filters.items.push_back({gui_.next_item++,0,0,u"所有檔案",0});}const auto filter_index=load(abi.filter_index,32);filters.selection=filter_index>=1 && filter_index<=filters.items.size()?static_cast<int>(filter_index-1):0;filters.title=filters.items[static_cast<std::size_t>(filters.selection)].text;present_gui(filter);
         if(preview){
             add(preview_screen,u"static",u"",600,92,250,190,0x50800000);
@@ -323,7 +324,7 @@ bool WindowsServices::common_dialog_message(GuestMemory& memory,const GuiMessage
     const auto store=[&](unsigned offset,unsigned width,std::uint64_t value){memory.store(GuestAddress{p+offset},static_cast<std::uint8_t>(width),value);};
     if(data.kind==Kind::Font && msg.message==0x465){
         const auto font=msg.lparam;if(!font)return true;memory.check(GuestAddress{font},wide?92:60,Access::Read);
-        control(401).title=wide?read_utf16(memory,GuestAddress{font+28},31):utf8_to_utf16_lossy(read_ansi(memory,font+28,31));
+        control(401).title=wide?read_utf16(memory,GuestAddress{font+28},31):ansi_to_utf16_lossy(read_ansi(memory,font+28,31));
         const auto height=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{font},32)));
         control(402).title=number(static_cast<std::int32_t>(std::clamp((std::llabs(static_cast<long long>(height))*72+48)/96,1LL,512LL)));
         control(403).check=memory.load(GuestAddress{font+16},32)>=700;control(404).check=memory.load(GuestAddress{font+20},8)!=0;
@@ -356,14 +357,14 @@ bool WindowsServices::common_dialog_message(GuestMemory& memory,const GuiMessage
             const bool known=std::any_of(control(401).items.begin(),control(401).items.end(),[&](const auto& item){return fold(item.text)==family;}) || std::find(aliases.begin(),aliases.end(),family)!=aliases.end();
             if(!known){status(u"請從清單選擇可用字型。 ");return true;}
         }
-        const auto encoded=utf16_to_utf8(face);if((wide?face.size():encoded.size())>=32){status(u"字型名稱過長。 ");return true;}
+        const auto encoded=utf16_to_ansi(face);if((wide?face.size():encoded.size())>=32){status(u"字型名稱過長。 ");return true;}
         std::uint32_t effects_color=0;
         if(!query_font && (data.flags&0x100U)){const auto r=integer(control(405).title),g=integer(control(406).title),b=integer(control(407).title);if(!r || !g || !b || *r<0 || *r>255 || *g<0 || *g>255 || *b<0 || *b>255){status(u"文字 RGB 每個值必須介於 0 和 255。 ");return true;}effects_color=static_cast<std::uint32_t>(*r|(*g<<8)|(*b<<16));}
         const auto lf=query_font?msg.lparam:load(abi.font);if(!lf)return true;memory.check(GuestAddress{lf},wide?92:60,Access::Write);std::vector<std::uint8_t> bytes(wide?92:60);if(data.flags&0x40)memory.read(GuestAddress{load(abi.font)},bytes);memory.write(GuestAddress{lf},bytes);
         memory.store(GuestAddress{lf},32,static_cast<std::uint32_t>(-((*points*96+36)/72)));memory.store(GuestAddress{lf+4},32,0);memory.store(GuestAddress{lf+16},32,control(403).check?700:400);memory.store(GuestAddress{lf+20},8,control(404).check?1:0);
         memory.write(GuestAddress{lf+28},std::vector<std::uint8_t>(wide?64:32));if(wide)memory.write(GuestAddress{lf+28},utf16_bytes(face));else {memory.write(GuestAddress{lf+28},{reinterpret_cast<const std::uint8_t*>(encoded.c_str()),encoded.size()+1});}
         if(data.flags&0x100U){memory.store(GuestAddress{lf+21},8,control(408).check!=0);memory.store(GuestAddress{lf+22},8,control(409).check!=0);if(!query_font)store(abi.font_color,32,effects_color);}
-        if(!query_font && (data.flags&0x80U) && load(abi.style)){const auto style=control(403).check?(control(404).check?u"粗斜體":u"粗體"):(control(404).check?u"斜體":u"一般");if(wide)memory.write(GuestAddress{load(abi.style)},utf16_bytes(style));else{const auto text=utf16_to_utf8(style);memory.write(GuestAddress{load(abi.style)},{reinterpret_cast<const std::uint8_t*>(text.c_str()),text.size()+1});}}
+        if(!query_font && (data.flags&0x80U) && load(abi.style)){const auto style=control(403).check?(control(404).check?u"粗斜體":u"粗體"):(control(404).check?u"斜體":u"一般");if(wide)memory.write(GuestAddress{load(abi.style)},utf16_bytes(style));else{const auto text=utf16_to_ansi(style);memory.write(GuestAddress{load(abi.style)},{reinterpret_cast<const std::uint8_t*>(text.c_str()),text.size()+1});}}
         if(query_font)return true;store(abi.point_size,32,static_cast<std::uint32_t>(*points*10));store(abi.font_type,16,0x2000U | (control(403).check?0x100U:0U) | (control(404).check?0x200U:0U) | (!control(403).check && !control(404).check?0x400U:0U)); // SCREEN／BOLD／ITALIC／REGULAR_FONTTYPE
     }else if(data.kind==Kind::Colour){
         const auto r=integer(control(401).title),g=integer(control(402).title),b=integer(control(403).title);if(!r || !g || !b || *r<0 || *r>255 || *g<0 || *g>255 || *b<0 || *b>255){status(u"RGB 每個值必須介於 0 和 255。 ");return true;}store(abi.color,32,static_cast<std::uint32_t>(*r|(*g<<8)|(*b<<16)));
@@ -379,12 +380,12 @@ bool WindowsServices::common_dialog_message(GuestMemory& memory,const GuiMessage
         if(parent.error || !(parent.metadata.attributes&16) || (info.error && info.error!=2 && info.error!=3)){status(u"路徑無法存取，請使用已映射的目錄。 ");return true;}
         if((data.flags&0x1000) && info.error){status(u"指定的檔案不存在。 ");return true;}
         if(data.kind==Kind::SaveFile && (data.flags&2) && !info.error && data.overwrite_path!=path){data.overwrite_path=path;status(u"檔案已存在；再次按 OK 確認覆寫。 ");return true;}
-        const auto utf8=utf16_to_utf8(path);const auto length=wide?path.size():utf8.size();if(length+1>load(abi.file_capacity,32)){gui_.common_dialog_error=0x3003;if(load(abi.file_capacity,32)*(wide?2:1)>=2)memory.store(GuestAddress{load(abi.file)},16,std::min<std::size_t>(length+1,65535));dialog.ended=true;dialog.dialog_result=0;return true;}
+        const auto utf8=utf16_to_ansi(path);const auto length=wide?path.size():utf8.size();if(length+1>load(abi.file_capacity,32)){gui_.common_dialog_error=0x3003;if(load(abi.file_capacity,32)*(wide?2:1)>=2)memory.store(GuestAddress{load(abi.file)},16,std::min<std::size_t>(length+1,65535));dialog.ended=true;dialog.dialog_result=0;return true;}
         const auto basename=path.substr(path.find_last_of(u'\\')==path.npos?0:path.find_last_of(u'\\')+1);const auto title=load(abi.file_title),capacity=load(abi.title_capacity,32);const auto out=load(abi.file);
         if(title && capacity)memory.check(GuestAddress{title},capacity*(wide?2:1),Access::Write);
         if(wide)memory.write(GuestAddress{out},utf16_bytes(path));else memory.write(GuestAddress{out},{reinterpret_cast<const std::uint8_t*>(utf8.c_str()),utf8.size()+1});
-        if(title && capacity){if(wide)memory.write(GuestAddress{title},utf16_bytes(basename.substr(0,capacity-1)));else{const auto t=utf16_to_utf8(basename).substr(0,capacity-1);memory.write(GuestAddress{title},{reinterpret_cast<const std::uint8_t*>(t.c_str()),t.size()+1});}}
-        const auto offset=wide?path.size()-basename.size():utf8.size()-utf16_to_utf8(basename).size();const auto ext=wide?path.find_last_of(u'.'):utf8.find_last_of('.');
+        if(title && capacity){if(wide)memory.write(GuestAddress{title},utf16_bytes(basename.substr(0,capacity-1)));else{const auto encoded_name=utf16_to_ansi(basename);const auto t=encoded_name.substr(0,ansi_prefix_length(encoded_name,capacity-1));memory.write(GuestAddress{title},{reinterpret_cast<const std::uint8_t*>(t.c_str()),t.size()+1});}}
+        const auto offset=wide?path.size()-basename.size():utf8.size()-utf16_to_ansi(basename).size();const auto ext=wide?path.find_last_of(u'.'):utf8.find_last_of('.');
         store(abi.file_offset,16,offset);store(abi.extension_offset,16,ext==std::string::npos || ext<offset?0:ext+1);store(abi.filter_index,32,static_cast<std::uint32_t>(control(413).selection+1));
     }
     dialog.ended=true;dialog.dialog_result=1;return true;

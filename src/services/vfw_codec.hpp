@@ -33,7 +33,7 @@ struct Codec {
     std::uint32_t quality{7500};
     avi::Bytes rle_encoded_format,rle_decoded_format,rle_input,rle_output;
     avi::Bytes video1_source,video1_target;
-    std::unique_ptr<media::Video1Decoder> video1_decoder;
+    std::unique_ptr<media::DibVideoDecoder> video1_decoder;
     std::unique_ptr<media::Video1Encoder> video1_encoder;
     DrawChannel drawing;
 };

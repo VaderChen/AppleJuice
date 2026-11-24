@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "debug_semaphore.hpp"
 #include "x64arm/startup_profile.hpp"
 #include "parallel_mapping_lock.hpp"
@@ -3010,7 +3011,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
             last_thread_dump=now_ms;
             if(auto* out=std::fopen((std::string(thread_dump_directory)+"/threads-"+std::to_string(::getpid())+".log").c_str(),"a")){
                 std::fprintf(out,"thread_dump unix_ms=%lld current=%llu threads=%zu\n",now_ms,static_cast<unsigned long long>(threads_.current),threads_.items.size());
-                trace_guest_thread_waits(out,&memory);std::fclose(out);
+                trace_guest_thread_waits(out,&memory);trace_d3d12_fences(out);std::fclose(out);
             }
         }
     }
@@ -3023,7 +3024,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
             const auto* directory=std::getenv("TMPDIR");
             if(auto* out=std::fopen((std::string(directory?directory:"/tmp")+"/x64arm-threads-"+std::to_string(::getpid())+".log").c_str(),"a")){
                 std::fprintf(out,"thread_dump signal current=%llu threads=%zu\n",static_cast<unsigned long long>(threads_.current),threads_.items.size());
-                trace_guest_thread_waits(out,&memory);std::fclose(out);
+                trace_guest_thread_waits(out,&memory);trace_d3d12_fences(out);std::fclose(out);
             }
         }
     }
@@ -3457,7 +3458,7 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             continue;
         }
         if (wait.kind == ThreadWaitKind::Http) {
-            if (http_ready(wait.handles.at(0))) {
+            if (http_ready(wait.handles)) {
                 thread.status = ThreadStatus::Runnable;
                 thread.wait = {};
             }
@@ -3539,7 +3540,7 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
                 std::uint32_t timeout = 0;
                 const auto pipe_name = name(thread.context.rip).ends_with('W')
                                            ? read_utf16(memory, GuestAddress{args(0)}, 256)
-                                           : utf8_to_utf16(read_ansi(memory, args(0), 256));
+                                           : ansi_to_utf16(read_ansi(memory, args(0), 256));
                 pending = NamedPipe::available(mapping_session(), pipe_name, timeout) == 231;
                 if (wait.deadline <= runtime_.clock_ticks) {
                     wait.timed_out = true;
@@ -3885,6 +3886,14 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
                 wait.kind != ThreadWaitKind::Sleep && result != 258 && !(wait.slim_timed && !result) && thread.priority > -15 && thread.priority < 15)
                 thread.dynamic_priority_boost = 1;
             if(wait.kind==ThreadWaitKind::Objects)for(const auto handle:wait.handles)trace_event_operation(result==258?'t':'w',handle,id,thread.context.rip.value);
+            // 診斷 X64ARM_TRACE_WAIT_WAKES=<檔案>：物件等待被滿足（非逾時）的時間（steady_clock 秒，與 X64ARM_TRACE_D3D12_FENCE_WAITS 同一時基）、
+            // 第一個 handle、結果與執行緒，用來還原「fence 完成→喚醒→送出命令」的執行緒交接鏈。
+            if(static std::FILE* const wake_trace=[]()->std::FILE* {const auto* path=std::getenv("X64ARM_TRACE_WAIT_WAKES");return path && *path?std::fopen(path,"w"):nullptr;}();
+               wake_trace && wait.kind!=ThreadWaitKind::Sleep && result!=258){
+                static std::mutex wake_mutex;const std::lock_guard wake_lock(wake_mutex);
+                std::fprintf(wake_trace,"W %.6f %llx %u %llu %u\n",std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+                    static_cast<unsigned long long>(wait.handles.empty()?0:wait.handles.front()),static_cast<unsigned>(result),static_cast<unsigned long long>(id),static_cast<unsigned>(wait.kind));
+            }
             if (!guest_return)complete_call(thread.context, memory, result);
             thread.status = ThreadStatus::Runnable;
             thread.wait = {};
@@ -5057,7 +5066,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 threads_.yield=true;return done(1);
             }
             using Profile=MultimediaProfile;
-            const auto read_name=[&](std::uint64_t address){auto text=service.symbol.ends_with('W')?read_utf16(memory,GuestAddress{address},256):utf8_to_utf16_lossy(read_ansi(memory,address,256));for(auto& c:text)c=unicode_case_unit(c,false);return text;};
+            const auto read_name=[&](std::uint64_t address){auto text=service.symbol.ends_with('W')?read_utf16(memory,GuestAddress{address},256):ansi_to_utf16_lossy(read_ansi(memory,address,256));for(auto& c:text)c=unicode_case_unit(c,false);return text;};
             const auto profile=[&](std::u16string name){return multimedia_profile(std::move(name));};
             RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
             if(transaction.error)return done(0,transaction.error);

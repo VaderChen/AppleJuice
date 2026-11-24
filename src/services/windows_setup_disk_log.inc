@@ -19,7 +19,7 @@
         const auto read=opened.file->read(std::span(reinterpret_cast<std::uint8_t*>(content.data()),content.size()),0);if(read.error)throw Failure{read.error};content.resize(static_cast<std::size_t>(read.bytes));return content;};
     const auto store_text=[&](std::uint64_t address,std::u16string_view value){
         if(wide){memory.write(GuestAddress{address},utf16_bytes(std::u16string(value)));return;}
-        const auto narrow=utf16_to_utf8(value);std::vector<std::uint8_t> bytes(narrow.begin(),narrow.end());bytes.push_back(0);memory.write(GuestAddress{address},bytes);};
+        const auto narrow=utf16_to_ansi(value);std::vector<std::uint8_t> bytes(narrow.begin(),narrow.end());bytes.push_back(0);memory.write(GuestAddress{address},bytes);};
     const auto text_length=[&](std::u16string_view value)->std::size_t{return wide?value.size():utf16_to_utf8(value).size();};
     const auto handle_block=[&]{const auto handle=allocate_heap(memory,16);if(!handle)throw std::bad_alloc{};return handle;};
     if(name.find("DiskSpaceList")!=std::string_view::npos || name.starts_with("SetupQuerySpaceRequiredOnDrive")){

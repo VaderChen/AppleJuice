@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/unicode.hpp"
@@ -35,7 +36,7 @@ std::u16string substitute(std::u16string_view pattern,const std::u16string& targ
 std::optional<std::uint32_t> WindowsServices::invoke_shell_execute(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const bool wide=service.symbol.ends_with('W'),find=service.symbol.starts_with("FindExecutable"),extended=service.symbol.starts_with("ShellExecuteEx");
     const auto bits=static_cast<std::uint8_t>(x86_?32:64);const unsigned unit=x86_?4:8;
-    const auto read=[&](std::uint64_t p){return !p?std::u16string{}:wide?read_utf16(memory,GuestAddress{p},32768):utf8_to_utf16(read_ansi(memory,p,32768));};
+    const auto read=[&](std::uint64_t p){return !p?std::u16string{}:wide?read_utf16(memory,GuestAddress{p},32768):ansi_to_utf16(read_ansi(memory,p,32768));};
     std::uint64_t info=0,instance_at=0,process_at=0,arena=0,result=0;std::uint32_t flags=0,show=1;
     try {
         std::u16string verb,file,parameters,directory,class_name;std::uint64_t parent=0;

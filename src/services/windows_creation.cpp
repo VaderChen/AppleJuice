@@ -134,6 +134,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_creation(GuestState& st
     if(window==gui_.windows.end())return abort_gui_creation(state,memory,id);
     auto& current=window->second;
     if(frame.continuation==Continuation::GuiCbtCreate){
+        if(gui_create_show_late() && !current.dialog && (current.style&0x10000000U)){current.style&=~0x10000000U;current.show_after_create=true;}
         if(result){
             erase_window(handle,false);
             return abort_gui_creation(state,memory,id);
@@ -182,13 +183,18 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_creation(GuestState& st
     }
     if(frame.continuation==Continuation::GuiCreationCreate){
         if(static_cast<std::uint32_t>(result)==UINT32_MAX)return abort_gui_creation(state,memory,id);
-        if(!current.dialog && (current.style&0x10000000U)){current.visible=true;if(native_gui_)show_native_window(handle,true);present_gui(handle);invalidate_window(handle);}
+        // WS_VISIBLE 在 WM_SIZE／WM_MOVE 之後（GuiCreationFinish）才套用，建立期間 IsWindowVisible 為 FALSE。
+        if(!gui_create_show_late() && !current.dialog && (current.style&0x10000000U)){current.visible=true;if(native_gui_)show_native_window(handle,true);present_gui(handle);invalidate_window(handle);}
         std::vector<GuestCallback> callbacks;
-        if(!current.dialog && !(current.initial_size_pending && !current.visible)){
+        if(!current.dialog && !(current.initial_size_pending && !current.show_after_create && !current.visible)){
             current.initial_size_pending=false;callbacks={{current.procedure,{handle,5,current.mdi_child?(current.show_command==2?1U:current.show_command==3?2U:0U):0U,(current.width&65535U)|((current.height&65535U)<<16)}},{current.procedure,{handle,3,0,gui_move_lparam(current)}}};
         }
         auto mdi=finish_mdi_creation(handle,memory);callbacks.insert(callbacks.end(),mdi.begin(),mdi.end());
         start_callbacks(state,memory,std::move(callbacks),Continuation::GuiCreationFinish,id);return std::nullopt;
+    }
+    if(frame.continuation==Continuation::GuiCreationFinish && current.show_after_create){
+        current.show_after_create=false;current.style|=0x10000000U;current.visible=true;
+        if(native_gui_)show_native_window(handle,true);present_gui(handle);invalidate_window(handle);
     }
     ++operation.index;return advance_gui_creation(state,memory,id);
 }catch(const std::bad_alloc&){const auto operation=gui_.creation_operations.find(frame.value);const auto failure=operation!=gui_.creation_operations.end() && operation->second.pending.front().window.modal?UINT64_MAX:0;cancel_gui_creation(frame.value,memory,state);last_error_=8;complete_call(state,memory,failure);return std::nullopt;}catch(...){cancel_gui_creation(frame.value,memory,state);throw;}

@@ -2,6 +2,21 @@
 // 離線產生工具負責限額與原子發布；執行時只讀取，損毀或不相容便回到原生編譯。
 // 頂點位置在深度預先繪製與著色 pass 間必須一致；兩個編譯入口共用同一份選項與 MSL 調整。
 // 預設保留位置一致性；X64ARM_METAL_POSITION_INVARIANCE=0 僅供診斷對照。
+// D3D 著色器的 Metal 編譯選項。同一管線的各變體（細分、幾何、片段連結、alpha test、非點、雙來源）必須共用同一設定，
+// 位置計算才會一致（深度預先繪製與 EQUAL 測試），所以由產生它的著色器路徑決定（modern）。
+// 預設：現代路徑（D3D12 的 SM5.1／DXIL，經 vkd3d→SPIRV-Cross）用 relaxed 數學模式＋快速超越函式——允許 FMA 與重組、保留 Inf／NaN，
+// D3D 的 precise 運算由 SPIRV-Cross 包成 optnone 輔助函式不受影響；電馭叛客 Benchmark 熱快取 44.7→54.2（+21%），對馬 GPU −12%。
+// D3D9／HLSLcc 舊路徑維持 safe（fastMathEnabled=NO），待各自回歸後再決定。
+// X64ARM_METAL_SHADER_MATH 覆寫全部路徑：safe、fastfunc（safe＋快速超越函式）、relaxed。
+inline MTLCompileOptions* metal_d3d_compile_options(bool modern=false){
+    static const int forced=[] {const auto* text=std::getenv("X64ARM_METAL_SHADER_MATH");if(!text)return -1;const std::string_view value(text);return value=="relaxed"?2:value=="fastfunc"?1:0;}();
+    const int mode=forced>=0?forced:modern?2:0;
+    auto options=[MTLCompileOptions new];
+    if(@available(macOS 15.0,*)){
+        if(mode){options.mathMode=mode==2?MTLMathModeRelaxed:MTLMathModeSafe;options.mathFloatingPointFunctions=MTLMathFloatingPointFunctionsFast;return options;}
+    }
+    options.fastMathEnabled=NO;return options;
+}
 struct MetalLibraryCompilation {
     std::string source;MTLCompileOptions* options{};
 };

@@ -1,4 +1,10 @@
+#include "ansi_codepage.hpp"
+#include "d3d12_shader_pending.hpp"
 #include "debug_semaphore.hpp"
+#include <csignal>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "x64arm/startup_profile.hpp"
 #include "parallel_mapping_lock.hpp"
 #include "x64arm/resource_usage.hpp"
@@ -116,8 +122,33 @@
 namespace x64arm::detail {void peek_idle_invalidate() noexcept;}
 namespace x64arm::detail {ParallelMappingLock& parallel_mapping_mutex() noexcept;void stream_timing_dump(std::FILE*) noexcept;}
 namespace x64arm {
+namespace {
+// 診斷（X64ARM_DEBUG_HOST_FAULT=<檔案>，預設關閉）：宿主 SIGSEGV／SIGBUS 時把訊號、位址與呼叫堆疊附加到檔案，再交給原本的處理程序
+// （客體記憶體錯誤仍由既有處理程序承接）。用於子程序在宿主層級崩潰、沒有留下停止原因的情形。
+struct sigaction host_fault_previous[2];int host_fault_fd=-1;
+void host_fault_handler(int sig,siginfo_t* info,void* context){
+    if(host_fault_fd>=0){
+        char header[96];const int length=std::snprintf(header,sizeof(header),"signal=%d address=%p\n",sig,info?info->si_addr:nullptr);
+        if(length>0)(void)::write(host_fault_fd,header,static_cast<std::size_t>(length));
+        void* frames[64];const int count=::backtrace(frames,64);::backtrace_symbols_fd(frames,count,host_fault_fd);
+    }
+    const auto& previous=host_fault_previous[sig==SIGBUS?1:0];
+    if((previous.sa_flags&SA_SIGINFO) && previous.sa_sigaction){previous.sa_sigaction(sig,info,context);return;}
+    if(!(previous.sa_flags&SA_SIGINFO) && previous.sa_handler!=SIG_DFL && previous.sa_handler!=SIG_IGN && previous.sa_handler){previous.sa_handler(sig);return;}
+    ::signal(sig,SIG_DFL);
+}
+void install_host_fault_diagnostic(){
+    static std::once_flag once;std::call_once(once,[]{
+        const char* path=std::getenv("X64ARM_DEBUG_HOST_FAULT");if(!path || !*path)return;
+        host_fault_fd=::open(path,O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC,0600);if(host_fault_fd<0)return;
+        struct sigaction action{};action.sa_sigaction=host_fault_handler;action.sa_flags=SA_SIGINFO|SA_ONSTACK;sigemptyset(&action.sa_mask);
+        ::sigaction(SIGSEGV,&action,&host_fault_previous[0]);::sigaction(SIGBUS,&action,&host_fault_previous[1]);
+    });
+}
+}
 WindowsServices::WindowsServices() {
     startup_profile::Scope phase("services","construct_body",true);
+    install_host_fault_diagnostic();
     native_angle_=make_native_angle();
     if(const auto* trace=std::getenv("X64ARM_TRACE_SERVICES"))trace_services_=trace;
     if(const auto* counts=std::getenv("X64ARM_SERVICE_COUNTS");counts && *counts){service_counts_enabled_=true;if(std::string_view(counts)!="1")service_counts_directory_=counts;}
@@ -2365,8 +2396,8 @@ bool d3d12_local_service(std::string_view symbol) noexcept {
     static constexpr std::string_view names[]{
         "Device.CopyDescriptors","Device.CopyDescriptorsSimple","Device.CreateConstantBufferView","Device.CreateShaderResourceView",
         "Device.CreateUnorderedAccessView","Device.CreateRenderTargetView","Device.CreateDepthStencilView","Device.CreateSampler",
-        "Device.GetDescriptorHandleIncrementSize","Device.GetResourceAllocationInfo","Device.GetCopyableFootprints","Device.CheckFeatureSupport",
-        "Device.GetNodeCount","DescriptorHeap.GetCPUDescriptorHandleForHeapStart","DescriptorHeap.GetGPUDescriptorHandleForHeapStart",
+        "Device.GetDescriptorHandleIncrementSize","Device.GetResourceAllocationInfo","Device.GetResourceAllocationInfo1","Device.GetResourceAllocationInfo2",
+        "Device.GetResourceAllocationInfo3","Device.GetCopyableFootprints","Device.CheckFeatureSupport","Device.GetNodeCount","DescriptorHeap.GetCPUDescriptorHandleForHeapStart","DescriptorHeap.GetGPUDescriptorHandleForHeapStart",
         "DescriptorHeap.GetDesc","Heap.GetDesc","Resource.GetGPUVirtualAddress","Resource.GetDesc","Fence.GetCompletedValue","Allocator.Reset","Queue.Wait",
         // 駐留管理：統一記憶體恆駐留，只核對物件表後回 S_OK（EnqueueMakeResident 會推進 fence、觸發事件，不在此列）。
         //《古墓奇兵：暗影》Benchmark 每秒約 51 次 MakeResident 原本每次全停。worker 版仍由 X64ARM_WORKER_D3D12_RESIDENCY=1 對照。
@@ -2835,7 +2866,10 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         } restore{*this,previous,key,saved_error};
         threads_.current=key;last_error_=entry_error;
         entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,descriptor.symbol);
-        const auto result=invoke_runtime(state,memory,descriptor);
+        // PSO 的著色器尚未翻譯完成時（已交給背景佇列）交回完整路徑停駐呼叫者，不在持獨占映射鎖時同步翻譯。
+        struct LocalCall {~LocalCall(){d3d12_local_call_flag()=false;}} local_call;d3d12_local_call_flag()=true;
+        std::optional<std::uint32_t> result;
+        try{result=invoke_runtime(state,memory,descriptor);}catch(const D3D12ShaderPending&){return false;}
         if(result)throw std::logic_error("D3D12 本地協調服務意外終止客體");
         if(last_error_!=entry_error)memory.store(error_slot,32,last_error_);
         if(signal)(void)resolve_thread_waits(memory,ThreadWakeScope::Objects);
@@ -3458,11 +3492,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
         try {
             const WindowsCall args(state,memory,6);
             const auto trace_text=[&](const char* label,std::uint64_t pointer,bool wide) {
-                if(pointer){const auto value=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{pointer})):read_ansi(memory,pointer);std::fprintf(stderr,"[api] %s=%s\n",label,value.c_str());}
+                if(pointer){const auto value=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{pointer})):ansi_to_utf8(read_ansi(memory,pointer));std::fprintf(stderr,"[api] %s=%s\n",label,value.c_str());}
             };
             if(service_name=="GetProcAddress") {
                 if(args(1)>0xffff)trace_text("symbol",args(1),false);
                 else std::fprintf(stderr,"[api] ordinal=%llu\n",static_cast<unsigned long long>(args(1)));
+            }else if(service_name=="CoCreateInstance" || service_name=="CoGetClassObject" || service_name=="CoCreateInstanceEx"){
+                // COM 啟用的 CLSID／IID（診斷用，只讀取；CoCreateInstance 的 IID 是第 4 個參數、CoGetClassObject 是第 4 個）。
+                const auto guid=[&](std::uint64_t pointer){
+                    if(!pointer)return std::string("null");std::array<std::uint8_t,16> g{};memory.read(GuestAddress{pointer},g);char text[40];
+                    std::snprintf(text,sizeof(text),"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",g[3],g[2],g[1],g[0],g[5],g[4],g[7],g[6],g[8],g[9],g[10],g[11],g[12],g[13],g[14],g[15]);return std::string(text);};
+                std::fprintf(stderr,"[api] clsid=%s iid=%s\n",guid(args(0)).c_str(),service_name=="CoCreateInstanceEx"?"-":guid(args(3)).c_str());
             }else if(std::getenv("X64ARM_TRACE_SERVICE_STRINGS") && (service_name=="wcscmp" || service_name=="_wcsicmp" || service_name=="wcsncmp" || service_name=="_wcsnicmp" ||
                      service_name=="strcmp" || service_name=="_stricmp" || service_name=="strncmp" || service_name=="_strnicmp" || service_name=="wcsstr" || service_name=="strstr")){
                 // 比較類 CRT 函式的兩個字串（診斷用，只讀取）。
@@ -3518,7 +3558,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
             }catch(const MemoryFault&){}catch(const SecurityDescriptorError&){}
         }
         if(service_name=="CreateFileA" || service_name=="CreateFileW" || service_name.starts_with("GetFileAttributes") || service_name.starts_with("DeleteFile") || service_name.starts_with("CreateDirectory") || service_name.starts_with("GetFullPathName") || service_name.starts_with("SetCurrentDirectory")){
-            try{const auto pointer=x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+4},32):state.reg(Gpr::Rcx);const auto path=service_name.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{pointer})):read_ansi(memory,pointer);std::fprintf(stderr,"[api] path=%s\n",path.c_str());}catch(const MemoryFault&){}catch(const std::invalid_argument&){}
+            try{const auto pointer=x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+4},32):state.reg(Gpr::Rcx);const auto path=service_name.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{pointer})):ansi_to_utf8(read_ansi(memory,pointer));std::fprintf(stderr,"[api] path=%s\n",path.c_str());}catch(const MemoryFault&){}catch(const std::invalid_argument&){}
         }
     }
     if(tracing && state.rip.value>=stub_base_.value && state.rip.value<stub_base_.value+(services.size()+runtime_service_descriptors().size())*16) {
@@ -3615,7 +3655,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
     const auto fail = [&](std::uint32_t error) { last_error_ = error; returned = 0; };
     if(symbol=="OutputDebugStringA" || symbol=="OutputDebugStringW"){
         if(!arg(0)){frame.return_to(state,0);return std::nullopt;}
-        const auto text=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+        const auto text=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
         if(debugger_attached()){
             const auto length=symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)}).size()+1:text.size()+1;
             auto caller=state;frame.return_to(caller,0);

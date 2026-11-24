@@ -107,7 +107,7 @@ if(name.starts_with("FindExecutableImage") || name.starts_with("FindDebugInfoFil
     const auto invalid_handle=x86_?UINT64_C(0xffffffff):UINT64_MAX;
     // 寫入找到的路徑後以同一個緩衝開啟（A 版用 CreateFileA，W 版用 CreateFileW）；路徑超過 MAX_PATH 的候選略過。
     const auto open=[this,wide,output,invalid_handle](GuestState& s,GuestMemory& m,const std::u16string& path)->std::uint64_t{
-        auto bytes=wide?utf16_bytes(path):[&]{auto narrow=utf16_to_utf8(path);std::vector<std::uint8_t> value(narrow.begin(),narrow.end());value.push_back(0);return value;}();
+        auto bytes=wide?utf16_bytes(path):[&]{auto narrow=utf16_to_ansi(path);std::vector<std::uint8_t> value(narrow.begin(),narrow.end());value.push_back(0);return value;}();
         if(bytes.size()>(wide?520U:260U))return 0;
         m.write(GuestAddress{output},bytes);
         const auto handle=nested_service(s,m,"kernel32.dll",wide?"CreateFileW":"CreateFileA",{output,0x80000000U,3,0,3,0x80,0});

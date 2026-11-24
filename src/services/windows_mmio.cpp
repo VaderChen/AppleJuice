@@ -3,6 +3,7 @@
 // MMIOM_READ／WRITE／SEEK，開啟與關閉送 MMIOM_OPEN／CLOSE，mmioRename 送 MMIOM_RENAME，mmioSendMessage 轉交自訂訊息。
 // 交給客體程序的 MMIOINFO 由引擎配置並在開啟期間保留（程序在其中保存 lDiskOffset 與 adwInfo 狀態）。
 // 檔名含「+」時以「+」之前副檔名的 FOURCC（轉大寫）選取已安裝的程序，完整檔名交給程序。
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/riff_chunk.hpp"
 #include "x64arm/unicode.hpp"
@@ -64,7 +65,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mmio(GuestState& state,Gues
     const auto name=service.symbol;
     if(name.starts_with("mmioStringToFOURCC")){
         const WindowsCall call(state,memory,service);std::u16string text;
-        try{if(call(0))text=name.ends_with('W')?read_utf16(memory,GuestAddress{call(0)},64):utf8_to_utf16_lossy(read_ansi(memory,call(0),64));}catch(const MemoryFault&){}
+        try{if(call(0))text=name.ends_with('W')?read_utf16(memory,GuestAddress{call(0)},64):ansi_to_utf16_lossy(read_ansi(memory,call(0),64));}catch(const MemoryFault&){}
         call.return_to(state,string_fourcc(text,(static_cast<std::uint32_t>(call(1))&0x10U)!=0));return std::nullopt;
     }
     if(name.starts_with("mmioInstallIOProc")){
@@ -93,7 +94,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mmio(GuestState& state,Gues
     std::uint64_t transfer=0;
     const auto transfer_block=[&]{if(!transfer)transfer=scratch(65536);return transfer;};
     const auto file_name=[&](std::u16string_view text,bool unicode)->std::uint64_t{
-        std::vector<std::uint8_t> bytes;if(unicode)bytes=utf16_bytes(text);else {const auto narrow=utf16_to_utf8(text);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
+        std::vector<std::uint8_t> bytes;if(unicode)bytes=utf16_bytes(text);else {const auto narrow=utf16_to_ansi(text);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
         const auto block=scratch(bytes.size());m.write(GuestAddress{block},bytes);return block;
     };
     // 客體 I/O 程序呼叫：LRESULT IOProc(LPSTR lpmmioinfo, UINT uMsg, LPARAM lParam1, LPARAM lParam2)。
@@ -162,7 +163,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mmio(GuestState& state,Gues
             if(mode==3 || sharing>4 || (flags&~0x11073U))co_return fail(11);
             if(runtime_.multimedia_files.size()>=4096)co_return fail(271);
             const bool wide=name.ends_with('W');
-            const std::u16string path=call(0)?(wide?read_utf16(m,GuestAddress{call(0)}):utf8_to_utf16_lossy(read_ansi(m,call(0)))):std::u16string{};
+            const std::u16string path=call(0)?(wide?read_utf16(m,GuestAddress{call(0)}):ansi_to_utf16_lossy(read_ansi(m,call(0)))):std::u16string{};
             const auto selection=select(info,path);if(!selection.found)co_return fail(259);
             MultimediaFile file;file.mode=mode;file.open_flags=flags;file.memory=!selection.procedure && selection.fourcc==memory_proc;
             const auto handle=runtime_.allocate_wait_handle();
@@ -216,7 +217,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mmio(GuestState& state,Gues
             // MMIOM_RENAME 交給選定的 I/O 程序；內建 DOS 程序以 MoveFileW 改名，MEM 檔案沒有名稱。
             if(!call(0) || !call(1) || static_cast<std::uint32_t>(call(3)))co_return finish(11);
             const bool wide=name.ends_with('W');
-            const auto text=[&](std::uint64_t address){return wide?read_utf16(m,GuestAddress{address}):utf8_to_utf16_lossy(read_ansi(m,address));};
+            const auto text=[&](std::uint64_t address){return wide?read_utf16(m,GuestAddress{address}):ansi_to_utf16_lossy(read_ansi(m,address));};
             const auto from=text(call(0)),to=text(call(1));const auto info=call(2);
             if(info)m.check(GuestAddress{info},info_size,Access::Read);
             const auto selection=select(info,from);if(!selection.found)co_return finish(259);

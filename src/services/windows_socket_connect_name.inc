@@ -22,7 +22,7 @@ if(service.symbol=="WSAConnectByNameA" || service.symbol=="WSAConnectByNameW"){
         const auto guest=[&](std::string_view symbol,std::vector<std::uint64_t> arguments)->service_callback::Task<std::uint64_t>{
             co_return co_await service_callback::call_value(resolve("ws2_32.dll",symbol).value,std::move(arguments));};
         const auto finish=[&](std::uint32_t error){last_error_=error;arg.return_to(s,error?0:1);return std::optional<std::uint32_t>{};};
-        const auto text=[&](std::uint64_t address){return wide?read_utf16(m,GuestAddress{address},1024):utf8_to_utf16_lossy(read_ansi(m,address,1024));};
+        const auto text=[&](std::uint64_t address){return wide?read_utf16(m,GuestAddress{address},1024):ansi_to_utf16_lossy(read_ansi(m,address,1024));};
         const auto socket=arg(0);
         const auto node=scratch(utf16_bytes(text(arg(1)))),port=scratch(utf16_bytes(text(arg(2))));
         // ADDRINFOW {ai_flags, ai_family, ai_socktype, ai_protocol, ai_addrlen, ai_canonname, ai_addr, ai_next}

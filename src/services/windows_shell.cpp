@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/windows_window_state.hpp"
@@ -212,7 +213,7 @@ std::optional<std::uint64_t> WindowsServices::shell_browse_control(GuestMemory& 
     auto& data=found->second;const auto msg=message.message;
     if(msg==0x466 || msg==0x467 || msg==0x46a){ // BFFM_SETSELECTIONA/W, BFFM_SETEXPANDED
         std::u16string path;
-        if(message.wparam)path=message.lparam?(msg==0x466?utf8_to_utf16_lossy(read_ansi(memory,message.lparam)):read_utf16(memory,GuestAddress{message.lparam})):u"";
+        if(message.wparam)path=message.lparam?(msg==0x466?ansi_to_utf16_lossy(read_ansi(memory,message.lparam)):read_utf16(memory,GuestAddress{message.lparam})):u"";
         else if(const auto pidl=gui_.shell_pidls.find(message.lparam);pidl!=gui_.shell_pidls.end() && allocations_.contains(pidl->first))path=pidl->second;
         path=normalized(path);if(path.empty() || !within(path,data.root))return 0;
         const auto info=filesystem_.information(utf16_to_utf8(path));if(info.error || !(info.metadata.attributes&16))return 0;
@@ -221,7 +222,7 @@ std::optional<std::uint64_t> WindowsServices::shell_browse_control(GuestMemory& 
         return 1;
     }
     if(msg==0x464 || msg==0x468){
-        data.status=message.lparam?(msg==0x464?utf8_to_utf16_lossy(read_ansi(memory,message.lparam)):read_utf16(memory,GuestAddress{message.lparam})):u"";
+        data.status=message.lparam?(msg==0x464?ansi_to_utf16_lossy(read_ansi(memory,message.lparam)):read_utf16(memory,GuestAddress{message.lparam})):u"";
         gui_.windows.at(gui_child(message.window,499)).title=data.status;present_gui(gui_child(message.window,499));return 0;
     }
     if(msg==0x465){gui_set_window_enabled(gui_.windows.at(gui_child(message.window,1)),message.lparam!=0);present_gui(gui_child(message.window,1));return 0;}
@@ -292,7 +293,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
     if(service.symbol=="SHChangeNotify")return invoke_shell_notification(state,memory,service);
     if(service.symbol.starts_with("ShellExecute") || service.symbol.starts_with("FindExecutable"))return invoke_shell_execute(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W') || symbol=="SHILCreateFromPath" || symbol=="SHSimpleIDListFromPath";
-    const auto read=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):utf8_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
+    const auto read=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):ansi_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
     std::uint64_t result=0;
     if(symbol=="SHGetMalloc" || symbol=="CoGetMalloc" || service.family=="internal-mapi-allocator" || symbol.starts_with("IMalloc.")){
         const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
@@ -635,7 +636,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
             if(!at)return 87;
             std::size_t units=0;
             while(units<65536){
-                const auto path=unicode?utf16_to_utf8(read_utf16(memory,GuestAddress{at},32767)):read_ansi(memory,at,32767);
+                const auto path=unicode?utf16_to_utf8(read_utf16(memory,GuestAddress{at},32767)):ansi_to_utf8(read_ansi(memory,at,32767));
                 if(path.empty())return list.empty()?87:0;
                 if(list.size()>=4096)return 8;
                 list.push_back(path);

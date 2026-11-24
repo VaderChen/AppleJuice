@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "crt_secure_string_contract.h"
@@ -125,7 +126,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_string(GuestState& stat
                 if(format){initialize_tokens();text=u"\\Registry\\User\\"+utf8_to_utf16(token_user_sid_string(effective_token_id()));}
                 else if(create){
                     if(!arg(1))return finish(0);
-                    text=symbol=="RtlCreateUnicodeString"?read_utf16(memory,GuestAddress{arg(1)},32766):utf8_to_utf16_lossy(read_ansi(memory,arg(1),65534));
+                    text=symbol=="RtlCreateUnicodeString"?read_utf16(memory,GuestAddress{arg(1)},32766):ansi_to_utf16_lossy(read_ansi(memory,arg(1),65534));
                 }else {
                     if(!arg(1))return finish(0xc000000dU);
                     memory.check(GuestAddress{arg(1)},pointer_size*2U,Access::Read);

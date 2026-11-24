@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "system_object_identity.hpp"
 #include "x64arm/process_identity.hpp"
 #include "x64arm/windows_services.hpp"
@@ -975,7 +976,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
             const auto path=mapped_file_name(arg(1));
             if(path.empty())fail(memory.query(GuestAddress{arg(1)})?1006:487);
             else {
-                const bool wide=symbol.ends_with('W');const auto ansi=utf16_to_utf8(path);const auto length=wide?path.size():ansi.size(),count=std::min<std::size_t>(length,dword(3)-1);
+                const bool wide=symbol.ends_with('W');const auto ansi=utf16_to_ansi(path);const auto length=wide?path.size():ansi.size(),count=std::min<std::size_t>(length,dword(3)-1);
                 if(wide)memory.write(GuestAddress{arg(2)},utf16_bytes(path.substr(0,count)));else {std::vector<std::uint8_t> bytes(ansi.begin(),ansi.begin()+static_cast<std::ptrdiff_t>(count));bytes.push_back(0);memory.write(GuestAddress{arg(2)},bytes);}
                 result=std::min<std::uint64_t>(length,dword(3));if(length>=dword(3))last_error_=122;
             }
@@ -1006,7 +1007,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
         // 再於完成時縮小 handle。新建與既有物件均沿相同權限值，DACL 仍照原流程檢查。
         const auto create_access=create && service.family=="internal-nt-mapping"?dword(6):0xf001fU;
         const auto security=create?synchronization_descriptor(memory,arg(1)):SynchronizationDescriptor{arg(1)!=0,{}};
-        auto name = name_at ? (symbol.ends_with('W') || from_app ? read_utf16(memory,GuestAddress{name_at}) : utf8_to_utf16(read_ansi(memory,name_at))) : std::u16string{};
+        auto name = name_at ? (symbol.ends_with('W') || from_app ? read_utf16(memory,GuestAddress{name_at}) : ansi_to_utf16(read_ansi(memory,name_at))) : std::u16string{};
         // 私有命名空間別名與 BaseNamedObjects 下的子目錄（物件命名空間）轉成既有具名物件名稱。
         const auto namespace_error=name.empty()?0U:win32_namespace_object_name(name,create);
         if(name.starts_with(u"Local\\"))name.erase(0,6);

@@ -36,7 +36,7 @@ if(service.symbol=="WSARecvEx" || service.symbol=="EnumProtocolsA" || service.sy
         std::vector<std::vector<std::uint8_t>> names;std::size_t total=static_cast<std::size_t>(count)*entry_size;
         for(std::int32_t i=0;i<count;++i){
             const auto text=read_utf16(m,GuestAddress{catalog+static_cast<std::uint64_t>(i)*info_size+name_offset},256);
-            std::vector<std::uint8_t> bytes;if(wide)bytes=utf16_bytes(text);else{const auto narrow=utf16_to_utf8(text);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
+            std::vector<std::uint8_t> bytes;if(wide)bytes=utf16_bytes(text);else{const auto narrow=utf16_to_ansi(text);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
             total+=(bytes.size()+unit-1)/unit*unit;names.push_back(std::move(bytes));
         }
         if(total>capacity || !arg(1)){m.store(GuestAddress{arg(2)},32,total);last_error_=122;co_return finish(UINT32_MAX);}

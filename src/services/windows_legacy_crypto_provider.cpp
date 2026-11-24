@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "legacy_crypto_catalog.hpp"
@@ -74,7 +75,7 @@ std::uint32_t WindowsServices::legacy_crypto_provider(GuestMemory& memory,const 
     try {
     if(symbol=="CryptAcquireContextA" || symbol=="CryptAcquireContextW"){
         if(!arg(0))return fail(87);
-        const auto string=[&](unsigned n){return symbol.back()=='W'?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(n)},1024)):read_ansi(memory,arg(n),4096);};
+        const auto string=[&](unsigned n){return symbol.back()=='W'?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(n)},1024)):ansi_to_utf8(read_ansi(memory,arg(n),4096));};
         memory.check(GuestAddress{arg(0)},x86_?4:8,Access::Write);
         const auto handle=acquire_crypto_provider(arg(1)?string(1):std::string{},arg(2)?string(2):std::string{},u32(3),u32(4));
         if(!handle)return 0;memory.store(GuestAddress{arg(0)},x86_?32:64,handle==UINT64_MAX?0:handle);return 1;
@@ -96,7 +97,7 @@ std::uint32_t WindowsServices::legacy_crypto_provider(GuestMemory& memory,const 
         if(!legacy_crypto::provider(type))return fail(0x80090014);
         std::optional<std::string> name;
         if(!(flags&4U)){
-            if(!arg(0))return fail(87);name=symbol.back()=='W'?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)},1024)):read_ansi(memory,arg(0),4096);
+            if(!arg(0))return fail(87);name=symbol.back()=='W'?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)},1024)):ansi_to_utf8(read_ansi(memory,arg(0),4096));
             if(!legacy_crypto::provider(type,*name)){const bool known=std::any_of(std::begin(providers),std::end(providers),[&](const auto& p){return *name==p.name;});return fail(known?0x8009001bU:0x80090013U);}
         }
         const auto status=set_crypto_default_provider(type,(flags&2U)!=0,name);return status?fail(status):1U;

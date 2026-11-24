@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/file_security.hpp"
 #include "x64arm/unicode.hpp"
@@ -53,7 +54,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security_descriptor(
     };
     try {
         if((symbol.starts_with("GetNamedSecurityInfo") || symbol.starts_with("SetNamedSecurityInfo")) && u32(1)==1 && call(0)) {
-            auto name=wide?read_utf16(memory,GuestAddress{call(0)}):utf8_to_utf16(read_ansi(memory,call(0)));
+            auto name=wide?read_utf16(memory,GuestAddress{call(0)}):ansi_to_utf16(read_ansi(memory,call(0)));
             for(std::size_t i=0;i<std::min<std::size_t>(9,name.size());++i)if(name[i]>=u'A' && name[i]<=u'Z')name[i]+=u'a'-u'A';
             if(name.starts_with(u"\\\\.\\pipe\\"))return invoke_object_security(state,memory,service);
         }
@@ -92,7 +93,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security_descriptor(
                 }
             } else {
                 if(!call(0))throw SecurityDescriptorError{87};
-                const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{call(0)})):read_ansi(memory,call(0));
+                const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{call(0)})):ansi_to_utf8(read_ansi(memory,call(0)));
                 security_stage="pin_root";security_path=path;
                 const auto opened=filesystem_.pin_security(path,true);if(opened.error)throw SecurityDescriptorError{opened.error};
                 file=opened.file;object_path=opened.key;
@@ -248,7 +249,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security_descriptor(
                 volume_device=file->volume_device();if(!volume_device)native=read_native_file_security(*file,flags&4U);
             } else {
                 if (!call(0)) throw SecurityDescriptorError{87};
-                const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{call(0)})):read_ansi(memory,call(0));
+                const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{call(0)})):ansi_to_utf8(read_ansi(memory,call(0)));
                 native=filesystem_.security_information(path,true);
                 (void)native_file_token_access(file_descriptor(native,0x17),0x20000U);
             }

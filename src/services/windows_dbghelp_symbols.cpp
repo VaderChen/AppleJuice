@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/pe_loader.hpp"
 #include "x64arm/unicode.hpp"
 #include "pdb_reader.hpp"
@@ -267,11 +268,11 @@ bool WindowsServices::start_symbol_events(GuestState& state,GuestMemory& memory,
             put(0,32,at.size);put(at.base,at.base_bits,at.base_bits==32?event.base&UINT32_MAX:event.base);put(at.checksum,32,event.checksum);put(at.timestamp,32,event.timestamp);
             const auto name=event.text.substr(0,at.name_units-1);
             if(kind==3)for(std::size_t i=0;i<name.size();++i)put(at.name+static_cast<unsigned>(i)*2,16,name[i]);
-            else{const auto ansi=utf16_to_utf8(name);for(std::size_t i=0;i<ansi.size() && i<at.name_units-1;++i)bytes[at.name+i]=static_cast<std::uint8_t>(ansi[i]);}
+            else{const auto ansi=utf16_to_ansi(name);for(std::size_t i=0;i<ansi.size() && i<at.name_units-1;++i)bytes[at.name+i]=static_cast<std::uint8_t>(ansi[i]);}
             (void)at.reparse;(void)at.file; // Reparse、hFile、Flags：沒有重新剖析、沒有呼叫端檔案 handle、沒有不相符的符號檔。
         }else if(event.action==0x10000000U){
             if(kind==3){for(const auto c:event.text){bytes.push_back(static_cast<std::uint8_t>(c));bytes.push_back(static_cast<std::uint8_t>(c>>8));}bytes.insert(bytes.end(),{0,0});}
-            else{const auto ansi=utf16_to_utf8(event.text);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
+            else{const auto ansi=utf16_to_ansi(event.text);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
         }else pointer=false;
         // CallbackData 指向區塊內的結構或字串（配置後才知道位址）；CBA_SET_OPTIONS 直接帶值。
         if(pointer){offsets.emplace_back(size);size+=(bytes.size()+7)&~std::size_t{7};payloads.emplace_back(*offsets.back(),std::move(bytes));}else offsets.emplace_back();
@@ -302,7 +303,7 @@ namespace {bool dbghelp_line_service(std::string_view name);}
 std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_symbol_core(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
     if(dbghelp_line_service(name))return invoke_dbghelp_lines(state,memory,service);const bool wide=name.ends_with('W') || name.ends_with("W64");
-    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer},32768):utf8_to_utf16(read_ansi(memory,pointer,32768));};
+    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer},32768):ansi_to_utf16(read_ansi(memory,pointer,32768));};
     std::uint64_t result=0;const auto fail=[&](std::uint32_t error){last_error_=error;};
     if(name.starts_with("EnumerateLoadedModules")){
         // 不需 SymInitialize：依載入器清單（主程式、外部 DLL、內建系統 DLL）回呼完整路徑、基底與大小，回呼回 FALSE 即停止。
@@ -315,7 +316,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_symbol_core(GuestSt
         for(const auto* image:images){
             auto cached=runtime_.loaded_module_names.find(image->path);
             if(cached==runtime_.loaded_module_names.end()){
-                const auto ansi=utf16_to_utf8(image->path);std::vector<std::uint8_t> narrow(ansi.begin(),ansi.end());narrow.push_back(0);
+                const auto ansi=utf16_to_ansi(image->path);std::vector<std::uint8_t> narrow(ansi.begin(),ansi.end());narrow.push_back(0);
                 std::vector<std::uint8_t> wide_text;for(const auto c:image->path){wide_text.push_back(static_cast<std::uint8_t>(c));wide_text.push_back(static_cast<std::uint8_t>(c>>8));}wide_text.insert(wide_text.end(),{0,0});
                 cached=runtime_.loaded_module_names.emplace(image->path,std::array<std::uint64_t,2>{runtime_allocate(memory,narrow),runtime_allocate(memory,wide_text)}).first;
             }
@@ -353,7 +354,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_symbol_core(GuestSt
     if(name=="MakeSureDirectoryPathExists"){
         // 依序建立路徑中的每一層目錄；最後一段不以分隔符號結尾時視為檔名不建立。沿用 CreateDirectoryW 的安全性與錯誤語義。
         if(!arg(0)){fail(87);arg.return_to(state,0);return std::nullopt;}
-        const auto path=utf8_to_utf16(read_ansi(memory,arg(0),32768));std::size_t start=0;
+        const auto path=ansi_to_utf16(read_ansi(memory,arg(0),32768));std::size_t start=0;
         if(path.size()>=3 && path[1]==u':' && (path[2]==u'\\' || path[2]==u'/'))start=3;
         else if(path.starts_with(u"\\\\")){start=path.find_first_of(u"\\/",2);if(start!=path.npos)start=path.find_first_of(u"\\/",start+1);start=start==path.npos?path.size():start+1;}
         result=1;GuestScratch scratch(*this,memory,state);
@@ -369,7 +370,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_symbol_core(GuestSt
         if(!arg(0) || !arg(1) || !arg(2)){fail(87);arg.return_to(state,0);return std::nullopt;}
         const auto found_path=search_tree_for_file(text(arg(0)),text(arg(1)));
         if(!found_path || found_path->size()>=260){fail(2);arg.return_to(state,0);return std::nullopt;}
-        if(wide)memory.write(GuestAddress{arg(2)},utf16_bytes(*found_path));else{auto narrow=utf16_to_utf8(*found_path);narrow.push_back(0);memory.write(GuestAddress{arg(2)},std::span(reinterpret_cast<const std::uint8_t*>(narrow.data()),narrow.size()));}
+        if(wide)memory.write(GuestAddress{arg(2)},utf16_bytes(*found_path));else{auto narrow=utf16_to_ansi(*found_path);narrow.push_back(0);memory.write(GuestAddress{arg(2)},std::span(reinterpret_cast<const std::uint8_t*>(narrow.data()),narrow.size()));}
         arg.return_to(state,1);return std::nullopt;
     }
     const auto found=runtime_.symbol_sessions.find(arg(0));
@@ -464,7 +465,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_symbol_core(GuestSt
             const auto [module,symbol]=by_name(text(arg(1)));if(!symbol)throw SymbolFailure{1168};symbol_info(*module,*symbol,arg(2));result=1;
         }else if(name=="SymGetSymFromName" || name=="SymGetSymFromName64"){
             const bool wide_address=name.ends_with("64");if(!arg(1) || !arg(2) || memory.load(GuestAddress{arg(2)},32)<(wide_address?32U:24U))throw SymbolFailure{87};
-            const auto [module,symbol]=by_name(utf8_to_utf16(read_ansi(memory,arg(1),32768)));(void)module;if(!symbol)throw SymbolFailure{1168};imagehlp_symbol(*symbol,arg(2),wide_address);result=1;
+            const auto [module,symbol]=by_name(ansi_to_utf16(read_ansi(memory,arg(1),32768)));(void)module;if(!symbol)throw SymbolFailure{1168};imagehlp_symbol(*symbol,arg(2),wide_address);result=1;
         }else if(name.starts_with("SymGetSymNext") || name.starts_with("SymGetSymPrev")){
             // 依結構中的 Address 在同一模組找位址較大（Next）或較小（Prev）的最近符號。
             const bool wide_address=name.ends_with("64"),next=name.starts_with("SymGetSymNext");if(!arg(1) || memory.load(GuestAddress{arg(1)},32)<(wide_address?32U:24U))throw SymbolFailure{87};
@@ -652,7 +653,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_symbol_core(GuestSt
                 const auto put=[&](unsigned offset,std::uint64_t value){memory.store(GuestAddress{arg(2)+offset},32,value);};
                 const auto string=[&](unsigned offset,unsigned count,std::u16string_view value){
                     if(wide)memory.write(GuestAddress{arg(2)+offset},utf16_bytes(std::u16string(value.substr(0,count-1))));
-                    else {auto ansi=utf16_to_utf8(value);ansi.resize(std::min<std::size_t>(ansi.size(),count-1));memory.write(GuestAddress{arg(2)+offset},std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(ansi.data()),ansi.size()});}
+                    else {auto ansi=utf16_to_ansi(value);ansi.resize(std::min<std::size_t>(ansi.size(),count-1));memory.write(GuestAddress{arg(2)+offset},std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(ansi.data()),ansi.size()});}
                 };
                 put(0,size);put(4,module->image.base);put(8,module->image.size);put(12,module->timestamp);put(16,module->checksum);put(20,module->pending?0:module->symbols.size());put(24,module->symbol_type);
                 string(28,32,module->name);string(28+32*unit,256,module->image_name);string(28+288*unit,256,module->loaded_image_name);result=1;
@@ -663,7 +664,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_symbol_core(GuestSt
                 const auto put=[&](unsigned offset,unsigned bits,std::uint64_t value){memory.store(GuestAddress{arg(2)+offset},static_cast<std::uint8_t>(bits),value);};
                 const auto string=[&](unsigned offset,unsigned count,std::u16string_view value){
                     if(wide)memory.write(GuestAddress{arg(2)+offset},utf16_bytes(std::u16string(value.substr(0,count-1))));
-                    else {auto ansi=utf16_to_utf8(value);ansi.resize(std::min<std::size_t>(ansi.size(),count-1));memory.write(GuestAddress{arg(2)+offset},std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(ansi.data()),ansi.size()});}
+                    else {auto ansi=utf16_to_ansi(value);ansi.resize(std::min<std::size_t>(ansi.size(),count-1));memory.write(GuestAddress{arg(2)+offset},std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(ansi.data()),ansi.size()});}
                 };
                 put(0,32,size);put(8,64,module->image.base);put(16,32,module->image.size);put(20,32,module->timestamp);put(24,32,module->checksum);put(28,32,module->pending?0:module->symbols.size());put(32,32,module->symbol_type);
                 string(36,32,module->name);string(36+32*unit,256,module->image_name);string(36+288*unit,256,module->loaded_image_name);
@@ -678,7 +679,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_symbol_core(GuestSt
             }else if(name=="SymAddSymbol" || name=="SymAddSymbolW"){
                 if(arg(1)!=module->image.base || !arg(2))throw SymbolFailure{87};const auto symbol=text(arg(2));const auto offset=arg(3)-module->image.base;
                 if(symbol.empty() || symbol.size()>2000 || arg(3)<module->image.base || offset>=module->image.size || arg(4)>module->image.size-offset)throw SymbolFailure{87};
-                materialize(*module);if(module->symbols.size()>=maximum_symbols)throw SymbolFailure{8};const auto ansi=utf16_to_utf8(symbol);
+                materialize(*module);if(module->symbols.size()>=maximum_symbols)throw SymbolFailure{8};const auto ansi=utf16_to_ansi(symbol);
                 if(std::any_of(module->symbols.begin(),module->symbols.end(),[&](const auto& item){return item.name==ansi && item.address==arg(3);}))throw SymbolFailure{183};
                 module->symbols.push_back({ansi,arg(3),static_cast<std::uint32_t>(arg(4)),static_cast<std::uint32_t>(module->symbols.size()+1),0x1000,10});result=1;
             }else if(name=="SymDeleteSymbol" || name=="SymDeleteSymbolW"){

@@ -1,7 +1,7 @@
 // CM 類別函式：與 SetupDi 類別共用 Control\Class 與 DeviceClasses 的登錄資料（上方已同步裝置節點的類別）。
 const auto class_guid=[&](std::uint64_t pointer){WindowsGuid guid{};memory.read(GuestAddress{pointer},guid);return guid;};
 const auto class_key=[&](bool interface_kind,const WindowsGuid& guid){return (interface_kind?interface_root:root)+u"\\"+folded(windows_guid_text(guid));};
-const auto encode=[&](std::u16string_view text){std::vector<std::uint8_t> bytes;if(wide)bytes=utf16_bytes(text);else {const auto ansi=utf16_to_utf8(std::u16string(text));bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}return bytes;};
+const auto encode=[&](std::u16string_view text){std::vector<std::uint8_t> bytes;if(wide)bytes=utf16_bytes(text);else {const auto ansi=utf16_to_ansi(std::u16string(text));bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}return bytes;};
 const auto value_of=[&](const std::u16string& path,std::u16string_view value_name)->const RegistryValue*{
     const auto key=registry.keys.find(path);if(key==registry.keys.end())return nullptr;const auto found=key->second.find(std::u16string(value_name));return found==key->second.end()?nullptr:&found->second;
 };

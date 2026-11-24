@@ -5,7 +5,7 @@
            name.starts_with("SetupAddToSourceList") || name.starts_with("SetupSetSourceList") || name.starts_with("SetupAddInstallSectionToDiskSpaceList")){
             const bool unicode=!name.ends_with('A');const unsigned chars=unicode?2U:1U;
             const auto encode=[unicode](const std::u16string& value){
-                std::vector<std::uint8_t> bytes;if(unicode)bytes=utf16_bytes(value);else{const auto narrow=utf16_to_utf8(value);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}return bytes;};
+                std::vector<std::uint8_t> bytes;if(unicode)bytes=utf16_bytes(value);else{const auto narrow=utf16_to_ansi(value);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}return bytes;};
             const auto u32=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
             const auto leaf_of=[](const std::u16string& path){const auto slash=path.find_last_of(u"\\/");return slash==std::u16string::npos?path:path.substr(slash+1);};
             const auto store32=[&](std::uint64_t at,std::uint64_t value){memory.check(GuestAddress{at},4,Access::Write);memory.store(GuestAddress{at},32,value);};
@@ -71,7 +71,7 @@
                             if(answer==0){failure=static_cast<std::uint32_t>(m.load(GuestAddress{info+size+4},32));if(!failure)failure=1223;aborted=true;release();break;}
                             if(answer!=1){release();continue;}
                             const auto target_at=info+size+14;
-                            const auto target=unicode?read_utf16(m,GuestAddress{target_at},260):utf8_to_utf16(read_ansi(m,target_at,260));
+                            const auto target=unicode?read_utf16(m,GuestAddress{target_at},260):ansi_to_utf16(read_ansi(m,target_at,260));
                             std::uint32_t error=0;
                             if(target.empty())error=87;
                             else{

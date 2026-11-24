@@ -35,7 +35,9 @@
             const auto type=flags&0x2000U?field(p+4,p):0;
             const auto type_name=(flags&0x2000U) && !(flags&0x1000U)?fold(string(type)):std::u16string{};
             const auto lower=fold(requested);
-            constexpr std::u16string_view quartz_extensions[]{u".mp4",u".m4v",u".mov",u".m4a",u".mpg",u".mpeg",u".m1v",u".m2v",u".vob",u".mp3"};
+            // Windows 的 [MCI Extensions] 預設對應到 MPEGVideo 的副檔名（含 Windows Media 的 ASF 系列）。
+            constexpr std::u16string_view quartz_extensions[]{u".mp4",u".m4v",u".mov",u".m4a",u".mpg",u".mpeg",u".m1v",u".m2v",u".vob",u".mp3",
+                u".mp2",u".mpa",u".mpe",u".mpv2",u".wmv",u".wma",u".wm",u".asf",u".asx",u".wax",u".wmx",u".wvx"};
             const bool quartz_extension=std::any_of(std::begin(quartz_extensions),std::end(quartz_extensions),
                 [&](std::u16string_view extension){return lower.ends_with(extension);});
             const bool quartz=quartz_installable || (!avi_installable &&
@@ -45,8 +47,9 @@
                 quartz_extension || lower.ends_with(u".avi"));
             if(video){
                 check_flags(0x3700|mci::video_open_style|mci::video_open_parent|mci::video_open_nostatic);
-                if(flags&mci::video_open_style)throw mci::Error(mci::unsupported);
                 auto media=open_video(requested,quartz);
+                // MCI_DGV_OPEN_PARMS：dwStyle 在 lpstrAlias 之後、hWndParent 之前（pack(1)，MCIDEVICEID 後無對齊填補）。
+                if(flags&mci::video_open_style)media->style=static_cast<std::uint32_t>(field(4*p+4,4));
                 media->creator=threads_.current;
                 media->shareable=(flags&0x100U)!=0;
                 if(flags&mci::video_open_parent){
@@ -65,7 +68,40 @@
                 }
                 memory.check(GuestAddress{parameters+p},4,Access::Write);
                 const auto created=video_installable?id:bridge.allocate_device();
-                if(video_installable || quartz)media->presentation=bridge.next_presentation++;
+                // 每個影片都有自己的呈現代號：播放中由 poll_mci 依時間自動繪到顯示視窗（經 winmm 開啟的 AVI 也是）。
+                media->presentation=bridge.next_presentation++;
+                bridge.videos.emplace(created,std::move(media));
+                memory.store(GuestAddress{parameters+p},32,created);
+                if(flags&mci::notify)notify_mci(created,callback,1);
+                return finish(0);
+            }
+        }
+        // 只以裝置型別開啟（不帶元素）：複合裝置可先開驅動供 MCI_GETDEVCAPS／MCI_INFO 查詢與確認驅動存在，
+        // 沒有載入片段（長度 0、無畫面），之後的播放立即完成。遊戲常以「open avivideo」探測影片驅動。
+        if(!wave_installable && !sequencer_installable && command==mci::open && (flags&0x2000U) && !(flags&mci::open_element)){
+            block(4*p+4);
+            const auto type=field(p+4,p);
+            const auto type_name=(flags&0x1000U)?std::u16string{}:fold(string(type));
+            const bool video=video_installable || ((flags&0x1000U)?type==mci::avi_device:(type_name==u"avivideo" || type_name==u"digitalvideo" || type_name==u"mpegvideo"));
+            if(video){
+                check_flags(0x3700|mci::video_open_style|mci::video_open_parent|mci::video_open_nostatic);
+                auto media=std::make_shared<mci::AviDevice>(std::make_unique<EmptyVideoPreview>());
+                media->quartz=quartz_installable || type_name==u"mpegvideo";
+                media->creator=threads_.current;
+                media->shareable=(flags&0x100U)!=0;
+                if(flags&mci::video_open_style)media->style=static_cast<std::uint32_t>(field(4*p+4,4));
+                if(flags&mci::video_open_parent){
+                    const auto parent=field(4*p+8,p);
+                    if(!parent || !gui_.windows.contains(parent))throw mci::Error(mci::bad_constant);
+                    media->window=parent;
+                }
+                if(flags&0x400U){
+                    media->alias=string(field(3*p+4,p));
+                    if(media->alias.empty())throw mci::Error(mci::missing_parameter);
+                    if(find_device(bridge,media->alias))throw mci::Error(mci::duplicate_alias);
+                }
+                memory.check(GuestAddress{parameters+p},4,Access::Write);
+                const auto created=video_installable?id:bridge.allocate_device();
                 bridge.videos.emplace(created,std::move(media));
                 memory.store(GuestAddress{parameters+p},32,created);
                 if(flags&mci::notify)notify_mci(created,callback,1);
@@ -88,7 +124,10 @@
                     return succeeded();
                 }
                 if(command==mci::play){
-                    check_flags(mci::from|mci::to|mci::video_reverse|mci::video_repeat);
+                    // MCI_MCIAVI_PLAY_WINDOW（0x01000000）：在顯示視窗播放，即預設行為。全螢幕（0x02000000）與 2 倍全螢幕（0x04000000）
+                    // 需要暫時的全螢幕播放視窗，尚未提供，維持「不支援」。
+                    if(flags&0x06000000U)throw mci::Error(mci::unsupported);
+                    check_flags(mci::from|mci::to|mci::video_reverse|mci::video_repeat|0x01000000U);
                     const auto backwards=bool(flags&mci::video_reverse);
                     const auto first=flags&mci::from?video.from_time(static_cast<std::uint32_t>(field(p))):
                         backwards?0:video.current(now);
@@ -98,6 +137,8 @@
                     if(video.audible() && !output_available())throw mci::Error(mci::hardware);
                     complete_mci_transport(id,4);
                     video.play(first,last,backwards,flags&mci::video_repeat,now);
+                    if(std::getenv("X64ARM_TRACE_MCI"))std::fprintf(stderr,"[mci-video] play id=%u first=%llu last=%llu length=%llu mode=%d audible=%d window=0x%llx\n",id,
+                        static_cast<unsigned long long>(first),static_cast<unsigned long long>(last),static_cast<unsigned long long>(video.length()),static_cast<int>(video.mode),video.audible()?1:0,static_cast<unsigned long long>(video.window));
                     if(video.mode==mci::Mode::Stopped)return succeeded();
                     video.notify_window=callback;
                     if(flags&mci::wait)return wait_transport(video.waiters);
@@ -250,11 +291,20 @@
                     return succeeded();
                 }
                 if(command==mci::video_window){
-                    check_flags(0x10000U);
-                    if(!(flags&0x10000U))throw mci::Error(mci::missing_parameter);
-                    const auto hwnd=field(p,p);
-                    if(hwnd && !gui_.windows.contains(hwnd))throw mci::Error(mci::bad_constant);
-                    video.window=hwnd;
+                    // MCI_DGV_WINDOW_PARMS：dwCallback、hWnd、nCmdShow（UINT）、lpstrText；旗標 HWND 0x10000、STATE 0x40000、TEXT 0x80000。
+                    check_flags(0xd0000U);
+                    if(!(flags&0xd0000U))throw mci::Error(mci::missing_parameter);
+                    if(flags&0x10000U){
+                        const auto hwnd=field(p,p);
+                        if(hwnd && !gui_.windows.contains(hwnd))throw mci::Error(mci::bad_constant);
+                        video.window=hwnd;
+                    }
+                    if(flags&0x40000U){
+                        const auto show=static_cast<std::uint32_t>(field(2*p,4));
+                        if(show>11)throw mci::Error(mci::bad_constant);
+                        video.hidden=show==0 || show==2 || show==6 || show==7 || show==11;
+                    }
+                    if(flags&0x80000U)video.caption=string(field(2*p+4,p));
                     video.presented_frame=UINT64_MAX;
                     return succeeded();
                 }

@@ -12,6 +12,7 @@
 // - WTSSendMessageA／W：在 session 1 顯示訊息方塊（標題與內容長度以位元組計）；bWait 時以 MessageBoxTimeoutW 等候回應（逾時 IDTIMEOUT），
 //   否則以 MessageBoxIndirectW 為執行緒入口非同步顯示並回 IDASYNC，結束的執行緒在後續呼叫時回收。
 // - WTSTerminateProcess：以 OpenProcess（PROCESS_TERMINATE）＋TerminateProcess 結束指定程序。
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
@@ -70,7 +71,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wts(GuestState& state,Guest
     };
     try{
         if(name.starts_with("WTSOpenServer")){
-            const auto server=arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)},256):utf8_to_utf16_lossy(read_ansi(memory,arg(0),256))):std::u16string{};
+            const auto server=arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)},256):ansi_to_utf16_lossy(read_ansi(memory,arg(0),256))):std::u16string{};
             if(!local_server(server))return fail(1722);
             if(runtime_.wts_servers.size()>=1024)return fail(8);
             const auto handle=runtime_.wts_next_server;runtime_.wts_next_server+=4;runtime_.wts_servers[handle]=0;return finish(handle);

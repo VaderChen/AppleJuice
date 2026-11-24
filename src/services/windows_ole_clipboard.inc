@@ -297,7 +297,7 @@ std::optional<std::uint32_t> WindowsServices::resume_ole_clipboard(GuestState& s
         if((data==gui_.clipboard.end() || !data->second) && op.type!=op.requested){
             const auto rendered=gui_.clipboard.find(op.type);GuiClipboardEntry text;text.format.format=op.type;text.type=1;
             if(rendered!=gui_.clipboard.end() && rendered->second && global_bytes(rendered->second,text.bytes))if(const auto value=clip_text(text)){
-                std::vector<std::uint8_t> bytes;if(op.requested==13)bytes=utf16_bytes(*value);else{const auto ansi=utf16_to_utf8(*value);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
+                std::vector<std::uint8_t> bytes;if(op.requested==13)bytes=utf16_bytes(*value);else{const auto ansi=utf16_to_ansi(*value);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
                 const auto handle=allocate_gui_global(memory,bytes.size(),2);if(!handle)return finish(clip_memory);
                 auto& block=gui_.global_memory.at(handle);memory.write(GuestAddress{block.address},bytes);block.clipboard_owned=true;gui_.clipboard[op.requested]=handle;gui_.clipboard_types[op.requested]=1;gui_.clipboard_order.push_back(op.requested);data=gui_.clipboard.find(op.requested);
             }
@@ -321,7 +321,7 @@ std::optional<std::uint32_t> WindowsServices::resume_ole_clipboard(GuestState& s
         std::optional<std::u16string> text;for(const auto format:{13U,1U})for(const auto& entry:op.entries)if(entry.format.format==format && !text)text=clip_text(entry);
         if(op.kind==Kind::Render && (op.requested==1 || op.requested==13) && !op.prepared.contains(op.requested) && text){
             GuiClipboardEntry converted;converted.format.format=op.requested;converted.type=converted.format.tymed=1;
-            if(op.requested==13)converted.bytes=utf16_bytes(*text);else{const auto ansi=utf16_to_utf8(*text);converted.bytes.assign(ansi.begin(),ansi.end());converted.bytes.push_back(0);}
+            if(op.requested==13)converted.bytes=utf16_bytes(*text);else{const auto ansi=utf16_to_ansi(*text);converted.bytes.assign(ansi.begin(),ansi.end());converted.bytes.push_back(0);}
             if(!prepare(converted))return clip_memory;
         }
         if(native_gui_ && interactive_station() && text && !native_gui_->set_clipboard_text(*text))return clip_set;

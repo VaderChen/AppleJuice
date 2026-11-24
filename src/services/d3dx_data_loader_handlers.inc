@@ -12,7 +12,7 @@
                 else{
                     output(out);write_pointer(arg(out),0);
                     Identity::DataLoader loader;loader.source=file?1:memory_source?2:3;loader.d3d10=service.family=="d3dx10_43.dll";
-                    if(file)loader.path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+                    if(file)loader.path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
                     else if(memory_source){loader.data=arg(0);loader.size=arg(1);loader.loaded=true;}
                     else{
                         const auto found=gui_resource(memory,arg(0),arg(1),10,wide);const auto* owner=found?resource_image(found,true):nullptr;

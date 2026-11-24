@@ -529,6 +529,10 @@ int compare(GuestState state, GuestMemory memory, RunOptions options, WindowsSer
 int main(int argc, char** argv) {
     using namespace x64arm;
     startup_profile::mark("main_enter");
+    // Metal 效能 HUD 依程式個別設定（Launcher 的「效能統計」→ X64ARM_METAL_HUD=1）；全域的 MTL_HUD_ENABLED
+    //（例如 launchctl setenv）不套用到每個程式，否則 Steam 等所有視窗都會出現 HUD。須在任何 Metal 物件建立前處理。
+    if(const auto* hud=std::getenv("X64ARM_METAL_HUD");hud && std::string_view(hud)=="1")::setenv("MTL_HUD_ENABLED","1",1);
+    else ::unsetenv("MTL_HUD_ENABLED");
     std::ofstream diagnostics_file;
     std::ostream* diagnostics=&std::cerr;
     try {

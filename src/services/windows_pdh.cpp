@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/processor_information.hpp"
@@ -280,8 +281,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_pdh(GuestState& state,Guest
     if(!pdh_)pdh_=std::make_shared<PdhState>();auto& pdh_state=*pdh_;const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);
     const unsigned count=std::max(1U,runtime_.processor_count);
     const bool wide=symbol.ends_with('W');
-    const auto text=[&](unsigned i){return wide?read_utf16(memory,GuestAddress{arg(i)},1024):utf8_to_utf16_lossy(read_ansi(memory,arg(i),2048));};
-    const auto text_at=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer},1024):utf8_to_utf16_lossy(read_ansi(memory,pointer,2048));};
+    const auto text=[&](unsigned i){return wide?read_utf16(memory,GuestAddress{arg(i)},1024):ansi_to_utf16_lossy(read_ansi(memory,arg(i),2048));};
+    const auto text_at=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer},1024):ansi_to_utf16_lossy(read_ansi(memory,pointer,2048));};
     try{
         if(symbol.starts_with("PdhOpenQuery")){
             if(!arg(2))return finish(pdh::invalid_argument);memory.check(GuestAddress{arg(2)},unit,Access::Write);

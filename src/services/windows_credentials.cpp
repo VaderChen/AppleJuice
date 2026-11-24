@@ -3,6 +3,7 @@
 // CRED_PERSIST_SESSION 只存在本程序的記憶體（真實系統是登入工作階段，本專案沒有跨程序的工作階段服務）。
 // 網域認證（CredReadDomainCredentials／CredWriteDomainCredentials）沿用同一份儲存，依 CREDENTIAL_TARGET_INFORMATION 由最具體到最廣的名稱比對；
 // CRED_CACHE_TARGET_INFORMATION 快取的目標資訊與工作階段認證同樣只在本程序有效，供 CredGetTargetInfo 取回。
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/data_protection.hpp"
 #include "x64arm/private_key_store.hpp"
@@ -104,7 +105,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_credentials(GuestState& sta
     const unsigned attribute_size=x86_?16:24,a_flags=unit,a_size=unit+4,a_value=unit+8;
     const auto read_text=[&](std::uint64_t pointer){
         if(!pointer)return std::u16string{};
-        return wide?read_utf16(memory,GuestAddress{pointer},32767):utf8_to_utf16(read_ansi(memory,pointer,32767));
+        return wide?read_utf16(memory,GuestAddress{pointer},32767):ansi_to_utf16(read_ansi(memory,pointer,32767));
     };
     const auto finish=[&](std::uint32_t error){last_error_=error;arg.return_to(state,error?0:1);return std::optional<std::uint32_t>{};};
     if(symbol=="CredFree"){
@@ -128,7 +129,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_credentials(GuestState& sta
             if(type==1){if(body.size()!=27)return std::nullopt;bytes.resize(20);return std::pair{type,bytes};}
             if(bytes.size()<4)return std::nullopt;const auto length=static_cast<std::uint64_t>(bytes[0])|static_cast<std::uint64_t>(bytes[1])<<8|static_cast<std::uint64_t>(bytes[2])<<16|static_cast<std::uint64_t>(bytes[3])<<24;
             if(4+length>bytes.size() || (type==2 && (!length || length%2)) || body.size()!=((4+length)*8+5)/6)return std::nullopt;bytes.resize(static_cast<std::size_t>(4+length));return std::pair{type,bytes};};
-        const auto marshaled_text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer},32767):utf8_to_utf16(read_ansi(memory,pointer,32767));};
+        const auto marshaled_text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer},32767):ansi_to_utf16(read_ansi(memory,pointer,32767));};
         try{
             if(symbol=="CredGetSessionTypes"){
                 // (MaximumPersistCount, MaximumPersist)
@@ -146,7 +147,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_credentials(GuestState& sta
                 else if(type==3){const auto size=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)},32));const auto blob=memory.load(GuestAddress{arg(1)+unit},bits);
                     if(size && !blob)return finish(87);if(size>16U*1024U*1024U)return finish(87);put_length(size);const auto start=payload.size();payload.resize(start+size);if(size)memory.read(GuestAddress{blob},std::span(payload).subspan(start));}
                 else return finish(87);
-                const auto text=u"@@"+std::u16string(1,static_cast<char16_t>(u'A'+type))+encode(payload);Bytes bytes;if(wide)bytes=utf16_bytes(text);else {const auto narrow=utf16_to_utf8(text);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
+                const auto text=u"@@"+std::u16string(1,static_cast<char16_t>(u'A'+type))+encode(payload);Bytes bytes;if(wide)bytes=utf16_bytes(text);else {const auto narrow=utf16_to_ansi(text);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
                 const auto at=allocate_heap(memory,bytes.size());if(!at)return finish(8);memory.write(GuestAddress{at},bytes);memory.store(GuestAddress{arg(2)},bits,at);return finish(0);
             }
             // CredUnmarshalCredential(MarshaledCredential, CredType, Credential)
@@ -164,7 +165,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_credentials(GuestState& sta
     const auto encode_text=[&](const std::u16string& text){
         Bytes out;
         if(wide){out=utf16_bytes(text);}
-        else {const auto narrow=utf16_to_utf8(text);out.assign(narrow.begin(),narrow.end());out.push_back(0);}
+        else {const auto narrow=utf16_to_ansi(text);out.assign(narrow.begin(),narrow.end());out.push_back(0);}
         return out;
     };
     const auto block_size=[&](const Credential& item){

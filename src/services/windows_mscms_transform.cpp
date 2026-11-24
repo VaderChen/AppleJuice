@@ -3,6 +3,7 @@
 // GetCMMInfo、CreateDeviceLinkProfile、ConvertColorNameToIndex、ConvertIndexToColorName、GetNamedProfileInfo、GetPS2ColorRenderingIntent、
 // GetPS2ColorSpaceArray、GetPS2ColorRenderingDictionary、GenerateCopyFilePaths、SpoolerCopyFileEvent。
 // 轉換以宿主 ColorSync 處理 0..1 浮點裝置值；mscms 的 COLOR 與點陣格式在這裡解碼／編碼。
+#include "ansi_codepage.hpp"
 #include "windows_icm_store.hpp"
 #include "service_callback_task.hpp"
 #include <algorithm>
@@ -129,7 +130,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mscms_transform(GuestState&
             // {LOGCOLORSPACE*, hDestProfile, hTargetProfile, dwFlags}：來源由 LOGCOLORSPACE 產生（有 lcsFilename 時讀該設定檔），目標設定檔用於模擬。
             const bool wide=name.ends_with('W');if(!arg(0) || !arg(1))return fail(87);
             std::array<std::uint32_t,17> fields{};for(unsigned i=0;i<17;++i)fields[i]=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+i*4},32));if(fields[0]!=0x50534f43)return fail(87);
-            const auto file=wide?read_utf16(memory,GuestAddress{arg(0)+68},259):utf8_to_utf16(read_ansi(memory,arg(0)+68,259));
+            const auto file=wide?read_utf16(memory,GuestAddress{arg(0)+68},259):ansi_to_utf16(read_ansi(memory,arg(0)+68,259));
             std::vector<std::uint8_t> source;
             if(!file.empty()){const auto bytes=store.read_profile(icm_profile_path(file));if(!bytes)return finish(0);source=*bytes;}
             else {IccRgbParameters parameters;

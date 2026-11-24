@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_gui_abi.hpp"
 #include "x64arm/windows_calendar.hpp"
@@ -130,6 +131,29 @@ bool WindowsServices::begin_gui_control(GuestState& state,GuestMemory& memory,co
         try{memory.write(GuestAddress{buffer},std::vector<std::uint8_t>(header));memory.store(GuestAddress{buffer},abi.bits,message.window);memory.store(GuestAddress{buffer+abi.unit},abi.bits,id);memory.store(GuestAddress{buffer+abi.unit*2},32,static_cast<std::uint32_t>(-880));
             start_callbacks(state,memory,{{resolve("user32.dll",wide?"SendMessageW":"SendMessageA").value,{parent,0x4e,id,buffer}}},Continuation::ReturnCallbackFreeHeap,buffer);
         }catch(...){(void)free_heap(memory,buffer,state);throw;}return true;
+    }
+    // LVS_OWNERDRAWFIXED 的報表清單：每一列由父視窗在 WM_DRAWITEM（ODT_LISTVIEW）繪製。原生表格負責資料、捲動與選取，
+    // 這裡依它目前可見的列逐列通知，畫在清單 DC 的光柵表面上（接續流程在 GuiControlOperation 的 owner_draw 分支）。
+    if(cls==u"syslistview32" && (window->second.style&0x400U) && (window->second.style&3U)==1 && message.message==15 && native_gui_){
+        auto& control=window->second;
+        std::erase_if(gui_.queue,[&](const auto& queued){return queued.window==message.window && queued.message==15;});
+        if(!control.redraw || !gui_.windows.contains(control.parent) || std::any_of(gui_.control_operations.begin(),gui_.control_operations.end(),[&](const auto& op){return op.second.owner_draw && op.second.message.window==message.window;})){complete_call(state,memory,0);return true;}
+        if(gui_.control_operations.size()>=128)throw HostCallFault("清單自繪回呼超過上限");
+        control.invalid=false;control.drawing.clear();const auto dc=0x10000000+message.window;
+        rasters_.erase(dc);native_gui_->graphics_surface(message.window,{});present_gui(message.window);
+        gui_.contexts.try_emplace(dc);
+        // 底色：清單自己的背景色（LVM_SETBKCOLOR，預設白）；CLR_NONE 時以原生畫面為底。不能拿原生表格的列文字當底，各列由客體重畫。
+        if(const auto surface=raster_surface(memory,dc)){
+            if(control.list_background==UINT32_MAX){if(const auto background=native_gui_->capture_client(message.window))surface->upload(background->pixels);}
+            else {const std::vector<std::uint32_t> fill(static_cast<std::size_t>(surface->width())*surface->height(),0xff000000U|(control.list_background&0xffffffU));surface->upload(fill);}
+        }
+        GuiControlOperation operation;operation.message=message;operation.thread=threads_.current;operation.wide=wide;operation.owner_draw=true;
+        if(const auto rows=native_gui_->list_visible_rows(message.window))
+            for(auto row=std::max(0,(*rows)[0]);row<(*rows)[1] && static_cast<std::size_t>(row)<control.items.size();++row)operation.identities.push_back(control.items[static_cast<std::size_t>(row)].handle);
+        auto& saved=gui_.saved_contexts[dc];saved.push_back(gui_.contexts[dc]);operation.parameter=saved.size();
+        if(gui_.control_notification_buffers.empty())operation.buffer=runtime_allocate(memory,{},display_bytes);else {operation.buffer=gui_.control_notification_buffers.back();gui_.control_notification_buffers.pop_back();}
+        const auto token=gui_.next_object++;gui_.control_operations.emplace(token,std::move(operation));
+        try{start_callbacks(state,memory,{},Continuation::GuiControlOperation,token);}catch(...){discard_gui_control(token);throw;}return true;
     }
     if(cls==u"msctls_statusbar32" && message.message==15){
         auto& control=window->second;
@@ -266,7 +290,7 @@ bool WindowsServices::begin_gui_control(GuestState& state,GuestMemory& memory,co
         if(operation.parameter==2 && (selection<0 || static_cast<std::size_t>(selection)>=combo.items.size() || combo.items[static_cast<std::size_t>(selection)].text!=combo.title))selection=-1;
         operation.subitem=static_cast<std::uint32_t>(selection);memory.store(GuestAddress{buffer+header+4},32,operation.subitem);
         if(combo.list_unicode)memory.write(GuestAddress{buffer+header+8},utf16_bytes(combo.title.substr(0,259)));
-        else {auto text=utf16_to_utf8(combo.title);text.resize(std::min<std::size_t>(text.size(),259));std::vector<std::uint8_t> bytes(text.begin(),text.end());bytes.push_back(0);memory.write(GuestAddress{buffer+header+8},bytes);}
+        else {auto text=utf16_to_ansi(combo.title);text.resize(ansi_prefix_length(text,259));std::vector<std::uint8_t> bytes(text.begin(),text.end());bytes.push_back(0);memory.write(GuestAddress{buffer+header+8},bytes);}
         memory.store(GuestAddress{buffer+header+(combo.list_unicode?528U:268U)},32,operation.parameter);
         combo.combo_edit_changed=false;
         const auto token=gui_.next_object++;gui_.control_operations.emplace(token,std::move(operation));
@@ -487,7 +511,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_control(GuestState& sta
         auto& date=*control.calendar;
         const auto again=[&](std::vector<GuestCallback> callbacks){start_callbacks(state,memory,std::move(callbacks),Continuation::GuiControlOperation,frame.value);};
         const auto text_memory=[&](const std::vector<std::uint8_t>& bytes){if(request.text_buffer)(void)free_heap(memory,request.text_buffer,state);request.text_buffer=allocate_heap(memory,bytes.size());if(!request.text_buffer)throw HostCallFault("日期編輯文字配置失敗");memory.write(GuestAddress{request.text_buffer},bytes);return request.text_buffer;};
-        const auto callback_text=[&](std::u16string_view value){if(request.callback_wide)return utf16_bytes(value);const auto text=utf16_to_utf8(value);std::vector<std::uint8_t> bytes(text.begin(),text.end());bytes.push_back(0);return bytes;};
+        const auto callback_text=[&](std::u16string_view value){if(request.callback_wide)return utf16_bytes(value);const auto text=utf16_to_ansi(value);std::vector<std::uint8_t> bytes(text.begin(),text.end());bytes.push_back(0);return bytes;};
         if(request.stage==27){
             if(date.callback_revision==request.callback_revision && date.picker_revision==request.callback_value_revision){(void)gui_control_message(memory,{operation.message.window,0,operation.buffer+(x86_?20U:40U),0x1002},operation.wide);request.callback_value_revision=date.picker_revision;auto notices=std::move(date.notices);date.notices.clear();request.notices.insert(request.notices.end(),notices.begin(),notices.end());}
             request.stage=4;
@@ -496,7 +520,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_control(GuestState& sta
             if(date.callback_revision==request.callback_revision && date.picker_revision==request.callback_value_revision && request.callback_next<date.callback_fields.size()){
                 auto& field=date.callback_fields[request.callback_next];
                 if(request.stage==28){for(unsigned n=0;n<2;++n){const auto value=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{operation.buffer+abi.notify_size+abi.unit+n*4},32)));field.maximum[n]=std::max(0,value);}request.callback_query_done=true;}
-                else {const auto display=operation.buffer+abi.notify_size+abi.unit+16;const auto pointer=memory.load(GuestAddress{display},abi.bits);const auto limit=pointer==display+abi.unit?64U:65535U;field.text=pointer?(request.callback_wide?read_utf16(memory,GuestAddress{pointer},limit):utf8_to_utf16_lossy(read_ansi(memory,pointer,limit))):std::u16string{};++request.callback_next;request.callback_query_done=false;}
+                else {const auto display=operation.buffer+abi.notify_size+abi.unit+16;const auto pointer=memory.load(GuestAddress{display},abi.bits);const auto limit=pointer==display+abi.unit?64U:65535U;field.text=pointer?(request.callback_wide?read_utf16(memory,GuestAddress{pointer},limit):ansi_to_utf16_lossy(read_ansi(memory,pointer,limit))):std::u16string{};++request.callback_next;request.callback_query_done=false;}
             }
             request.stage=4;
         }
@@ -531,7 +555,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_control(GuestState& sta
                 else {memory.write(GuestAddress{operation.buffer+128},utf16_bytes(u"Edit"));request.stage=19;again({{resolve("user32.dll","CreateWindowExW").value,{0,operation.buffer+128,text_memory(utf16_bytes(operation.text)),0x50000080U,(control.style&2U)?24U:5U,2,control.width>50?control.width-((control.style&2U)?45U:26U):1U,control.height>4?control.height-4:1U,operation.message.window,1,control.instance,0}}});return {};}
             }
             if((request.commit || request.cancel) && date.editing && date.edit_generation==request.edit_generation){date.editing=false;present_gui(operation.message.window);
-                if(request.commit){const auto parent=control.parent?control.parent:control.owner;if(gui_.windows.contains(parent)){const auto bytes=control.list_unicode?utf16_bytes(operation.text):[&]{const auto value=utf16_to_utf8(operation.text);std::vector<std::uint8_t> result(value.begin(),value.end());result.push_back(0);return result;}();const auto text=text_memory(bytes);memory.write(GuestAddress{operation.buffer},std::vector<std::uint8_t>(gui_control_notification_bytes));memory.store(GuestAddress{operation.buffer},abi.bits,operation.message.window);memory.store(GuestAddress{operation.buffer+abi.unit},abi.bits,control.id);memory.store(GuestAddress{operation.buffer+abi.notify_code},32,static_cast<std::uint32_t>(control.list_unicode?-745:-758));memory.store(GuestAddress{operation.buffer+abi.notify_size},abi.bits,text);gui_date_write(memory,operation.buffer+abi.notify_size+abi.unit,date.value);memory.store(GuestAddress{operation.buffer+abi.notify_size+abi.unit+16},32,date.none?1U:0U);request.stage=21;again({{resolve("user32.dll",control.list_unicode?"SendMessageW":"SendMessageA").value,{parent,0x4e,control.id,operation.buffer}}});return {};}}
+                if(request.commit){const auto parent=control.parent?control.parent:control.owner;if(gui_.windows.contains(parent)){const auto bytes=control.list_unicode?utf16_bytes(operation.text):[&]{const auto value=utf16_to_ansi(operation.text);std::vector<std::uint8_t> result(value.begin(),value.end());result.push_back(0);return result;}();const auto text=text_memory(bytes);memory.write(GuestAddress{operation.buffer},std::vector<std::uint8_t>(gui_control_notification_bytes));memory.store(GuestAddress{operation.buffer},abi.bits,operation.message.window);memory.store(GuestAddress{operation.buffer+abi.unit},abi.bits,control.id);memory.store(GuestAddress{operation.buffer+abi.notify_code},32,static_cast<std::uint32_t>(control.list_unicode?-745:-758));memory.store(GuestAddress{operation.buffer+abi.notify_size},abi.bits,text);gui_date_write(memory,operation.buffer+abi.notify_size+abi.unit,date.value);memory.store(GuestAddress{operation.buffer+abi.notify_size+abi.unit+16},32,date.none?1U:0U);request.stage=21;again({{resolve("user32.dll",control.list_unicode?"SendMessageW":"SendMessageA").value,{parent,0x4e,control.id,operation.buffer}}});return {};}}
                 request.stage=22;if(gui_.focus==date.edit_window){again({{resolve("user32.dll","SetFocus").value,{operation.message.window}}});return {};}
                 if(gui_.windows.contains(date.edit_window)){request.stage=4;again({{resolve("user32.dll","ShowWindow").value,{date.edit_window,0}}});return {};}request.stage=4;
             }
@@ -614,6 +638,29 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_control(GuestState& sta
                 memory.store(GuestAddress{buffer+item_window},abi.bits,operation.message.window);memory.store(GuestAddress{buffer+item_window+abi.unit},abi.bits,dc);
                 for(unsigned n=0;n<4;++n)memory.store(GuestAddress{buffer+rectangle+n*4},32,static_cast<std::uint32_t>(rect[n]));memory.store(GuestAddress{buffer+rectangle+16},abi.bits,part->data);
                 auto& context=gui_.contexts[dc];context.font=control.font;context.clipped=true;context.clip=rect;context.excluded.clear();
+                start_callbacks(state,memory,{{resolve("user32.dll",operation.wide?"SendMessageW":"SendMessageA").value,{control.parent,0x2b,control.id,buffer}}},Continuation::GuiControlOperation,frame.value);return std::nullopt;
+            }
+        }
+        if(window!=gui_.windows.end() && native_gui_ && gui_control_class(window->second)==u"syslistview32" && (window->second.style&0x400U)){
+            auto& control=window->second;const GuiControlAbi abi(x86_);const auto buffer=operation.buffer;
+            if(!operation.pending){
+                // 先讓清單自己的視窗程序擦背景（WM_ERASEBKGND，wParam 為 DC）：子類別化的程式在這裡塗上自訂底色，之後才逐列繪製。
+                operation.pending=true;const auto dc=0x10000000+operation.message.window;
+                auto& context=gui_.contexts[dc];context.clipped=false;context.excluded.clear();
+                start_callbacks(state,memory,{{resolve("user32.dll",operation.wide?"SendMessageW":"SendMessageA").value,{operation.message.window,0x14,dc,0}}},Continuation::GuiControlOperation,frame.value);return std::nullopt;
+            }
+            while(gui_.windows.contains(control.parent) && operation.start<operation.identities.size()){
+                const auto identity=operation.identities[operation.start++];const auto item=std::find_if(control.items.begin(),control.items.end(),[&](const auto& value){return value.handle==identity;});
+                if(item==control.items.end())continue;
+                const auto index=static_cast<std::int32_t>(item-control.items.begin());const auto rect=native_gui_->list_row_rect(operation.message.window,index);
+                if(!rect || (*rect)[2]<=(*rect)[0] || (*rect)[3]<=(*rect)[1])continue;
+                memory.write(GuestAddress{buffer},std::array<std::uint8_t,64>{});memory.store(GuestAddress{buffer},32,102);memory.store(GuestAddress{buffer+4},32,control.id);
+                memory.store(GuestAddress{buffer+8},32,static_cast<std::uint32_t>(index));memory.store(GuestAddress{buffer+12},32,1);
+                memory.store(GuestAddress{buffer+16},32,((item->state&2U)?1U:0U)|(!control.enabled?4U:0U)|((item->state&1U) && gui_.focus==operation.message.window?16U:0U));
+                const auto item_window=x86_?20U:24U,rectangle=item_window+abi.unit*2;const auto dc=0x10000000+operation.message.window;
+                memory.store(GuestAddress{buffer+item_window},abi.bits,operation.message.window);memory.store(GuestAddress{buffer+item_window+abi.unit},abi.bits,dc);
+                for(unsigned n=0;n<4;++n)memory.store(GuestAddress{buffer+rectangle+n*4},32,static_cast<std::uint32_t>((*rect)[n]));memory.store(GuestAddress{buffer+rectangle+16},abi.bits,item->data);
+                auto& context=gui_.contexts[dc];context.font=control.font;context.clipped=true;context.clip=*rect;context.excluded.clear();
                 start_callbacks(state,memory,{{resolve("user32.dll",operation.wide?"SendMessageW":"SendMessageA").value,{control.parent,0x2b,control.id,buffer}}},Continuation::GuiControlOperation,frame.value);return std::nullopt;
             }
         }

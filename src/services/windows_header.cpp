@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_window_state.hpp"
 #include "x64arm/windows_gui_abi.hpp"
@@ -44,7 +45,7 @@ struct ItemAbi {
 std::vector<std::uint8_t> text_bytes(const std::u16string& text,std::size_t capacity,bool wide){
     if(!capacity)return {};
     if(wide){auto n=std::min(text.size(),capacity-1);if(n && n<text.size() && text[n-1]>=0xd800 && text[n-1]<=0xdbff)--n;return utf16_bytes(text.substr(0,n));}
-    auto value=utf16_to_utf8(text);auto n=std::min(value.size(),capacity-1);while(n && n<value.size() && (static_cast<unsigned char>(value[n])&0xc0U)==0x80U)--n;
+    auto value=utf16_to_ansi(text);auto n=ansi_prefix_length(value,capacity-1);
     std::vector<std::uint8_t> result(value.begin(),value.begin()+static_cast<std::ptrdiff_t>(n));result.push_back(0);return result;
 }
 template<class ReadText>
@@ -168,7 +169,7 @@ std::optional<std::uint64_t> WindowsServices::gui_header_message(GuestMemory& me
     auto& w=gui_.windows.at(message.window);auto& control=header(w);layout_gui_header(message.window);auto& items=columns(gui_,w);const auto m=message.message;const auto index=integer(message.wparam);const auto lp=message.lparam;
     const ItemAbi abi(x86_);const auto valid=[&]{return index>=0 && static_cast<std::size_t>(index)<items.size();};
     const auto update=[&](std::uint64_t result){invalidate_window(message.window);if(w.header_list && gui_.windows.contains(w.header_list))present_gui(w.header_list);else present_gui(message.window);return result;};
-    const auto read=[&](std::uint64_t p,bool unicode){return p?(unicode?read_utf16(memory,GuestAddress{p},65535):utf8_to_utf16_lossy(read_ansi(memory,p,65535))):std::u16string{};};
+    const auto read=[&](std::uint64_t p,bool unicode){return p?(unicode?read_utf16(memory,GuestAddress{p},65535):ansi_to_utf16_lossy(read_ansi(memory,p,65535))):std::u16string{};};
     if(m==0x55 && lp==3)return w.unicode?2:1;
     if(m==0x1200)return items.size();
     if(m==0x1201 || m==0x120a || m==0x1203 || m==0x120b || m==0x1204 || m==0x120c){
@@ -241,7 +242,7 @@ std::optional<std::uint64_t> WindowsServices::gui_header_message(GuestMemory& me
 bool WindowsServices::begin_gui_header(GuestState& state,GuestMemory& memory,const GuiMessage& message,bool wide){
     auto& w=gui_.windows.at(message.window);layout_gui_header(message.window);auto& control=header(w);auto& items=columns(gui_,w);const ItemAbi abi(x86_);const auto m=message.message;
     GuiControlOperation op;op.message=message;op.thread=threads_.current;op.wide=wide;op.header.emplace();auto& request=*op.header;
-    const auto read=[&](std::uint64_t p,bool unicode){return p?(unicode?read_utf16(memory,GuestAddress{p},65535):utf8_to_utf16_lossy(read_ansi(memory,p,65535))):std::u16string{};};
+    const auto read=[&](std::uint64_t p,bool unicode){return p?(unicode?read_utf16(memory,GuestAddress{p},65535):ansi_to_utf16_lossy(read_ansi(memory,p,65535))):std::u16string{};};
     const auto done=[&](std::uint64_t value=0){complete_call(state,memory,value);return true;};
     const auto cancel=[&]{control.pressed=0;control.overflow_pressed=false;control.tracking=control.dragging=false;control.drag_order=-1;if(gui_.capture==message.window)gui_.capture=0;present_gui(message.window);};
     const auto filter_event=m==0x1217 || m==0x1218 || m==0x10018 || m==0x10019 || (m==0x111 && message.lparam==control.filter_editor);
@@ -518,7 +519,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_header(GuestState& stat
     }
     if(request.kind==Kind::Display){
         if(op.phase==1){const auto item=std::find_if(items.begin(),items.end(),[&](const auto& i){return i.identity==op.item;});if(item!=items.end() && item->revision==request.revision){
-            const auto mask=static_cast<std::uint32_t>(memory.load(GuestAddress{op.buffer+common.notify_size+4},32));if(mask&2U){const auto pointer=memory.load(GuestAddress{op.buffer+(x86_?20U:32U)},abi.bits);item->text=pointer?(w.list_unicode?read_utf16(memory,GuestAddress{pointer},2048):utf8_to_utf16_lossy(read_ansi(memory,pointer,4096))):std::u16string{};if((mask|request.mask)&64U)item->text_callback=false;}
+            const auto mask=static_cast<std::uint32_t>(memory.load(GuestAddress{op.buffer+common.notify_size+4},32));if(mask&2U){const auto pointer=memory.load(GuestAddress{op.buffer+(x86_?20U:32U)},abi.bits);item->text=pointer?(w.list_unicode?read_utf16(memory,GuestAddress{pointer},2048):ansi_to_utf16_lossy(read_ansi(memory,pointer,4096))):std::u16string{};if((mask|request.mask)&64U)item->text_callback=false;}
             if(mask&32U){item->image=integer(memory.load(GuestAddress{op.buffer+(x86_?28U:44U)},32));if((mask|request.mask)&64U)item->image_callback=false;}
         }++op.start;op.phase=0;}
         while(op.start<op.identities.size()){

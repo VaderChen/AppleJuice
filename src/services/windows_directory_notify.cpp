@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "directory_watch.hpp"
@@ -35,7 +36,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_directory_notification(Gues
     if(symbol.starts_with("FindFirstChangeNotification")){
         if(!arg(0) || !u32(2) || (u32(2)&~0x17fU))return fail(87,true);
         if(change_notifications_.size()>=64)return fail(8,true);
-        const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+        const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
         const auto info=filesystem_.information(path);if(info.error)return fail(info.error,true);
         if(!(info.metadata.attributes&0x10))return fail(267,true);
         const auto opened=filesystem_.open_directory_observer(path);if(opened.error)return fail(opened.error,true);

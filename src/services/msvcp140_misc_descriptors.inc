@@ -26,7 +26,7 @@
 {"msvcp140.dll","??4_Timevec@std@@QEAAAEAV01@AEBV01@@Z",2},{"msvcp140.dll","??4_Timevec@std@@QAEAAV01@ABV01@@Z",1},
 {"msvcp140.dll","?_Getptr@_Timevec@std@@QEBAPEAXXZ",1},{"msvcp140.dll","?_Getptr@_Timevec@std@@QBEPAXXZ",0},
 {"msvcp140.dll","??_F_Timevec@std@@QEAAXXZ",1},{"msvcp140.dll","??_F_Timevec@std@@QAEXXZ",0},
-{"msvcp140.dll","?_Gettnames@_Locinfo@std@@QEBA?AV_Timevec@2@XZ",2},{"msvcp140.dll","?_Gettnames@_Locinfo@std@@QBE?AV_Timevec@2@XZ",1},
+{"msvcp140.dll","?_Gettnames@_Locinfo@std@@QEBA?AV_Timevec@2@XZ",2},{"msvcp140.dll","?_Gettnames@_Locinfo@std@@QBE?AV_Timevec@2@XZ",1},{"msvcp140.dll","?_W_Gettnames@_Locinfo@std@@QEBA?AV_Timevec@2@XZ",2},{"msvcp140.dll","?_W_Gettnames@_Locinfo@std@@QBE?AV_Timevec@2@XZ",1},
 {"msvcp140.dll","??0_Winit@std@@QEAA@XZ",1},{"msvcp140.dll","??0_Winit@std@@QAE@XZ",0},
 {"msvcp140.dll","??1_Winit@std@@QEAA@XZ",1},{"msvcp140.dll","??1_Winit@std@@QAE@XZ",0},
 {"msvcp140.dll","??4_Winit@std@@QEAAAEAV01@AEBV01@@Z",2},{"msvcp140.dll","??4_Winit@std@@QAEAAV01@ABV01@@Z",1},

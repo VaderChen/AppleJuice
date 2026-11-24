@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include <functional>
@@ -140,7 +141,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_advapi32_extra(GuestState& 
         if(name=="PathUnExpandEnvStringsA" || name=="PathUnExpandEnvStringsW"){
             // (path, buffer, cch)：沒有可換的或緩衝不足回 FALSE。
             const bool wide=name.ends_with('W');if(!arg(0) || !arg(1))return done(0);
-            const auto path=wide?read_utf16(memory,GuestAddress{arg(0)},32767):utf8_to_utf16_lossy(read_ansi(memory,arg(0),32767));const auto result=unexpand(path);if(!result)return done(0);
+            const auto path=wide?read_utf16(memory,GuestAddress{arg(0)},32767):ansi_to_utf16_lossy(read_ansi(memory,arg(0),32767));const auto result=unexpand(path);if(!result)return done(0);
             if(wide){if(result->size()+1>static_cast<std::uint32_t>(arg(2)))return done(0);for(std::size_t i=0;i<result->size();++i)memory.store(GuestAddress{arg(1)+i*2},16,(*result)[i]);memory.store(GuestAddress{arg(1)+result->size()*2},16,0);return done(1);}
             const auto narrow=utf16_to_utf8_lossy(*result);if(narrow.size()+1>static_cast<std::uint32_t>(arg(2)))return done(0);
             memory.write(GuestAddress{arg(1)},std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(narrow.c_str()),narrow.size()+1));return done(1);
@@ -230,7 +231,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_advapi32_extra(GuestState& 
                 const auto kind=static_cast<std::uint32_t>(memory.load(GuestAddress{type},32));
                 if(kind==4 || kind==3)return done(memory.load(GuestAddress{data},32)!=0);
                 if(kind!=1 && kind!=2)return done(fallback);
-                auto text=wide?read_utf16(memory,GuestAddress{data},31):utf8_to_utf16_lossy(read_ansi(memory,data,62));for(auto& c:text)c=unicode_case_unit(c,false);
+                auto text=wide?read_utf16(memory,GuestAddress{data},31):ansi_to_utf16_lossy(read_ansi(memory,data,62));for(auto& c:text)c=unicode_case_unit(c,false);
                 if(text==u"yes" || text==u"true" || text==u"1")return done(1);if(text==u"no" || text==u"false" || text==u"0")return done(0);return done(fallback);
             }
             if(name=="SHRegGetIntW"){
@@ -262,7 +263,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_advapi32_extra(GuestState& 
             }
             if(name.starts_with("SHRegSetPath")){
                 // (hkey, subkey, value, path, flags)：可還原成環境變數形式時存成 REG_EXPAND_SZ，否則 REG_SZ。
-                if(!arg(3))return done(87);const auto text=wide?read_utf16(memory,GuestAddress{arg(3)},260):utf8_to_utf16_lossy(read_ansi(memory,arg(3),260));
+                if(!arg(3))return done(87);const auto text=wide?read_utf16(memory,GuestAddress{arg(3)},260):ansi_to_utf16_lossy(read_ansi(memory,arg(3),260));
                 std::uint32_t type=1;auto stored=text;if(const auto shorter=unexpand(text)){stored=*shorter;type=2;}
                 const auto bytes=wide_copy(stored);
                 if(wide)return done(reg("RegSetKeyValueW",{arg(0),arg(1),arg(2),type,bytes,(stored.size()+1)*2}));
@@ -356,7 +357,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_advapi32_extra(GuestState& 
         if(name=="RegCopyTreeW" || name=="RegCopyTreeA"){
             // (Source, SubKey 可為 NULL, Destination)：遞迴複製值與子機碼到目的機碼；目的已有的同名值會被覆寫。
             std::uint64_t subkey=0;
-            if(arg(1)){const auto text=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)},32767):utf8_to_utf16_lossy(read_ansi(memory,arg(1),65534));subkey=wide_copy(text);}
+            if(arg(1)){const auto text=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)},32767):ansi_to_utf16_lossy(read_ansi(memory,arg(1),65534));subkey=wide_copy(text);}
             const auto handles=allocate(4*16);
             std::uint64_t source=arg(0);bool opened=false;
             if(subkey){if(const auto error=reg("RegOpenKeyExW",{arg(0),subkey,0,0x20019U,handles}))return done(error);source=memory.load(GuestAddress{handles},bits);opened=true;}

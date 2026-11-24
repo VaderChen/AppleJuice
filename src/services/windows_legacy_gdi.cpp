@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "adapter_multisampling.hpp"
 #include "d3d9_format_contract.h"
 #include "gpu_budget_request.hpp"
@@ -763,10 +764,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
             else if(!path)return fail(87);
             if(copy && path){
                 // 複製到磁碟：與 CloseMetaFile 共用寫檔流程，標頭改為磁碟 metafile。
-                bytes[0]=2;bytes[1]=0;if(!write_guest_file(state,memory,wide?read_utf16(memory,GuestAddress{path}):utf8_to_utf16(read_ansi(memory,path)),bytes))return finish(0);
+                bytes[0]=2;bytes[1]=0;if(!write_guest_file(state,memory,wide?read_utf16(memory,GuestAddress{path}):ansi_to_utf16(read_ansi(memory,path)),bytes))return finish(0);
             }else if(path){
                 // 磁碟 metafile 經一般檔案服務讀入，沿用映射、權限與共用模式（與 GetEnhMetaFile 共用）。
-                auto loaded=read_guest_file(state,memory,wide?read_utf16(memory,GuestAddress{path}):utf8_to_utf16(read_ansi(memory,path)),18,metafile_limit);
+                auto loaded=read_guest_file(state,memory,wide?read_utf16(memory,GuestAddress{path}):ansi_to_utf16(read_ansi(memory,path)),18,metafile_limit);
                 if(!loaded)return finish(0);bytes=std::move(*loaded);
                 if(!valid_windows_metafile(bytes))return fail(13);bytes.resize(windows_metafile_size(bytes));
             }

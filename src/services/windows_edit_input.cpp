@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -104,7 +105,7 @@ std::optional<std::uint64_t> WindowsServices::gui_edit_input(GuestMemory& memory
     }
     if(code==0xb8)return window.edit_modified?1:0;
     if(code==0xb9){window.edit_modified=message.wparam!=0;return 0;}
-    if(code==0xc2){replace(message.lparam?(wide?read_utf16(memory,GuestAddress{message.lparam}):utf8_to_utf16_lossy(read_ansi(memory,message.lparam))):std::u16string{},message.wparam!=0);return 0;}
+    if(code==0xc2){replace(message.lparam?(wide?read_utf16(memory,GuestAddress{message.lparam}):ansi_to_utf16_lossy(read_ansi(memory,message.lparam))):std::u16string{},message.wparam!=0);return 0;}
     if(code==0xc6)return window.edit_undo?1:0;
     if(code==0xc7 || code==0x304)return undo()?1:0;
     if(code==0xcd){window.edit_undo.reset();return 0;}

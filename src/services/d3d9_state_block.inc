@@ -23,7 +23,7 @@
         const std::set<unsigned> vertex_render{22,34,35,36,37,38,48,137,139,140,141,142,143,145,146,147,148,151,152,154,155,156,157,158,159,160,161,162,163,166,167,170,172,173,178,179,180,181,182,183,184};
         for(const auto& [key,v]:device.render){(void)v;if(type==1 || (type==3?vertex_render.contains(key):(!vertex_render.contains(key) || key==36 || key==37 || key==38 || key==142 || (key>=145 && key<=148))))mask.emplace(0,key);}
         for(const auto& [key,v]:device.sampler){(void)v;if(type==1 || (type==3?(key/32>=16 || key%32==13):(key/32<16 && key%32!=13)))mask.emplace(1,key);}
-        for(const auto& [key,v]:device.stage){(void)v;if(type==1 || (type==3?(key%32==11 || key%32==24):true))mask.emplace(2,key);}
+        for(const auto& [key,v]:device.stage){(void)v;if(type==1 || (type==3?(key%d3d9_fixed::stage_stride==11 || key%d3d9_fixed::stage_stride==24):true))mask.emplace(2,key);}
         if(type==1){for(const auto& [key,v]:device.transforms){(void)v;mask.emplace(3,key);}for(unsigned i=0;i<8;++i)mask.emplace(4,i);for(unsigned i=0;i<15;++i)mask.emplace(15,i);for(unsigned i=0;i<16;++i)mask.emplace(16,i);}
         else if(type==2){mask.emplace(4,1);mask.emplace(4,3);}else {mask.emplace(4,0);mask.emplace(4,2);}
         for(unsigned index=0;index<19;++index)if(type==1 || (type==2?index<15:index>=15))mask.emplace(14,index);

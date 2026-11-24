@@ -146,7 +146,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 
 已加入 AppleJuice 程式庫的遊戲，其 EXE 個別儲存的兩項顯示設定優先；尚未加入的遊戲沿用啟動器目前的顯示設定。空間混音為全域偏好。此流程同樣適用其他啟動器，不以遊戲名稱判斷。
 
-## 實測紀錄 / 2026-11-22 / 共 28 款遊戲
+## 實測紀錄 / 2026-11-24 / 共 34 款遊戲
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="無法運作、處理中" title="無法運作、處理中"> 無法運作、處理中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="可開啟" title="可開啟"> 可開啟　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="效率不高" title="效率不高"> 效率不高　<img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> 運作良好 (MetalFX)　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="運作良好" title="運作良好"> 運作良好
 
@@ -154,6 +154,8 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | --- | --- | --- | :---: |
 | 7-Zip | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 七龍珠Z 卡卡洛特 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
+| 三國志VII with 威力加強版 | x86 | GDI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
+| 三國志XII with 威力加強版 | x86 | GDI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 不谙世事的猫艾露莎 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 天穗之咲稻姬 | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 古墓奇兵（2013） | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
@@ -175,9 +177,14 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 古墓奇兵：崛起 | x64 | D3D11 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> |
 | 古墓奇兵：暗影 | x64 | D3D12 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> |
 | 光與影：33號遠征隊 | x64 | D3D11（Unreal Engine 5） | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> |
+| 對馬戰鬼 導演剪輯版 | x64 | D3D12 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> |
 | 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
-| 三國志X with 威力加強版 | x86 | 未知 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 三國志VIII with 威力加強版 | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 三國志IX with 威力加強版 | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 三國志X with 威力加強版 | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 三國志XI with 威力加強版 | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 巫師三：狂獵 次世代版 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 電馭叛客 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 緋夜傳奇 | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
@@ -188,7 +195,6 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 死亡擱淺 DIRECTOR'S CUT | x64 | D3D12 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可開啟" title="可開啟"> |
 | 特警 Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可開啟" title="可開啟"> |
 | 女神異聞錄5 皇家版 | x64 | 未知（保護層） | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="無法運作、處理中" title="無法運作、處理中"> |
-| 巫師三：狂獵 次世代版 | x64 | D3D12 | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="無法運作、處理中" title="無法運作、處理中"> |
 | 惡靈古堡 村莊 | x64 | D3D12（RE Engine） | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="無法運作、處理中" title="無法運作、處理中"> |
 
 「運作良好 (MetalFX)」表示開啟 Launcher 的畫面內插或 2 倍放大（MetalFX）後達到運作良好標準；未開啟時仍屬效率不高。

@@ -1,4 +1,5 @@
 #include "x64arm/native_desktop_notifications.hpp"
+#include "application.hpp"
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <algorithm>
@@ -8,7 +9,8 @@
 namespace x64arm { NSImage* native_gui_icon_image(const GuiIcon&); }
 namespace {
 NSString* text(const std::u16string& value){return [[NSString alloc] initWithCharacters:reinterpret_cast<const unichar*>(value.data()) length:value.size()];}
-std::array<std::int32_t,2> point(){const auto p=NSEvent.mouseLocation;return {static_cast<std::int32_t>(p.x),static_cast<std::int32_t>(NSMaxY(NSScreen.screens.firstObject.frame)-p.y)};}
+// 系統匣事件的游標位置：與 GUI 視窗同一個客體座標基準（背景螢幕模式不是主螢幕），應用程式依此開的選單才會出現在點擊處。
+std::array<std::int32_t,2> point(){return x64arm::native_guest_point(NSEvent.mouseLocation);}
 }
 @interface X64ArmStatusEvents : NSView {
 @public
@@ -23,7 +25,7 @@ std::array<std::int32_t,2> point(){const auto p=NSEvent.mouseLocation;return {st
 - (void)send:(std::uint32_t)code{if(events)events->push_back({token,code,point()});}
 - (void)sendKey:(std::uint32_t)code{
     const auto anchor=[self.window convertPointToScreen:[self convertPoint:NSMakePoint(0,NSMaxY(self.bounds)) toView:nil]];
-    if(events)events->push_back({token,code,{static_cast<std::int32_t>(anchor.x),static_cast<std::int32_t>(NSMaxY(NSScreen.screens.firstObject.frame)-anchor.y)}});
+    if(events)events->push_back({token,code,x64arm::native_guest_point(anchor)});
 }
 - (void)updateTrackingAreas{
     if(tracking)[self removeTrackingArea:tracking];

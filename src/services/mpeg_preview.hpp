@@ -3,6 +3,7 @@
 #include "avi_frame_image.hpp"
 #include "video_preview.hpp"
 #include "x64arm/readonly_files.hpp"
+#include <array>
 #include <cstring>
 #include <map>
 
@@ -14,6 +15,7 @@ extern "C" {
 namespace x64arm {
 
 // libavformat 只從沙箱已授權的描述元取得內容。視訊及音訊交由共用的 FFmpeg 解碼後端。
+// 容器：MPEG 程式／基本串流、MP3 與 ASF（WMV／WMA，MCI MPEGVideo 與 DirectShow 的 Windows Media 檔案）。
 class MpegPreview final : public VideoPreview {
 public:
     static std::unique_ptr<MpegPreview> open(const OpenHostFile& file){
@@ -138,10 +140,12 @@ private:
         if(video_index>=0){
             AVStream& stream=*input->streams[static_cast<unsigned>(video_index)];
             const auto& format=*stream.codecpar;
-            if((format.codec_id==AV_CODEC_ID_MPEG1VIDEO || format.codec_id==AV_CODEC_ID_MPEG2VIDEO) &&
-               format.width>0 && format.height>0 && std::int64_t{format.width}*format.height<=16*1024*1024){
+            const std::uint32_t fourcc=format.codec_id==AV_CODEC_ID_MPEG1VIDEO?0x3147504dU:format.codec_id==AV_CODEC_ID_MPEG2VIDEO?0x3247504dU:
+                format.codec_id==AV_CODEC_ID_WMV1?0x31564d57U:format.codec_id==AV_CODEC_ID_WMV2?0x32564d57U:format.codec_id==AV_CODEC_ID_WMV3?0x33564d57U:
+                format.codec_id==AV_CODEC_ID_VC1?0x31435657U:0U;
+            if(fourcc && format.width>0 && format.height>0 && std::int64_t{format.width}*format.height<=16*1024*1024){
                 visual_stream=video_index;
-                video_.fourcc=format.codec_id==AV_CODEC_ID_MPEG1VIDEO?0x3147504dU:0x3247504dU;
+                video_.fourcc=fourcc;
                 video_.width=static_cast<unsigned>(format.width);
                 video_.height=static_cast<unsigned>(format.height);
                 if(format.extradata_size>0)video_.extra.assign(format.extradata,format.extradata+format.extradata_size);
@@ -151,13 +155,20 @@ private:
         }
         if(audio_index>=0){
             const auto& format=*input->streams[static_cast<unsigned>(audio_index)]->codecpar;
-            if((format.codec_id==AV_CODEC_ID_MP2 || format.codec_id==AV_CODEC_ID_MP3) &&
-                format.sample_rate>=8000 && format.sample_rate<=192000 &&
-                (format.ch_layout.nb_channels==1 || format.ch_layout.nb_channels==2)){
+            const std::uint16_t tag=format.codec_id==AV_CODEC_ID_MP2?0x50:format.codec_id==AV_CODEC_ID_MP3?0x55:format.codec_id==AV_CODEC_ID_WMAV1?0x160:
+                format.codec_id==AV_CODEC_ID_WMAV2?0x161:format.codec_id==AV_CODEC_ID_WMAPRO?0x162:format.codec_id==AV_CODEC_ID_WMALOSSLESS?0x163:
+                format.codec_id==AV_CODEC_ID_WMAVOICE?0x0a:0;
+            if(tag && format.sample_rate>=8000 && format.sample_rate<=192000 &&
+                format.ch_layout.nb_channels>=1 && format.ch_layout.nb_channels<=8){
                 sound_stream=audio_index;
-                sound.format_tag=format.codec_id==AV_CODEC_ID_MP2?0x50:0x55;
+                sound.format_tag=tag;
                 sound.sample_rate=static_cast<unsigned>(format.sample_rate);
                 sound.channels=static_cast<std::uint16_t>(format.ch_layout.nb_channels);
+                // Windows Media 音訊需要 WAVEFORMATEX 的封包大小、位元率與編碼器私有資料。
+                sound.block_align=static_cast<std::uint16_t>(std::clamp(format.block_align,0,65535));
+                sound.bytes_per_second=static_cast<std::uint32_t>(std::clamp<std::int64_t>(format.bit_rate/8,0,UINT32_MAX));
+                sound.bits=static_cast<std::uint16_t>(std::clamp(format.bits_per_coded_sample,0,65535));
+                if(format.extradata_size>0)sound.extra.assign(format.extradata,format.extradata+format.extradata_size);
             }
         }
         if(visual_stream<0 && sound_stream<0)return false;
@@ -217,15 +228,22 @@ private:
         AudioTrack audio{{2,format.sample_rate,32,8,true},{}};
         const auto append=[&](std::vector<media::DecodedAudio> blocks){
             for(const auto& block:blocks){
-                if(block.rate!=format.sample_rate || (block.channels!=1 && block.channels!=2))
+                if(block.rate!=format.sample_rate || !block.channels || block.channels>8)
                     throw std::invalid_argument("MPEG 音訊格式於串流中變更");
                 if(block.frames()>(pcm_limit-audio.pcm.size())/8)throw std::length_error("MPEG 解碼音訊超出預覽容量");
                 const auto offset=audio.pcm.size();
                 audio.pcm.resize(offset+block.frames()*8);
                 if(block.channels==2)std::memcpy(audio.pcm.data()+offset,block.samples.data(),block.frames()*8);
-                else for(std::size_t frame=0;frame<block.frames();++frame)
+                else if(block.channels==1)for(std::size_t frame=0;frame<block.frames();++frame)
                     for(unsigned channel=0;channel<2;++channel)
                         std::memcpy(audio.pcm.data()+offset+frame*8+channel*4,&block.samples[frame],4);
+                else for(std::size_t frame=0;frame<block.frames();++frame){
+                    // 多聲道（WMA Pro）縮混為立體聲：前左右加上 -3 dB 的中央聲道（WAVEFORMATEXTENSIBLE 預設順序 FL、FR、FC…）。
+                    const float* in=&block.samples[frame*block.channels];
+                    const float center=block.channels>=3?in[2]*0.70710678F:0.F;
+                    const std::array<float,2> out{in[0]+center,in[1]+center};
+                    std::memcpy(audio.pcm.data()+offset+frame*8,out.data(),8);
+                }
             }
         };
         const auto padding=static_cast<std::uint64_t>(packets.front().time)*format.sample_rate/10000000;

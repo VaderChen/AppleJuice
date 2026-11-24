@@ -1,0 +1,7 @@
+{
+  "version": "8.23.0",
+  "upstream_url": "https://curl.se/download/curl-8.23.0.tar.gz",
+  "upstream_sha256": "e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49",
+  "policy": "保留原始編譯來源、建置規則與授權；只啟用 HTTP／HTTPS，TLS 使用內建 OpenSSL。",
+  "build_configuration": "static, HTTP_ONLY, CURL_USE_OPENSSL, zlib, GSS-API, no nghttp2／libpsl／libssh2／IDN, no default CA bundle"
+}

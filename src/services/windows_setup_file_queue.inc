@@ -211,7 +211,7 @@
             }
             const bool unicode=!name.ends_with('A');
             const auto encode=[unicode](const std::u16string& value){
-                std::vector<std::uint8_t> bytes;if(unicode)bytes=utf16_bytes(value);else{const auto narrow=utf16_to_utf8(value);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}return bytes;};
+                std::vector<std::uint8_t> bytes;if(unicode)bytes=utf16_bytes(value);else{const auto narrow=utf16_to_ansi(value);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}return bytes;};
             const auto interactive=!(setup_inf_->global_flags&4U);
             if(name.starts_with("SetupPromptForDisk") || name.starts_with("SetupCopyError") || name.starts_with("SetupDeleteError") || name.starts_with("SetupRenameError")){
                 // 提示與錯誤對話框以 MessageBoxW 呈現（中止／重試／略過）；回傳 DPROMPT_*。非互動模式回 DPROMPT_CANCEL 與 ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION。
@@ -289,7 +289,7 @@
                     const auto box=resolve("user32.dll","MessageBoxW").value;const auto paths=p1;const auto owner=callback.owner;
                     return nested_continuation(state,memory,"SetupQueueOverwrite",[this,service,box,owner,paths,unicode](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
                         const WindowsCall inner(s,m,service);const auto target_at=m.load(GuestAddress{paths},x86_?32:64);
-                        const auto target=target_at?(unicode?read_utf16(m,GuestAddress{target_at},32768):utf8_to_utf16(read_ansi(m,target_at,32768))):std::u16string{};
+                        const auto target=target_at?(unicode?read_utf16(m,GuestAddress{target_at},32768):ansi_to_utf16(read_ansi(m,target_at,32768))):std::u16string{};
                         std::uint32_t pressed=0;
                         {GuestScratch scratch(*this,m,s);const auto text=scratch.text(u"The file \""+target+u"\" already exists or is newer than the file being copied.\n\nOverwrite it?"),caption=scratch.text(u"Confirm File Replace");
                          if(!text || !caption)throw std::bad_alloc{};pressed=co_await service_callback::call(box,{owner,text,caption,0x34});}
@@ -323,12 +323,12 @@
                             if(notification==0xe){
                                 const auto path=put(strings[1]);const auto out=allocate_heap(m,max_path*(unicode?2:1));if(!out)throw std::bad_alloc{};blocks.push_back(out);
                                 const auto result=co_await service_callback::call(dialog,{owner,0,strings[0].empty()?0:put(strings[0]),path,put(strings[2]),strings[3].empty()?0:put(strings[3]),values[0],out,max_path,0});
-                                if(result==prompt_success){chosen=unicode?read_utf16(m,GuestAddress{out},max_path):utf8_to_utf16(read_ansi(m,out,max_path));answer=chosen==strings[1]?op_doit:op_newpath;}
+                                if(result==prompt_success){chosen=unicode?read_utf16(m,GuestAddress{out},max_path):ansi_to_utf16(read_ansi(m,out,max_path));answer=chosen==strings[1]?op_doit:op_newpath;}
                                 else answer=result==prompt_skip?op_skip:op_abort;
                             }else if(notification==0xd){
                                 const auto out=allocate_heap(m,max_path*(unicode?2:1));if(!out)throw std::bad_alloc{};blocks.push_back(out);
                                 const auto result=co_await service_callback::call(dialog,{owner,0,0,put(strings[0]),put(strings[1]),put(strings[2]),values[0],values[1],out,max_path,0});
-                                if(result==prompt_success){chosen=unicode?read_utf16(m,GuestAddress{out},max_path):utf8_to_utf16(read_ansi(m,out,max_path));answer=chosen==strings[0]?op_doit:op_newpath;}
+                                if(result==prompt_success){chosen=unicode?read_utf16(m,GuestAddress{out},max_path):ansi_to_utf16(read_ansi(m,out,max_path));answer=chosen==strings[0]?op_doit:op_newpath;}
                                 else answer=result==prompt_skip?op_skip:op_abort;
                             }else{
                                 std::uint32_t result=0;
@@ -413,7 +413,7 @@
                         const auto block=[&](std::size_t length)->std::uint64_t{const auto at=allocate_heap(m,length);if(!at)throw std::bad_alloc{};blocks.push_back(at);std::vector<std::uint8_t> zero(length);m.write(GuestAddress{at},zero);return at;};
                         const auto paths=[&](const Step& step,std::uint32_t error,std::uint32_t flags){const auto at=block(2*size+8);m.store(GuestAddress{at},bits,put(step.target));m.store(GuestAddress{at+size},bits,put(step.source));
                             m.store(GuestAddress{at+2*size},32,error);m.store(GuestAddress{at+2*size+4},32,flags);return at;};
-                        const auto read_back=[&](std::uint64_t at){return unicode?read_utf16(m,GuestAddress{at},max_path):utf8_to_utf16(read_ansi(m,at,max_path));};
+                        const auto read_back=[&](std::uint64_t at){return unicode?read_utf16(m,GuestAddress{at},max_path):ansi_to_utf16(read_ansi(m,at,max_path));};
                         const auto host=host_path;const auto exists_file=file_present;const auto compare=version_compare;
                         bool aborted=false,modified=false;std::uint32_t failure=0;
                         const auto notify=[&](std::uint32_t code,std::uint64_t p1,std::uint64_t p2){return service_callback::call(handler,{context,code,p1,p2});};

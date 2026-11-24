@@ -30,7 +30,7 @@
                                 }
                             }else{
                                 driver->alias=symbol.ends_with('W')?read_utf16(m,GuestAddress{call(2)},1024):
-                                                                   utf8_to_utf16_lossy(read_ansi(m,call(2),1024));
+                                                                   ansi_to_utf16_lossy(read_ansi(m,call(2),1024));
                                 if(driver->alias.empty() || driver->alias.size()>=1024)co_return finish(11);
                                 const auto machine=x86_?UINT64_C(0x80000002):UINT64_C(0xffffffff80000002);
                                 const auto key_slot=buffer(unit),size=buffer(4),type=buffer(4);

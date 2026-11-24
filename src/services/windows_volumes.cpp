@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
@@ -112,10 +113,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
     if(symbol.starts_with("NtNotifyChangeDirectory"))return invoke_directory_notification(state,memory,service);
     const bool wide = symbol.back() == 'W' || symbol.starts_with("_wtempnam") || symbol.starts_with("_wtmpnam");
     const auto u32 = [&](unsigned i) { return static_cast<std::uint32_t>(arg(i)); };
-    const auto text = [&](unsigned i) { return wide ? utf16_to_utf8(read_utf16(memory, GuestAddress{arg(i)})) : read_ansi(memory, arg(i)); };
+    const auto text = [&](unsigned i) { return wide ? utf16_to_utf8(read_utf16(memory, GuestAddress{arg(i)})) : ansi_to_utf8(read_ansi(memory, arg(i))); };
     const auto encoded = [&](std::u16string_view value) {
         if (wide) return utf16_bytes(value);
-        const auto ansi = utf16_to_utf8(value); std::vector<std::uint8_t> out(ansi.begin(), ansi.end()); out.push_back(0); return out;
+        const auto ansi = utf16_to_ansi(value); std::vector<std::uint8_t> out(ansi.begin(), ansi.end()); out.push_back(0); return out;
     };
     std::uint64_t result = 0;
     const auto fail = [&](std::uint32_t code) { last_error_ = code; result = 0; };

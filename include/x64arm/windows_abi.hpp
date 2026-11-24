@@ -229,6 +229,7 @@ std::span<const WindowsServiceDescriptor> ole_picture_service_descriptors();
 std::span<const WindowsServiceDescriptor> dxdiag_service_descriptors();
 std::span<const WindowsServiceDescriptor> crt_console_read_service_descriptors();
 std::span<const WindowsServiceDescriptor> com_moniker_service_descriptors();
+std::span<const WindowsServiceDescriptor> directshow_service_descriptors();
 std::span<const WindowsServiceDescriptor> ole_advise_service_descriptors();
 // 由 windows_power.cpp 轉到 invoke_power_schemes 的既有方案查詢入口（描述元仍在 environment 表）。
 bool power_scheme_query_symbol(std::string_view symbol);

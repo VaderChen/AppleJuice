@@ -1,6 +1,7 @@
 // mscms.dll 設定檔與裝置管理：開啟／建立／關閉設定檔（HPROFILE）、標頭與 tag 元素讀寫、驗證，
 // 安裝／解除安裝、裝置關聯、列舉、色彩目錄、標準色彩空間、CMM 登錄與 WCS 預設查詢，以及由 LOGCOLORSPACE 產生 ICC 設定檔。
 // 與 gdi32 ICM 共用 IcmStore；色彩轉換（CreateColorTransform 等）另屬轉換家族。只支援本機（pMachineName 為 NULL）。
+#include "ansi_codepage.hpp"
 #include "windows_icm_store.hpp"
 #include <algorithm>
 #include <cmath>
@@ -28,8 +29,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_mscms(GuestState& state,Gue
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto fail=[&](std::uint32_t error){last_error_=error;return finish(0);};
-    const auto text=[&](std::uint64_t pointer,bool unicode){return unicode?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16(read_ansi(memory,pointer));};
-    const auto encode=[&](std::u16string_view value,bool unicode){std::vector<std::uint8_t> bytes;if(unicode)bytes=utf16_bytes(value);else {const auto narrow=utf16_to_utf8(value);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}return bytes;};
+    const auto text=[&](std::uint64_t pointer,bool unicode){return unicode?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16(read_ansi(memory,pointer));};
+    const auto encode=[&](std::u16string_view value,bool unicode){std::vector<std::uint8_t> bytes;if(unicode)bytes=utf16_bytes(value);else {const auto narrow=utf16_to_ansi(value);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}return bytes;};
     // 輸出字串：所需位元組數寫回 *size，緩衝區為 NULL 或不足時回 ERROR_INSUFFICIENT_BUFFER。
     const auto output=[&](std::uint64_t buffer,std::uint64_t size,const std::vector<std::uint8_t>& bytes){
         if(!size)return fail(87);const auto capacity=static_cast<std::uint32_t>(memory.load(GuestAddress{size},32));memory.store(GuestAddress{size},32,bytes.size());

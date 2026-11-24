@@ -16,7 +16,7 @@
                 try{const auto ptr=allocate_heap(memory,std::max<std::size_t>(1,data.size()));if(!ptr)throw std::bad_alloc{};id->allocations.push_back(ptr);id->mapped=ptr;id->sequence=data.size();memory.write(GuestAddress{ptr},data);write_pointer(arg(3),id->root);}
                 catch(...){release(id->root);throw;}
             }else{
-                const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(3)})):read_ansi(memory,arg(3));
+                const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(3)})):ansi_to_utf8(read_ansi(memory,arg(3)));
                 require(!path.empty());
                 auto file=filesystem_.open_host(path,0x40000000U,2,0x80,1);
                 if(file.error)result=0x80070000U|(file.error&0xffffU);

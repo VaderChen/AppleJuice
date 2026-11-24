@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 
@@ -15,7 +16,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_encryption(GuestState&
     try{
         if(!arg(0) || (decrypt?arg(1)!=0:arg(1)==0))return finish(false,87);
         if(!decrypt)memory.check(GuestAddress{arg(1)},4,Access::Write);
-        const auto path=service.symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+        const auto path=service.symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
         const auto info=filesystem_.target_information(path);if(info.error)return finish(false,info.error);
         const auto attributes=info.metadata.attributes;
         if(!decrypt){

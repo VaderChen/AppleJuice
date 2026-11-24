@@ -71,14 +71,14 @@
         const auto size=static_cast<std::uint32_t>(arg(1));return finish(arg(0)?reallocate_heap(memory,arg(0),size,state):allocate_heap(memory,size));
     }
     if(name=="DuplicateString")return finish(arg(0)?wide_copy(read_utf16(memory,GuestAddress{arg(0)},32768)):0);
-    if(name=="MultiByteToUnicode")return finish(arg(0)?wide_copy(utf8_to_utf16(read_ansi(memory,arg(0),65536))):0);
+    if(name=="MultiByteToUnicode")return finish(arg(0)?wide_copy(ansi_to_utf16(read_ansi(memory,arg(0),65536))):0);
     if(name=="UnicodeToMultiByte"){
         if(!arg(0))return finish(0);const auto text=utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)},32768));std::vector<std::uint8_t> bytes(text.begin(),text.end());bytes.push_back(0);return finish(guest_copy(bytes));
     }
     if(name=="CaptureStringArg" || name=="CaptureAndConvertAnsiArg"){
         // (String, Captured*) → Win32 錯誤碼：成功時 Captured 為以 MyFree 釋放的 Unicode 複本。
         if(!arg(0) || !arg(1))return finish(87);
-        const auto text=name=="CaptureStringArg"?read_utf16(memory,GuestAddress{arg(0)},32768):utf8_to_utf16(read_ansi(memory,arg(0),65536));
+        const auto text=name=="CaptureStringArg"?read_utf16(memory,GuestAddress{arg(0)},32768):ansi_to_utf16(read_ansi(memory,arg(0),65536));
         memory.check(GuestAddress{arg(1)},unit,Access::Write);memory.store(GuestAddress{arg(1)},width,wide_copy(text));return finish(0);
     }
     if(name=="IsUserAdmin" || name=="pSetupIsUserAdmin"){

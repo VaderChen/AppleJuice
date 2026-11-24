@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
@@ -151,7 +152,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_rpc_client(GuestState& stat
             if(!length)return done(rpc_invalid_parameter);
             const auto text=read_utf16_counted(memory,GuestAddress{buffer},static_cast<std::size_t>(std::min<std::uint64_t>(length,255)));
             if(wide){auto bytes=utf16_bytes(text);memory.write(GuestAddress{arg(1)},bytes);}
-            else {auto narrow=utf16_to_utf8(text);if(narrow.size()>255)narrow.resize(255);std::vector<std::uint8_t> bytes(narrow.begin(),narrow.end());bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);}
+            else {auto narrow=utf16_to_ansi(text);if(narrow.size()>255)narrow.resize(255);std::vector<std::uint8_t> bytes(narrow.begin(),narrow.end());bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);}
             return done(rpc_ok);
         }
         if(name=="I_RpcAllocate")return done(allocate_heap(memory,std::max<std::uint64_t>(static_cast<std::uint32_t>(arg(0)),1)));

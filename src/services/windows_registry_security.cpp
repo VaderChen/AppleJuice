@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/registry_store.hpp"
 #include "x64arm/unicode.hpp"
@@ -70,7 +71,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry_security(GuestStat
         const auto needed=key_flags(flags,setting);std::u16string path;
         if(named){
             if(!call(0))throw SecurityDescriptorError{87};
-            auto name=fold(wide?read_utf16(memory,GuestAddress{call(0)}):utf8_to_utf16(read_ansi(memory,call(0),32768)));
+            auto name=fold(wide?read_utf16(memory,GuestAddress{call(0)}):ansi_to_utf16(read_ansi(memory,call(0),32768)));
             const auto slash=name.find(u'\\');const auto prefix=name.substr(0,slash);
             const std::array<std::u16string_view,7> roots{u"classes_root",u"current_user",u"machine",u"users",u"",u"current_config",u""};
             const auto found=std::find(roots.begin(),roots.end(),prefix);if(found==roots.end() || prefix.empty())throw SecurityDescriptorError{123};

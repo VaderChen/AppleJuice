@@ -3,7 +3,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_guest_service(GuestState& s
     namespace gs=guest_service;
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');
     const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);
-    const auto read=[&](std::uint64_t at){return at?(wide?read_utf16(memory,GuestAddress{at},32768):utf8_to_utf16(read_ansi(memory,at,32768))):std::u16string{};};
+    const auto read=[&](std::uint64_t at){return at?(wide?read_utf16(memory,GuestAddress{at},32768):ansi_to_utf16(read_ansi(memory,at,32768))):std::u16string{};};
     const auto finish=[&](std::uint64_t value,std::uint32_t error=0){if(error)last_error_=error;arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto handle=[&](std::uint64_t id)->ServiceControlHandle&{const auto it=service_control_handles_.find(id);if(it==service_control_handles_.end() || it->second.owner!=process_id())throw SecurityDescriptorError{6};return it->second;};
     const auto require=[&](const ServiceControlHandle& object,std::uint32_t access){if(!object.guest || object.manager || object.status_handle)throw SecurityDescriptorError{6};if((object.access&access)!=access)throw SecurityDescriptorError{5};};

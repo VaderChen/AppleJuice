@@ -10,7 +10,7 @@
                             if(!args(2))co_return finish(0);
                             std::u16string description;
                             if(args(3))description=(flags&0x8000U)?read_utf16(m,GuestAddress{args(3)},256):
-                                utf8_to_utf16_lossy(read_ansi(m,args(3),256));
+                                ansi_to_utf16_lossy(read_ansi(m,args(3),256));
                             if(basic==4 && !installable_drivers_.contains(args(2)))co_return finish(0);
                             vfw::Driver driver{type,handler,basic==1?Backend::Callback:Backend::InstallableDriver,
                                 {},std::move(description),{},basic==1?args(2):0,basic==4?args(2):0};
@@ -27,7 +27,7 @@
                             co_return finish(0==co_await api("advapi32.dll","RegDeleteKeyValueW",{machine,path,label}));
                         if(!args(2))co_return finish(0);
                         const auto file=(flags&0x8000U)?read_utf16(m,GuestAddress{args(2)},32767):
-                            utf8_to_utf16_lossy(read_ansi(m,args(2),32767));
+                            ansi_to_utf16_lossy(read_ansi(m,args(2),32767));
                         if(file.empty())co_return finish(0);
                         const auto data=utf16_bytes(file);
                         const auto status=co_await api("advapi32.dll","RegSetKeyValueW",

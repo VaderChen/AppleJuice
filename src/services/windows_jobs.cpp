@@ -1,4 +1,5 @@
 #if !defined(_WIN32)
+#include "ansi_codepage.hpp"
 #include <sys/resource.h>
 #endif
 #include "x64arm/windows_services.hpp"
@@ -151,7 +152,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_job(GuestState& state,Guest
         const auto security=create?synchronization_descriptor(memory,arg(0),false):SynchronizationDescriptor{arg(1)!=0,{}};
         if(rights&~0x21f003fU)fail(5);else if(jobs_->handles.size()>=1024)fail(8);else if(!nameptr && !create)fail(87);
         else {
-            auto name=nameptr?(symbol.ends_with('W')?read_utf16(memory,GuestAddress{nameptr}):utf8_to_utf16(read_ansi(memory,nameptr))):std::u16string{};
+            auto name=nameptr?(symbol.ends_with('W')?read_utf16(memory,GuestAddress{nameptr}):ansi_to_utf16(read_ansi(memory,nameptr))):std::u16string{};
             if(!nameptr){const auto text="x64arm-job-"+std::to_string(process_id())+"-"+std::to_string(runtime_.next_wait_handle);name.assign(text.begin(),text.end());}
             // 私有命名空間別名與 BaseNamedObjects 下的子目錄（物件命名空間）轉成既有具名物件名稱。
             const auto namespace_error=nameptr?win32_namespace_object_name(name,create):0U;

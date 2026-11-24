@@ -42,3 +42,48 @@ bool MetalGl::graphics_indirect_count_masks(std::span<const GraphicsIndirectCoun
     scope.end();indirect_count_masks_+=masks.size();++indirect_count_batches_;
     return true;
 }}
+
+// 遮擋查詢解析：kernel 以各查詢 visibility 緩衝的 GPU 位址讀取計數並相加（Metal 3 的裝置位址），一次派送解析整段查詢。
+// X64ARM_METAL_OCCLUSION_RESOLVE_GPU=0 關閉（回到同步讀回）作同成品對照。
+bool metal_occlusion_resolve_shape(std::span<const GraphicsOcclusionQuery> queries,const GraphicsResource* destination,std::uint64_t offset){
+    static const bool enabled=[] {const auto* text=std::getenv("X64ARM_METAL_OCCLUSION_RESOLVE_GPU");return !text || std::string_view(text)!="0";}();
+    if(!enabled || queries.empty() || !destination || destination->desc.dimension!=1 || (offset&7) || offset+queries.size()*8>destination->desc.width)return false;
+    for(const auto& query:queries)if(query.buffer && (query.buffer->desc.dimension!=1 || std::uint64_t{query.slots}*8>query.buffer->desc.width))return false;
+    return true;
+}
+bool MetalGl::graphics_resolve_occlusion(std::span<const GraphicsOcclusionQuery> queries,const std::shared_ptr<GraphicsResource>& destination,std::uint64_t offset,bool binary){@autoreleasepool{
+    if(@available(macOS 13.0,*)){}else return false; // 裝置位址需要 macOS 13。
+    if(occlusion_resolve_failed_ || !metal_occlusion_resolve_shape(queries,destination.get(),offset))return false;
+    auto& output=metal_resource(destination);if(!output.buffer)return false;
+    if(!occlusion_resolve_pipeline_){
+        const char* code="#include <metal_stdlib>\nusing namespace metal;\n"
+            "struct Query {ulong address; uint slots; uint pad;};\n"
+            "kernel void x64OcclusionResolve(device const Query* queries [[buffer(0)]],device ulong* out [[buffer(1)]],constant uint2& shape [[buffer(2)]],uint index [[thread_position_in_grid]]){"
+            "if(index>=shape.x)return;const Query q=queries[index];ulong sum=0;"
+            "if(q.address){device const ulong* counts=reinterpret_cast<device const ulong*>(q.address);for(uint s=0;s<q.slots;++s)sum+=counts[s];}"
+            "if(shape.y!=0u)sum=sum!=0ul?1ul:0ul;out[index]=sum;}\n";
+        NSError* error=nil;auto options=[MTLCompileOptions new];options.fastMathEnabled=NO;
+        auto library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:code] options:options error:&error];
+        if(library)occlusion_resolve_pipeline_=[device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"x64OcclusionResolve"] error:&error];
+        if(!occlusion_resolve_pipeline_){occlusion_resolve_failed_=true;std::fprintf(stderr,"[metal] 遮擋查詢 GPU 解析不可用：%s\n",error?error.localizedDescription.UTF8String:"?");return false;}
+    }
+    struct Query {std::uint64_t address;std::uint32_t slots,pad;};std::vector<Query> entries(queries.size());
+    begin_commands(true,"occlusion_resolve");auto encoder=[commands_ computeCommandEncoder];MetalEncoderScope scope{encoder};
+    if(metal_labels())encoder.label=[NSString stringWithFormat:@"occlusion-resolve %zu",queries.size()];
+    [encoder setComputePipelineState:occlusion_resolve_pipeline_];
+    for(std::size_t i=0;i<queries.size();++i){
+        if(!queries[i].buffer || !queries[i].slots)continue;
+        auto& source=metal_resource(queries[i].buffer);if(!source.buffer)continue;
+        if(@available(macOS 13.0,*))entries[i]={source.buffer.gpuAddress,queries[i].slots,0};[encoder useResource:source.buffer usage:MTLResourceUsageRead];graphics_pending_.push_back(queries[i].buffer);
+    }
+    const auto bytes=entries.size()*sizeof(Query);
+    if(bytes<=4096)[encoder setBytes:entries.data() length:bytes atIndex:0];
+    else{auto staging=graphics_scratch_buffer(bytes,true);if(!staging || !staging->buffer)throw std::bad_alloc{};
+        std::memcpy(staging->buffer.contents,entries.data(),bytes);graphics_pending_.push_back(staging);[encoder setBuffer:staging->buffer offset:0 atIndex:0];}
+    [encoder setBuffer:output.buffer offset:offset atIndex:1];
+    const std::array<std::uint32_t,2> shape{static_cast<std::uint32_t>(queries.size()),binary?1U:0U};[encoder setBytes:shape.data() length:sizeof(shape) atIndex:2];
+    const auto width=std::min<NSUInteger>(64,occlusion_resolve_pipeline_.maxTotalThreadsPerThreadgroup);
+    [encoder dispatchThreads:MTLSizeMake(queries.size(),1,1) threadsPerThreadgroup:MTLSizeMake(width,1,1)];
+    scope.end();graphics_pending_.push_back(destination);output.gpu_written=true;note_gpu_buffer_write(output);output.constant_bytes_valid=false;
+    return true;
+}}

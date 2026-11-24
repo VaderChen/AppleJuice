@@ -217,9 +217,54 @@ public:
     void clear(){objects_.clear();index_.clear();index_valid_=false;batch_=next_batch();tables=false;}
 };
 // 與固定管線共用 MetalGl；本檔只提供資源與可程式化管線的共用資料。
+// D3D12 heap 的 Metal 對應：每種儲存模式（Private／Shared）一個 placement heap，第一次需要時才配置整個 heap 大小，
+// placed 資源依偏移建立而共用記憶體（別名）。hazard tracking 設為 tracked：Metal 以 heap 為單位保守追蹤，
+// 別名資源之間的先後順序不會因為是不同的 MTLResource 而被重疊執行。
+struct MetalHeap final:GraphicsHeap {
+    std::mutex mutex;
+    std::array<id<MTLHeap>,2> heaps{};std::array<std::shared_ptr<GpuMemoryReservation>,2> leases{};std::array<bool,2> failed{};
+    // 被描述元表引用時加入 residency set 的是整個 heap（heap 內資源不能個別加入）。
+    id residency;std::array<bool,2> resident{};
+    id<MTLHeap> get(id<MTLDevice> device,MTLStorageMode mode){
+        const std::size_t index=mode==MTLStorageModeShared?1:0;const std::lock_guard lock(mutex);
+        if(heaps[index] || failed[index])return heaps[index];
+        try{
+            auto descriptor=[MTLHeapDescriptor new];descriptor.type=MTLHeapTypePlacement;descriptor.storageMode=mode;
+            descriptor.cpuCacheMode=MTLCPUCacheModeDefaultCache;descriptor.hazardTrackingMode=MTLHazardTrackingModeTracked;descriptor.size=static_cast<NSUInteger>(size);
+            static const bool trace=std::getenv("X64ARM_TRACE_METAL_HEAPS")!=nullptr;  // 診斷：每次實際配置的大小、模式與耗時
+            const auto begin=std::chrono::steady_clock::now();
+            leases[index]=reserve_gpu_memory(static_cast<std::size_t>(size));heaps[index]=[device newHeapWithDescriptor:descriptor];
+            // D3D12 heap 建立時內容為零：配置後以涵蓋整個 heap 的緩衝清零（共享以 CPU、私有以 GPU blit 同步完成），
+            // 之後放進來的 placed 資源第一次使用前讀到的是 0，與 Windows 相同（再次別名時的殘留內容由應用程式負責初始化）。
+            if(heaps[index] && zeroed){
+                constexpr auto options_tracked=MTLResourceHazardTrackingModeTracked;
+                NSUInteger length=static_cast<NSUInteger>(size);
+                const auto need=[device heapBufferSizeAndAlignWithLength:length options:(index?MTLResourceStorageModeShared:MTLResourceStorageModePrivate)|options_tracked];
+                if(need.size>heaps[index].size)length=static_cast<NSUInteger>(heaps[index].size)&~static_cast<NSUInteger>(std::max<NSUInteger>(need.align,1)-1);
+                if(id<MTLBuffer> span=[heaps[index] newBufferWithLength:length options:(index?MTLResourceStorageModeShared:MTLResourceStorageModePrivate)|options_tracked offset:0]){
+                    if(index)std::memset(span.contents,0,span.length);
+                    else{
+                        static id<MTLCommandQueue> queue=[device newCommandQueue];
+                        id<MTLCommandBuffer> command=[queue commandBuffer];id<MTLBlitCommandEncoder> blit=[command blitCommandEncoder];
+                        [blit fillBuffer:span range:NSMakeRange(0,span.length) value:0];[blit endEncoding];[command commit];[command waitUntilCompleted];
+                    }
+                }
+            }
+            if(trace)std::fprintf(stderr,"[metal_heap] allocate %llu MiB %s zeroed=%d %.2f ms\n",static_cast<unsigned long long>(size>>20),index?"shared":"private",zeroed?1:0,
+                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());
+        }catch(const std::bad_alloc&){}
+        if(!heaps[index]){leases[index].reset();failed[index]=true;}
+        return heaps[index];
+    }
+    ~MetalHeap() override {
+        if(residency){if(@available(macOS 15.0,*))for(std::size_t i=0;i<2;++i)if(resident[i] && heaps[i])[(id<MTLResidencySet>)residency removeAllocation:(id<MTLAllocation>)heaps[i]];}
+    }
+};
 struct MetalResource final:GraphicsResource {
     // 零複製緩衝的宿主記憶體擁有者：宣告在 buffer 之前，解構時最後釋放（buffer 先放掉對記憶體的引用）。
     std::shared_ptr<void> host_owner;
+    // placed 資源所屬的 heap：宣告在 buffer／texture 之前，資源物件先釋放、heap 最後才釋放。
+    std::shared_ptr<MetalHeap> placement;
     id<MTLBuffer> buffer;id<MTLTexture> texture;
     std::shared_ptr<GpuMemoryReservation> lease;
     std::shared_ptr<MetalBufferBacking> backing;
@@ -361,6 +406,7 @@ struct MetalShader final:GraphicsShader {
     std::shared_ptr<MetalPendingLibrary> pending;
     std::exception_ptr compile_failure;
     std::array<unsigned,4> tessellation{}; // 分割、繞序、最大係數、每群 patch 數。
+    bool isoline{}; // 現代路徑的 HS 宣告等值線 domain（繪製時改走線段展開，見 graphics_modern_tessellation）。
     id<MTLFunction> function,dual_source_function,non_point_function;id<MTLComputePipelineState> compute;
     std::map<unsigned,id<MTLFunction>> alpha_functions;
     // 與前一階段輸出對齊後的 PS 變體（鍵：缺少或改型別的輸入清單），見 metal_link_fragment。
@@ -380,6 +426,8 @@ struct MetalShader final:GraphicsShader {
     unsigned geometry_input{},geometry_output{},geometry_max{},geometry_instances{1};
     unsigned buffer_views_slot{UINT32_MAX};
     unsigned buffer_sizes_slot{UINT32_MAX}; // SPIRV-Cross OpArrayLength；索引為著色器的原生 buffer 槽位。
+    bool reduction_marker{},reduction_enabled{}; // 含 MIN／MAX 模擬的閘門巨集；是否已以啟用模擬的原始碼編譯。
+    bool modern_math{}; // 現代路徑（SM5.1／DXIL）產生：各編譯變體使用現代路徑的數學模式（metal_d3d_compile_options）。
 };
 // 現代與傳統著色器共用編譯完成狀態；首次使用由 metal_resolve_shader 等待並承接錯誤。
 bool metal_queue_shader_library(id<MTLDevice> device,MetalShader& shader,const std::string& source,NSString* entry,MTLCompileOptions* options){
@@ -404,7 +452,32 @@ bool metal_queue_shader_library(id<MTLDevice> device,MetalShader& shader,const s
     return true;
 }
 // 取得非同步編譯的結果：建立 function（運算著色器再建立 compute pipeline）。失敗時沿用同步路徑的錯誤訊息。
+// MIN／MAX 縮減取樣器的著色器模擬（d3d12_shader.cpp）：程序建立過這類取樣器後設定旗標，含閘門巨集的著色器改以 1 編譯。
+inline std::atomic<bool>& metal_reduction_flag() noexcept {static std::atomic<bool> value{false};return value;}
+constexpr std::string_view metal_reduction_marker="#define SPV_REDUCTION_ENABLED 0";
+inline std::string metal_reduction_source(std::string source){
+    if(!metal_reduction_flag().load(std::memory_order_acquire))return source;
+    if(const auto at=source.find(metal_reduction_marker);at!=std::string::npos)source[at+metal_reduction_marker.size()-1]='1';
+    return source;
+}
+// 旗標在著色器編譯後才設定時：以啟用模擬的原始碼重編，並清掉由舊原始碼衍生的函式（管線快取由 graphics_draw 在旗標翻轉時清除）。
+void metal_refresh_reduction(id<MTLDevice> device,MetalShader& shader){
+    if(!shader.reduction_marker || shader.reduction_enabled || !metal_reduction_flag().load(std::memory_order_acquire))return;
+    shader.source=metal_reduction_source(std::move(shader.source));shader.reduction_enabled=true;
+    if(shader.stage!=0 && shader.stage!=1 && shader.stage!=5)return; // HS／DS 由細分管線依來源重新建立；GS 只做驗證編譯。
+    MetalStallScope timing("shader_reduction_recompile",shader.serial,shader.stage);
+    NSError* error=nil;auto library=metal_library_with_source(device,shader.source,metal_d3d_compile_options(shader.modern_math),&error);
+    if(!library)throw std::invalid_argument("Metal 著色器（縮減模擬）編譯失敗："+std::string(error.localizedDescription.UTF8String));
+    shader.function=[library newFunctionWithName:@"xlatMtlMain"];if(!shader.function)throw std::invalid_argument("Metal 著色器（縮減模擬）沒有入口");
+    if(shader.stage==5){shader.compute=[device newComputePipelineStateWithFunction:shader.function error:&error];if(!shader.compute)throw std::invalid_argument("Metal compute pipeline（縮減模擬）建立失敗："+std::string(error.localizedDescription.UTF8String));}
+    shader.non_point_function=nil;shader.dual_source_function=nil;shader.linked_functions.clear();shader.linked_by_producer.clear();
+}
+void metal_resolve_shader_pending(id<MTLDevice> device,MetalShader& shader);
 void metal_resolve_shader(id<MTLDevice> device,MetalShader& shader){
+    metal_resolve_shader_pending(device,shader);
+    if(shader.reduction_marker && !shader.reduction_enabled)metal_refresh_reduction(device,shader);
+}
+void metal_resolve_shader_pending(id<MTLDevice> device,MetalShader& shader){
     if(shader.compile_failure)std::rethrow_exception(shader.compile_failure);
     if(!shader.pending)return;
     try{
@@ -442,12 +515,25 @@ struct MetalTessellationPipeline {
     bool captured{};
     // direct：逐頂點輸入由 GPU 直接讀原始緩衝（索引走 stage-in 索引步進），不經 CPU 收集；uses_vertex_id：VS 讀 SV_VertexID，要由 CPU 準備編號。
     bool direct{},uses_vertex_id{true};unsigned index_slot{};
+    // 現代路徑（SM5.1／DXIL，見 graphics_modern_tessellation）：VS 與 HS 各一個 compute kernel，DS 以 raw buffer 讀控制點、patch 常數與係數。
+    bool modern{};id<MTLComputePipelineState> vertex_compute;
+    // flat_instances：HS 與 DS 只以 gl_PrimitiveID 定址（係數、控制點、patch 常數），不讀 SV_PrimitiveID 的值；
+    // 這時各實例的 patch 可攤平成連續的全域 patch，HS 一次派送、DS 一次 drawPatches，不必逐實例序列派送與繪製。
+    bool flat_instances{};
+    // GPU 驅動的間接細分：暫存容量（patch 數，依回饋倍增）與需求量回饋緩衝（共享記憶體，kernel 以原子最大值寫入）。
+    unsigned indirect_capacity{16384};id<MTLBuffer> indirect_feedback;
+    std::array<unsigned,7> vertex_slots{},hull_slots{};unsigned vertex_stride{},output_points{};
+    std::vector<std::pair<unsigned,unsigned>> stage_in; // （輸入 layout 的頂點緩衝槽位，Metal buffer 索引）
+    // 等值線：HS 之後以 compute 展開線段頂點（patch, u, v），DS 轉成一般頂點函式讀取，再以線段間接繪製。
+    bool isoline{};id<MTLComputePipelineState> isoline_reset,isoline_expand,isoline_args;unsigned domain_isoline_slot{};
     std::map<std::string,std::array<unsigned,2>> control_fields,patch_fields;
 };
 struct MetalTessellationDraw {
     std::shared_ptr<MetalTessellationPipeline> pipeline;
     id<MTLBuffer> controls,patches,factors,raw_factors;
     unsigned count{};
+    id<MTLBuffer> isoline_vertices,isoline_arguments; // 等值線：展開後的頂點與間接繪製參數。
+    id<MTLBuffer> indirect_args; // GPU 驅動的間接細分：drawPatches 間接參數在位移 80。
     // 暫存緩衝的持有者：細分輸出要活到使用它的 render pass 所屬批次完成才能回到池裡。
     std::vector<std::shared_ptr<GraphicsObject>> holders;
 };
@@ -469,7 +555,7 @@ struct MetalGeometryMesh {
     // vertex：VS 併入 mesh 函式；vertex_offsets：VS 的 buffer／texture／sampler 槽位在 mesh 綁定表中的位移。
     bool vertex{};std::array<unsigned,3> vertex_offsets{};
 };
-struct MetalSampler final:GraphicsSampler {id<MTLSamplerState> sampler;};
+struct MetalSampler final:GraphicsSampler {id<MTLSamplerState> sampler;std::uint32_t reduction_flags{};};
 MTLPrimitiveTopologyClass metal_primitive_class(std::uint32_t topology){
     switch(topology){case 1:return MTLPrimitiveTopologyClassPoint;case 2:case 3:case 10:case 11:return MTLPrimitiveTopologyClassLine;
     case 4:case 5:case 12:case 13:return MTLPrimitiveTopologyClassTriangle;default:throw std::invalid_argument("Metal topology 尚未映射");}

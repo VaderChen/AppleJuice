@@ -1,4 +1,4 @@
-# SM6.6 的資源 handle 共用既有 DXIL 描述元與 VSIR 讀寫路徑。
+# SM6.6 的資源 handle 共用既有 DXIL 描述元與 VSIR 讀寫路徑；CreateHandleFromHeap 的堆積視圖見 Vkd3dDxilDescriptorHeap.cmake。
 # ResBind 使用 register space／完整範圍選取資源，索引與 non-uniform 屬性保留；
 # ResourceProperties 與 metadata 交叉驗證後傳遞同一 handle，既有宣告承接 UAV 一致性、counter 與 ROV。
 # 契約參照 DirectXShaderCompiler/docs/DXIL.rst 及 include/dxc/DXIL/DxilResourceProperties.h。
@@ -10,6 +10,7 @@ x64arm_vkd3d_patch("${X64ARM_VKD3D_DXIL}"
   [=[    DX_RAW_BUFFER_STORE             = 140,
     DX_ANNOTATE_HANDLE              = 216,
     DX_CREATE_HANDLE_FROM_BINDING   = 217,
+    DX_CREATE_HANDLE_FROM_HEAP      = 218,
 };]=])
 
 x64arm_vkd3d_patch("${X64ARM_VKD3D_DXIL}"
@@ -67,6 +68,12 @@ invalid:
             binding[0], binding[1], binding[2], binding[3]);
 }
 
+/* x64arm: SM6.6 descriptor heap handles; see cmake/Vkd3dDxilDescriptorHeap.cmake. */
+static void sm6_parser_emit_dx_create_handle_from_heap(struct sm6_parser *sm6, enum dx_intrinsic_opcode op,
+        const struct sm6_value **operands, struct function_emission_state *state);
+static void sm6_parser_emit_dx_annotate_heap_handle(struct sm6_parser *sm6,
+        const struct sm6_value **operands, struct sm6_value *dst);
+
 /* x64arm: annotations refine compile-time type information; memory operations still use the shared descriptor. */
 static void sm6_parser_emit_dx_annotate_handle(struct sm6_parser *sm6, enum dx_intrinsic_opcode op,
         const struct sm6_value **operands, struct function_emission_state *state)
@@ -76,6 +83,11 @@ static void sm6_parser_emit_dx_annotate_handle(struct sm6_parser *sm6, enum dx_i
     unsigned int kind = properties[0] & 0xff, expected = 0, count, samples;
     struct sm6_value *dst = sm6_parser_get_current_value(sm6);
 
+    if (!d && operands[0]->u.handle.heap)
+    {
+        sm6_parser_emit_dx_annotate_heap_handle(sm6, operands, dst);
+        return;
+    }
     if (!d || kind != d->kind || (properties[0] & 0xffff0000u))
         goto invalid;
     if (d->type == VKD3D_SHADER_DESCRIPTOR_TYPE_UAV)
@@ -134,6 +146,7 @@ x64arm_vkd3d_patch("${X64ARM_VKD3D_DXIL}"
   [=[    [DX_CREATE_HANDLE                 ] = {"H", "ccib", sm6_parser_emit_dx_create_handle},]=]
   [=[    [DX_ANNOTATE_HANDLE               ] = {"H", "HP",   sm6_parser_emit_dx_annotate_handle},
     [DX_CREATE_HANDLE_FROM_BINDING    ] = {"H", "Bib",  sm6_parser_emit_dx_create_handle_from_binding},
+    [DX_CREATE_HANDLE_FROM_HEAP       ] = {"H", "ibb",  sm6_parser_emit_dx_create_handle_from_heap},
     [DX_CREATE_HANDLE                 ] = {"H", "ccib", sm6_parser_emit_dx_create_handle},]=])
 
 x64arm_vkd3d_patch("${X64ARM_VKD3D_DXIL}"

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "dns_query.hpp"
@@ -240,7 +241,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dns_records(GuestState& sta
     const WindowsCall call(state,memory,service);const auto symbol=service.symbol;const unsigned unit=x86_?4U:8U;const auto width=static_cast<std::uint8_t>(unit*8);
     const auto load=[&](std::uint64_t address,unsigned bits){return memory.load(GuestAddress{address},static_cast<std::uint8_t>(bits));};
     const auto suffix_charset=[&]{return symbol.ends_with("_W")?1U:2U;};
-    const auto text=[&](std::uint64_t pointer,unsigned charset)->std::string{if(!pointer)return {};return charset==1?utf16_to_utf8(read_utf16(memory,GuestAddress{pointer},1024)):read_ansi(memory,pointer,1024);};
+    const auto text=[&](std::uint64_t pointer,unsigned charset)->std::string{if(!pointer)return {};return charset==1?utf16_to_utf8(read_utf16(memory,GuestAddress{pointer},1024)):charset==2?read_ansi(memory,pointer,1024):ansi_to_utf8(read_ansi(memory,pointer,1024));};
     // DNS_RECORD：pNext、pName、wType、wDataLength、Flags（Section 0～1、Delete 2、CharSet 3～4）、dwTtl、dwReserved，資料自 2×指標＋16 起。
     const unsigned header=2*unit+16;
     const auto record_charset=[&](std::uint64_t address){const auto value=(load(address+2*unit+4,32)>>3)&3U;return value?static_cast<unsigned>(value):1U;};

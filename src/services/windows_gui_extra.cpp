@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "gui_cursor_bounds.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_geometry.hpp"
@@ -111,7 +112,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
     const auto cache_text = [&](std::uint32_t format, const std::u16string& text) -> std::uint64_t {
         std::vector<std::uint8_t> bytes;
         if (format == 13) bytes = utf16_bytes(text);
-        else { const auto ansi = utf16_to_utf8(text); bytes.assign(ansi.begin(), ansi.end()); bytes.push_back(0); }
+        else { const auto ansi = utf16_to_ansi(text); bytes.assign(ansi.begin(), ansi.end()); bytes.push_back(0); }
         const auto handle = allocate_global(bytes.size(), 2);
         if (handle) {
             auto& block = gui_.global_memory.at(handle);
@@ -255,7 +256,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
                                 if(length && length<260)text=read_utf16(memory,GuestAddress{target},259);
                             }
                         }
-                        const auto ansi=output_wide?std::string{}:utf16_to_utf8(text);const auto length=output_wide?text.size():ansi.size();
+                        const auto ansi=output_wide?std::string{}:utf16_to_ansi(text);const auto length=output_wide?text.size():ansi.size();
                         if(!arg(2))result=length;
                         else if(dword(3)){
                             result=std::min<std::size_t>(length,dword(3)-1);
@@ -516,7 +517,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
                 result=gui_registered_message(name);
             }
         }else{
-            const auto name=symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16_lossy(read_ansi(memory,arg(0)));
+            const auto name=symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)}):ansi_to_utf16_lossy(read_ansi(memory,arg(0)));
             result=gui_registered_message(name);
         }
     } else if (symbol == "SetClipboardData") {

@@ -32,7 +32,7 @@ public:
             auto clip=std::make_unique<AviPreviewClip>();
             clip->layout_=*layout;
             clip->format_=std::move(stream.format);
-            if(avi::is_run_length(*layout) || media::video1_fourcc(layout->compression)){
+            if(avi::is_run_length(*layout) || media::dib_codec_fourcc(layout->compression)){
                 clip->compressed_dib_=avi::frame_layout(avi::uncompressed_frame_header(clip->format_));
                 if(!clip->compressed_dib_ || clip->compressed_dib_->top_down)continue;
             }
@@ -101,11 +101,14 @@ public:
     }
 private:
     avi::View decode_compressed_dib(std::size_t position){
-        const bool video1=media::video1_fourcc(layout_.compression);
+        const bool video1=media::dib_codec_fourcc(layout_.compression);
         if(compressed_frame_.empty() || position+1<dib_submitted_ || position>dib_submitted_){
             dib_submitted_=position;
             while(dib_submitted_ && !(packets_[dib_submitted_].flags&0x10U))--dib_submitted_;
-            if(video1)video1_decoder_=avi::open_video1(format_,layout_);
+            if(video1){
+                try{video1_decoder_=avi::open_dib_decoder(format_,layout_);}
+                catch(const std::runtime_error&){compressed_frame_.clear();return {};}
+            }
             else compressed_frame_.assign(compressed_dib_->image_size(),0);
         }
         while(dib_submitted_<=position){
@@ -182,7 +185,7 @@ private:
     std::map<std::size_t,avi::Bytes> decoded_;
     std::optional<avi::FrameLayout> compressed_dib_;
     avi::Bytes compressed_frame_;
-    std::unique_ptr<media::Video1Decoder> video1_decoder_;
+    std::unique_ptr<media::DibVideoDecoder> video1_decoder_;
     std::size_t dib_submitted_{};
 };
 }

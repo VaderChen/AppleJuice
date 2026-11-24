@@ -519,7 +519,7 @@ std::optional<std::uint64_t> WindowsServices::invoke_native_mapping(GuestState& 
     CreationSecurity security{};
     if(create || open){
         const auto name_at=arg(create?5:2);
-        if(name_at)name=symbol.ends_with('W')?read_utf16(memory,GuestAddress{name_at},32768):utf8_to_utf16(read_ansi(memory,name_at));
+        if(name_at)name=symbol.ends_with('W')?read_utf16(memory,GuestAddress{name_at},32768):ansi_to_utf16(read_ansi(memory,name_at));
         if(open && (!name_at || name.empty()))co_return fail(87);
         if(name.starts_with(u"Local\\"))name.erase(0,6);
         if(!name.empty())name=u"\\BaseNamedObjects\\"+name;

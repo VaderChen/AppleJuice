@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/unicode.hpp"
@@ -87,7 +88,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi32_extra(GuestState& sta
                 const bool wide=name.ends_with('W');const auto source=arg(0);if(!source)return fail(87);
                 if(memory.load(GuestAddress{source},32)!=0x50534f43U || memory.load(GuestAddress{source+4},32)!=0x400U || memory.load(GuestAddress{source+8},32)!=(wide?wide_size:narrow_size))return fail(87);
                 std::vector<std::uint8_t> bytes(wide_size);memory.read(GuestAddress{source},std::span(bytes).first(header));
-                const auto file=wide?read_utf16(memory,GuestAddress{source+header},259):utf8_to_utf16_lossy(read_ansi(memory,source+header,259));
+                const auto file=wide?read_utf16(memory,GuestAddress{source+header},259):ansi_to_utf16_lossy(read_ansi(memory,source+header,259));
                 for(std::size_t i=0;i<file.size() && i<259;++i){bytes[header+i*2]=static_cast<std::uint8_t>(file[i]);bytes[header+i*2+1]=static_cast<std::uint8_t>(file[i]>>8);}
                 for(unsigned b=0;b<4;++b)bytes[8+b]=static_cast<std::uint8_t>(wide_size>>(8*b));
                 const auto handle=gui_.next_object++;gui_.color_spaces.emplace(handle,std::move(bytes));return done(handle);
@@ -159,7 +160,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi32_extra(GuestState& sta
         if(name=="GetGlyphIndicesA"){
             // ACP 字串轉成 UTF-16 後由 GetGlyphIndicesW 查字型；回傳的索引數為轉換後的字元數。
             const auto count=static_cast<std::int32_t>(u32(2));if(count<0 || (count && !arg(1)))return done(UINT32_MAX);
-            const auto text=utf8_to_utf16_lossy(read_ansi(memory,arg(1),static_cast<std::size_t>(count)).substr(0,static_cast<std::size_t>(count)));
+            const auto text=ansi_to_utf16_lossy(read_ansi(memory,arg(1),static_cast<std::size_t>(count)).substr(0,static_cast<std::size_t>(count)));
             const auto wide=temporary.text(text);if(!wide)return fail(8);
             return done(gdi("GetGlyphIndicesW",{arg(0),wide,text.size(),arg(3),u32(4)}));
         }

@@ -43,7 +43,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread_ordering(GuestState&
                 if(symbol.ends_with('A') || symbol.ends_with('W')){
                     if(!arg(4))return done(87);
                     auto name=symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(4)},256)
-                        :utf8_to_utf16_lossy(read_ansi(memory,arg(4),256));
+                        :ansi_to_utf16_lossy(read_ansi(memory,arg(4),256));
                     for(auto& unit:name)unit=unicode_case_unit(unit,false);
                     RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
                     if(transaction.error)return done(transaction.error);

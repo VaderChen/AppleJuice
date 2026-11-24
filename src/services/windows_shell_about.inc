@@ -26,7 +26,7 @@ if(service.symbol.starts_with("ShellAbout") || service.symbol.starts_with("OpenA
         return nested_continuation(state,memory,"ShellAbout",[this,service,local_machine](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
             const WindowsCall call(s,m,service);const bool wide=service.symbol.ends_with('W');const unsigned unit=x86_?4U:8U;
             const auto finish=[&](std::uint64_t value){call.return_to(s,value);return std::optional<std::uint32_t>{};};
-            const auto text=[&](std::uint64_t at){return at?(wide?read_utf16(m,GuestAddress{at},4096):utf8_to_utf16_lossy(read_ansi(m,at,4096))):std::u16string{};};
+            const auto text=[&](std::uint64_t at){return at?(wide?read_utf16(m,GuestAddress{at},4096):ansi_to_utf16_lossy(read_ansi(m,at,4096))):std::u16string{};};
             // szApp：「標題#第一行」時 # 前為標題、後為第一行；沒有 # 時兩者相同。
             const auto app=text(call(1)),other=text(call(2));const auto mark=app.find(u'#');
             const auto title=mark==app.npos?app:app.substr(0,mark),first=mark==app.npos?app:app.substr(mark+1);
@@ -67,7 +67,7 @@ if(service.symbol.starts_with("ShellAbout") || service.symbol.starts_with("OpenA
             const WindowsCall call(s,m,service);const bool wide=service.symbol.ends_with('W');const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
             const auto finish=[&]{call.return_to(s,0);return std::optional<std::uint32_t>{};};
             if(!call(2))co_return finish();
-            auto file=wide?read_utf16(m,GuestAddress{call(2)},32767):utf8_to_utf16_lossy(read_ansi(m,call(2),32767));
+            auto file=wide?read_utf16(m,GuestAddress{call(2)},32767):ansi_to_utf16_lossy(read_ansi(m,call(2),32767));
             while(!file.empty() && (file.front()==u' ' || file.front()==u'\t'))file.erase(0,1);while(!file.empty() && (file.back()==u' ' || file.back()==u'\t'))file.pop_back();
             if(file.size()>=2 && file.front()==u'"' && file.back()==u'"')file=file.substr(1,file.size()-2);
             if(file.empty())co_return finish();

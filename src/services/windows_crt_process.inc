@@ -81,8 +81,8 @@ if(symbol=="_pclose"){
 if(symbol=="_popen" || symbol=="_wpopen"){
     const bool wide_text=symbol=="_wpopen";
     if(!crt_call(0) || !crt_call(1)){error(22);crt_call.return_to(state,0);return std::nullopt;}
-    const auto command=wide_text?read_utf16(memory,GuestAddress{crt_call(0)}):utf8_to_utf16(read_ansi(memory,crt_call(0)));
-    const auto mode=wide_text?read_utf16(memory,GuestAddress{crt_call(1)},16):utf8_to_utf16(read_ansi(memory,crt_call(1),16));
+    const auto command=wide_text?read_utf16(memory,GuestAddress{crt_call(0)}):ansi_to_utf16(read_ansi(memory,crt_call(0)));
+    const auto mode=wide_text?read_utf16(memory,GuestAddress{crt_call(1)},16):ansi_to_utf16(read_ansi(memory,crt_call(1),16));
     // 模式必須以 r 或 w 開頭，可再帶 t／b。
     bool valid_mode=!mode.empty() && (mode[0]==u'r' || mode[0]==u'w');
     for(std::size_t i=1;i<mode.size();++i)if(mode[i]!=u't' && mode[i]!=u'b')valid_mode=false;
@@ -136,7 +136,7 @@ const bool system=symbol=="system" || symbol=="_wsystem";
 const bool exec=symbol.starts_with("_exec") || symbol.starts_with("_wexec");
 const bool search=symbol.ends_with("vp") || symbol.ends_with("vpe");
 const bool explicit_environment=symbol.ends_with("ve") || symbol.ends_with("vpe");
-const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16(read_ansi(memory,pointer));};
+const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16(read_ansi(memory,pointer));};
 const auto comspec=runtime_.environment.find(u"COMSPEC");
 if(system && !crt_call(0)){
     const bool exists=comspec!=runtime_.environment.end() && !filesystem_.information(utf16_to_utf8(normalized_windows_path(comspec->second.second,runtime_.current_directory))).error;

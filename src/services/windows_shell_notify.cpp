@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/unicode.hpp"
@@ -287,7 +288,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_notification(GuestSta
             std::array<std::u16string,2> paths;
             for(unsigned n=0;n<2;++n)if(arg(n+2)){
                 if(type==0){const auto item=gui_.shell_pidls.find(arg(n+2));if(item==gui_.shell_pidls.end() || !allocations_.contains(item->first))return fail(87);paths[n]=item->second;}
-                else paths[n]=canonical(type==5?read_utf16(memory,GuestAddress{arg(n+2)}):utf8_to_utf16(read_ansi(memory,arg(n+2))));
+                else paths[n]=canonical(type==5?read_utf16(memory,GuestAddress{arg(n+2)}):ansi_to_utf16(read_ansi(memory,arg(n+2))));
                 if(paths[n].empty() || paths[n].size()>=260)return fail(87);
             }
             std::vector<GuestCallback> callbacks;shell_notify(memory,event,paths,(event&interrupt_event)!=0,(flags&0x3000U)==0x1000?&callbacks:nullptr,0,(flags&0x10000U)!=0);

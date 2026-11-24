@@ -152,15 +152,15 @@
                     catch(const std::runtime_error&){co_return finish(0);}
                 }
                 if(rgba.empty())co_return finish(0);
-            }else if(avi::is_run_length(*source) || media::video1_fourcc(source->compression)){
+            }else if(avi::is_run_length(*source) || media::dib_codec_fourcc(source->compression)){
                 const auto nearest=co_await service_callback::call(slot(stream,5),{stream,position,0x14});
                 const auto key=static_cast<unsigned>(nearest);
                 if(key>position || position>INT32_MAX)co_return finish(0);
                 decoded_source=avi::frame_layout(avi::uncompressed_frame_header(format));
                 if(!decoded_source || decoded_source->top_down)co_return finish(0);
-                std::unique_ptr<media::Video1Decoder> video1;
-                if(media::video1_fourcc(source->compression)){
-                    try{video1=avi::open_video1(format,*source);}
+                std::unique_ptr<media::DibVideoDecoder> video1;
+                if(media::dib_codec_fourcc(source->compression)){
+                    try{video1=avi::open_dib_decoder(format,*source);}
                     catch(const std::runtime_error&){co_return finish(0);}
                 }else packet.resize(decoded_source->image_size());
                 for(unsigned pos=key;pos<=position;++pos){

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "shell_icon_location.h"
 #include "shell_unc_path.h"
 #include "shell_drive_root.h"
@@ -235,11 +236,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_association(GuestState& sta
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     const std::uint64_t classes_root=x86_?0x80000000ULL:0xffffffff80000000ULL;
     const auto done=[&](std::uint64_t value)->std::optional<std::uint32_t>{arg.return_to(state,value);return {};};
-    const auto read=[&](std::uint64_t at)->std::u16string{if(!at)return {};return wide?read_utf16(memory,GuestAddress{at},32768):utf8_to_utf16(read_ansi(memory,at,32768));};
+    const auto read=[&](std::uint64_t at)->std::u16string{if(!at)return {};return wide?read_utf16(memory,GuestAddress{at},32768):ansi_to_utf16(read_ansi(memory,at,32768));};
     const auto host=[&](std::string_view dll,std::string_view symbol,std::initializer_list<std::uint64_t> args){return nested_service(state,memory,dll,symbol,args);};
     // 字串輸出（AssocQueryString 慣例）：*pcch 寫回含 NUL 的所需長度；輸出為 NULL 回 S_FALSE；空間不足時 NOTRUNCATE（0x20）回 E_POINTER，否則截斷並回 ERROR_INSUFFICIENT_BUFFER。
     const auto write_string=[&](bool as_wide,std::uint32_t flags,const std::u16string& value,std::uint64_t out,std::uint64_t count)->std::uint32_t{
-        std::vector<std::uint8_t> bytes;if(as_wide)bytes=utf16_bytes(value);else {const auto text=utf16_to_utf8(value);bytes.assign(text.begin(),text.end());bytes.push_back(0);}
+        std::vector<std::uint8_t> bytes;if(as_wide)bytes=utf16_bytes(value);else {const auto text=utf16_to_ansi(value);bytes.assign(text.begin(),text.end());bytes.push_back(0);}
         const auto width=as_wide?2U:1U,required=static_cast<std::uint32_t>(bytes.size()/width),capacity=static_cast<std::uint32_t>(memory.load(GuestAddress{count},32));
         memory.store(GuestAddress{count},32,required);if(!out)return 1;
         if(capacity<required){if(flags&0x20){if(capacity)memory.store(GuestAddress{out},as_wide?16:8,0);return 0x80004003U;}memory.write(GuestAddress{out},std::span(bytes).first(capacity*width));return too_small;}
@@ -475,8 +476,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
     if(service.symbol=="PathCanonicalizeA" || service.symbol=="PathCanonicalizeW"){
         const WindowsCall call(state,memory,service);std::uint64_t result=0;
         if(!call(0) || !call(1))last_error_=87;
-        else {const bool wide=service.symbol.ends_with('W');const auto input=wide?read_utf16(memory,GuestAddress{call(1)}):utf8_to_utf16(read_ansi(memory,call(1)));std::u16string out;
-            const auto error=canonicalize(input,0,260,out);const auto bytes=wide?std::string{}:utf16_to_utf8(out);
+        else {const bool wide=service.symbol.ends_with('W');const auto input=wide?read_utf16(memory,GuestAddress{call(1)}):ansi_to_utf16(read_ansi(memory,call(1)));std::u16string out;
+            const auto error=canonicalize(input,0,260,out);const auto bytes=wide?std::string{}:utf16_to_ansi(out);
             if(error || (!wide && bytes.size()>=260)){last_error_=206;memory.store(GuestAddress{call(0)},wide?16:8,0);}
             else {if(wide)memory.write(GuestAddress{call(0)},utf16_bytes(out));else {std::vector<std::uint8_t> value(bytes.begin(),bytes.end());value.push_back(0);memory.write(GuestAddress{call(0)},value);}result=1;}}
         call.return_to(state,result);return std::nullopt;
@@ -484,7 +485,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
     if(service.symbol=="PathIsDirectoryA" || service.symbol=="PathIsDirectoryW"){
         const WindowsCall arg(state,memory,service);std::uint32_t value=0;const auto previous=last_error_;
         try{if(arg(0)){
-            const auto path=service.symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},32768):utf8_to_utf16(read_ansi(memory,arg(0)));
+            const auto path=service.symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},32768):ansi_to_utf16(read_ansi(memory,arg(0)));
             if(!path.empty()){const auto info=query_native_file_attributes(state,memory,path,false);if(!info.error)value=info.metadata.attributes&0x10U;}
         }}catch(const MemoryFault&){}catch(const std::invalid_argument&){}catch(const std::bad_alloc&){}
         last_error_=previous;
@@ -510,7 +511,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
         const bool wide=service.symbol.ends_with('W'),extended=service.symbol.starts_with("PathMatchSpecEx");const auto flags=extended?static_cast<std::uint32_t>(arg(2)):1U;
         if(!arg(0) || !arg(1) || (flags&~0x10001U))result=extended?invalid:0;
         else{
-            const auto read=[&](unsigned i){return wide?read_utf16(memory,GuestAddress{arg(i)},32768):utf8_to_utf16(read_ansi(memory,arg(i),32768));};
+            const auto read=[&](unsigned i){return wide?read_utf16(memory,GuestAddress{arg(i)},32768):ansi_to_utf16(read_ansi(memory,arg(i),32768));};
             const auto file=read(0),spec=read(1);bool matched=false;
             for(std::size_t at=0;at<spec.size();){const auto end=(flags&1)?spec.find(u';',at):spec.npos;auto part=std::u16string_view(spec).substr(at,end==spec.npos?spec.size()-at:end-at);
                 if(!(flags&0x10000))while(!part.empty() && part.front()==u' ')part.remove_prefix(1);
@@ -524,7 +525,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
         else if((runtime_.search_path_mode&0x8000) && flags!=0x8001)last_error_=5;
         else{runtime_.search_path_mode=flags;result=1;}
     }else if(service.symbol.starts_with("SearchPath")){
-        const bool wide=service.symbol.ends_with('W');const auto read=[&](unsigned i){return arg(i)?(wide?read_utf16(memory,GuestAddress{arg(i)},32768):utf8_to_utf16(read_ansi(memory,arg(i),32768))):std::u16string{};};
+        const bool wide=service.symbol.ends_with('W');const auto read=[&](unsigned i){return arg(i)?(wide?read_utf16(memory,GuestAddress{arg(i)},32768):ansi_to_utf16(read_ansi(memory,arg(i),32768))):std::u16string{};};
         auto name=read(1);const auto extension=read(2);std::replace(name.begin(),name.end(),u'/',u'\\');
         if(name.empty() || (!extension.empty() && extension.front()!=u'.'))last_error_=87;
         else{
@@ -548,12 +549,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
             }
             if(found.empty())last_error_=lookup_error;
             else{
-                const auto ansi=utf16_to_utf8(found);const auto count=wide?found.size():ansi.size();const auto capacity=static_cast<std::uint32_t>(arg(3));
+                const auto ansi=utf16_to_ansi(found);const auto count=wide?found.size():ansi.size();const auto capacity=static_cast<std::uint32_t>(arg(3));
                 if(!arg(4) || capacity<=count)result=static_cast<std::uint32_t>(count+1);
                 else{
                     if(arg(5))memory.check(GuestAddress{arg(5)},x86_?4:8,Access::Write);
                     if(wide)memory.write(GuestAddress{arg(4)},utf16_bytes(found));else{std::vector<std::uint8_t> bytes(ansi.begin(),ansi.end());bytes.push_back(0);memory.write(GuestAddress{arg(4)},bytes);}
-                    if(arg(5)){const auto slash=found.find_last_of(u'\\');const auto offset=wide?(slash+1)*2:utf16_to_utf8(found.substr(0,slash+1)).size();memory.store(GuestAddress{arg(5)},x86_?32:64,arg(4)+offset);}
+                    if(arg(5)){const auto slash=found.find_last_of(u'\\');const auto offset=wide?(slash+1)*2:utf16_to_ansi(found.substr(0,slash+1)).size();memory.store(GuestAddress{arg(5)},x86_?32:64,arg(4)+offset);}
                     result=static_cast<std::uint32_t>(count);
                 }
             }
@@ -939,7 +940,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_path_extra(GuestState& stat
                         text.push_back(c);
                     }
                 }else if(source){
-                    text=utf8_to_utf16_lossy(read_ansi(m,source));
+                    text=ansi_to_utf16_lossy(read_ansi(m,source));
                     if(text.size()>=260)text.resize(259);
                 }
                 GuestScratch temporary(*this,m,s);const auto rect=temporary.allocate(16);if(!rect)co_return finish();

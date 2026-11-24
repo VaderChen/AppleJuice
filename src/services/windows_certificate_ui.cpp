@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "sandbox_certificate_roots.hpp"
@@ -91,7 +92,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate_ui(GuestState& 
         if(!encoded || !size || size>1024U*1024U)return fail(87);
         std::vector<std::uint8_t> der(static_cast<std::size_t>(size));memory.read(GuestAddress{encoded},der);
         const auto text=describe(der);if(!text)return fail(0x80092002U); // CRYPT_E_BAD_ENCODE
-        std::u16string title=u"憑證";if(title_pointer)title=wide?read_utf16(memory,GuestAddress{title_pointer},1024):utf8_to_utf16_lossy(read_ansi(memory,title_pointer,2048));
+        std::u16string title=u"憑證";if(title_pointer)title=wide?read_utf16(memory,GuestAddress{title_pointer},1024):ansi_to_utf16_lossy(read_ansi(memory,title_pointer,2048));
         const auto body=utf16_bytes(*text),caption=utf16_bytes(title);
         const auto scratch=allocate_heap(memory,body.size()+caption.size());if(!scratch)return fail(8);
         memory.write(GuestAddress{scratch},body);memory.write(GuestAddress{scratch+body.size()},caption);

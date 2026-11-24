@@ -445,6 +445,13 @@ entry EnterCriticalSection
     mov dword ptr [ecx + 8], 1
     ret 4
 2:
+    // 未持有但有等待者：搶得並保留等待者位元（不公平鎖，與 x64 版相同）。
+    cmp eax, 0x7fffffff
+    jne 7f
+    mov edx, 0x40000000
+    lock cmpxchg dword ptr [ecx + 4], edx
+    je 5b
+7:
     mov edx, dword ptr fs:[0x24]
     cmp dword ptr [ecx + 12], edx
     jne 3f
@@ -456,7 +463,7 @@ entry EnterCriticalSection
     lock inc dword ptr [ecx + 4]
     ret 4
 3:
-    // 他人持有：多處理器（PEB32 NumberOfProcessors>1）時先有界自旋等字組回到 -1，逾量才進原服務登記等待。只讀字組，不設等待位元。
+    // 他人持有：多處理器（PEB32 NumberOfProcessors>1）時先有界自旋等字組回到未持有（-1 或 0x7fffffff），逾量才進原服務登記等待。
     mov edx, dword ptr fs:[0x30]
     cmp dword ptr [edx + 0x64], 1
     jbe 1f
@@ -464,9 +471,17 @@ entry EnterCriticalSection
     mov esi, 4000
 4:
     pause
-    cmp dword ptr [ecx + 4], -1
+    mov eax, dword ptr [ecx + 4]
+    cmp eax, -1
+    je 8f
+    cmp eax, 0x7fffffff
     jne 6f
-    mov eax, -1
+    mov edx, 0x40000000
+    lock cmpxchg dword ptr [ecx + 4], edx
+    jne 6f
+    pop esi
+    jmp 5b
+8:
     xor edx, edx
     lock cmpxchg dword ptr [ecx + 4], edx
     jne 6f
@@ -523,7 +538,16 @@ entry TryEnterCriticalSection
     ret 4
 2:
     cmp eax, 0x7fffffff
-    je 1f
+    jne 7f
+    mov edx, 0x40000000
+    lock cmpxchg dword ptr [ecx + 4], edx
+    jne 4f
+    mov eax, dword ptr fs:[0x24]
+    mov dword ptr [ecx + 12], eax
+    mov dword ptr [ecx + 8], 1
+    mov eax, 1
+    ret 4
+7:
     mov edx, dword ptr fs:[0x24]
     cmp dword ptr [ecx + 12], edx
     jne 4f

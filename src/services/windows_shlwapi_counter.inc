@@ -8,7 +8,7 @@ if(name=="#222" || name=="#422" || name=="#423"){
         object_name+=windows_guid_text(id);
     }else{
         initial=u32(1);
-        if(arg(0) && name=="#422")object_name+=utf8_to_utf16_lossy(read_ansi(memory,arg(0))).substr(0,253);
+        if(arg(0) && name=="#422")object_name+=ansi_to_utf16_lossy(read_ansi(memory,arg(0))).substr(0,253);
         if(arg(0) && name=="#423")for(unsigned i=0;i<253;++i){
             const auto unit=static_cast<char16_t>(memory.load(GuestAddress{arg(0)+2*i},16));
             if(!unit)break;

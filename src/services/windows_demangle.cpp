@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "microsoft_demangle.hpp"
@@ -149,7 +150,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_demangle(GuestState& state,
     const auto flags=static_cast<std::uint16_t>(call(crt?(extended?6:5):3));
     if(extended && call(5))return invalid(22); // 非零延伸參數的未公開契約尚未接入。
     if(!input || (crt && signed_size<0) || (!crt && (!buffer || !capacity || (call(3)&~UINT64_C(0xffff)))))return invalid(crt?22U:87U);
-    const auto source=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{input},microsoft_name_limit)):read_ansi(memory,input,microsoft_name_limit);
+    const auto source=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{input},microsoft_name_limit)):ansi_to_utf8(read_ansi(memory,input,microsoft_name_limit));
     auto parsed=demangle_microsoft_name(source,flags,crt && (flags&0x2000U));
     if(!parsed)return invalid(crt?34U:8U);
     if(!crt) {

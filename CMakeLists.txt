@@ -217,6 +217,9 @@ target_sources(x64arm_windows PRIVATE src/services/native_library.cpp src/servic
 target_link_libraries(x64arm_windows PRIVATE ZLIB::ZLIB)
 include(cmake/NativeV8.cmake)
 include(cmake/OpenSSL.cmake)
+if(APPLE)
+  include(cmake/Curl.cmake)
+endif()
 include(cmake/FFmpeg.cmake)
 include(cmake/LibGSM.cmake)
 # FFmpeg 供 Windows Media、MPEG 與 H.264 軟體解碼及 MPEG 容器讀取，共用既有色彩與 PCM 轉換。
@@ -251,7 +254,7 @@ find_package(LibXml2 REQUIRED)
 target_link_libraries(x64arm_windows PRIVATE LibXml2::LibXml2)
 target_sources(x64arm_windows PRIVATE src/services/sspi_digest.cpp src/services/windows_digest.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_tls.cpp src/services/windows_crypto_keys.cpp src/services/windows_ncrypt.cpp src/services/cng_asymmetric.cpp src/services/windows_image_certificates.cpp src/services/windows_wintrust.cpp src/platform/dhcp_inform.cpp src/services/windows_network_tables.cpp src/services/windows_legacy_crypto.cpp src/services/windows_certificates.cpp src/services/certificate_pfx.cpp src/services/windows_certificate_decode.cpp src/services/windows_certificate_keys.cpp src/services/windows_certificate_find.cpp src/services/windows_stdio.cpp src/services/windows_registry.cpp
-    src/services/registry_store.cpp src/services/network_registry.cpp src/services/guest_strings.cpp src/services/windows_shell.cpp
+    src/services/registry_store.cpp src/services/network_registry.cpp src/services/guest_strings.cpp src/services/ansi_codepage.cpp src/services/windows_shell.cpp
     src/services/windows_shell_execute.cpp src/services/windows_shell_notify.cpp src/services/windows_shell_item.cpp src/services/windows_shell_desktop.cpp)
 target_sources(x64arm_windows PRIVATE src/services/shared_wake.cpp)
 target_sources(x64arm_windows PRIVATE src/services/machine_clock.cpp)
@@ -313,7 +316,7 @@ target_sources(x64arm_windows PRIVATE src/services/crypto_encoding.cpp src/servi
 target_link_libraries(x64arm_windows PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 if(APPLE)
   target_sources(x64arm_windows PRIVATE src/platform/macos/crypto.cpp src/platform/macos/http.cpp src/platform/macos/autoproxy.cpp src/platform/macos/audio.cpp src/platform/macos/usb.cpp src/platform/macos/usb_session.mm src/platform/macos/audio_mixer.cpp src/platform/macos/midi.cpp src/platform/macos/midi_input.cpp)
-  target_link_libraries(x64arm_windows PRIVATE "-framework Security" "-framework CFNetwork" "-framework SystemConfiguration" "-framework CoreMIDI" "-framework AudioUnit" "-framework AudioToolbox" "-framework CoreAudio" "-framework IOUSBHost" "-lcurl")
+  target_link_libraries(x64arm_windows PRIVATE "-framework Security" "-framework CFNetwork" "-framework SystemConfiguration" "-framework CoreMIDI" "-framework AudioUnit" "-framework AudioToolbox" "-framework CoreAudio" "-framework IOUSBHost" CURL::libcurl)
   set_source_files_properties(src/platform/macos/usb_session.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
   target_sources(x64arm_windows PRIVATE src/platform/macos/color_transform.cpp)
   target_link_libraries(x64arm_windows PRIVATE "-framework ColorSync")
@@ -429,4 +432,4 @@ if(X64ARM_CROSS_ARCH_PROFILE AND X64ARM_NATIVE_JIT)
 endif()
 
 target_sources(x64arm_windows PRIVATE src/services/com_marshal.cpp src/services/windows_com_marshal.cpp src/services/windows_com_marshal_public.cpp)
-target_sources(x64arm_windows PRIVATE src/services/windows_com_agile.cpp)
+target_sources(x64arm_windows PRIVATE src/services/windows_com_agile.cpp src/services/windows_directshow.cpp)

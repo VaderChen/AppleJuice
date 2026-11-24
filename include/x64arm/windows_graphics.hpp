@@ -5,6 +5,7 @@
 #include <memory>
 #include <atomic>
 #include <span>
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -14,7 +15,16 @@ namespace x64arm {
 // 遊戲自己的升頻（XeSS、FSR）已初始化的情境數。大於 0 時停用內建的畫面內插與 2 倍放大，由遊戲的升頻輸出畫面；
 // 遊戲銷毀升頻情境後恢復。服務層（內建 libxess／FidelityFX）增減，Metal 後端在呈現時讀取。
 inline std::atomic<int>& game_upscaler_contexts(){static std::atomic<int> count{0};return count;}
-inline bool game_upscaler_active(){return game_upscaler_contexts().load(std::memory_order_acquire)>0;}
+// 情境存在不代表正在使用：把升頻設為關閉的遊戲常保留情境物件。以最近一次實際執行升頻的時間判斷（2 秒內），
+// 之後視為停用、恢復內建的畫面內插與 2 倍放大；遊戲再次執行升頻時立即切回。
+inline std::atomic<std::int64_t>& game_upscaler_last_dispatch(){static std::atomic<std::int64_t> ticks{0};return ticks;}
+inline std::int64_t game_upscaler_clock(){return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+inline void game_upscaler_dispatched(){game_upscaler_last_dispatch().store(game_upscaler_clock(),std::memory_order_release);}
+inline bool game_upscaler_active(){
+    if(game_upscaler_contexts().load(std::memory_order_acquire)<=0)return false;
+    const auto last=game_upscaler_last_dispatch().load(std::memory_order_acquire);
+    return last && game_upscaler_clock()-last<INT64_C(2'000'000'000);
+}
 class SharedWake;
 // D3D9 固定管線及 D3D11 可程式化管線共用同一 Metal context、提交與呈現。
 // pending_stamp：後端在途清單最近一次加入此物件的批次編號（Metal 在途追蹤以它略過同批重複加入，不查雜湊表）。
@@ -24,6 +34,10 @@ struct GraphicsResourceDesc {
     std::uint32_t sample_quality{};
     std::uint32_t initialized{}; // 呼叫端建立後會立即寫入的前段位元組數：緩衝的這一段不必先清零。
 };
+// D3D12 heap 的 GPU 記憶體：placed 資源從同一段記憶體依偏移建立，彼此可以別名（重疊）。
+struct GraphicsHeap:GraphicsObject {std::uint64_t size{};bool zeroed{true};};
+// 資源在 heap 內需要的大小與對齊（0 表示後端無法提供）。
+struct GraphicsResourceAllocation {std::uint64_t size{},alignment{};};
 struct GraphicsResource:GraphicsObject {
     GraphicsResourceDesc desc;
     std::uint64_t stream_cursor{},stream_vertices{};
@@ -47,10 +61,32 @@ GraphicsLegacyShader graphics_legacy_shader(std::uint32_t stage,std::span<const 
 // SM5.1 DXBC 與 DXIL：經 vkd3d-shader（SPIR-V）與 SPIRV-Cross 轉為 MSL；入口為 xlatMtlMain。
 // 原始 D3D 簽章的位置與分量遮罩；階段連結不能把轉譯器的 locnN 當成語意名稱。
 struct GraphicsShaderSemantic {std::string semantic;std::uint32_t index{},location{},mask{};};
-struct GraphicsModernShader {std::string source,entry;std::vector<GraphicsBinding> bindings;std::vector<GraphicsInput> inputs;std::vector<GraphicsShaderSemantic> signature_inputs,signature_outputs;std::array<std::uint32_t,3> threads{1,1,1};std::uint32_t buffer_sizes_slot{UINT32_MAX};std::uint32_t capture_output_slot{UINT32_MAX};};
+struct GraphicsModernShader {std::string source,entry;std::vector<GraphicsBinding> bindings;std::vector<GraphicsInput> inputs;std::vector<GraphicsShaderSemantic> signature_inputs,signature_outputs;std::array<std::uint32_t,3> threads{1,1,1};std::uint32_t buffer_sizes_slot{UINT32_MAX};std::uint32_t capture_output_slot{UINT32_MAX};
+    // 細分階段的內部緩衝槽位（依 GraphicsTessellationSlot 索引；UINT32_MAX 表示未使用），及 HS 的細分設定（GraphicsTessellationInfo 索引）。
+    std::array<std::uint32_t,7> tess_slots{UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX};
+    std::array<std::uint32_t,6> tess_info{};};
+enum GraphicsTessellationSlot:std::uint32_t {graphics_tess_params,graphics_tess_input,graphics_tess_output,graphics_tess_patch_output,graphics_tess_factor,graphics_tess_patch_input,graphics_tess_index};
+// domain：0 三角形、1 四邊形、2 等值線；spacing：0 integer、1 fractional_odd、2 fractional_even；winding：0 順時針、1 逆時針。
+enum GraphicsTessellationInfo:std::uint32_t {graphics_tess_domain,graphics_tess_spacing,graphics_tess_winding,graphics_tess_output_points,graphics_tess_point_mode,graphics_tess_input_points};
+// 現代路徑的細分管線連結：VS 轉成擷取輸出的 compute kernel，HS 是 tessellation control kernel，DS 是 post-tessellation vertex 函式。
+// 相鄰階段的介面依生產端的 location 與分量數對齊（{location, 分量數}），消費端缺少的欄位補位、分量較少者補齊，兩端結構版面一致；
+// 位置內建變數另給一個 location。patch 常數的 location 正規化到 patch_base 之後。
+struct GraphicsModernTessellationLink {
+    std::vector<std::array<std::uint32_t,2>> vertex_locations,control_locations,patch_locations;
+    std::uint32_t vertex_position{UINT32_MAX},control_position{UINT32_MAX},vertex_point_size{},patch_base{},hull_patch_offset{},domain_patch_offset{};
+    // 帶非零 Component 的介面變數（同一暫存器有多個未合併的元素）：SPIRV-Cross 的細分階段不支援 Component，
+    // 生產端與消費端都把這些 (暫存器, 分量) 改到「基底＋暫存器×4＋分量」的獨立 location；形狀取自生產端實際的 SPIR-V 變數。
+    std::vector<std::array<std::uint32_t,2>> vertex_packed,control_packed,patch_packed;
+    std::uint32_t vertex_packed_base{},control_packed_base{},patch_packed_base{};
+    std::array<std::uint32_t,6> info{};
+    std::uint32_t index_type{}; // VS：0 非索引、1 uint16、2 uint32
+};
 bool graphics_modern_shader_required(std::span<const std::uint8_t> bytes);
 GraphicsModernShader graphics_modern_point_capture(std::span<const std::uint8_t> bytes);
 GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes);
+// 由三個階段的位元組碼建立連結資訊（介面 location、patch 常數偏移、HS 的細分設定）；再以 graphics_modern_tessellation_stage 依連結轉譯 VS（階段 0）、HS（3）、DS（4）。
+GraphicsModernTessellationLink graphics_modern_tessellation_link(std::span<const std::uint8_t> vertex,std::span<const std::uint8_t> hull,std::span<const std::uint8_t> domain);
+GraphicsModernShader graphics_modern_tessellation_stage(std::uint32_t stage,std::span<const std::uint8_t> bytes,const GraphicsModernTessellationLink& link);
 struct GraphicsShader:GraphicsObject {
     std::vector<GraphicsStreamElement> stream_output;
     std::array<std::uint32_t,4> stream_strides{};
@@ -75,6 +111,9 @@ struct GraphicsView {
     std::uint32_t stride{};
     // 計數器在 counter 資源內的位元組位移（D3D12 的 CounterOffsetInBytes；D3D11 的隱藏計數器為 0）。
     std::uint32_t counter_offset{};
+    // D3D12 SRV 的 Shader4ComponentMapping：0 表示原樣（R、G、B、A）；否則低 12 位元依序為 R／G／B／A 的來源
+    //（各 3 位元：0～3 取記憶體分量、4 固定 0、5 固定 1），並設第 12 位元。只用於貼圖 SRV。
+    std::uint32_t swizzle{};
 };
 inline constexpr std::uint32_t graphics_view_stride_unknown=UINT32_MAX;
 // 時間性升頻（XeSS 等升頻 API）：抖動取樣的低解析度色彩、深度與動態向量合成高解析度輸出。
@@ -88,6 +127,8 @@ struct GraphicsTemporalUpscale {
 };
 // D3D12 描述元表：heap 為描述元堆積的 GPU 鏡像（貼圖每項 8 位元組 MTLResourceID；緩衝每項位址＋長度共 16 位元組），
 // offset 為此表第一個描述元在鏡像中的位元組位置。views：有界小表逐項解析的資源，後端據此宣告使用以維持危害追蹤。
+// 遮擋查詢解析的一筆：該查詢的 visibility 計數緩衝與已使用的槽數（每槽 8 位元組）。
+struct GraphicsOcclusionQuery {std::shared_ptr<GraphicsResource> buffer;std::uint32_t slots{};};
 struct GraphicsDescriptorTable {std::uint32_t type{},space{},slot{};std::shared_ptr<GraphicsResource> heap;std::uint64_t offset{};std::vector<GraphicsView> views;};
 struct GraphicsStage {
     std::shared_ptr<GraphicsShader> shader;
@@ -164,6 +205,13 @@ public:
     // 零複製緩衝：以呼叫端的宿主記憶體（宿主分頁對齊、長度為分頁倍數）作為緩衝內容，GPU 直接讀寫同一段記憶體；
     // owner 持有記憶體直到資源釋放。後端不支援或位址不符時回傳空值，呼叫端改用一般資源加上傳。
     virtual std::shared_ptr<GraphicsResource> graphics_buffer_alias(std::shared_ptr<void>,std::span<std::uint8_t>){return nullptr;}
+    // D3D12 heap：graphics_heap 建立（實體記憶體可延後到第一個 placed 資源才配置），graphics_resource_placed 在指定偏移建立資源，
+    // 與同一 heap 內其他資源共用記憶體；偏移未對齊或超出 heap 時回傳空值，呼叫端改用獨立配置。
+    // graphics_resource_allocation 回報 placed 建立所需的大小與對齊，供 GetResourceAllocationInfo 讓應用程式的配置不重疊。
+    // zeroed：D3D12 heap 建立時內容為零（D3D12_HEAP_FLAG_CREATE_NOT_ZEROED 除外），實體記憶體配置時一併清零。
+    virtual std::shared_ptr<GraphicsHeap> graphics_heap(std::uint64_t,bool){return nullptr;}
+    virtual std::shared_ptr<GraphicsResource> graphics_resource_placed(const GraphicsResourceDesc&,const std::shared_ptr<GraphicsHeap>&,std::uint64_t){return nullptr;}
+    virtual GraphicsResourceAllocation graphics_resource_allocation(const GraphicsResourceDesc&){return {};}
     // 在途命令緩衝上限：每幀多次提交、由應用程式以 fence 控制幀數的 API（D3D12）可提高，CPU 不必每幾次提交就等 GPU。
     // 預設後端不限制；明確設定的環境變數優先。
     virtual void graphics_submission_depth(std::uint32_t){}
@@ -202,6 +250,11 @@ public:
     // 描述元表項目：type 6／7 回傳 view 的 GPU 資源 ID（value[0]），8／9 回傳緩衝位址與長度；空 view 回傳後端的預設空資源。
     // keep 持有 view 物件直到描述元被覆寫；被引用的配置由後端維持駐留。
     virtual bool graphics_descriptor(const GraphicsView&,std::uint32_t,std::array<std::uint64_t,2>&,std::shared_ptr<void>&){return false;}
+    // 取樣器堆積鏡像項目（8 位元組資源 ID）：SM6.6 SamplerDescriptorHeap 與取樣器描述元表使用；空取樣器回傳預設取樣器。
+    virtual bool graphics_sampler_descriptor(const std::shared_ptr<GraphicsSampler>&,std::uint64_t&,std::shared_ptr<void>&){return false;}
+    // 取樣器的縮減模擬旗標（位元 0～1：2＝MIN、3＝MAX；位元 2：線性 mip；位元 4～6／8～10／12～14：U／V／W 定址）；0 表示一般取樣。
+    // 現代著色器以此在不支援取樣器縮減的 GPU 上模擬 D3D 的 MINIMUM_*／MAXIMUM_* 篩選（見 d3d12_shader.cpp）。
+    virtual std::uint32_t graphics_sampler_flags(const std::shared_ptr<GraphicsSampler>&){return 0;}
     // 呼叫端已確認寫入此範圍的 GPU 工作都已完成（例如遮蔽查詢 fence）時讀回：不等待同一資源上較新的批次，
     // 非同步後端也不先排空命令佇列。只用於不會被 discard 改名的緩衝；預設沿用 graphics_read。
     virtual std::vector<std::uint8_t> graphics_read_completed(const GraphicsView& view){return graphics_read(view);}
@@ -222,6 +275,9 @@ public:
     // 依 count 資源 count_offset 處的計數遮罩後緊密寫入 target 的 target_offset——第 i≥min(計數, maximum) 筆的實例數（繪製）或三個群組數（dispatch）歸零。
     // 一批共用一個 compute 段落；任一項形狀不支援就回傳 false 且不排入任何命令，呼叫端改回讀計數。
     virtual bool graphics_indirect_count_masks(std::span<const GraphicsIndirectCountMask>,const std::shared_ptr<GraphicsResource>&){return false;}
+    // 遮擋查詢解析（D3D12 ResolveQueryData）：每個查詢的 visibility 緩衝前 slots 個 64 位元計數相加，依序寫到 destination 的 offset 起
+    //（binary 時非零寫 1）。在命令流中於 GPU 完成，不讓 CPU 等待；buffer 為空的查詢寫 0。後端不支援時回傳 false。
+    virtual bool graphics_resolve_occlusion(std::span<const GraphicsOcclusionQuery>,const std::shared_ptr<GraphicsResource>&,std::uint64_t,bool){return false;}
     virtual void graphics_mips(const GraphicsView&){throw std::runtime_error("後端缺少 mipmap 操作");}
     // 呼叫期間由呼叫端持有跨程序鎖；返回前 GPU 已完成寫入。
     virtual void graphics_export_frame(const GraphicsView&,void*,std::size_t,std::uint32_t,std::shared_ptr<void> = {}){throw std::runtime_error("後端缺少共用影格匯出");}

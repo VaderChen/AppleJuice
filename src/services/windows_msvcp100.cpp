@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "crt_c_locale.hpp"
@@ -302,6 +303,9 @@ void WindowsServices::initialize_msvcp100(GuestMemory& memory){
     }
     // locale::id::_Id_cnt 是匯出的 static int；inline locale::id 轉換與 ??Bid 共用同一個客體計數，已預建 8 個標準 facet id。
     m.id_count14=runtime_allocate(memory,{},4);memory.store(GuestAddress{m.id_count14},32,8);m.data14.emplace("?_Id_cnt@id@locale@std@@0HA",m.id_count14);
+    // _Locimp 的虛擬表與 static _Clocptr（classic locale 的 _Locimp）。
+    m.data14.emplace("??_7_Locimp@locale@std@@6B@",m.locimp_table14);
+    {const auto cell=runtime_allocate(memory,{},l.p);put(cell,m.classic14);m.data14.emplace(x86_?"?_Clocptr@_Locimp@locale@std@@0PAV123@A":"?_Clocptr@_Locimp@locale@std@@0PEAV123@EA",cell);}
     if(!variant){s.ostream_vb=runtime_allocate(memory,{},8);memory.store(GuestAddress{s.ostream_vb+4},32,8);}
     m.ostream_vb14=runtime_allocate(memory,{},8);memory.store(GuestAddress{m.ostream_vb14+4},32,modern.ostream_base());
     m.istream_vb14=runtime_allocate(memory,{},8);memory.store(GuestAddress{m.istream_vb14+4},32,modern.istream_base());
@@ -530,7 +534,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
     const bool numeric_put16=numeric_put && name.find("num_put@G")!=name.npos;
     if(l.modern && (numeric_punct || numeric_put) && (name.starts_with("??0") || (numeric_put && name.starts_with("??_F")))){
         auto category=current_crt_locale(state,memory).categories[4];const bool byname=name.find("numpunct_byname@")!=name.npos,closure=name.starts_with("??_F");
-        if(byname){const auto named=windows_crt_locale(utf8_to_utf16(read_ansi(memory,a(0),4095)));if(!named){throw_msvc_exception(state,memory,service,MsvcExceptionKind::RuntimeError);return {};}category=*named;}
+        if(byname){const auto named=windows_crt_locale(ansi_to_utf16(read_ansi(memory,a(0),4095)));if(!named){throw_msvc_exception(state,memory,service,MsvcExceptionKind::RuntimeError);return {};}category=*named;}
         // refs 位於 byname 名稱或 _Locinfo 之後；預設建構閉包為 refs 0、無回傳值。
         const auto references=closure?0U:static_cast<std::uint32_t>(a(byname || name.find("_Locinfo@")!=name.npos?1:0));
         initialize_msvcp_numeric_facet(state,memory,object,numeric_punct,l.element==2,category,references,false,l.variant());if(byname)put(object,tables.numpunct_byname);if(numeric_put16)put(object,tables.num_put16);
@@ -543,7 +547,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
     }
     if(l.modern && (numeric_punct || numeric_put) && method=="_Getcat"){
         if(a(0) && !ptr(a(0))){const auto imp=a(1)?ptr(a(1)+l.locale_pointer()):global;const auto label=ptr(imp+4*l.p+8);
-            const auto text=label?utf8_to_utf16(read_ansi(memory,label,4095)):std::u16string{u"C"};
+            const auto text=label?ansi_to_utf16(read_ansi(memory,label,4095)):std::u16string{u"C"};
             const auto category=text==u"*"?std::optional<CrtLocaleCategory>{current_crt_locale(state,memory).categories[4]}:windows_crt_locale(text);
             if(!category){throw_msvc_exception(state,memory,service,MsvcExceptionKind::RuntimeError);return {};}
             const auto facet=allocate_heap(memory,(numeric_punct?6U:2U)*l.p);if(!facet){throw_msvc_exception(state,memory,service,MsvcExceptionKind::BadAlloc);return {};}
@@ -682,14 +686,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         }throw HostCallFault("未知 STL 錯誤分類操作");
     }
     // 只處理 _Locinfo 類別本身的成員；以 _Locinfo 為參數的 facet 建構子（codecvt、num_put…）由各 facet 處理。
-    if(l.modern && (name.find("@_Locinfo@std@@")!=name.npos || name.starts_with("??0_Locinfo@") || name.starts_with("??1_Locinfo@"))){
+    if(l.modern && (name.find("@_Locinfo@std@@")!=name.npos || name.starts_with("??0_Locinfo@") || name.starts_with("??1_Locinfo@") || name.starts_with("??_F_Locinfo@"))){
         // _Locinfo::_Getlconv 在 msvcp140 內即 localeconv()，回傳目前 CRT locale 的 lconv。
         if(method=="_Getlconv"){start_callbacks(state,memory,{{resolve("crt","localeconv").value,{}}},Continuation::ReturnCallback);return {};}
         if(method=="_Getcvt"){write_cvtvec(a(0));return done(a(0));}
         // _Gettnames 回傳擁有 CRT _Gettnames 配置的 _Timevec（隱藏指標）。
-        if(method=="_Gettnames"){const auto output=a(0);memory.check(GuestAddress{output},l.p,Access::Write);put(output,nested_service(state,memory,"crt","_Gettnames",{}));return done(output);}
+        if(method=="_Gettnames" || method=="_W_Gettnames"){const auto output=a(0);memory.check(GuestAddress{output},l.p,Access::Write);put(output,nested_service(state,memory,"crt",method=="_Gettnames"?"_Gettnames":"_W_Gettnames",{}));return done(output);}
         if(method=="_Getctype"){write_ctypevec(a(0));return done(a(0));}
-        if(method=="_Locinfo_ctor" || method=="_Locinfo_dtor"){
+        if((method=="_Locinfo_ctor" && name.find("@HP")==name.npos) || method=="_Locinfo_dtor"){ // 依類別的 _Locinfo_ctor 見下方 categories。
             // 靜態入口由客體內聯的 _Locinfo 呼叫：鎖與各 _Yarn 的建構解構都在客體，這裡只切換 CRT locale 並填入新舊名稱。
             const bool destroy=method=="_Locinfo_dtor";memory.check(GuestAddress{a(0)},x86_?52:104,Access::Write);
             Operation op;op.service=service;op.modern=true;op.element=1;op.kind=destroy?"locinfo_destroy":"locinfo_construct";op.object=a(0);op.buffer=destroy?0:a(1);op.skip=true;
@@ -710,6 +714,50 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
             if(category.codepage){const auto bytes=utf16_bytes(category.name);locale_name=allocate_heap(memory,bytes.size());if(!locale_name){throw_msvc_exception(state,memory,service,MsvcExceptionKind::BadAlloc);return {};}
                 try{memory.write(GuestAddress{locale_name},bytes);}catch(...){(void)free_heap(memory,locale_name,state);throw;}}
             memory.write(GuestAddress{output},std::vector<std::uint8_t>(2*l.p));memory.store(GuestAddress{output},32,category.codepage);put(output+l.p,locale_name);return done(output);
+        }
+        // _Newlocname 的 C 字串：_Yarn 沒有字串時回傳其內嵌的結尾字元（空字串）。
+        if(method=="_Getname"){const auto at=object+(x86_?4U:8U)+5*2*l.p;const auto text=ptr(at);return done(text?text:at+l.p);}
+        // _Getdateorder：time_base::dateorder；目前的 CRT locale 皆採月／日／年（mdy）。
+        if(method=="_Getdateorder")return done(2);
+        // 依類別建立或增補 locale 名稱（_Locinfo(int, const char*)、_Locinfo_ctor(_Locinfo*, int, const char*)、_Addcats、_Locinfo_Addcats）：
+        // 建構時先記錄舊的完整 locale 名稱（寬字元）；再依 MSVC：名稱為 "*" 不變更、類別 0 只查詢、全部類別一次設定、其餘逐一設定 LC_COLLATE～LC_TIME，
+        // 最後以 setlocale(LC_ALL, nullptr) 的結果更新 _Newlocname（失敗為 "*"，原本已是 "*" 時維持）。
+        const bool categories=name.find("@HP")!=name.npos && (name.starts_with("??0_Locinfo@") || method=="_Locinfo_ctor" || method=="_Addcats" || method=="_Locinfo_Addcats");
+        if(categories){
+            const bool static_form=method=="_Locinfo_ctor" || method=="_Locinfo_Addcats";const bool member_ctor=name.starts_with("??0"),construct=member_ctor || method=="_Locinfo_ctor";
+            const auto info=static_form?a(0):object;const auto category=static_cast<std::uint32_t>(a(static_form?1:0));const auto locale_name=a(static_form?2:1);
+            if(!locale_name){throw_msvc_exception(state,memory,service,MsvcExceptionKind::RuntimeError);return {};}
+            // nested_continuation 完成後會重新進入本服務取回結果：清零等副作用都放在續行內，避免重入時覆寫已寫好的名稱。
+            memory.check(GuestAddress{info},x86_?52:104,Access::Write);
+            const auto lockit=member_ctor?resolve("msvcp140.dll",x86_?"??0_Lockit@std@@QAE@H@Z":"??0_Lockit@std@@QEAA@H@Z").value:0;
+            const auto setlocale_entry=resolve("crt","setlocale").value,wsetlocale_entry=resolve("crt","_wsetlocale").value;const auto layout=l;
+            const std::uint64_t result=method=="_Locinfo_ctor"?0:info;
+            return nested_continuation(state,memory,"locinfo categories",[this,service,info,category,locale_name,construct,lockit,setlocale_entry,wsetlocale_entry,layout,bits,result](GuestState& s2,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                const auto load=[&](std::uint64_t at){return m.load(GuestAddress{at},bits);};const auto store=[&](std::uint64_t at,std::uint64_t value){m.store(GuestAddress{at},bits,value);};
+                const auto yarns=info+(x86_?4U:8U),old_name=yarns+4*2*layout.p,new_name=old_name+2*layout.p;
+                const auto replace=[&](std::uint64_t at,std::uint64_t text){if(const auto previous=load(at);previous && allocations_.contains(previous))(void)free_heap(m,previous,s2);store(at,text);};
+                if(lockit)m.write(GuestAddress{info},std::vector<std::uint8_t>(x86_?52:104));
+                if(lockit){GuestCallback lock{lockit,{info,0}};lock.x86_register_arguments=x86_?1:0;(void)co_await service_callback::call_native(std::move(lock));}
+                if(construct){const auto current=co_await service_callback::call_value(wsetlocale_entry,{0,0});replace(old_name,current?crt_duplicate_string(m,current,true):0);}
+                const bool star=m.load(GuestAddress{locale_name},8)=='*' && !m.load(GuestAddress{locale_name+1},8);
+                std::uint64_t updated=0;
+                if(star)updated=0;
+                else if(!category)updated=co_await service_callback::call_value(setlocale_entry,{0,0});
+                else if((category&63U)==63U)updated=co_await service_callback::call_value(setlocale_entry,{0,locale_name});
+                else{for(unsigned index=1;index<=5;++index)if(category&(1U<<(index-1)))(void)co_await service_callback::call_value(setlocale_entry,{index,locale_name});
+                    updated=co_await service_callback::call_value(setlocale_entry,{0,0});}
+                const auto current=load(new_name);const bool already_star=current && m.load(GuestAddress{current},8)=='*' && !m.load(GuestAddress{current+1},8);
+                if(!updated){const auto marker=allocate_heap(m,2);if(marker){m.store(GuestAddress{marker},16,'*');replace(new_name,marker);}}
+                else if(!already_star)replace(new_name,crt_duplicate_string(m,updated));
+                const WindowsCall done_call(s2,m,service);done_call.return_to(s2,result);co_return std::nullopt;
+            });
+        }
+        // 預設建構閉包（??_F）：等同 _Locinfo("C")。
+        if(name.starts_with("??_F_Locinfo@")){
+            auto found=m.data14.find("#locinfo-C");if(found==m.data14.end()){const std::array<std::uint8_t,2> text{'C',0};found=m.data14.emplace("#locinfo-C",runtime_allocate(memory,text)).first;}
+            Operation op;op.service=service;op.modern=true;op.element=1;op.kind="locinfo_construct";op.object=object;op.buffer=found->second;
+            memory.write(GuestAddress{object},std::vector<std::uint8_t>(x86_?52:104));
+            const auto token=s.next++;s.operations.emplace(token,std::move(op));return resume_msvcp100(state,memory,token,0);
         }
         if(name.starts_with("??0") || name.starts_with("??1")){
             const bool destroy=name.starts_with("??1");if(!destroy && !a(0)){throw_msvc_exception(state,memory,service,MsvcExceptionKind::RuntimeError);return {};}
@@ -805,6 +853,95 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
     }
     if(l.modern && method=="xalloc"){const auto index=memory.load(GuestAddress{m.ios_index14},32);memory.store(GuestAddress{m.ios_index14},32,index+1);return done(index);}
     if(l.modern && method=="_Init" && name.find("@locale@")!=name.npos){if(static_cast<std::uint8_t>(a(0)))put_refs(global,refs(global)+1);return done(global);}
+    // locale::_Locimp 的建立（_New_Locimp(bool)、_Locimp(bool)）：facet(1)、沒有 facet、類別遮罩 none、名稱 "*"。
+    const auto init_locimp=[&](std::uint64_t imp,bool transparent)->bool{
+        const auto star=allocate_heap(memory,2);if(!star)return false;memory.store(GuestAddress{star},16,'*');
+        memory.write(GuestAddress{imp},std::vector<std::uint8_t>(x86_?32:56));put(imp,m.locimp_table14);put_refs(imp,1);
+        memory.store(GuestAddress{imp+4*l.p+4},8,transparent?1:0);put(imp+4*l.p+8,star);s.owned_locale_imps.insert(imp);return true;
+    };
+    if(l.modern && (method=="_New_Locimp" || name.starts_with("??0_Locimp@locale@std@@")) && name.find("@_N@Z")!=name.npos){
+        const bool allocate=method=="_New_Locimp";const auto imp=allocate?allocate_heap(memory,x86_?32:56):object;
+        if(!allocate)memory.check(GuestAddress{imp},x86_?32:56,Access::Write);
+        if(!imp || !init_locimp(imp,static_cast<std::uint8_t>(a(0))!=0)){if(allocate && imp)(void)free_heap(memory,imp,state);throw_msvc_exception(state,memory,service,MsvcExceptionKind::BadAlloc);return {};}
+        return done(imp);
+    }
+    // 複製建構（_Locimp(const _Locimp&)、static _Locimp_ctor）：與 _New_Locimp(const _Locimp&) 共用複製流程，寫入呼叫端提供的物件。
+    // 解構（~_Locimp、static _Locimp_dtor）：釋放各 facet 的參考與名稱，不釋放物件本身。
+    if(l.modern && (name.starts_with("??0_Locimp@locale@std@@") || method=="_Locimp_ctor")){
+        const bool static_form=method=="_Locimp_ctor";const auto target=static_form?a(0):object,source=static_form?a(1):a(0);
+        memory.check(GuestAddress{target},x86_?32:56,Access::Write);memory.check(GuestAddress{source},x86_?32:56,Access::Read);
+        Operation op;op.service=service;op.modern=true;op.element=l.element;op.kind="clone_locale_imp";op.locale_source=source;op.scratch=target;
+        op.locale_lock_storage=allocate_heap(memory,16);if(!op.locale_lock_storage){throw_msvc_exception(state,memory,service,MsvcExceptionKind::BadAlloc);return {};}
+        memory.fill(GuestAddress{op.locale_lock_storage},0,16);const auto token=s.next++;
+        try{s.operations.emplace(token,std::move(op));}catch(...){(void)free_heap(memory,op.locale_lock_storage,state);throw;}
+        return resume_msvcp100(state,memory,token,0);
+    }
+    if(l.modern && (name.starts_with("??1_Locimp@locale@std@@") || method=="_Locimp_dtor")){
+        const auto imp=method=="_Locimp_dtor"?a(0):object;memory.check(GuestAddress{imp},x86_?32:56,Access::Write);
+        Operation op;op.service=service;op.modern=true;op.element=l.element;op.kind="destroy_locale_imp";op.object=imp;op.output=ptr(imp+2*l.p);op.limit=ptr(imp+3*l.p);op.final_result=0;
+        const auto token=s.next++;s.operations.emplace(token,std::move(op));return resume_msvcp100(state,memory,token,0);
+    }
+    // _Makeloc／_Makexloc／_Makewloc／_Makeushloc：依 _Locinfo 的名稱為 _Locimp 加入所選類別的 facet。指定了來源 locale 時沿用它的 facet；
+    // 否則以 facet 的 _Getcat 依名稱建立。加入的種類是目前已實作的標準 facet（ctype／codecvt 屬 ctype 類別，numpunct／num_get／num_put
+    // 屬 numeric，time_get／time_put 屬 time）；_Makeloc 另合併類別遮罩並把 _Locimp 的名稱改為 _Locinfo 的名稱。
+    if(l.modern && (method=="_Makeloc" || method=="_Makexloc" || method=="_Makewloc" || method=="_Makeushloc")){
+        const auto info=a(0);const auto category=static_cast<std::uint32_t>(a(1));const auto imp=a(2),from=a(3);
+        memory.check(GuestAddress{imp},x86_?32:56,Access::Write);memory.check(GuestAddress{info},x86_?52:104,Access::Read);
+        struct FacetKind {unsigned element,category;const char* type;};
+        static constexpr FacetKind kinds[]{
+            {0,2,"ctype@D"},{0,2,"codecvt@DDU_Mbstatet@@"},{0,8,"numpunct@D"},{0,8,"num_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@"},
+            {0,8,"num_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@"},{0,16,"time_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@"},
+            {0,16,"time_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@"},
+            {1,2,"ctype@_W"},{1,2,"codecvt@_WDU_Mbstatet@@"},{1,8,"numpunct@_W"},{1,8,"num_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@"},
+            {1,8,"num_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@"},{1,16,"time_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@"},
+            {1,16,"time_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@"},
+            {2,2,"ctype@G"},{2,2,"codecvt@GDU_Mbstatet@@"},{2,8,"num_get@GV?$istreambuf_iterator@GU?$char_traits@G@std@@@std@@"},
+            {2,8,"num_put@GV?$ostreambuf_iterator@GU?$char_traits@G@std@@@std@@"},{2,16,"time_put@GV?$ostreambuf_iterator@GU?$char_traits@G@std@@@std@@"}};
+        const int only=method=="_Makexloc"?0:method=="_Makewloc"?1:method=="_Makeushloc"?2:-1;
+        struct Planned {std::uint64_t getcat,id;};std::vector<Planned> planned;
+        for(const auto& kind:kinds){
+            if((only>=0 && static_cast<int>(kind.element)!=only) || !(kind.category&category))continue;
+            const auto getcat=resolve("msvcp140.dll",std::string("?_Getcat@?$")+kind.type+(x86_?"@std@@SAIPAPBVfacet@locale@2@PBV42@@Z":"@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z")).value;
+            const auto id_cell=m.data14.find(std::string("?id@?$")+kind.type+"@std@@2V0locale@2@A");
+            if(!getcat || id_cell==m.data14.end())throw HostCallFault("STL _Makeloc 缺少 facet 定義");
+            auto id=ptr(id_cell->second);if(!id){id=memory.load(GuestAddress{m.id_count14},32)+1;memory.store(GuestAddress{m.id_count14},32,id);put(id_cell->second,id);}
+            planned.push_back({getcat,id});
+        }
+        // 暫時 locale：_Getcat 只讀 _Ptr->_Name，指向 _Locinfo 的新名稱（不轉移擁有權）。
+        const auto info_name=ptr(info+(x86_?4U:8U)+5*2*l.p);
+        const auto addfac=resolve("msvcp140.dll",x86_?"?_Locimp_Addfac@_Locimp@locale@std@@CAXPAV123@PAVfacet@23@I@Z":"?_Locimp_Addfac@_Locimp@locale@std@@CAXPEAV123@PEAVfacet@23@_K@Z").value;
+        const auto layout=l;const auto global_imp=m.global14;const bool makeloc=method=="_Makeloc";
+        // 暫存（假 _Locimp、locale 與 facet 輸出格）在續行內配置：續行完成後會重新進入本服務取回結果。
+        return nested_continuation(state,memory,"locale makeloc",[this,service,planned,imp,from,info_name,category,addfac,layout,bits,global_imp,makeloc](GuestState& s2,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const auto load=[&](std::uint64_t at){return m.load(GuestAddress{at},bits);};const auto store=[&](std::uint64_t at,std::uint64_t value){m.store(GuestAddress{at},bits,value);};
+            const auto imp_size=x86_?32U:56U;const auto scratch=allocate_heap(m,imp_size+layout.locale_size()+layout.p);
+            if(!scratch)throw std::bad_alloc{};
+            const auto temp_imp=scratch,temp_locale=scratch+imp_size,cell=temp_locale+layout.locale_size();
+            m.write(GuestAddress{scratch},std::vector<std::uint8_t>(imp_size+layout.locale_size()+layout.p));store(temp_imp+4*layout.p+8,info_name);store(temp_locale+layout.locale_pointer(),temp_imp);
+            // 透明的 _Locimp 找不到 facet 時改查全域 locale（與 _Locimp::_Getfacet 相同）。
+            const auto facet_in=[&](std::uint64_t locimp,std::uint64_t id)->std::uint64_t{
+                for(unsigned step=0;step<2 && locimp;++step){
+                    const auto count=load(locimp+3*layout.p),array=load(locimp+2*layout.p);
+                    if(id<count && array)if(const auto facet=load(array+id*layout.p))return facet;
+                    if(!m.load(GuestAddress{locimp+4*layout.p+4},8) || locimp==global_imp)break;
+                    locimp=global_imp;
+                }
+                return 0;
+            };
+            for(const auto& item:planned){
+                std::uint64_t facet=from?facet_in(load(from+layout.locale_pointer()),item.id):0;
+                if(!facet){store(cell,0);(void)co_await service_callback::call_value(item.getcat,{cell,from?from:temp_locale});facet=load(cell);}
+                if(facet)(void)co_await service_callback::call_value(addfac,{imp,facet,item.id});
+            }
+            if(makeloc){
+                m.store(GuestAddress{imp+4*layout.p},32,static_cast<std::uint32_t>(m.load(GuestAddress{imp+4*layout.p},32))|category);
+                const auto label=info_name?crt_duplicate_string(m,info_name):0;
+                if(label){if(const auto previous=load(imp+4*layout.p+8);previous && allocations_.contains(previous))(void)free_heap(m,previous,s2);store(imp+4*layout.p+8,label);}
+            }
+            (void)free_heap(m,scratch,s2);
+            const WindowsCall done_call(s2,m,service);done_call.return_to(s2,makeloc?imp:0);co_return std::nullopt;
+        });
+    }
     if(l.modern && method=="_New_Locimp"){
         const auto source=a(0);memory.check(GuestAddress{source},x86_?32:56,Access::Read);
         Operation op;op.service=service;op.modern=true;op.element=l.element;op.kind="clone_locale_imp";op.locale_source=source;
@@ -976,7 +1113,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         if(a(0) && !ptr(a(0))){
             const auto loc=a(1)?ptr(a(1)+l.locale_pointer()):global;
             const auto locale_name=ptr(loc+4*l.p+8);
-            const auto text=locale_name?utf8_to_utf16(read_ansi(memory,locale_name,4095)):std::u16string{u"C"};
+            const auto text=locale_name?ansi_to_utf16(read_ansi(memory,locale_name,4095)):std::u16string{u"C"};
             const auto category=text==u"*"?std::optional<CrtLocaleCategory>{current_crt_locale(state,memory).categories[2]}:windows_crt_locale(text);
             if(!category){throw_msvc_exception(state,memory,service,MsvcExceptionKind::RuntimeError);return {};}
             const bool codecvt=name.find("codecvt@")!=name.npos;
@@ -2099,15 +2236,15 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
             memory.check(GuestAddress{facets},static_cast<std::size_t>(count*l.p),Access::Read);
             std::uint64_t copy=0,array=0,label=0;
             try{
-                copy=allocate_heap(memory,x86_?32:56);if(!copy)throw std::bad_alloc{};memory.move(GuestAddress{copy},GuestAddress{source},x86_?32:56);
+                copy=op.scratch?op.scratch:allocate_heap(memory,x86_?32:56);if(!copy)throw std::bad_alloc{};memory.move(GuestAddress{copy},GuestAddress{source},x86_?32:56);
                 if(count){array=allocate_heap(memory,count*l.p);if(!array)throw std::bad_alloc{};memory.move(GuestAddress{array},GuestAddress{facets},static_cast<std::size_t>(count*l.p));}
                 if(const auto name=ptr(source+4*l.p+8)){label=crt_duplicate_string(memory,name);if(!label)throw std::bad_alloc{};}
                 put(copy,m.locimp_table14);memory.store(GuestAddress{copy+l.p},l.reference_bits(),1);put(copy+2*l.p,array);put(copy+4*l.p+8,label);
                 s.owned_locale_imps.insert(copy);op.object=copy;op.output=array;op.limit=count;op.phase=2;
             }catch(const std::bad_alloc&){
-                s.owned_locale_imps.erase(copy);if(label)(void)free_heap(memory,label,state);if(array)(void)free_heap(memory,array,state);if(copy)(void)free_heap(memory,copy,state);
+                s.owned_locale_imps.erase(copy);if(label)(void)free_heap(memory,label,state);if(array)(void)free_heap(memory,array,state);if(copy && !op.scratch)(void)free_heap(memory,copy,state);
                 op.allocation_failure=true;op.phase=3;
-            }catch(...){if(label)(void)free_heap(memory,label,state);if(array)(void)free_heap(memory,array,state);if(copy)(void)free_heap(memory,copy,state);throw;}
+            }catch(...){if(label)(void)free_heap(memory,label,state);if(array)(void)free_heap(memory,array,state);if(copy && !op.scratch)(void)free_heap(memory,copy,state);throw;}
         }
         if(returned==1){++op.count;op.locale_pending=0;}
         if(op.phase==2){while(op.count<op.limit){const auto facet=ptr(op.output+op.count*l.p);if(facet){op.locale_pending=facet;return callback(ptr(ptr(facet)+l.p),{facet},1);}++op.count;}op.phase=3;}

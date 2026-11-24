@@ -108,15 +108,15 @@ async function perform(fn) {
   try { await fn(); } catch (error) { toast(errorText(error), true); }
   finally { ++mutationVersion; busy = false; render(); }
 }
-function settingsFrom(p) { return { arguments: p.arguments, workDir: p.workDir, cDrive: p.cDrive, installRoot: p.installRoot || '', writable: p.writable, maxInstructions: p.maxInstructions, gpuMemoryMiB: p.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB, cpuCores: p.cpuCores || 0, presentUpscale: p.presentUpscale === true, presentInterpolation: p.presentInterpolation === true }; }
+function settingsFrom(p) { return { arguments: p.arguments, workDir: p.workDir, cDrive: p.cDrive, installRoot: p.installRoot || '', writable: p.writable, maxInstructions: p.maxInstructions, gpuMemoryMiB: p.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB, cpuCores: p.cpuCores || 0, presentUpscale: p.presentUpscale === true, presentInterpolation: p.presentInterpolation === true, performanceHud: p.performanceHud === true }; }
 function readSettings() {
   const p = selected();
-  return { arguments: $('arguments').value, workDir: $('work-dir').value, cDrive: $('c-drive').value, installRoot: $('install-root').value, writable: $('writable').checked, maxInstructions: p?.maxInstructions ?? 0, gpuMemoryMiB: p?.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB, cpuCores: programCPUSelection, presentUpscale: $('present-upscale').checked, presentInterpolation: $('present-interpolation').checked };
+  return { arguments: $('arguments').value, workDir: $('work-dir').value, cDrive: $('c-drive').value, installRoot: $('install-root').value, writable: $('writable').checked, maxInstructions: p?.maxInstructions ?? 0, gpuMemoryMiB: p?.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB, cpuCores: programCPUSelection, presentUpscale: $('present-upscale').checked, presentInterpolation: $('present-interpolation').checked, performanceHud: $('performance-hud').checked };
 }
 function rememberDraft() { if (currentID) drafts.set(currentID, readSettings()); }
 function loadSettings(p) {
   const s = drafts.get(p.id) || settingsFrom(p);
-  $('arguments').value = s.arguments; $('work-dir').value = s.workDir; $('c-drive').value = s.cDrive; $('install-root').value = s.installRoot || ''; $('writable').checked = s.writable; $('present-upscale').checked = s.presentUpscale === true; $('present-interpolation').checked = s.presentInterpolation === true;
+  $('arguments').value = s.arguments; $('work-dir').value = s.workDir; $('c-drive').value = s.cDrive; $('install-root').value = s.installRoot || ''; $('writable').checked = s.writable; $('present-upscale').checked = s.presentUpscale === true; $('present-interpolation').checked = s.presentInterpolation === true; $('performance-hud').checked = s.performanceHud === true;
   loadProgramCPUChoices(s.cpuCores || 0, p.architecture);
 
 }
@@ -389,9 +389,9 @@ $('spatial-headphones-quick').onchange = () => {
   })));
 };
 // 顯示開關切換即保存；新啟動的子程序也會讀取最新設定，已執行的程式於重啟後生效。
-for (const id of ['present-upscale', 'present-interpolation']) $(id).onchange = () => perform(async () => {
+for (const id of ['present-upscale', 'present-interpolation', 'performance-hud']) $(id).onchange = () => perform(async () => {
   const p = selected(); if (!p) return;
-  const display = { presentUpscale: $('present-upscale').checked, presentInterpolation: $('present-interpolation').checked };
+  const display = { presentUpscale: $('present-upscale').checked, presentInterpolation: $('present-interpolation').checked, performanceHud: $('performance-hud').checked };
   const next = await api('save', { id: p.id, settings: { ...settingsFrom(p), ...display } });
   const draft = drafts.get(p.id); if (draft) drafts.set(p.id, { ...draft, ...display });
   applyState(next);

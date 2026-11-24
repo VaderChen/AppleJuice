@@ -4,7 +4,7 @@
             const auto dc=gui_.contexts.find(arg(1));require(dc!=gui_.contexts.end() && arg(2));
             const auto model=gui_font(gui_,dc->second.font);const auto face=native_resolve_font(model);require(bool(face) && face->em>0,unavailable);
             const auto deviation=scalar_arg(3),extrusion=scalar_arg(4);require(std::isfinite(deviation) && deviation>=0 && std::isfinite(extrusion) && extrusion>=0);
-            const auto text=symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(2)}):utf8_to_utf16_lossy(read_ansi(memory,arg(2)));require(!text.empty() && text.size()<=65536);
+            const auto text=symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(2)}):ansi_to_utf16_lossy(read_ansi(memory,arg(2)));require(!text.empty() && text.size()<=65536);
             std::vector<std::uint32_t> characters(text.begin(),text.end());const auto glyphs=native_font_glyph_indices(*face,characters);
             const double tolerance=deviation!=0?deviation:1./1024.,scale=1./face->em;
             const double em=model.height<0?-static_cast<double>(model.height):model.height?static_cast<double>(model.height)*face->em/std::max(1,face->ascent+face->descent):13;const double width_scale=model.width?std::abs(static_cast<double>(model.width))*face->em/(std::max(1,face->average_width)*em):1;

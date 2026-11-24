@@ -11,7 +11,7 @@ if(service.family=="dnsapi.dll"){
         if(!dns_call(0) || dns_call(3) || dns_call(5))throw dns_detail::Error{87};
         if(dns_call(4)){memory.check(GuestAddress{dns_call(4)},pointer_size,Access::Write);memory.store(GuestAddress{dns_call(4)},width,0);}
         if(!runtime_.network.external_io)throw HostCallFault("比較模式不執行外部 DNS 查詢");
-        const auto name=service.symbol=="DnsQuery_W"?utf16_to_utf8(read_utf16(memory,GuestAddress{dns_call(0)},254)):read_ansi(memory,dns_call(0),1024);
+        const auto name=service.symbol=="DnsQuery_W"?utf16_to_utf8(read_utf16(memory,GuestAddress{dns_call(0)},254)):ansi_to_utf8(read_ansi(memory,dns_call(0),1024));
         const auto records=dns_detail::query(name,static_cast<std::uint16_t>(dns_call(1)),static_cast<std::uint32_t>(dns_call(2)));
         if(dns_call(4))memory.store(GuestAddress{dns_call(4)},width,dns_store_records(state,memory,records,service.symbol=="DnsQuery_W"?1U:service.symbol=="DnsQuery_UTF8"?2U:3U));
     }catch(const dns_detail::Error& error){status=error.code;}catch(const MemoryFault&){status=87;}catch(const std::bad_alloc&){status=8;}

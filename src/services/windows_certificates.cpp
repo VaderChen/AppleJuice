@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/registry_store.hpp"
@@ -189,8 +190,9 @@ using SignedMessage=std::unique_ptr<PKCS7,decltype(&PKCS7_free)>;
 #include "certificate_store_save.inc"
 SignedMessage decode_message(std::span<const std::uint8_t> bytes){
     if(bytes.empty())throw CertificateError{0x8009310b};
+    // 訊息之後允許補零：WIN_CERTIFICATE 以 8 位元組對齊，呼叫端常把整段（含補零）交給 CryptVerifyMessageSignature，Windows 會忽略。
     const auto* cursor=bytes.data();SignedMessage message(d2i_PKCS7(nullptr,&cursor,static_cast<long>(bytes.size())),PKCS7_free);
-    if(!message || cursor!=bytes.data()+bytes.size()){ERR_clear_error();throw CertificateError{0x8009310b};}
+    if(!message || !std::all_of(cursor,bytes.data()+bytes.size(),[](std::uint8_t value){return value==0;})){ERR_clear_error();throw CertificateError{0x8009310b};}
     if(!PKCS7_type_is_data(message.get()) && !PKCS7_type_is_signed(message.get()))throw CertificateError{50};
     return message;
 }
@@ -740,7 +742,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate(GuestState& sta
             if(type==1 || type==2 || type==4 || type==14 || type==15 || type==18)wanted=blob(parameter);
             else if(type==5){property=static_cast<std::uint32_t>(memory.load(GuestAddress{parameter},32));if(!property || property>65535)throw CertificateError{0x80070057};}
             else if(type==6)wanted_key=public_key(parameter);
-            else if(type==7 || type==8){substring=type==8?read_utf16(memory,GuestAddress{parameter}):utf8_to_utf16_lossy(read_ansi(memory,parameter));for(auto& c:substring)c=unicode_case_unit(c,false);}
+            else if(type==7 || type==8){substring=type==8?read_utf16(memory,GuestAddress{parameter}):ansi_to_utf16_lossy(read_ansi(memory,parameter));for(auto& c:substring)c=unicode_case_unit(c,false);}
             else if(type==11){wanted=blob(parameter+6*unit);wanted_serial=blob(parameter+unit);}
             else if(type==12 || type==13){const auto input=certs.contexts.find(parameter);if(input==certs.contexts.end())throw CertificateError{87};subject=decode_certificate(input->second.der);wanted=input->second.der;}
             else if(type!=0 && type!=21)throw CertificateError{50};
@@ -851,7 +853,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate(GuestState& sta
         }else if(symbol=="CertStrToNameA" || symbol=="CertStrToNameW"){
             if((u32(0)&65535)!=1 || !arg(1) || arg(3) || !arg(5))throw CertificateError{87};
             memory.check(GuestAddress{arg(5)},4,Access::Write);if(arg(6))memory.check(GuestAddress{arg(6)},unit,Access::Write);
-            const bool wide=symbol.ends_with('W');const auto text=wide?read_utf16(memory,GuestAddress{arg(1)},65536):utf8_to_utf16_lossy(read_ansi(memory,arg(1),65536));
+            const bool wide=symbol.ends_with('W');const auto text=wide?read_utf16(memory,GuestAddress{arg(1)},65536):ansi_to_utf16_lossy(read_ansi(memory,arg(1),65536));
             try {
                 const auto der=encode_certificate_name(text,u32(2));const auto capacity=memory.load(GuestAddress{arg(5)},32);
                 if(arg(6))memory.store(GuestAddress{arg(6)},bits,0);memory.store(GuestAddress{arg(5)},32,der.size());
@@ -936,7 +938,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate(GuestState& sta
             else if(system){
                 const auto flags=simple?0x10000U:u32(3);const auto location=flags&0xff0000U;const auto pointer=simple?arg(1):arg(4);
                 if((simple?arg(0):arg(2)) || (flags&~0x3f204U) || (location!=0x10000U && location!=0x20000U))throw CertificateError{50};if(!pointer)throw CertificateError{87};
-                const auto display=(simple?symbol.ends_with('W'):arg(0)!=9)?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer));auto name=display;for(auto& c:name)c=unicode_case_unit(c,true);
+                const auto display=(simple?symbol.ends_with('W'):arg(0)!=9)?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16_lossy(read_ansi(memory,pointer));auto name=display;for(auto& c:name)c=unicode_case_unit(c,true);
                 if(name!=u"ROOT"){
                     // ROOT 以外的系統存放區：沙箱登錄中的持久存放區。
                     CertificateStore store;store.readonly=(flags&0x8000U)!=0;store.enum_archived=(flags&0x200U)!=0;

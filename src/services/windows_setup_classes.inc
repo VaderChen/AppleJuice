@@ -73,7 +73,7 @@ if(!arg(0) || (!arg(1) && number(2)))return failed_class(87);
 WindowsGuid guid{};memory.read(GuestAddress{arg(0)},guid);
 const auto item=std::find_if(classes.begin(),classes.end(),[&](const auto& entry){return entry.guid==guid;});if(item==classes.end())return failed_class(2);
 const auto& value=name.starts_with("SetupDiClassNameFromGuid")?item->name:item->description;
-const auto ansi=utf16_to_utf8(value);const auto count=(wide?value.size():ansi.size())+1;
+const auto ansi=utf16_to_ansi(value);const auto count=(wide?value.size():ansi.size())+1;
 if(arg(3))memory.check(GuestAddress{arg(3)},4,Access::Write);
 const bool fits=arg(1) && number(2)>=count;if(fits)memory.check(GuestAddress{arg(1)},wide?count*2:count,Access::Write);
 if(arg(3))memory.store(GuestAddress{arg(3)},32,count);if(!fits)return failed_class(122);

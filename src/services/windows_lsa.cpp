@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "windows_sddl.hpp"
@@ -135,7 +136,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_lsa(GuestState& state,Guest
                 if(type!=2 && type!=3 && type!=4 && type!=5 && type!=7 && type!=8 && type!=9)throw Failure{0xc000000dU};
                 // NULL 密碼的內建服務帳號仍需原生服務帳號 provider。
                 if(!arg(2))throw Failure{0xc00000bbU};
-                const auto text=[&](std::uint64_t p){return name.ends_with('W')?read_utf16(memory,GuestAddress{p}):utf8_to_utf16_lossy(read_ansi(memory,p,32767));};
+                const auto text=[&](std::uint64_t p){return name.ends_with('W')?read_utf16(memory,GuestAddress{p}):ansi_to_utf16_lossy(read_ansi(memory,p,32767));};
                 user=text(arg(0));if(arg(1))domain=text(arg(1));
                 if(name.ends_with('W'))password.value=read_utf16(memory,GuestAddress{arg(2)});else{authentication::ByteSecret raw;raw.value=read_ansi(memory,arg(2),131068);try{password.value=utf8_to_utf16(raw.value);}catch(const std::invalid_argument&){throw Failure{0xc000000dU};}}
                 if(user.empty() || user.size()>4096 || domain.size()>4096 || password.value.size()>4096)throw Failure{0xc000000dU};

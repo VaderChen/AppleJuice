@@ -19,7 +19,8 @@ func (a *App) savePresentationOptionsLocked(library Library) error {
 		return errors.New("程式顯示設定數量超過上限")
 	}
 	var data bytes.Buffer
-	header := []byte{'A', 'J', 'P', 'O', 1, 0, 0, 0}
+	// v2：每筆第 4 位元組為旗標（位元 0 畫面內插、位元 1 效能統計）。
+	header := []byte{'A', 'J', 'P', 'O', 2, 0, 0, 0}
 	if library.SpatialHeadphones {
 		header[5] = 1
 	}
@@ -31,15 +32,18 @@ func (a *App) savePresentationOptionsLocked(library Library) error {
 			return errors.New("程式顯示設定的身分或路徑不正確")
 		}
 		_ = binary.Write(&data, binary.LittleEndian, uint16(len(program.Path)))
-		upscale, interpolation := byte(1), byte(0)
+		upscale, flags := byte(1), byte(0)
 		if program.PresentUpscale {
 			upscale = 2
 		}
 		if program.PresentInterpolation {
-			interpolation = 1
+			flags |= 1
+		}
+		if program.PerformanceHUD {
+			flags |= 2
 		}
 		data.WriteByte(upscale)
-		data.WriteByte(interpolation)
+		data.WriteByte(flags)
 		data.Write(id)
 		data.WriteString(program.Path)
 	}

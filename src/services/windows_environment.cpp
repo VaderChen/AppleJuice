@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "shared_policy.hpp"
 #include "x64arm/shared_wake.hpp"
 #include <chrono>
@@ -232,7 +233,7 @@ void WindowsServices::rebuild_crt_environment(GuestMemory& memory,const GuestSta
     const auto& environment=runtime_.crt_environment;const unsigned unit=x86_?4:8;const auto pointers=(environment.size()+1)*unit;
     std::vector<std::uint8_t> bytes(pointers*2);std::vector<std::pair<std::uint64_t,std::uint64_t>> positions;
     for (const auto& [key,entry] : environment) {
-        (void)key;auto text=entry.first+u"="+entry.second;const auto ansi=utf16_to_utf8(text);const auto wide=utf16_bytes(text);
+        (void)key;auto text=entry.first+u"="+entry.second;const auto ansi=utf16_to_ansi(text);const auto wide=utf16_bytes(text);
         const auto narrow_offset=bytes.size();bytes.insert(bytes.end(),ansi.begin(),ansi.end());bytes.push_back(0);
         const auto wide_offset=bytes.size();bytes.insert(bytes.end(),wide.begin(),wide.end());positions.emplace_back(narrow_offset,wide_offset);
     }
@@ -305,10 +306,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
     const bool wide=symbol.back()=='W' || symbol.starts_with("_w");
     if(symbol=="EventRegister" || symbol=="EventUnregister" || symbol=="EventEnabled" || symbol=="EventProviderEnabled" || symbol=="EventWrite" || symbol=="EventWriteTransfer" || symbol=="EventWriteEx" ||
        symbol=="RegisterTraceGuidsA" || symbol=="RegisterTraceGuidsW" || symbol=="UnregisterTraceGuids" || symbol=="GetTraceEnableFlags" || symbol=="GetTraceEnableLevel" || symbol=="GetTraceLoggerHandle" || symbol=="TraceEvent" || symbol=="TraceMessage" || symbol=="TraceMessageVa")return invoke_etw_provider(state,memory,service);
-    const auto text=[&](unsigned i){return wide?read_utf16(memory,GuestAddress{arg(i)}):utf8_to_utf16(read_ansi(memory,arg(i),32767));};
+    const auto text=[&](unsigned i){return wide?read_utf16(memory,GuestAddress{arg(i)}):ansi_to_utf16(read_ansi(memory,arg(i),32767));};
     const auto encode=[&](std::u16string_view value) {
         if (wide) return utf16_bytes(value);
-        const auto ansi=utf16_to_utf8(value);std::vector<std::uint8_t> bytes(ansi.begin(),ansi.end());bytes.push_back(0);return bytes;
+        const auto ansi=utf16_to_ansi(value);std::vector<std::uint8_t> bytes(ansi.begin(),ansi.end());bytes.push_back(0);return bytes;
     };
     const auto crt_environment_value=[&](unsigned index){
         const auto found=runtime_.environment_values.find(environment_key(text(index)));
@@ -383,7 +384,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
         if(static_cast<std::uint32_t>(arg(0))&~1U || !arg(3) || !arg(4))return done(87);
         try{
             if(arg(1)){
-                auto machine=symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)},260):utf8_to_utf16(read_ansi(memory,arg(1),260));
+                auto machine=symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)},260):ansi_to_utf16(read_ansi(memory,arg(1),260));
                 if(machine.starts_with(u"\\"))machine.erase(0,2);
                 for(auto& c:machine)if(c>=u'a' && c<=u'z')c=static_cast<char16_t>(c-32);
                 if(!machine.empty() && machine!=u"X64ARM")return done(53);
@@ -413,7 +414,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
                 if(!std::equal(prefix.begin(),prefix.end(),path.begin(),[](char16_t a,char16_t b){
                     return unicode_case_unit(a,false)==unicode_case_unit(b,false);
                 }))continue;
-                const auto prefix_units=wide?prefix.size():utf16_to_utf8(prefix).size();
+                const auto prefix_units=wide?prefix.size():utf16_to_ansi(prefix).size();
                 if(prefix_units>=260 || prefix_units>=static_cast<unsigned>(capacity))continue;
                 const auto packed=encode(u"%"+std::u16string(variable)+u"%"+path.substr(prefix.size()));
                 if(packed.size()/(wide?2U:1U)>static_cast<unsigned>(capacity))continue;
@@ -458,7 +459,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
             merge(std::u16string(1,2)+u"\\system\\currentcontrolset\\control\\session manager\\environment",false);
             if(user){merge(std::u16string(1,1)+u"\\environment",true);merge(std::u16string(1,1)+u"\\volatile environment",false);}
             if(packing){arg.return_to(state,pack_path(values));return std::nullopt;}
-            if(!creating){if(!arg(1) || !arg(2))return finish(false,87);const auto source=wide?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16(read_ansi(memory,arg(1),32767));const auto expanded=expand(source,values);const auto bytes=wide?utf16_bytes(expanded):encode(expanded);const auto count=static_cast<std::uint32_t>(arg(3));if(bytes.size()>(wide?static_cast<std::uint64_t>(count)*2:count))return finish(false,122);memory.write(GuestAddress{arg(2)},bytes);return finish(true);}
+            if(!creating){if(!arg(1) || !arg(2))return finish(false,87);const auto source=wide?read_utf16(memory,GuestAddress{arg(1)}):ansi_to_utf16(read_ansi(memory,arg(1),32767));const auto expanded=expand(source,values);const auto bytes=wide?utf16_bytes(expanded):encode(expanded);const auto count=static_cast<std::uint32_t>(arg(3));if(bytes.size()>(wide?static_cast<std::uint64_t>(count)*2:count))return finish(false,122);memory.write(GuestAddress{arg(2)},bytes);return finish(true);}
             if(runtime_.environment_blocks.size()>=4096)return finish(false,8);std::vector<std::uint8_t> bytes;for(const auto& [key,value]:values){(void)key;const auto entry=utf16_bytes(value.first+u"="+value.second);if(entry.size()>output_limit-bytes.size())return finish(false,8);bytes.insert(bytes.end(),entry.begin(),entry.end());}bytes.push_back(0);bytes.push_back(0);if(values.empty()){bytes.push_back(0);bytes.push_back(0);}const auto pointer=allocate_heap(memory,bytes.size());if(!pointer)return finish(false,8);
             try{memory.write(GuestAddress{pointer},bytes);runtime_.environment_blocks.emplace(pointer,true);memory.store(GuestAddress{arg(0)},x86_?32:64,pointer);}catch(...){runtime_.environment_blocks.erase(pointer);(void)free_heap(memory,pointer,state);throw;}return finish(true);
         }catch(const std::bad_alloc&){return finish(false,8);}catch(const std::invalid_argument&){return finish(false,13);}catch(const std::length_error&){return finish(false,203);}

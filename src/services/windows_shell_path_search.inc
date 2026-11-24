@@ -6,7 +6,7 @@ if(service.family=="internal-shell-path-search" || name.starts_with("PathFindOnP
         const unsigned pointer_size=x86_?4U:8U;
         const auto bits=static_cast<std::uint8_t>(pointer_size*8);
         const auto done=[&](bool result){arg.return_to(s,result);return std::optional<std::uint32_t>{};};
-        const auto read_path=[&](std::uint64_t at){return wide?read_utf16(m,GuestAddress{at},32768):utf8_to_utf16_lossy(read_ansi(m,at,32768));};
+        const auto read_path=[&](std::uint64_t at){return wide?read_utf16(m,GuestAddress{at},32768):ansi_to_utf16_lossy(read_ansi(m,at,32768));};
         const bool search=name.starts_with("PathFindOnPath");
         const bool defext=name.starts_with("PathFileExistsDefExt");
         const bool with_attributes=name.find("AndAttributes")!=name.npos;

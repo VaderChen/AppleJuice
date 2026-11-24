@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
@@ -183,7 +184,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_item(GuestState& stat
         if(symbol.starts_with("SHCreateStreamOnFile")){
             const bool ex=symbol=="SHCreateStreamOnFileEx";const auto out=arg(ex?5:2);if(!out)return finish(pointer_error);memory.check(GuestAddress{out},unit,Access::Write);failure_output=out;
             if(!arg(0) || (ex && arg(4))){output(out);return finish(invalid);}
-            const auto path=canonical(symbol.ends_with('A')?utf8_to_utf16_lossy(read_ansi(memory,arg(0),32767)):read_utf16(memory,GuestAddress{arg(0)},32767),runtime_.current_directory);
+            const auto path=canonical(symbol.ends_with('A')?ansi_to_utf16_lossy(read_ansi(memory,arg(0),32767)):read_utf16(memory,GuestAddress{arg(0)},32767),runtime_.current_directory);
             output(out);std::uint64_t stream{};const auto status=open_shell_file_stream(memory,path,d(1),ex?d(2):0,ex && d(3),stream);if(!status)memory.store(GuestAddress{out},bits,stream);return finish(status);
         }
         // 項目輸出：介面須為 IUnknown／IShellItem，路徑必須存在。

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/audio_mixer.hpp"
 #include "x64arm/midi.hpp"
@@ -155,7 +156,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_mixer(GuestState& sta
                 else if(mode==3){const auto type=read(scalar);if(type==(endpoint.capture?0x1003U:0x1008U))source=true;else if(type!=(endpoint.capture?7U:4U))throw MixerError{1024};}
                 else if(mode==4){
                     if(read(target)!=(endpoint.capture?2U:1U) || memory.load(GuestAddress{arg(1)+target+8},32) || read(target+12)!=0x100)throw MixerError{1024};
-                    const auto label=wide?read_utf16(memory,GuestAddress{arg(1)+target+16},32):utf8_to_utf16(read_ansi(memory,arg(1)+target+16,32));
+                    const auto label=wide?read_utf16(memory,GuestAddress{arg(1)+target+16},32):ansi_to_utf16(read_ansi(memory,arg(1)+target+16,32));
                     if(label!=(endpoint.capture?u"macOS Core Audio PCM input":u"macOS Core Audio PCM"))throw MixerError{1024};
                 }else throw MixerError{10};
                 std::vector<std::uint8_t> line(size);put(line,0,size);put(line,12,line_id(selected.id,source));put(line,16,1U|(source?0x80000000U:0));put(line,scalar,endpoint.capture?(source?0x1003U:7U):(source?0x1008U:4U));put(line,scalar+4,endpoint.channels);put(line,scalar+8,source?0U:1U);put(line,scalar+12,unsigned(endpoint.volume.has_value())+unsigned(endpoint.muted.has_value()));

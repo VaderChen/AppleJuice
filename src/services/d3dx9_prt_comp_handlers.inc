@@ -13,7 +13,7 @@
             float progress=0;if(operation->worker->wait(progress)){GuestCallback callback{operation->callback,{bits(progress),operation->context}};callback.floating_arguments=1;start_callbacks(state,memory,{std::move(callback)},Continuation::D3DXProgressOperation,operation->id);return std::nullopt;}
             result=operation->worker->result;if(!result){auto object=create(Kind::PRTComp);object->compressed_prt=operation->output;store_pointer(arg(6),object->root);}bridge.prt_comp_operations.erase(operation->id);
         }else if(symbol.starts_with("D3DXLoadPRTCompBufferFromFile") || symbol.starts_with("D3DXSavePRTCompBufferToFile")){
-            prt_handled=true;const bool load=symbol.starts_with("D3DXLoad");if(load)output(1);require(arg(0));const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+            prt_handled=true;const bool load=symbol.starts_with("D3DXLoad");if(load)output(1);require(arg(0));const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
             if(load){
                 const auto file=filesystem_.open_reader(d3dx_path(path));require(!file.error,0x80070000U|file.error);const auto metadata=file.file->information();require(!metadata.error && metadata.metadata.size>=32 && metadata.metadata.size<=512U*1024U*1024U);
                 std::vector<std::uint8_t> data(metadata.metadata.size);const auto io=file.file->read(data,0);require(!io.error && io.bytes==data.size());

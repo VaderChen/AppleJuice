@@ -36,6 +36,57 @@ inline Level parse(std::span<const std::uint8_t> bytes){
     return result.value_or(Level::Invoker);
 }
 
+// 應用程式清單 compatibility/application/supportedOS 宣告的最高 Windows 版本：100＝Windows 10／11、81＝Windows 8.1、0＝未宣告。
+// 未宣告 8.1／10 的程式在 Windows 8.1 之後由 GetVersion(Ex)／VerifyVersionInfo 看到 6.2.9200（Windows 8）。清單格式不合法時視為未宣告。
+inline unsigned supported_os(std::span<const std::uint8_t> bytes){
+    if(bytes.empty() || bytes.size()>1024U*1024U)return 0;
+    struct Document {xmlDocPtr value;~Document(){if(value)xmlFreeDoc(value);}} doc{
+        xmlReadMemory(reinterpret_cast<const char*>(bytes.data()),static_cast<int>(bytes.size()),nullptr,nullptr,
+                      XML_PARSE_NONET|XML_PARSE_NOERROR|XML_PARSE_NOWARNING)};
+    if(!doc.value || doc.value->intSubset || doc.value->extSubset)return 0;
+    const auto equals=[](const xmlChar* value,const char* text){return value && xmlStrEqual(value,reinterpret_cast<const xmlChar*>(text));};
+    const auto element=[&](xmlNodePtr node,const char* name){return node && node->type==XML_ELEMENT_NODE && equals(node->name,name);};
+    const auto compatibility=[&](xmlNodePtr node){return node->ns && equals(node->ns->href,"urn:schemas-microsoft-com:compatibility.v1");};
+    const auto root=xmlDocGetRootElement(doc.value);
+    if(!element(root,"assembly"))return 0;
+    unsigned result=0;
+    for(auto group=root->children;group;group=group->next)if(element(group,"compatibility") && compatibility(group))
+      for(auto application=group->children;application;application=application->next)if(element(application,"application") && compatibility(application))
+        for(auto os=application->children;os;os=os->next)if(element(os,"supportedOS") && compatibility(os)){
+            struct Property {xmlChar* value;~Property(){xmlFree(value);}} id{xmlGetProp(os,BAD_CAST "Id")};
+            const auto is=[&](const char* text){return id.value && !xmlStrcasecmp(id.value,reinterpret_cast<const xmlChar*>(text));};
+            if(is("{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"))result=std::max(result,100U);
+            else if(is("{1f676c76-80e1-4239-95bb-83d0f6d0da78}"))result=std::max(result,81U);
+        }
+    return result;
+}
+
+// 應用程式清單 windowsSettings/activeCodePage：UTF-8 回傳 65001；Legacy、未宣告或格式不合法回傳 0（沿用預設判定）。
+inline std::uint32_t active_codepage(std::span<const std::uint8_t> bytes){
+    if(bytes.empty() || bytes.size()>1024U*1024U)return 0;
+    struct Document {xmlDocPtr value;~Document(){if(value)xmlFreeDoc(value);}} doc{
+        xmlReadMemory(reinterpret_cast<const char*>(bytes.data()),static_cast<int>(bytes.size()),nullptr,nullptr,
+                      XML_PARSE_NONET|XML_PARSE_NOERROR|XML_PARSE_NOWARNING)};
+    if(!doc.value || doc.value->intSubset || doc.value->extSubset)return 0;
+    const auto root=xmlDocGetRootElement(doc.value);
+    if(!root || root->type!=XML_ELEMENT_NODE || !xmlStrEqual(root->name,BAD_CAST "assembly"))return 0;
+    // assembly/application/windowsSettings/activeCodePage；windowsSettings 的命名空間依 Windows 版本不同，只比對元素名稱。
+    for(auto application=root->children;application;application=application->next)
+      if(application->type==XML_ELEMENT_NODE && xmlStrEqual(application->name,BAD_CAST "application"))
+        for(auto settings=application->children;settings;settings=settings->next)
+          if(settings->type==XML_ELEMENT_NODE && xmlStrEqual(settings->name,BAD_CAST "windowsSettings"))
+            for(auto page=settings->children;page;page=page->next)
+              if(page->type==XML_ELEMENT_NODE && xmlStrEqual(page->name,BAD_CAST "activeCodePage")){
+                  struct Content {xmlChar* value;~Content(){xmlFree(value);}} text{xmlNodeGetContent(page)};
+                  if(!text.value)return 0;
+                  std::string value(reinterpret_cast<const char*>(text.value));
+                  while(!value.empty() && (value.back()==' ' || value.back()=='\n' || value.back()=='\r' || value.back()=='\t'))value.pop_back();
+                  while(!value.empty() && (value.front()==' ' || value.front()=='\n' || value.front()=='\r' || value.front()=='\t'))value.erase(0,1);
+                  return !xmlStrcasecmp(BAD_CAST value.c_str(),BAD_CAST "UTF-8")?65001U:0U;
+              }
+    return 0;
+}
+
 struct Inspection {
     Level level{};std::uint16_t subsystem{},flags{},machine{};
     std::uint64_t file_bytes{},read_bytes{},read_calls{};

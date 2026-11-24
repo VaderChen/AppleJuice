@@ -14,7 +14,7 @@ const auto append_text=[&](property_set::Bytes& record,unsigned type,std::uint64
     record.resize(start+4);
     if(!pointer)return;
     std::u16string text;
-    if(type==30)text=utf8_to_utf16_lossy(read_ansi(m,pointer));
+    if(type==30)text=ansi_to_utf16_lossy(read_ansi(m,pointer));
     else if(type==31)text=read_utf16(m,GuestAddress{pointer});
     else{
         const auto length=m.load(GuestAddress{pointer-4},32);

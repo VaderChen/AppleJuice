@@ -8,6 +8,7 @@
 // - InternetCanonicalizeUrlA／W、InternetCombineUrlA／W：沿用 shlwapi 的 UrlCanonicalize／UrlCombine（加 URL_WININET_COMPATIBILITY）；ICU_NO_ENCODE 與 URL_ESCAPE_UNSAFE 同一位元但意義相反，
 //   且依文件一律為 ICU_BROWSER_MODE（不編碼 "?"、"#" 之後）。HRESULT 轉成 BOOL 與 Win32 錯誤碼。
 // - Cookie 與隱私設定 API 同屬本服務群組，實作見 windows_http_cookies.cpp。
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -92,7 +93,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http_helpers(GuestState& st
     const auto read=[&](std::uint64_t at,std::uint32_t length=0)->std::u16string{
         if(!at)return {};
         if(wide){if(!length)return read_utf16(memory,GuestAddress{at},65536);std::u16string out;for(std::uint32_t i=0;i<length;++i)out.push_back(static_cast<char16_t>(memory.load(GuestAddress{at+i*2},16)));return out;}
-        if(!length)return utf8_to_utf16_lossy(read_ansi(memory,at,65536));std::string out(length,'\0');for(std::uint32_t i=0;i<length;++i)out[i]=static_cast<char>(memory.load(GuestAddress{at+i},8));return utf8_to_utf16_lossy(out);
+        if(!length)return ansi_to_utf16_lossy(read_ansi(memory,at,65536));std::string out(length,'\0');for(std::uint32_t i=0;i<length;++i)out[i]=static_cast<char>(memory.load(GuestAddress{at+i},8));return utf8_to_utf16_lossy(out);
     };
     const auto encode=[&](std::u16string_view text,bool unicode){std::vector<std::uint8_t> bytes;if(unicode)bytes=utf16_bytes(text);else{const auto utf8=utf16_to_utf8(std::u16string(text));bytes.assign(utf8.begin(),utf8.end());bytes.push_back(0);}return bytes;};
     try{
@@ -109,7 +110,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http_helpers(GuestState& st
         if(name.find("TimeToSystemTime")!=std::string_view::npos){
             const auto text_at=call(0),system=call(1);if(!text_at || !system)return fail(87);
             const bool unicode=!inet || name.ends_with('W');
-            const auto text=unicode?utf16_to_utf8(read_utf16(memory,GuestAddress{text_at},256)):read_ansi(memory,text_at,256);
+            const auto text=unicode?utf16_to_utf8(read_utf16(memory,GuestAddress{text_at},256)):ansi_to_utf8(read_ansi(memory,text_at,256));
             const auto parsed=parse_http_time(text);if(!parsed)return fail(87);
             const std::array<std::uint16_t,8> fields{static_cast<std::uint16_t>(parsed->year),static_cast<std::uint16_t>(parsed->month),static_cast<std::uint16_t>(day_of_week(parsed->year,parsed->month,parsed->day)),
                 static_cast<std::uint16_t>(parsed->day),static_cast<std::uint16_t>(parsed->hour),static_cast<std::uint16_t>(parsed->minute),static_cast<std::uint16_t>(parsed->second),0};

@@ -97,7 +97,7 @@ bool background_display_enabled(){return x64arm::native_background_display_enabl
 NSScreen* background_display(){return x64arm::native_background_display();}
 // 客體座標的基準螢幕：背景螢幕模式以該螢幕為客體桌面；其餘以選單列所在的主螢幕左上為原點，
 // 與 Windows 主顯示器一致，其他螢幕依實際排列落在負值或主螢幕之外的座標。
-NSScreen* coordinate_screen(){return background_display()?:NSScreen.screens.firstObject?:NSScreen.mainScreen;}
+NSScreen* coordinate_screen(){return x64arm::native_coordinate_screen();}
 CGDirectDisplayID coordinate_display(){NSNumber* number=coordinate_screen().deviceDescription[@"NSScreenNumber"];return number?number.unsignedIntValue:CGMainDisplayID();}
 // AppKit 的 first responder 是每個 NSWindow 各自保存的狀態；建立／顯示非啟用
 // popup 也會設定它。只有 key window 的原生變更才代表客體鍵盤焦點真的移動。
@@ -1078,6 +1078,8 @@ NSDictionary* menu_bitmap_details(NSImage* image){
     (void)view;if(row<0 || static_cast<std::size_t>(row)>=self.model->items.size())return @"";
     const auto& item=self.model->items[static_cast<std::size_t>(row)];
     if(x64arm::gui_control_class(*self.model)!=u"syslistview32")return nsstring(item.text);
+    // 自繪清單（LVS_OWNERDRAWFIXED）：各列內容由客體在 WM_DRAWITEM 繪製，原生表格只負責列幾何、捲動與選取。
+    if(self.model->style&0x400U)return @"";
     const auto index=static_cast<std::size_t>([column.identifier integerValue]);
     const auto subitem=index<self.model->columns.size()?static_cast<std::uint32_t>(self.model->columns[index].subitem):0;
     if(x64arm::gui_list_text_callback(item,subitem) && !item.resolved_subitems.contains(subitem)){
@@ -1100,6 +1102,12 @@ NSDictionary* menu_bitmap_details(NSImage* image){
     x64arm::GuiMessage message{self.guestHandle,static_cast<std::uint64_t>(sender.selectedRow),0,x64arm::gui_control_class(*self.model)==u"syslistview32"?0x10005U:0x10002U};
     for(NSUInteger row=sender.selectedRowIndexes.firstIndex;row!=NSNotFound;row=[sender.selectedRowIndexes indexGreaterThanIndex:row])message.indices.push_back(static_cast<std::uint32_t>(row));
     self.events->push_back(std::move(message));
+}
+// 自繪清單捲動後各列位置改變：通知服務端使清單失效，重新逐列送 WM_DRAWITEM。
+- (void)listScrolled:(NSNotification*)notification{
+    (void)notification;if(self.updating || !self.model || !self.events || !(self.model->style&0x400U) || x64arm::gui_control_class(*self.model)!=u"syslistview32")return;
+    if(!self.events->empty() && self.events->back().window==self.guestHandle && self.events->back().message==0x10042)return;
+    self.events->push_back({self.guestHandle,0,0,0x10042});
 }
 - (void)sendListEvent:(NSTableView*)table message:(unsigned)code{
     if(self.updating || x64arm::gui_control_class(*self.model)!=u"syslistview32")return;
@@ -1481,7 +1489,9 @@ void create_table_view(Window& window,const NSRect& rect,X64ArmControlTarget* ta
     NSTableView* table=cls==u"systreeview32"?[[NSOutlineView alloc] initWithFrame:NSMakeRect(0,0,model.width,model.height)]:cls==u"syslistview32"?[[X64ArmListTableView alloc] initWithFrame:NSMakeRect(0,0,model.width,model.height)]:[[NSTableView alloc] initWithFrame:NSMakeRect(0,0,model.width,model.height)];
     auto* column=[[NSTableColumn alloc] initWithIdentifier:@"text"];column.width=std::max<CGFloat>(20,model.width-4);column.dataCell=[[X64ArmCenteredTextCell alloc] initTextCell:@""];[(NSTextFieldCell*)column.dataCell setFont:[NSFont systemFontOfSize:12]];[table addTableColumn:column];table.headerView=nil;table.columnAutoresizingStyle=NSTableViewNoColumnAutoresizing;table.rowHeight=17;table.intercellSpacing=NSMakeSize(0,0);table.dataSource=target;table.delegate=target;
     table.allowsMultipleSelection=cls==u"syslistview32"?!(model.style&4U):cls==u"listbox" && (model.style&0x808U)!=0;
-    if(cls==u"syslistview32"){table.target=target;table.action=@selector(listClicked:);table.doubleAction=@selector(doubleClicked:);scroll.hasHorizontalScroller=YES;}
+    if(cls==u"syslistview32"){table.target=target;table.action=@selector(listClicked:);table.doubleAction=@selector(doubleClicked:);scroll.hasHorizontalScroller=YES;
+        scroll.contentView.postsBoundsChangedNotifications=YES;
+        [NSNotificationCenter.defaultCenter addObserver:target selector:@selector(listScrolled:) name:NSViewBoundsDidChangeNotification object:scroll.contentView];}
     if(cls==u"systreeview32"){auto* tree=(NSOutlineView*)table;tree.outlineTableColumn=column;tree.indentationPerLevel=12;tree.dataSource=target;tree.delegate=target;
         // Windows 的選取／焦點屬於項目，不使用 AppKit 額外的整個控制項藍框。
         tree.focusRingType=NSFocusRingTypeNone;scroll.focusRingType=NSFocusRingTypeNone;}
@@ -1984,6 +1994,11 @@ class CocoaGui final : public NativeGui {
             auto* table=(NSTableView*)w.control;
             if(step[@"index"]){const auto row=[step[@"index"] unsignedLongLongValue];if(row>=w.model.items.size())return;[table selectRowIndexes:[NSIndexSet indexSetWithIndex:static_cast<NSUInteger>(row)] byExtendingSelection:NO];}
             [table sendAction:table.doubleAction to:table.target];
+        }else if([operation isEqualToString:@"click"] && gui_control_class(w.model)==u"syslistview32" && [w.control isKindOfClass:[NSTableView class]]){
+            // 清單單擊：選取指定列後送出與實際點擊相同的動作（NM_CLICK）。
+            auto* table=(NSTableView*)w.control;
+            if(step[@"index"]){const auto row=[step[@"index"] unsignedLongLongValue];if(row>=w.model.items.size())return;[table selectRowIndexes:[NSIndexSet indexSetWithIndex:static_cast<NSUInteger>(row)] byExtendingSelection:NO];}
+            [table sendAction:table.action to:table.target];
         }else if([operation isEqualToString:@"column_click"] && gui_control_class(w.model)==u"syslistview32" && [w.control isKindOfClass:[NSTableView class]]){
             auto* table=(NSTableView*)w.control;const auto column=[step[@"index"] unsignedLongLongValue];if(column>=table.tableColumns.count)return;
             const auto header=windows_.find(w.model.list_header);if(header==windows_.end() || !header->second.model.header || ![header->second.view isKindOfClass:X64ArmHeaderView.class])return;
@@ -2319,19 +2334,24 @@ public:
     std::array<std::int32_t,4> work_area() override {if(const auto size=virtual_display_size())return {0,0,static_cast<std::int32_t>(size->first),static_cast<std::int32_t>(size->second)};const auto screen=coordinate_screen();const auto frame=screen.visibleFrame;return {static_cast<std::int32_t>(frame.origin.x-screen.frame.origin.x),static_cast<std::int32_t>(NSMaxY(screen.frame)-NSMaxY(frame)),static_cast<std::int32_t>(frame.size.width),static_cast<std::int32_t>(frame.size.height)};}
     std::array<std::int32_t,4> screen_area() override {if(const auto size=virtual_display_size())return {0,0,static_cast<std::int32_t>(size->first),static_cast<std::int32_t>(size->second)};const auto r=coordinate_screen().frame;return {0,0,static_cast<std::int32_t>(r.size.width),static_cast<std::int32_t>(r.size.height)};}
     std::vector<x64arm::GuiMonitor> monitors() override {
-        // 虛擬解析度與背景螢幕模式只公開一台客體桌面；其餘依 NSScreen 排列換算為 Windows 虛擬桌面座標。
-        if(virtual_display_size() || background_display())return NativeGui::monitors();
+        // 虛擬解析度只公開一台客體桌面。其餘依 NSScreen 排列換算為 Windows 虛擬桌面座標：基準螢幕（背景螢幕模式為該螢幕，
+        // 否則為選單列所在的主螢幕）是主顯示器、左上為原點，其他螢幕依實際排列落在負值或基準之外。背景螢幕模式也公開全部螢幕，
+        // 使用者把視窗拖到其他螢幕後，應用程式的選單與彈出視窗仍以視窗所在螢幕定位（不會被夾回背景螢幕）。
+        if(virtual_display_size())return NativeGui::monitors();
         std::vector<x64arm::GuiMonitor> result;
         @autoreleasepool {
             NSArray<NSScreen*>* screens=NSScreen.screens;if(!screens.count)return NativeGui::monitors();
-            const auto top=NSMaxY(screens.firstObject.frame);
+            NSScreen* reference=coordinate_screen();if(![screens containsObject:reference])reference=screens.firstObject;
+            const auto left=NSMinX(reference.frame),top=NSMaxY(reference.frame);
             const auto convert=[&](NSRect r)->std::array<std::int32_t,4>{
-                return {static_cast<std::int32_t>(NSMinX(r)),static_cast<std::int32_t>(top-NSMaxY(r)),static_cast<std::int32_t>(NSMaxX(r)),static_cast<std::int32_t>(top-NSMinY(r))};};
-            for(NSScreen* screen in screens){
-                x64arm::GuiMonitor monitor{convert(screen.frame),convert(screen.visibleFrame),screen==screens.firstObject,60};
+                return {static_cast<std::int32_t>(NSMinX(r)-left),static_cast<std::int32_t>(top-NSMaxY(r)),static_cast<std::int32_t>(NSMaxX(r)-left),static_cast<std::int32_t>(top-NSMinY(r))};};
+            const auto add=[&](NSScreen* screen){
+                x64arm::GuiMonitor monitor{convert(screen.frame),convert(screen.visibleFrame),screen==reference,60};
                 if(@available(macOS 12.0,*)){if(screen.maximumFramesPerSecond>0)monitor.refresh=static_cast<std::uint32_t>(screen.maximumFramesPerSecond);}
                 result.push_back(monitor);
-            }
+            };
+            // 主顯示器固定排第一（HMONITOR 1）。
+            add(reference);for(NSScreen* screen in screens)if(screen!=reference)add(screen);
         }
         return result;
     }
@@ -2522,6 +2542,7 @@ public:
                         }
                         const auto header=windows_.find(model.list_header);table.headerView=report && !(model.style&0x4000) && header!=windows_.end()?(NSTableHeaderView*)header->second.view:nil;
                         table.allowsMultipleSelection=!(model.style&4U);table.usesAlternatingRowBackgroundColors=NO;
+                        table.selectionHighlightStyle=(model.style&0x400U)?NSTableViewSelectionHighlightStyleNone:NSTableViewSelectionHighlightStyleRegular;
                     }
                     if(old.items!=model.items || old.columns!=model.columns || old.list_icons!=model.list_icons || table.numberOfRows==0)[table reloadData];
                     if([table isKindOfClass:[NSOutlineView class]]){auto* tree=(NSOutlineView*)table;
@@ -2614,6 +2635,21 @@ public:
         const auto row=[table rowAtPoint:point],column=[table columnAtPoint:point];std::int32_t subitem=0;
         if(column>=0){const auto index=static_cast<std::size_t>([table.tableColumns[static_cast<NSUInteger>(column)].identifier integerValue]);if(index<found->second.model.columns.size())subitem=found->second.model.columns[index].subitem;}
         return std::array<std::int32_t,2>{static_cast<std::int32_t>(row),subitem};
+    }
+    std::optional<std::array<std::int32_t,2>> list_visible_rows(std::uint64_t handle) override {
+        const auto found=windows_.find(handle);if(found==windows_.end() || ![found->second.control isKindOfClass:NSTableView.class])return {};
+        auto* table=(NSTableView*)found->second.control;const auto rows=[table rowsInRect:table.visibleRect];
+        return std::array<std::int32_t,2>{static_cast<std::int32_t>(rows.location),static_cast<std::int32_t>(rows.location+rows.length)};
+    }
+    std::optional<std::array<std::int32_t,4>> list_row_rect(std::uint64_t handle,std::int32_t row) override {
+        const auto found=windows_.find(handle);if(found==windows_.end() || ![found->second.control isKindOfClass:NSTableView.class])return {};
+        auto* table=(NSTableView*)found->second.control;if(row<0 || row>=table.numberOfRows)return {};
+        const auto visible=[table convertRect:table.visibleRect toView:found->second.view];
+        const auto rect=NSIntersectionRect([table convertRect:[table rectOfRow:row] toView:found->second.view],visible);if(NSIsEmptyRect(rect))return {};
+        const auto full=[table convertRect:[table rectOfRow:row] toView:found->second.view];
+        // 水平範圍取整列（水平捲動後左緣可為負），至少涵蓋可見寬度。
+        return std::array<std::int32_t,4>{static_cast<std::int32_t>(std::lround(NSMinX(full))),static_cast<std::int32_t>(std::lround(NSMinY(full))),
+            static_cast<std::int32_t>(std::lround(std::max(NSMaxX(full),NSMaxX(visible)))),static_cast<std::int32_t>(std::lround(NSMaxY(full)))};
     }
     bool webview_loading(std::uint64_t id) override {return webview(id).loading;}
     void webview_destroy(std::uint64_t id) override {
@@ -3381,6 +3417,8 @@ public:
     std::optional<std::uint32_t> text_line_count(std::uint64_t handle) override {return real("text_line_count").text_line_count(handle);}
     bool webview_create(std::uint64_t id,std::uint64_t parent) override {return real("webview_create").webview_create(id,parent);}
     std::optional<std::array<std::int32_t,2>> list_hit_test(std::uint64_t handle,std::int32_t x,std::int32_t y) override {return real("list_hit_test").list_hit_test(handle,x,y);}
+    std::optional<std::array<std::int32_t,2>> list_visible_rows(std::uint64_t handle) override {return real("list_visible_rows").list_visible_rows(handle);}
+    std::optional<std::array<std::int32_t,4>> list_row_rect(std::uint64_t handle,std::int32_t row) override {return real("list_row_rect").list_row_rect(handle,row);}
     bool webview_loading(std::uint64_t id) override {return real("webview_loading").webview_loading(id);}
     void webview_destroy(std::uint64_t id) override {real("webview_destroy").webview_destroy(id);}
     void webview_visible(std::uint64_t id,bool visible) override {real("webview_visible").webview_visible(id,visible);}

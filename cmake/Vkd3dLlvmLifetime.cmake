@@ -20,9 +20,10 @@ x64arm_vkd3d_patch("${X64ARM_VKD3D_LIFETIME}"
                         "Invalid lifetime marker signature for '%s'.", name);
                 return;
             }
-            /* Retain all private storage; these hints never dispatch a GPU instruction. */
+            /* Retain all private storage; these hints never dispatch a GPU instruction.
+             * A void call defines no value: dst is the slot of the next value, which may already hold
+             * a forward-allocated SSA id (e.g. a phi incoming defined right after this marker). */
             dst->type = NULL;
-            dst->value_type = VALUE_TYPE_INVALID;
             return;
         }
         vkd3d_shader_parser_error(&sm6->p, VKD3D_SHADER_ERROR_DXIL_UNHANDLED_INTRINSIC,

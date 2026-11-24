@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "gui_window_menu.hpp"
 #include "gui_message_metadata.hpp"
 #include "gui_cursor_bounds.hpp"
@@ -177,7 +178,7 @@ namespace {
 std::int32_t s32(std::uint64_t v){return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(v));}
 std::optional<std::uint64_t> resource_key(const GuestMemory& memory,std::uint64_t key,bool wide) {
     if(key<=65535 || memory.load(GuestAddress{key},wide?16:8)!='#')return key;
-    const auto text=wide?read_utf16(memory,GuestAddress{key}):utf8_to_utf16_lossy(read_ansi(memory,key));
+    const auto text=wide?read_utf16(memory,GuestAddress{key}):ansi_to_utf16_lossy(read_ansi(memory,key));
     std::size_t at=1;
     while(at<text.size() && text[at]<=u' ')++at;
     const bool negative=at<text.size() && text[at]==u'-';
@@ -195,7 +196,7 @@ bool resource_name_matches(const GuestMemory& memory,std::uint64_t root,std::uin
     const auto check=[&](std::uint64_t offset,std::uint64_t length){if(offset>extent || length>extent-offset)throw HostCallFault("資源目錄超出 PE 範圍");};
     const auto offset=entry&0x7fffffffU;check(offset,2);const auto length=memory.load(GuestAddress{root+offset},16);check(offset+2,length*2);std::u16string text;
     for(std::uint64_t i=0;i<length;++i)text.push_back(static_cast<char16_t>(memory.load(GuestAddress{root+offset+2+i*2},16)));
-    const auto query=wide?read_utf16(memory,GuestAddress{requested}):utf8_to_utf16_lossy(read_ansi(memory,requested));
+    const auto query=wide?read_utf16(memory,GuestAddress{requested}):ansi_to_utf16_lossy(read_ansi(memory,requested));
     return std::equal(text.begin(),text.end(),query.begin(),query.end(),[](char16_t a,char16_t b){
         return unicode_case_unit(a,true)==unicode_case_unit(b,true);
     });
@@ -304,7 +305,7 @@ std::uint64_t WindowsServices::load_gui_icon(GuestMemory& memory,std::uint64_t i
         const auto store_resource=[&](GuiIcon icon,std::uint64_t entry){
             icon.resource_instance=resource_image(entry,true)->base;
             if(name<=65535)icon.resource_name_id=static_cast<std::uint32_t>(name);
-            else icon.resource_name=wide?read_utf16(memory,GuestAddress{name}):utf8_to_utf16_lossy(read_ansi(memory,name));
+            else icon.resource_name=wide?read_utf16(memory,GuestAddress{name}):ansi_to_utf16_lossy(read_ansi(memory,name));
             return store_gui_icon(std::move(icon),flags);
         };
         const auto group=gui_resource(memory,instance,name,cursor?12:14,wide,first);
@@ -383,7 +384,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     if(intercept_gui_cbt(state,memory,service))return std::nullopt;
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');std::uint64_t result=0;
     const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
-    const auto read=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):utf8_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
+    const auto read=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):ansi_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
     const auto selected_font=[&](){const auto dc=gui_.contexts.find(arg(0));return gui_font(gui_,dc==gui_.contexts.end()?0xb011:dc->second.font);};
     const auto font_metrics=[&](const GuiFont& font){return native_gui_?native_gui_->font_metrics(font).value_or(fallback_font_metrics(font)):fallback_font_metrics(font);};
     const auto text_width=[&](const GuiFont& font,const std::u16string& text){const auto metrics=font_metrics(font);const auto fallback=static_cast<std::int32_t>(text.size())*metrics.average_width;return native_gui_?native_gui_->text_width(font,text).value_or(fallback):fallback;};
@@ -540,7 +541,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             if(!callbacks.empty()){start_callbacks(state,memory,std::move(callbacks),Continuation::Return,0);return std::nullopt;}
         }}
     }
-    else if(symbol=="CoCreateInstance" || symbol=="CoGetClassObject"){if(begin_registered_com(state,memory,service))return std::nullopt;if(begin_avi_disk(state,memory,service))return std::nullopt;if(begin_msxml_com(state,memory,service))return std::nullopt;if(begin_webbrowser_com(state,memory,service))return std::nullopt;if(begin_ribbon_com(state,memory,service))return std::nullopt;if(begin_moniker_com(state,memory,service))return std::nullopt;if(begin_ole_picture_com(state,memory,service))return std::nullopt;if(begin_file_dialog_com(state,memory,service))return std::nullopt;if(dmusic::is_class(memory,arg(0)))return invoke_directmusic(state,memory,service);if(wic::is_class(memory,arg(0)))return invoke_wic(state,memory,service);if(dsound::is_class(memory,arg(0)))return invoke_dsound(state,memory,service);if(xaudio::is_class(memory,arg(0)))return invoke_xaudio(state,memory,service);if(wasapi::is_class(memory,arg(0)))return invoke_wasapi(state,memory,service);if(dinput::is_class(memory,arg(0)))return invoke_dinput(state,memory,service);if(dxdiag::is_class(memory,arg(0)))return invoke_dxdiag(state,memory,service);if(symbol=="CoGetClassObject"){memory.store(GuestAddress{arg(4)},x86_?32:64,0);arg.return_to(state,0x80040154U);return std::nullopt;}return invoke_wmi(state,memory,service);}
+    else if(symbol=="CoCreateInstance" || symbol=="CoGetClassObject"){if(begin_registered_com(state,memory,service))return std::nullopt;if(begin_avi_disk(state,memory,service))return std::nullopt;if(begin_msxml_com(state,memory,service))return std::nullopt;if(begin_webbrowser_com(state,memory,service))return std::nullopt;if(begin_ribbon_com(state,memory,service))return std::nullopt;if(begin_moniker_com(state,memory,service))return std::nullopt;if(begin_directshow_com(state,memory,service))return std::nullopt;if(begin_ole_picture_com(state,memory,service))return std::nullopt;if(begin_file_dialog_com(state,memory,service))return std::nullopt;if(dmusic::is_class(memory,arg(0)))return invoke_directmusic(state,memory,service);if(wic::is_class(memory,arg(0)))return invoke_wic(state,memory,service);if(dsound::is_class(memory,arg(0)))return invoke_dsound(state,memory,service);if(xaudio::is_class(memory,arg(0)))return invoke_xaudio(state,memory,service);if(wasapi::is_class(memory,arg(0)))return invoke_wasapi(state,memory,service);if(dinput::is_class(memory,arg(0)))return invoke_dinput(state,memory,service);if(dxdiag::is_class(memory,arg(0)))return invoke_dxdiag(state,memory,service);if(symbol=="CoGetClassObject"){memory.store(GuestAddress{arg(4)},x86_?32:64,0);arg.return_to(state,0x80040154U);return std::nullopt;}return invoke_wmi(state,memory,service);}
     else if(symbol.starts_with("InitCommonControls")){if(symbol.ends_with("Ex")){if(memory.load(GuestAddress{arg(0)},32)!=8)fail(87);else result=1;}}
     else if(symbol=="DisableProcessWindowsGhosting"){
         // 此 void API 停用的是 Windows 的替身視窗；AppKit 後端本來不建立替身。
@@ -689,7 +690,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     else if(symbol=="GetKeyboardLayoutNameA" || symbol=="GetKeyboardLayoutNameW"){
         if(!arg(0))fail(87);
         else {const auto name=keyboard_layout_name();
-            if(wide)memory.write(GuestAddress{arg(0)},utf16_bytes(name));else {const auto bytes=utf16_to_utf8(name);std::vector<std::uint8_t> value(bytes.begin(),bytes.end());value.push_back(0);memory.write(GuestAddress{arg(0)},value);}result=1;}
+            if(wide)memory.write(GuestAddress{arg(0)},utf16_bytes(name));else {const auto bytes=utf16_to_ansi(name);std::vector<std::uint8_t> value(bytes.begin(),bytes.end());value.push_back(0);memory.write(GuestAddress{arg(0)},value);}result=1;}
     }else if(symbol=="GetKeyboardLayoutList"){
         if(s32(arg(0))<0 || (d(0) && !arg(1)))fail(87);
         else {std::vector<std::uint32_t> layouts;for(const auto layout:keyboard_layouts())layouts.push_back(static_cast<std::uint32_t>(layout));
@@ -929,7 +930,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         }
         else if(set){f->second.title=read(arg(dlg?2:1));present_gui(h);result=1;}
         else {
-            const auto& value=f->second.title;const auto text=utf16_to_utf8(value);
+            const auto& value=f->second.title;const auto text=utf16_to_ansi(value);
             if(length)result=wide?value.size():text.size();
             else {const auto capacity=d(dlg?3:2);const auto pointer=arg(dlg?2:1);if(capacity){result=std::min<std::uint64_t>(wide?value.size():text.size(),capacity-1);if(wide)memory.write(GuestAddress{pointer},utf16_bytes(value.substr(0,result)));else {std::vector<std::uint8_t> bytes(text.begin(),text.begin()+static_cast<std::ptrdiff_t>(result));bytes.push_back(0);memory.write(GuestAddress{pointer},bytes);}}}
         }
@@ -1124,7 +1125,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         // WS_VISIBLE 只沿 parent 逐層判斷；owned popup 並不是 owner 的 child。
         for(std::size_t depth=0;handle && depth<=gui_.windows.size();++depth){
             if(handle==gui_.desktop){result=1;break;}
-            const auto found=gui_.windows.find(handle);if(found==gui_.windows.end() || !(found->second.style&0x10000000U))break;
+            const auto found=gui_.windows.find(handle);
+            if(found==gui_.windows.end()){
+                // 其他程序的視窗：HWND 在同一桌面全域有效，依共用視窗表沿 parent 判斷 WS_VISIBLE。
+                const auto remote=shared_gui_window(handle,false);if(!remote || !(remote->style&0x10000000U))break;
+                handle=remote->parent;if(!handle){result=1;break;}continue;
+            }
+            if(!(found->second.style&0x10000000U))break;
             handle=found->second.parent;if(!handle){result=1;break;}
         }
     } else if(symbol=="EnableWindow"){
@@ -1141,13 +1148,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             return std::nullopt;
         }
     } else if(symbol=="IsWindowEnabled" || symbol=="IsWindow" || symbol=="IsIconic" || symbol=="IsZoomed"){
-        const auto f=gui_.windows.find(arg(0));
-        // CEF GPU 程序的 eglCreateWindowSurface 靠 IsWindow 判斷視窗有效，失敗就整個退出、Steam 介面消失。事後無法重現，每程序留少量紀錄。
-        if(symbol=="IsWindow" && f==gui_.windows.end() && arg(0)>=0x10000 && arg(0)<0x0fffffff){
+        const auto f=gui_.windows.find(gui_expand_short_window(gui_,arg(0)));
+        // HWND 在同一桌面跨程序有效：本程序沒有時查共用視窗表。CEF 的 GPU 程序建立 EGL 表面前以 IsWindow 檢查瀏覽器程序擁有的視窗，
+        // 原本只查本程序而回 0，GPU 程序以結束碼 34 退出、Steam 停用 GPU 加速後「steamwebhelper 沒有回應」（11-23）。
+        const auto remote=f==gui_.windows.end() && arg(0)?shared_gui_window(arg(0),false):std::nullopt;
+        if(symbol=="IsWindow" && f==gui_.windows.end() && !remote && arg(0)>=0x10000 && arg(0)<0x0fffffff){
             static std::atomic<unsigned> reported{0};
             if(reported.fetch_add(1,std::memory_order_relaxed)<32)std::fprintf(stderr,"[iswindow_invalid] pid=%u thread=%llu hwnd=0x%llx\n",process_id(),static_cast<unsigned long long>(threads_.current),static_cast<unsigned long long>(arg(0)));
         }
         if(f!=gui_.windows.end()){if(symbol=="IsWindow")result=1;else if(symbol=="IsWindowEnabled")result=f->second.enabled?1:0;else if(symbol=="IsIconic")result=f->second.show_command==2;else if(symbol=="IsZoomed")result=f->second.show_command==3;}
+        else if(remote){if(symbol=="IsWindow")result=1;else if(symbol=="IsWindowEnabled")result=remote->enabled?1:0;else if(symbol=="IsIconic")result=remote->show==2;else if(symbol=="IsZoomed")result=remote->show==3;}
     } else if(symbol=="SetFocus" || symbol=="GetFocus"){
         detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,symbol=="SetFocus"?arg(0):0);
         result=gui_.focus;if(result && !input_connected(gui_.windows.at(result).thread))result=0;
@@ -1329,15 +1339,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         }
     }
     else if(symbol.starts_with("GetCharWidth32") || symbol.starts_with("GetCharABCWidthsFloat")){
-        if(d(2)<d(1) || d(2)>65535 || (!wide && d(2)>255))fail(87);
+        // DBCS 的 ACP 下 A 版字元碼可為雙位元組（高位元組為前導位元組），依字型字元集解碼。
+        const bool dbcs=!wide && !process_ansi_is_utf8();
+        if(d(2)<d(1) || d(2)>65535 || (!wide && !dbcs && d(2)>255))fail(87);
         else {const bool abc=symbol.starts_with("GetCharABC");memory.check(GuestAddress{arg(3)},static_cast<std::size_t>(d(2)-d(1)+1)*(abc?12:4),Access::Write);const auto font=selected_font();
-            for(std::uint64_t i=0;i<=d(2)-d(1);++i){const auto p=arg(3)+i*(abc?12:4);const auto character=wide?std::u16string(1,static_cast<char16_t>(d(1)+i)):cp1252_to_utf16(std::string(1,static_cast<char>(d(1)+i)));const auto width=text_width(font,character);
+            const auto narrow_character=[&](std::uint64_t code){std::string bytes;if(code>255)bytes.push_back(static_cast<char>(code>>8));bytes.push_back(static_cast<char>(code&255));return gdi_decode_ansi_text(bytes,font.charset);};
+            for(std::uint64_t i=0;i<=d(2)-d(1);++i){const auto p=arg(3)+i*(abc?12:4);const auto character=wide?std::u16string(1,static_cast<char16_t>(d(1)+i)):dbcs?narrow_character(d(1)+i):cp1252_to_utf16(std::string(1,static_cast<char>(d(1)+i)));const auto width=text_width(font,character);
                 if(abc){memory.store(GuestAddress{p},32,0);memory.store(GuestAddress{p+4},32,std::bit_cast<std::uint32_t>(static_cast<float>(width)));memory.store(GuestAddress{p+8},32,0);}else memory.store(GuestAddress{p},32,static_cast<std::uint32_t>(width));}result=1;}
     }
     else if(symbol=="SelectObject"){auto& value=gui_.dc_objects[arg(0)];result=value?value:0xb011;value=arg(1);}
     else if(symbol=="CreateFontA" || symbol=="CreateFontW"){
         std::vector<std::uint8_t> bytes(wide?92:60);for(unsigned i=0;i<5;++i)for(unsigned j=0;j<4;++j)bytes[i*4+j]=static_cast<std::uint8_t>(d(i)>>(j*8));for(unsigned i=5;i<13;++i)bytes[20+i-5]=static_cast<std::uint8_t>(d(i));
-        if(arg(13)){const auto face=read(arg(13)).substr(0,31);if(wide){const auto data=utf16_bytes(face);std::copy(data.begin(),data.end(),bytes.begin()+28);}else {const auto text=utf16_to_utf8(face);std::copy_n(text.begin(),std::min<std::size_t>(31,text.size()),bytes.begin()+28);}}
+        if(arg(13)){const auto face=read(arg(13)).substr(0,31);if(wide){const auto data=utf16_bytes(face);std::copy(data.begin(),data.end(),bytes.begin()+28);}else {const auto text=utf16_to_ansi(face);std::copy_n(text.begin(),ansi_prefix_length(text,31),bytes.begin()+28);}}
         result=gui_.next_object++;gui_.fonts[result]=std::move(bytes);if(const auto font=gui_font(gui_,result);font.native)gui_.font_natives[result]=font.native;
     }
     else if(symbol.starts_with("CreateFontIndirect")){const auto bytes=wide?92U:60U;std::vector<std::uint8_t> data(bytes);memory.read(GuestAddress{arg(0)},data);result=gui_.next_object++;gui_.fonts[result]=std::move(data);if(const auto font=gui_font(gui_,result);font.native)gui_.font_natives[result]=font.native;}
@@ -1362,7 +1375,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
                 const auto& src=gui_.fonts.at(arg(0));std::copy_n(src.begin(),std::min<std::size_t>(28,src.size()),data.begin());
                 const auto family=gui_font(gui_,arg(0)).face;
                 if(wide){auto count=std::min<std::size_t>(31,family.size());if(count && family[count-1]>=0xd800 && family[count-1]<=0xdbff)--count;const auto bytes=utf16_bytes(family.substr(0,count));std::copy(bytes.begin(),bytes.end(),data.begin()+28);}
-                else {const auto text=utf16_to_utf8(family);auto count=std::min<std::size_t>(31,text.size());while(count && count<text.size() && (static_cast<unsigned char>(text[count])&0xc0)==0x80)--count;std::copy_n(text.begin(),count,data.begin()+28);}
+                else {const auto text=utf16_to_ansi(family);const auto count=ansi_prefix_length(text,31);std::copy_n(text.begin(),count,data.begin()+28);}
             }else {data[0]=0xf3;data[1]=data[2]=data[3]=0xff;data[16]=0x90;data[17]=1;}
             if(!arg(2))result=size;else if(d(1)>=size){memory.write(GuestAddress{arg(2)},data);result=size;}
         }else if(gui_.pens.contains(arg(0))){
@@ -1390,9 +1403,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         const auto font=selected_font();const auto metrics=font_metrics(font);std::u16string text;std::vector<std::size_t> ends;
         if(wide){for(std::uint64_t i=0;i<count;++i)text.push_back(static_cast<char16_t>(memory.load(GuestAddress{arg(1)+i*2},16)));}
         else {std::string bytes(count,'\0');for(std::uint64_t i=0;i<count;++i)bytes[static_cast<std::size_t>(i)]=static_cast<char>(memory.load(GuestAddress{arg(1)+i},8));
-            for(std::size_t at=0;at<bytes.size();){const auto first=static_cast<unsigned char>(bytes[at]);std::size_t n=first<0x80?1:first>=0xc2 && first<=0xdf?2:first>=0xe0 && first<=0xef?3:first>=0xf0 && first<=0xf4?4:1;
-                if(n>bytes.size()-at || std::any_of(bytes.begin()+static_cast<std::ptrdiff_t>(at+1),bytes.begin()+static_cast<std::ptrdiff_t>(at+std::min(n,bytes.size()-at)),[](unsigned char c){return (c&0xc0)!=0x80;}))n=1;
-                text+=utf8_to_utf16_lossy(std::string_view(bytes).substr(at,n));for(std::size_t j=0;j<n;++j)ends.push_back(text.size());at+=n;}}
+            // 與 ExtTextOutA 相同依字型字元集（ACP 為 UTF-8 時為 UTF-8）解碼；ends 為每個來源位元組所屬字元結束時的 UTF-16 長度。
+            std::vector<std::uint8_t> sizes;text=gdi_decode_ansi_text(bytes,font.charset,&sizes);
+            for(std::size_t i=0;i<sizes.size();++i){if(!sizes[i])continue;auto end=i+1;while(end<sizes.size() && !sizes[end])++end;for(unsigned j=0;j<sizes[i];++j)ends.push_back(end);}}
         // SetTextCharacterExtra 與 SetTextJustification 的逐字間距加在各字元之後，寬度與各字元累計位置一併計入。
         const auto spacing=[&]{const auto context=gui_.contexts.find(arg(0));return context==gui_.contexts.end()?std::vector<std::int32_t>(text.size()):gui_text_spacing(context->second,text);}();
         std::int32_t total_spacing=0;for(const auto value:spacing)total_spacing+=value;

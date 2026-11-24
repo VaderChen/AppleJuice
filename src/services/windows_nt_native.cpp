@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "service_callback_task.hpp"
 #include "guest_counted_string.hpp"
 #include "x64arm/windows_services.hpp"

@@ -44,19 +44,39 @@
                             std::vector<std::uint8_t> fixed_constants;
                             if(fixed_vertex){
                                 const auto position=std::find_if(draw.layout.begin(),draw.layout.end(),[](const auto& element){return element.semantic=="POSITION";});require(position!=draw.layout.end() && (fixed_rhw || !object.render.at(137)),unavailable);
-                                std::string source="float4 viewport:register(c0);row_major float4x4 world:register(c4);row_major float4x4 view:register(c8);row_major float4x4 projection:register(c12);struct Input{";
+                                // 固定像素管線開霧時輸出 FOG：表格霧為視空間深度（已轉換頂點取 1/RHW），否則為頂點霧因子（RANGEFOGENABLE 用距離），
+                                // 兩種模式皆 NONE 時取鏡面色 alpha；c16＝（FOGSTART、FOGEND、FOGDENSITY）。
+                                const bool fixed_fog=object.render.at(28) && !object.shaders[1];const auto fog_table=object.render.at(35),fog_vertex=object.render.at(140);
+                                std::string source="float4 viewport:register(c0);row_major float4x4 world:register(c4);row_major float4x4 view:register(c8);row_major float4x4 projection:register(c12);float4 fogp:register(c16);struct Input{";
                                 for(unsigned i=0;i<draw.layout.size();++i){const auto& element=draw.layout[i];source+="float4 e"+std::to_string(i)+":"+element.semantic+std::to_string(element.index)+";";}
-                                source+="};struct Output{float4 p:POSITION;float4 c:COLOR0;float4 s:COLOR1;";for(const auto& element:draw.layout)if(element.semantic=="TEXCOORD")source+="float4 t"+std::to_string(element.index)+":TEXCOORD"+std::to_string(element.index)+";";source+="};Output main(Input i){Output o;";
+                                source+="};struct Output{float4 p:POSITION;float4 c:COLOR0;float4 s:COLOR1;";for(const auto& element:draw.layout)if(element.semantic=="TEXCOORD")source+="float4 t"+std::to_string(element.index)+":TEXCOORD"+std::to_string(element.index)+";";if(fixed_fog)source+="float f:FOG;";source+="};Output main(Input i){Output o;";
                                 const auto p="i.e"+std::to_string(position-draw.layout.begin());source+=fixed_rhw?"o.p=float4("+p+".xy*viewport.xy+viewport.zw,"+p+".z,1)/"+p+".w;":"o.p=mul(mul(mul("+p+",world),view),projection);";
-                                source+="o.c=float4(1,1,1,1);o.s=float4(0,0,0,0);";for(unsigned i=0;i<draw.layout.size();++i){const auto& element=draw.layout[i];if(element.semantic=="TEXCOORD")source+="o.t"+std::to_string(element.index)+"=i.e"+std::to_string(i)+";";else if(element.semantic=="COLOR" && element.index<2)source+=std::string(element.index?"o.s":"o.c")+"=i.e"+std::to_string(i)+";";}source+="return o;}";
+                                source+="o.c=float4(1,1,1,1);o.s=float4(0,0,0,0);";for(unsigned i=0;i<draw.layout.size();++i){const auto& element=draw.layout[i];if(element.semantic=="TEXCOORD")source+="o.t"+std::to_string(element.index)+"=i.e"+std::to_string(i)+";";else if(element.semantic=="COLOR" && element.index<2)source+=std::string(element.index?"o.s":"o.c")+"=i.e"+std::to_string(i)+";";}
+                                if(fixed_fog){const bool specular_input=std::any_of(draw.layout.begin(),draw.layout.end(),[](const auto& element){return element.semantic=="COLOR" && element.index==1;});
+                                    const std::string specular_alpha=specular_input?"o.f=o.s.a;":"o.f=1;";
+                                    if(fixed_rhw)source+=fog_table?"o.f=1/"+p+".w;":specular_alpha;
+                                    else{source+="float4 eye=mul(mul("+p+",world),view);";const std::string distance=object.render.at(48)?"length(eye.xyz)":"eye.z";
+                                        if(fog_table)source+="o.f=eye.z;";else if(fog_vertex==3)source+="o.f=(fogp.y-"+distance+")/(fogp.y-fogp.x);";else if(fog_vertex==1)source+="o.f=exp(-fogp.z*"+distance+");";
+                                        else if(fog_vertex==2)source+="{float d=fogp.z*"+distance+";o.f=exp(-d*d);}";else source+=specular_alpha;}}
+                                source+="return o;}";
                                 auto& shader=object.fixed_shaders[source];if(!shader){const auto compiled=graphics_compile_hlsl(std::span(reinterpret_cast<const std::uint8_t*>(source.data()),source.size()),"D3D9 fixed vertex stage","main","vs_2_0",{},0);if(compiled.bytecode.empty())throw std::invalid_argument("固定頂點管線編譯失敗："+compiled.messages);shader=object.native->graphics_shader(0,compiled.bytecode);}draw.stages[0].shader=shader;
                                 fixed_constants.resize(4096);const auto& v=object.viewport;const std::array<float,4> viewport{2.F/static_cast<float>(v[2]),-2.F/static_cast<float>(v[3]),-1.F+(1.F-2.F*static_cast<float>(v[0]))/static_cast<float>(v[2]),1.F-(1.F-2.F*static_cast<float>(v[1]))/static_cast<float>(v[3])};std::memcpy(fixed_constants.data(),viewport.data(),16);unsigned at=64;for(auto transform:{256U,2U,3U}){std::memcpy(fixed_constants.data()+at,object.transforms.at(transform).data(),64);at+=64;}
+                                for(unsigned component=0;component<3;++component){const auto fog_parameter=object.render.at(36+component);std::memcpy(fixed_constants.data()+256+component*4,&fog_parameter,4);}
                             }
+                            // 沒有像素著色器：依貼圖階段狀態產生固定像素管線（8 階段，見 d3d9_fixed_pixel.hpp），常數另以 c0～c24 傳入。
+                            std::vector<std::uint8_t> fixed_pixel_constants;
                             if(!object.shaders[1]){
-                                const auto semantics=graphics_legacy_semantics(get(object.shaders[0],Kind::VertexShader)->pixels,true);const auto has=[&](unsigned usage){return std::find(semantics.begin(),semantics.end(),std::array<unsigned,2>{usage,0})!=semantics.end();};const bool diffuse=has(10),texcoord=has(5),textured=object.texture && object.stage.at(1)!=1;
-                                std::string source="";if(textured)source+="sampler2D tex:register(s0);";source+="float4 main(";if(diffuse)source+="float4 diffuse:COLOR0";if(textured && texcoord)source+=std::string(diffuse?",":"")+"float2 uv:TEXCOORD0";source+="):COLOR0{float4 c=";source+=diffuse?"diffuse;":"float4(1,1,1,1);";
-                                if(textured){source+="float4 t=tex2D(tex,";source+=texcoord?"uv);":"float2(0,0));";const auto expression=[&](unsigned op,unsigned first,unsigned second,const char* mask){const auto argument=[&](unsigned selector){require((selector&15)<=2 && !(selector&~0x3fU),unavailable);std::string value=(selector&15)==2?"t":"c";value+=(selector&32)?".aaaa":"";if(selector&16)value="(1-"+value+")";return value+"."+mask;};if(op==1)return std::string("c.")+mask;if(op==2)return argument(first);if(op==3)return argument(second);require(op==4,unavailable);return argument(first)+"*"+argument(second);};source+="return float4("+expression(object.stage.at(1),object.stage.at(2),object.stage.at(3),"rgb")+","+expression(object.stage.at(4),object.stage.at(5),object.stage.at(6),"a")+");}";}else source+="return c;}";
-                                auto& shader=object.fixed_shaders[source];if(!shader){const auto compiled=graphics_compile_hlsl(std::span(reinterpret_cast<const std::uint8_t*>(source.data()),source.size()),"D3D9 fixed pixel stage","main","ps_2_0",{},0);if(compiled.bytecode.empty())throw std::invalid_argument("固定像素管線編譯失敗："+compiled.messages);shader=object.native->graphics_shader(1,compiled.bytecode);}draw.stages[1].shader=shader;
+                                d3d9_fixed::PixelInputs inputs;inputs.fixed_vertex=fixed_vertex;inputs.specular_enable=object.render.at(29)!=0;
+                                if(fixed_vertex){inputs.diffuse=inputs.specular=true;for(const auto& element:draw.layout)if(element.semantic=="TEXCOORD" && element.index<8)inputs.texcoord[element.index]=true;
+                                    if(object.render.at(28)){inputs.fog=object.render.at(35)?2U:1U;inputs.table_mode=object.render.at(35);}}
+                                else{auto vertex=get(object.shaders[0],Kind::VertexShader);if(!vertex->legacy_outputs_ready){vertex->legacy_outputs=graphics_legacy_semantics(vertex->pixels,true);vertex->legacy_outputs_ready=true;}
+                                    for(const auto& [usage,index]:vertex->legacy_outputs){if(usage==10 && index<2)(index?inputs.specular:inputs.diffuse)=true;else if(usage==5 && index<8)inputs.texcoord[index]=true;
+                                        // 頂點著色器搭配固定像素管線：FOGTABLEMODE 為 NONE 時霧因子取 oFog（表格霧需要逐像素深度，尚未接入）。
+                                        else if(usage==11 && index==0 && object.render.at(28) && !object.render.at(35))inputs.fog=1;}}
+                                for(unsigned texture_stage=0;texture_stage<d3d9_fixed::stage_count;++texture_stage){const auto binding=texture_stage?object.extra_textures[texture_stage-1]:object.texture;if(!binding)continue;
+                                    const auto texture_kind=get_texture(binding)->kind;inputs.texture[texture_stage]=texture_kind==Kind::CubeTexture?2U:texture_kind==Kind::VolumeTexture?3U:1U;}
+                                auto& shader=object.fixed_pixel_shaders[d3d9_fixed::pixel_key(object.stage,inputs)];if(!shader){const auto source=d3d9_fixed::pixel_source(object.stage,inputs);const auto compiled=graphics_compile_hlsl(std::span(reinterpret_cast<const std::uint8_t*>(source.data()),source.size()),"D3D9 fixed pixel stage","main",d3d9_fixed::pixel_profile(inputs),{},0);if(compiled.bytecode.empty())throw std::invalid_argument("固定像素管線編譯失敗："+compiled.messages);shader=object.native->graphics_shader(1,compiled.bytecode);}draw.stages[1].shader=shader;
+                                fixed_pixel_constants=d3d9_fixed::pixel_constants(object.stage,object.render.at(60),object.render.at(34),object.render.at(36),object.render.at(37),object.render.at(38));
                             }
                             // 像素取樣器綁定陰影深度紋理（D16／D24X8／D24S8）時，該取樣器以比較取樣編譯（依遮罩快取在 PS 物件上），取樣器設 LESS_EQUAL。
                             std::uint32_t shadow_mask=0;if(object.shaders[1])for(unsigned slot=0;slot<16;++slot){const auto binding=slot?object.extra_textures[slot-1]:object.texture;if(binding && d9_shadow_depth(get_texture(binding)->format))shadow_mask|=1U<<slot;}
@@ -69,7 +89,16 @@
                                     auto& cached=object.constant_resources[stage][register_set];auto& last=object.constant_values[stage][register_set];
                                     if(!cached || last!=values){cached=buffer(values,4);last=std::move(values);}
                                     draw.stages[stage].constants[register_set]=cached;}}
-                            if(fixed_vertex)draw.stages[0].constants[0]=buffer(fixed_constants,4);
+                            {
+                                static const bool reuse_fixed=[] {const auto* v=std::getenv("X64ARM_D3D9_CONSTANT_REUSE");return !v || std::string_view(v)!="0";}();
+                                const auto fixed_buffer=[&](unsigned stage,std::vector<std::uint8_t>& values){
+                                    if(!reuse_fixed)return buffer(values,4);
+                                    auto& cached=object.fixed_constant_resources[stage];auto& last=object.fixed_constant_values[stage];
+                                    if(!cached || last!=values){cached=buffer(values,4);last=std::move(values);}
+                                    return cached;};
+                                if(fixed_vertex)draw.stages[0].constants[0]=fixed_buffer(0,fixed_constants);
+                                if(!fixed_pixel_constants.empty())draw.stages[1].constants[0]=fixed_buffer(1,fixed_pixel_constants);
+                            }
                             // SM2+ 允許宣告省略 shader 輸入，其值未定義；使用共用零步幅串流。
                             // SM1 仍要求宣告提供全部輸入，不放寬實際已宣告串流的綁定檢查。
                             if(!fixed_vertex && ((word(get(object.shaders[0],Kind::VertexShader)->pixels,0)>>8)&255)>=2){

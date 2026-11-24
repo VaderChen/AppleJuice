@@ -482,7 +482,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_object_namespace(GuestState
         if(name=="RtlCreateBoundaryDescriptor" || name.starts_with("CreateBoundaryDescriptor")){
             std::u16string text;
             if(name=="RtlCreateBoundaryDescriptor"){if(!call(0))return finish(0);text=native_string(memory,call(0),x86_);}
-            else if(call(0))text=name.ends_with('W')?read_utf16(memory,GuestAddress{call(0)},0x8000):utf8_to_utf16(read_ansi(memory,call(0),0x8000));
+            else if(call(0))text=name.ends_with('W')?read_utf16(memory,GuestAddress{call(0)},0x8000):ansi_to_utf16(read_ansi(memory,call(0),0x8000));
             if(text.empty() || (word(1)&~1U)){if(!native)last_error_=87;return finish(0);}
             const auto block=create_boundary(std::move(text),word(1));
             if(!block && !native)last_error_=8;
@@ -507,7 +507,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_object_namespace(GuestState
             // CreatePrivateNamespace(SECURITY_ATTRIBUTES*, Boundary, Alias)、OpenPrivateNamespace(Boundary, Alias)
             const bool creating=name.starts_with("Create");const unsigned base=creating?1U:0U;const bool wide=name.ends_with('W');
             if(!call(base+1))return fail(87,0);
-            const auto alias=wide?read_utf16(memory,GuestAddress{call(base+1)},0x8000):utf8_to_utf16(read_ansi(memory,call(base+1),0x8000));
+            const auto alias=wide?read_utf16(memory,GuestAddress{call(base+1)},0x8000):ansi_to_utf16(read_ansi(memory,call(base+1),0x8000));
             if(alias.empty() || alias.find(u'\\')!=alias.npos)return fail(87,0);
             GuestScratch block(*this,memory,state);const auto out=block.allocate(8),attributes=block.allocate(x86_?24U:48U);if(!out || !attributes)return fail(8,0);
             memory.store(GuestAddress{attributes},32,x86_?24U:48U);

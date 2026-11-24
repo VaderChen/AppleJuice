@@ -15,6 +15,7 @@ void metal_timestamp_relay(NativeOpenGlContext&,const std::shared_ptr<GraphicsTi
 bool metal_copy_buffer_texture_eligible(const GraphicsView&,const GraphicsView&,std::uint64_t,std::uint32_t,std::uint32_t,const std::array<std::uint32_t,6>&);
 bool metal_unordered_clear_pattern(const GraphicsView&,const std::array<std::uint32_t,4>&,bool,std::array<std::uint8_t,16>&,unsigned&);
 bool metal_indirect_count_shapes(std::span<const GraphicsIndirectCountMask>,const GraphicsResource*);
+bool metal_occlusion_resolve_shape(std::span<const GraphicsOcclusionQuery>,const GraphicsResource*,std::uint64_t);
 class MetalCommandThread final:public NativeOpenGlContext {
 public:
     explicit MetalCommandThread(std::shared_ptr<NativeOpenGlContext> inner,std::function<void(const std::string&)> on_error={}):
@@ -102,6 +103,12 @@ public:
             if(!inner_->graphics_indirect_count_masks(copy,target))throw std::invalid_argument("間接計數遮罩形狀不一致");});
         return true;
     }
+    bool graphics_resolve_occlusion(std::span<const GraphicsOcclusionQuery> queries,const std::shared_ptr<GraphicsResource>& destination,std::uint64_t offset,bool binary) override {
+        if(!metal_occlusion_resolve_shape(queries,destination.get(),offset))return false;
+        post([this,copy=std::vector<GraphicsOcclusionQuery>(queries.begin(),queries.end()),destination,offset,binary]{
+            if(!inner_->graphics_resolve_occlusion(copy,destination,offset,binary))throw std::invalid_argument("遮擋查詢解析形狀不一致");});
+        return true;
+    }
     // 其餘方法：先等佇列清空，再同步轉交。
     bool fixed_vertex_supported()const noexcept override {return inner_->fixed_vertex_supported();}
     void graphics_fixed_targets(const GraphicsView& color,const GraphicsView& depth) override {graphics_sync();inner_->graphics_fixed_targets(color,depth);}
@@ -119,6 +126,10 @@ public:
     // 零複製緩衝別名與 graphics_resource 相同只建立新的 Metal 物件，不碰編碼狀態，不必等佇列清空（電馭判客 CreateCommittedResource1
     // 原本每次在協調者上等編碼執行緒排空，約 0.3 ms）。
     std::shared_ptr<GraphicsResource> graphics_buffer_alias(std::shared_ptr<void> owner,std::span<std::uint8_t> bytes) override {return inner_->graphics_buffer_alias(std::move(owner),bytes);}
+    // heap 與 placed 資源同樣只建立 Metal 物件（heap 內部自行加鎖），不碰編碼狀態。
+    std::shared_ptr<GraphicsHeap> graphics_heap(std::uint64_t size,bool zeroed) override {return inner_->graphics_heap(size,zeroed);}
+    std::shared_ptr<GraphicsResource> graphics_resource_placed(const GraphicsResourceDesc& desc,const std::shared_ptr<GraphicsHeap>& heap,std::uint64_t offset) override {return inner_->graphics_resource_placed(desc,heap,offset);}
+    GraphicsResourceAllocation graphics_resource_allocation(const GraphicsResourceDesc& desc) override {return inner_->graphics_resource_allocation(desc);}
     void graphics_submission_depth(std::uint32_t depth) override {graphics_sync();inner_->graphics_submission_depth(depth);}
     static bool direct_capability_queries(){
         static const bool enabled=[] {
@@ -174,6 +185,8 @@ public:
     }
     std::vector<std::uint8_t> graphics_read(const GraphicsView& view) override {graphics_sync();return inner_->graphics_read(view);}
     bool graphics_descriptor(const GraphicsView& view,std::uint32_t type,std::array<std::uint64_t,2>& value,std::shared_ptr<void>& keep) override {graphics_sync();return inner_->graphics_descriptor(view,type,value,keep);}
+    // 取樣器旗標是建立時決定的不可變資料，不需等命令佇列。
+    std::uint32_t graphics_sampler_flags(const std::shared_ptr<GraphicsSampler>& object) override {return inner_->graphics_sampler_flags(object);}
     // 已完成範圍的 Shared 緩衝不必等命令執行緒排空；其他資源仍同步後讀回。
     std::vector<std::uint8_t> graphics_read_completed(const GraphicsView& view) override {
         if(metal_completed_readable(view.resource))return inner_->graphics_read_completed(view);
@@ -251,11 +264,19 @@ public:
     GraphicsView graphics_drawable(bool depth) override {graphics_sync();return inner_->graphics_drawable(depth);}
 private:
     static bool& on_worker() noexcept {static thread_local bool value=false;return value;}
+    // 目前執行緒所屬的命令執行緒實例（診斷：X64ARM_TRACE_FENCE_RELAY=1 時記錄跨實例內嵌執行）。
+    static MetalCommandThread*& current_instance() noexcept {static thread_local MetalCommandThread* value=nullptr;return value;}
+    void note_cross_instance(const char* operation) noexcept {
+        static const bool trace=std::getenv("X64ARM_TRACE_FENCE_RELAY")!=nullptr;
+        if(!trace || current_instance()==this)return;
+        static std::atomic<unsigned> lines{};if(lines.fetch_add(1,std::memory_order_relaxed)<200)
+            std::fprintf(stderr,"[fence_relay] 跨實例內嵌 operation=%s target=%p from=%p\n",operation?operation:"?",static_cast<void*>(this),static_cast<void*>(current_instance()));
+    }
     // 統計：需要等待命令執行緒的同步次數與等待時間，依來源分組（隨 statistics 輸出，供判斷客體端是否被編碼速度卡住）。
     // 只在確實要等待時才計數與取時間，不必等待的同步不增加成本。
     struct SyncWaits {std::atomic<std::uint64_t> count{},ns{};};
     void sync_through(std::uint64_t ticket,SyncWaits& waits) {
-        if(on_worker())return;
+        if(on_worker()){note_cross_instance("sync");return;}
         const auto target=std::min(ticket,queued_.load(std::memory_order_acquire));
         if(completed_.load(std::memory_order_acquire)<target){
             const auto wait_begin=std::chrono::steady_clock::now();
@@ -288,13 +309,13 @@ private:
         }
     }
     template<class Task> void post(Task&& task,const char* operation=__builtin_FUNCTION()) {
-        if(on_worker()){task();return;}
+        if(on_worker()){note_cross_instance(operation);task();return;}
         bool wake=false;
         {std::lock_guard lock(mutex_);queue_.push_back({std::forward<Task>(task),operation});queued_.store(++submitted_,std::memory_order_release);wake=sleeping_;}
         if(wake)cv_.notify_one();
     }
     void run() {
-        on_worker()=true;
+        on_worker()=true;current_instance()=this;
 #if defined(__APPLE__)
         pthread_setname_np("x64arm.metal.commands");
         // 命令執行緒餵 GPU，與 D3D11 串流執行緒同為 USER_INTERACTIVE（原本繼承建立者的 QoS）；X64ARM_METAL_COMMAND_QOS=0 關閉。

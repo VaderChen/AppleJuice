@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/gpu_memory.hpp"
@@ -98,8 +99,8 @@ GuiFont gui_font(const GuiState& gui, std::uint64_t handle) {
     } else {
         std::string face;
         for (unsigned i = 28; i < 60 && bytes[i]; ++i) face.push_back(static_cast<char>(bytes[i]));
-        // 本虛擬 Windows 的 GetACP 固定為 UTF-8，A/W 字型名稱與其餘字串 API 使用相同約定。
-        font.face = utf8_to_utf16_lossy(face);
+        // LOGFONTA 的字型名稱依程序 ACP 解碼，與其餘 A 版字串 API 相同。
+        font.face = ansi_to_utf16_lossy(face);
     }
     if(const auto native=gui.font_natives.find(handle);native!=gui.font_natives.end())font.native=native->second;
     else{
@@ -197,6 +198,23 @@ std::shared_ptr<RasterSurface> WindowsServices::raster_surface(GuestMemory& memo
     if(created){surface=make_hardware_raster(width,height,pixels,view);if(!surface)return {};if(window!=gui_.windows.end()){
             if(native_gui_)native_gui_->graphics_surface(window->first,surface);
             else if(pixels.empty())for(const auto& draw:window->second.drawing)surface->draw(draw);
+            // 子視窗的畫布在自己繪製前顯示父視窗已畫好的像素（Windows 的子視窗與父視窗共用同一塊畫面，建立子視窗不會清掉底下的內容）。
+            // 只畫部分區域、其餘沿用底圖的程式（三國志 VIII 的武將選擇對話框只畫上方面板）原本會露出全白。
+            // X64ARM_CHILD_RASTER_INHERIT=0 恢復全白起始作對照。
+            static const bool inherit_parent=[] {const auto* value=std::getenv("X64ARM_CHILD_RASTER_INHERIT");return !value || std::string_view(value)!="0";}();
+            if(inherit_parent && native_gui_ && pixels.empty() && window->second.parent && gui_.windows.contains(window->second.parent)){
+                const auto parent=rasters_.find(0x10000000U+window->second.parent);
+                if(parent!=rasters_.end() && parent->second && parent->second!=surface){
+                    const auto x=window->second.x,y=window->second.y;
+                    const auto left=std::max(0,x),top=std::max(0,y);
+                    const auto right=std::min<std::int64_t>(std::int64_t{x}+width,parent->second->width()),bottom=std::min<std::int64_t>(std::int64_t{y}+height,parent->second->height());
+                    if(right>left && bottom>top){
+                        GuiDc copy_dc;const std::array<std::int32_t,4> source{left,top,static_cast<std::int32_t>(right),static_cast<std::int32_t>(bottom)};
+                        const std::array<std::int32_t,4> destination{left-x,top-y,static_cast<std::int32_t>(right-x),static_cast<std::int32_t>(bottom-y)};
+                        surface->blit(*parent->second,destination,source,copy_dc,UINT32_MAX);
+                    }
+                }
+            }
         }}
     if(writing && shared){
         auto independent=make_hardware_raster(width,height);GuiDc copy_dc;const std::array<std::int32_t,4> rect{0,0,static_cast<std::int32_t>(width),static_cast<std::int32_t>(height)};independent->blit(*surface,rect,rect,copy_dc,UINT32_MAX);surface=std::move(independent);shared=false;
@@ -562,9 +580,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
     else if(symbol=="GetTextColor")result=dc.color;
     else if(symbol=="GetTextAlign")result=dc.alignment;
     else if(symbol=="CreateDIBSection"){
-        if(!arg(3)){last_error_=87;}
-        else {
-            memory.store(GuestAddress{arg(3)},x86_?32:64,0);
+        // ppvBits 可為 NULL（不回傳位元指標，點陣圖照常建立）。
+        {
+            if(arg(3))memory.store(GuestAddress{arg(3)},x86_?32:64,0);
             if(!arg(1) || d(2)>1){last_error_=87;}
             else {
                 memory.check(GuestAddress{arg(1)},40,Access::Read);
@@ -590,7 +608,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
                                 else {const auto value=field(header+i*4);palette.push_back(((value>>16)&255)|(value&0xff00)|((value&255)<<16));}}
                         }
                         result=create_dib_bitmap(memory,state,columns,height,static_cast<std::uint16_t>(bpp),arg(4),d(5));
-                        if(result){auto& bitmap=gui_.bitmaps.at(result);bitmap.dib_compression=compression;bitmap.dib_masks=masks;bitmap.dib_palette=std::move(palette);import_dib_bitmap(memory,result);memory.store(GuestAddress{arg(3)},x86_?32:64,bitmap.dib_address);}
+                        if(result){auto& bitmap=gui_.bitmaps.at(result);bitmap.dib_compression=compression;bitmap.dib_masks=masks;bitmap.dib_palette=std::move(palette);import_dib_bitmap(memory,result);if(arg(3))memory.store(GuestAddress{arg(3)},x86_?32:64,bitmap.dib_address);}
                     }
                 }
             }
@@ -608,10 +626,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
             result=gui_.next_object++;gui_.bitmaps.emplace(result,std::move(bitmap));}
     }
     else if(symbol=="TranslateCharsetInfo"){
-        const auto input=d(2)==1?d(0):d(2)==2?d(0):UINT32_MAX;
-        if(input==0 || input==1 || input==65001 || input==1252){memory.write(GuestAddress{arg(1)},std::array<std::uint8_t,32>{});memory.store(GuestAddress{arg(1)+4},32,input==65001?65001:1252);result=1;}else last_error_=87;
+        // CHARSETINFO{ciCharset, ciACP, FONTSIGNATURE}：TCI_SRCCHARSET(1) 以字元集值、TCI_SRCCODEPAGE(2) 以碼頁值、
+        // TCI_SRCFONTSIG(3) 以指向 fsCsb[0] 的指標查表（取最低的已設位元）。UTF-8 ACP 沒有字元集，沿用 ANSI 並回報 65001。
+        struct Entry {std::uint8_t charset;std::uint16_t page;std::uint32_t csb;};
+        static constexpr Entry table[]{{0,1252,0x1},{238,1250,0x2},{204,1251,0x4},{161,1253,0x8},{162,1254,0x10},{177,1255,0x20},{178,1256,0x40},
+            {186,1257,0x80},{163,1258,0x100},{222,874,0x10000},{128,932,0x20000},{134,936,0x40000},{129,949,0x80000},{136,950,0x100000},
+            {130,1361,0x200000},{2,42,0x80000000U}};
+        const auto mode=d(2);const Entry* found=nullptr;
+        if(mode==1 || mode==2){
+            const auto input=d(0);
+            if(mode==2 && input==65001)found=&table[0];
+            else for(const auto& entry:table)if(mode==1?entry.charset==input:entry.page==input){found=&entry;break;}
+        }else if(mode==3 && arg(0)){
+            const auto mask=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)},32));
+            for(const auto& entry:table)if(mask&entry.csb){found=&entry;break;}
+        }
+        if(!found || !arg(1))last_error_=87;
+        else {
+            std::array<std::uint8_t,32> info{};info[0]=found->charset;
+            const std::uint32_t page=mode==2 && d(0)==65001?65001U:found->page;
+            for(unsigned i=0;i<4;++i){info[4+i]=static_cast<std::uint8_t>(page>>(8*i));info[24+i]=static_cast<std::uint8_t>(found->csb>>(8*i));}
+            memory.write(GuestAddress{arg(1)},info);result=1;
+        }
     }else if(symbol=="CreateDCA" || symbol=="CreateDCW" || symbol=="CreateICA" || symbol=="CreateICW"){
-        const auto text=[&](std::uint64_t pointer){auto value=pointer?(symbol.ends_with('W')?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16(read_ansi(memory,pointer))):std::u16string{};for(auto& c:value)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);return value;};
+        const auto text=[&](std::uint64_t pointer){auto value=pointer?(symbol.ends_with('W')?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16(read_ansi(memory,pointer))):std::u16string{};for(auto& c:value)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);return value;};
         const auto driver=text(arg(0)),device=text(arg(1));
         if((driver.empty() || driver==u"winspool") && device==u"win64 pdf")result=create_printer_dc(memory,arg(3),symbol.ends_with('W'),symbol.starts_with("CreateIC"));
         else if(driver.empty() && device.empty())last_error_=87;
@@ -680,8 +718,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
         if(count && !pointer)return fail_text(87);memory.check(GuestAddress{pointer},count*(wide?2U:1U),Access::Read);
         std::string narrow;
         if(wide)for(std::uint64_t i=0;i<count;++i)draw.text.push_back(static_cast<char16_t>(memory.load(GuestAddress{pointer+i*2},16)));
-        else {narrow.resize(count);for(std::uint64_t i=0;i<count;++i)narrow[static_cast<std::size_t>(i)]=static_cast<char>(memory.load(GuestAddress{pointer+i},8));draw.text=utf8_to_utf16_lossy(narrow);}
+        std::vector<std::uint8_t> narrow_sizes;
         draw.font=gui_font(gui_,dc.font);
+        if(!wide){narrow.resize(count);for(std::uint64_t i=0;i<count;++i)narrow[static_cast<std::size_t>(i)]=static_cast<char>(memory.load(GuestAddress{pointer+i},8));draw.text=gdi_decode_ansi_text(narrow,draw.font.charset,&narrow_sizes);}
         const auto metrics=native_gui_?native_gui_->font_metrics(draw.font).value_or(fallback_font_metrics(draw.font)):fallback_font_metrics(draw.font);
         if(metrics.fixed_pitch && !draw.glyph_indices)draw.cell_width=static_cast<std::uint32_t>(metrics.average_width);
         const auto checked=[](std::int64_t value){if(value<INT32_MIN || value>INT32_MAX)throw std::invalid_argument("GDI 文字座標溢位");return static_cast<std::int32_t>(value);};
@@ -690,9 +729,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
             const auto advance=[&](unsigned i,unsigned axis){return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{arg(7)+i*stride+axis*4},32)));};
             // ETO_PDY 使用字型向上的垂直軸，GuiDraw 的邏輯 Y 向下。
             if(wide)for(unsigned i=0;i<count;++i){draw.advances.push_back(advance(i,0));if(pdy)draw.advances_y.push_back(checked(-static_cast<std::int64_t>(advance(i,1))));}
-            else for(int at=0;at<static_cast<int>(count);){const auto begin=at;UChar32 cp;U8_NEXT_OR_FFFD(narrow.data(),at,static_cast<int>(count),cp);std::int64_t x=0,y=0;
-                for(int i=begin;i<at;++i){x+=advance(static_cast<unsigned>(i),0);if(pdy)y+=advance(static_cast<unsigned>(i),1);}draw.advances.push_back(checked(x));if(pdy){checked(y);draw.advances_y.push_back(checked(-y));}
-                if(cp>0xffff){draw.advances.push_back(0);if(pdy)draw.advances_y.push_back(0);}}
+            else {
+                // 每個字元的位移為其來源位元組在 lpDx 的總和（UTF-8 多位元組或 DBCS 雙位元組）；代理字元對的第二單位為 0。
+                unsigned at=0;
+                for(const auto size:narrow_sizes){
+                    std::int64_t x=0,y=0;for(unsigned i=at;i<at+size && i<count;++i){x+=advance(i,0);if(pdy)y+=advance(i,1);}at+=size;
+                    draw.advances.push_back(checked(x));if(pdy){checked(y);draw.advances_y.push_back(checked(-y));}
+                }
+            }
         }
         if(draw.glyph_indices){const auto widths=native_gdi_glyph_advances(draw.font,draw.text);if(draw.advances.empty())draw.advances=widths;}
         if(!(ext && arg(7)) && (dc.char_extra || dc.break_count) && !draw.glyph_indices && !draw.text.empty()){

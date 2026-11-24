@@ -1,4 +1,5 @@
 #pragma once
+#include "ansi_codepage.hpp"
 #include "crt_library.hpp"
 #include "x64arm/windows_guid.hpp"
 #include "msvcp_numeric_limits.hpp"
@@ -6,9 +7,9 @@ namespace x64arm::detail {
 // 不可變資料與可呼叫服務分別發布；資料保持真正的 PE RVA 及唯讀頁面。
 inline std::span<const msvcp_numeric::Constant> builtin_constant_exports(std::string_view family){
     static const msvcp_numeric::Constant crt[]{{"_HUGE",0x7ff0000000000000ULL,8}};
-    // ntdll 的 NLS 資料匯出：與 GetACP／GetOEMCP 相同的 UTF-8（65001）系統碼頁，屬多位元組碼頁。
-    static const msvcp_numeric::Constant nls[]{{"NlsAnsiCodePage",65001,2},{"NlsMbCodePageTag",1,1},{"NlsMbOemCodePageTag",1,1}};
-    if(family=="ntdll.dll")return nls;
+    // ntdll 的 NLS 資料匯出：與 GetACP／GetOEMCP 相同的程序碼頁（UTF-8 與 DBCS 碼頁皆屬多位元組碼頁）。
+    static thread_local msvcp_numeric::Constant nls[]{{"NlsAnsiCodePage",65001,2},{"NlsMbCodePageTag",1,1},{"NlsMbOemCodePageTag",1,1}};
+    if(family=="ntdll.dll"){nls[0].value=process_ansi_codepage();return nls;}
     if(const auto numeric=msvcp_numeric::module_constants(family);!numeric.empty())return numeric;
     if(crt_library(family))return crt;
     return {};

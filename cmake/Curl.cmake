@@ -1,0 +1,58 @@
+# libcurl 8.23.0：宿主 HTTP／HTTPS 傳輸（WinHTTP、WinINet、urlmon、WebSocket、PAC、CRL 下載）。
+# TLS 使用本專案的靜態 OpenSSL，與 Schannel 同一套函式庫與 tls_policy；不使用系統 libcurl／LibreSSL。
+# 只啟用 HTTP／HTTPS；不讀宿主 CA 檔、~/.netrc 或 openssl.cnf（信任根一律由呼叫端帶入沙箱信任根）。
+include(FetchContent)
+include(ExternalProject)
+FetchContent_Declare(x64arm_curl_source
+  URL "${PROJECT_SOURCE_DIR}/third_party/curl-8.23.0.tar.gz"
+  URL_HASH SHA256=e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR x64arm-do-not-add)
+FetchContent_MakeAvailable(x64arm_curl_source)
+# macOS 外接磁碟的 AppleDouble 檔可能使解壓縮保留頂層目錄。
+if(NOT EXISTS "${x64arm_curl_source_SOURCE_DIR}/include/curl/curl.h"
+   AND EXISTS "${x64arm_curl_source_SOURCE_DIR}/curl-8.23.0/include/curl/curl.h")
+  set(x64arm_curl_source_SOURCE_DIR "${x64arm_curl_source_SOURCE_DIR}/curl-8.23.0")
+endif()
+set(X64ARM_CURL_BUILD "${CMAKE_CURRENT_BINARY_DIR}/curl")
+set(X64ARM_CURL_DISABLED DICT FILE FTP GOPHER IMAP LDAP LDAPS MQTT POP3 RTSP SMTP TELNET TFTP IPFS
+  ALTSVC DOH WEBSOCKETS AWS NETRC CA_SEARCH OPENSSL_AUTO_LOAD_CONFIG)
+set(X64ARM_CURL_OPTIONS
+  -DCMAKE_BUILD_TYPE=Release
+  "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
+  "-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+  "-DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}"
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+  # OpenSSL 的標頭分在建置目錄（產生的 opensslv.h 等）與來源目錄兩處。
+  "-DCMAKE_C_FLAGS=-I${x64arm_openssl_source_SOURCE_DIR}/include"
+  -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF
+  -DBUILD_LIBCURL_DOCS=OFF -DBUILD_MISC_DOCS=OFF -DENABLE_CURL_MANUAL=OFF -DCURL_DISABLE_INSTALL=ON
+  -DCURL_USE_PKGCONFIG=OFF -DCURL_USE_CMAKECONFIG=OFF
+  -DCURL_USE_OPENSSL=ON -DOPENSSL_USE_STATIC_LIBS=TRUE
+  "-DOPENSSL_INCLUDE_DIR=${X64ARM_OPENSSL_BUILD}/include"
+  "-DOPENSSL_SSL_LIBRARY=${X64ARM_OPENSSL_BUILD}/libssl.a"
+  "-DOPENSSL_CRYPTO_LIBRARY=${X64ARM_OPENSSL_BUILD}/libcrypto.a"
+  -DCURL_ZLIB=ON -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF -DUSE_NGHTTP2=OFF -DUSE_LIBIDN2=OFF -DUSE_APPLE_IDN=OFF
+  -DCURL_USE_LIBPSL=OFF -DCURL_USE_LIBSSH2=OFF -DCURL_USE_LIBSSH=OFF -DENABLE_UNIX_SOCKETS=OFF
+  # WinHTTP 的 Negotiate 認證沿用系統 GSS.framework；NTLM（curl 8.23 預設關閉）以 OpenSSL 的 DES／MD4 實作，與原本的系統 libcurl 相同能力。
+  -DCURL_USE_GSSAPI=ON -DCURL_GSS_FLAVOR=Apple -DCURL_ENABLE_NTLM=ON
+  -DCURL_CA_BUNDLE=none -DCURL_CA_PATH=none)
+foreach(feature IN LISTS X64ARM_CURL_DISABLED)
+  list(APPEND X64ARM_CURL_OPTIONS "-DCURL_DISABLE_${feature}=ON")
+endforeach()
+ExternalProject_Add(x64arm_curl_build
+  SOURCE_DIR "${x64arm_curl_source_SOURCE_DIR}"
+  BINARY_DIR "${X64ARM_CURL_BUILD}"
+  DOWNLOAD_COMMAND ""
+  DEPENDS x64arm_openssl_build
+  CMAKE_ARGS ${X64ARM_CURL_OPTIONS}
+  BUILD_COMMAND "${CMAKE_COMMAND}" --build "${X64ARM_CURL_BUILD}" --target libcurl_static --parallel "${X64ARM_EXTERNAL_BUILD_JOBS}"
+  INSTALL_COMMAND ""
+  BUILD_BYPRODUCTS "${X64ARM_CURL_BUILD}/lib/libcurl.a"
+  LOG_CONFIGURE TRUE LOG_BUILD TRUE)
+add_library(CURL::libcurl STATIC IMPORTED GLOBAL)
+set_target_properties(CURL::libcurl PROPERTIES
+  IMPORTED_LOCATION "${X64ARM_CURL_BUILD}/lib/libcurl.a"
+  INTERFACE_INCLUDE_DIRECTORIES "${x64arm_curl_source_SOURCE_DIR}/include"
+  INTERFACE_COMPILE_DEFINITIONS CURL_STATICLIB
+  INTERFACE_LINK_LIBRARIES "OpenSSL::SSL;OpenSSL::Crypto;ZLIB::ZLIB;-framework SystemConfiguration;-framework CoreFoundation;-framework CoreServices;-framework GSS")
+add_dependencies(CURL::libcurl x64arm_curl_build)

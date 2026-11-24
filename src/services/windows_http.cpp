@@ -6,9 +6,11 @@
 #include "x64arm/security_descriptor.hpp"
 #include "http_proxy_configuration.hpp"
 #include "internet_connection.hpp"
+#include "sandbox_certificate_roots.hpp"
 #include <algorithm>
 #include <bit>
 #include <charconv>
+#include <chrono>
 #include <stdexcept>
 #include <system_error>
 
@@ -83,17 +85,21 @@ std::span<const WindowsServiceDescriptor> http_service_descriptors(){
         {"winhttp.dll","WinHttpCrackUrl",4},{"winhttp.dll","WinHttpGetProxyForUrl",4},{"winhttp.dll","WinHttpDetectAutoProxyConfigUrl",2},
         {"winhttp.dll","WinHttpCreateProxyResolver",2},{"winhttp.dll","WinHttpGetProxyForUrlEx",4},
         {"winhttp.dll","WinHttpGetProxyResult",2},{"winhttp.dll","WinHttpFreeProxyResult",1},
-        {"winhttp.dll","WinHttpSetStatusCallback",4},{"winhttp.dll","WinHttpCheckPlatform",0}
+        {"winhttp.dll","WinHttpSetStatusCallback",4},{"winhttp.dll","WinHttpCheckPlatform",0},
+        {"winhttp.dll","WinHttpWebSocketCompleteUpgrade",2},{"winhttp.dll","WinHttpWebSocketSend",4},{"winhttp.dll","WinHttpWebSocketReceive",5},
+        {"winhttp.dll","WinHttpWebSocketShutdown",4},{"winhttp.dll","WinHttpWebSocketClose",4},{"winhttp.dll","WinHttpWebSocketQueryCloseStatus",5}
     };return table;
 }
 namespace {
-void harvest_http_io(const std::shared_ptr<NativeHttp>& task,process_io::Counters& accounted){
+std::uint64_t websocket_clock(){return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());}
+template<typename Task>
+void harvest_http_io(const std::shared_ptr<Task>& task,process_io::Counters& accounted){
     if(!task)return;const auto snapshot=task->io_counters();process_io::Counters delta;
     for(unsigned i=0;i<6;++i)delta.values[i]=snapshot.values[i]-accounted.values[i];
     process_io::record(delta);accounted=snapshot;
 }
 }
-void WindowsServices::account_http_io(HttpHandle& request){harvest_http_io(request.pending,request.io_accounted);}
+void WindowsServices::account_http_io(HttpHandle& request){harvest_http_io(request.pending,request.io_accounted);harvest_http_io(request.websocket,request.websocket_io_accounted);}
 void WindowsServices::cancel_http_connection_probe(std::uint64_t thread){
     const auto found=runtime_.http.connection_probes.find(thread);if(found==runtime_.http.connection_probes.end())return;
     const auto handle=found->second;runtime_.http.connection_probes.erase(found);const auto entry=runtime_.http.handles.find(handle);if(entry==runtime_.http.handles.end())return;
@@ -112,6 +118,16 @@ void WindowsServices::poll_http_io(){
 bool WindowsServices::http_ready(std::uint64_t handle) const {
     if(const auto found=autoproxy_.find(handle);found!=autoproxy_.end())return (found->second.session && !runtime_.http.handles.contains(found->second.session)) || found->second.task->done();
     const auto found=runtime_.http.handles.find(handle);return found==runtime_.http.handles.end() || !found->second.pending || found->second.pending->done();
+}
+// WebSocket 等待：{handle, 種類, 送出序號, 期限}。1 收到資料／close／錯誤；2 送出、4 shutdown 寫入序號；3 關閉需收到 close 且自己的 close 已寫出。
+bool WindowsServices::http_ready(const std::vector<std::uint64_t>& wait) const {
+    if(wait.size()<4)return http_ready(wait.at(0));
+    const auto found=runtime_.http.handles.find(wait[0]);if(found==runtime_.http.handles.end() || !found->second.websocket)return true;
+    const auto& socket=*found->second.websocket;if(wait[3]!=UINT64_MAX && websocket_clock()>=wait[3])return true;
+    if(wait[1]==1)return socket.readable();
+    if(socket.error())return true;
+    if(wait[1]==3){std::uint16_t status=0;std::vector<std::uint8_t> reason;return socket.close_status(status,reason) && socket.written()>=wait[2];}
+    return socket.written()>=wait[2];
 }
 bool WindowsServices::http_waiting() const {
     return std::any_of(threads_.items.begin(),threads_.items.end(),[](const auto& item){return item.second.status==ThreadStatus::Waiting && item.second.wait.kind==ThreadWaitKind::Http;});
@@ -165,7 +181,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
         request.io_accounted={};
         if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許 WinHTTP 外部 I/O");
         if(request.inet){request.pending=read_http_cache(request);if(request.pending){request.cache_hit=true;return;}if(request.cache_flags&0x01000000U)throw HttpError{2};}
-        request.cache_hit=false;notify(request,30,0);auto input=request.input;if(request.inet && !(request.cache_flags&0x00080000U))add_http_cookies(input);request.pending=start_native_http(std::move(input));if(!request.pending)throw HttpError{50};
+        request.cache_hit=false;notify(request,30,0);auto input=request.input;if(request.inet && !(request.cache_flags&0x00080000U))add_http_cookies(input);
+        if(assign_sandbox_certificate_roots(filesystem_,input.certificate_roots,input.url.starts_with("https:")))throw HttpError{12175};
+        request.pending=start_native_http(std::move(input));if(!request.pending)throw HttpError{50};
     };
     const auto remember_server=[&](HttpHandle& request){
         if(request.inet){
@@ -174,6 +192,95 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
         }
         if(request.inet && request.received && !request.response.error){const auto host=internet_connection::url_host(request.response.effective_url.empty()?request.input.url:request.response.effective_url);if(host)runtime_.http.nearest_server=*host;}
     };
+    if(symbol.starts_with("WinHttpWebSocket")){
+        // WinHTTP WebSocket（同步模式）：CompleteUpgrade 回傳 handle、失敗時設定 LastError；其餘函式直接回傳 DWORD 錯誤碼、不改 LastError。
+        // 阻塞的收送與關閉以 {handle, 種類, 序號, 期限} 停駐，重新進入時沿用同一筆操作，不重送訊框。
+        const bool completing=symbol=="WinHttpWebSocketCompleteUpgrade";std::uint32_t code=0;
+        const auto deadline=[](std::int64_t milliseconds){return milliseconds>0?websocket_clock()+static_cast<std::uint64_t>(milliseconds)*1000000ULL:UINT64_MAX;};
+        const auto park=[&](std::uint64_t handle,const std::array<std::uint64_t,3>& operation){
+            auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;
+            thread.wait.handles={handle,operation[0],operation[1],operation[2]};threads_.yield=true;notify_concurrency_changed();};
+        // 送出端可用的關閉狀態：1005 表示不帶狀態碼（原因須為空），1004／1006／1015 只能由本機產生。
+        const auto close_payload=[&](std::uint16_t status,std::uint64_t reason,std::uint32_t length){
+            if(length>123 || (length && !reason))throw HttpError{87};
+            const bool valid=status==1005?length==0:((status>=1000 && status<=1003) || (status>=1007 && status<=1011) || (status>=3000 && status<=4999));
+            if(!valid)throw HttpError{87};std::vector<std::uint8_t> bytes(length);if(length)memory.read(GuestAddress{reason},bytes);return bytes;};
+        try{
+            const auto found=handles.find(arg(0));
+            if(found==handles.end() || found->second.kind==HttpHandle::Kind::Probe){
+                const auto canceled=runtime_.http.canceled_websocket_operations.find(threads_.current);
+                if(!completing && canceled!=runtime_.http.canceled_websocket_operations.end() && canceled->second==arg(0)){runtime_.http.canceled_websocket_operations.erase(canceled);throw HttpError{12017};}
+                throw HttpError{6};
+            }
+            auto& object=found->second;
+            if(completing){
+                if(object.kind!=HttpHandle::Kind::Request)throw HttpError{12018};
+                if(!object.input.websocket || !object.received || object.upgraded)throw HttpError{12019};
+                // 伺服器沒有以 101 接受升級（或 Sec-WebSocket-Accept 不符已在接收回應時拒絕）。
+                if(!object.websocket)throw HttpError{12152};if(handles.size()>=4096)throw HttpError{8};
+                HttpHandle socket;socket.kind=HttpHandle::Kind::WebSocket;socket.callback=object.callback;socket.callback_flags=object.callback_flags;socket.context=arg(1);
+                socket.host=object.host;socket.path=object.path;socket.port=object.port;socket.secure=object.secure;socket.input=object.input;socket.input.body.clear();
+                socket.websocket=std::move(object.websocket);socket.websocket_io_accounted=object.websocket_io_accounted;object.upgraded=true;
+                const auto handle=runtime_.http.next++;handles.emplace(handle,std::move(socket));arg.return_to(state,handle);return std::nullopt;
+            }
+            if(object.kind!=HttpHandle::Kind::WebSocket)throw HttpError{12018};
+            auto& socket=*object.websocket;const auto thread=threads_.current;auto operation=object.websocket_operations.find(thread);
+            const auto busy=[&](std::initializer_list<std::uint64_t> kinds){return std::any_of(object.websocket_operations.begin(),object.websocket_operations.end(),[&](const auto& item){
+                return item.first!=thread && std::find(kinds.begin(),kinds.end(),item.second[0])!=kinds.end();});};
+            const auto finish=[&]{object.websocket_operations.erase(thread);};
+            if(symbol=="WinHttpWebSocketQueryCloseStatus"){
+                if(!arg(1) || !arg(4) || (d(3) && !arg(2)))throw HttpError{87};
+                std::uint16_t status=0;std::vector<std::uint8_t> reason;if(!socket.close_status(status,reason))throw HttpError{4317};
+                memory.store(GuestAddress{arg(1)},16,status);memory.store(GuestAddress{arg(4)},32,reason.size());
+                if(d(3)<reason.size())throw HttpError{122};if(!reason.empty())memory.write(GuestAddress{arg(2)},reason);
+            }else if(symbol=="WinHttpWebSocketReceive"){
+                if(operation==object.websocket_operations.end()){
+                    if(!arg(1) || !d(2) || !arg(3) || !arg(4))throw HttpError{87};
+                    if(object.closed || object.close_delivered || busy({1}))throw HttpError{4317};
+                    operation=object.websocket_operations.emplace(thread,std::array<std::uint64_t,3>{1,0,deadline(object.input.timeouts[3])}).first;
+                }
+                if(socket.readable()){
+                    finish();memory.check(GuestAddress{arg(1)},d(2),Access::Write);memory.check(GuestAddress{arg(3)},4,Access::Write);memory.check(GuestAddress{arg(4)},4,Access::Write);
+                    std::vector<std::uint8_t> data;std::uint32_t type=0;if(const auto error=socket.receive(d(2),data,type))throw HttpError{error};
+                    if(!data.empty())memory.write(GuestAddress{arg(1)},data);memory.store(GuestAddress{arg(3)},32,data.size());memory.store(GuestAddress{arg(4)},32,type);
+                    if(type==4)object.close_delivered=true;
+                }else if(websocket_clock()>=operation->second[2]){finish();throw HttpError{12002};}
+                else {park(arg(0),operation->second);return std::nullopt;}
+            }else{
+                const bool send=symbol=="WinHttpWebSocketSend",shutdown=symbol=="WinHttpWebSocketShutdown",close=symbol=="WinHttpWebSocketClose";
+                if(!send && !shutdown && !close)throw HttpError{50};
+                if(operation==object.websocket_operations.end()){
+                    if(object.closed)throw HttpError{4317};
+                    std::array<std::uint64_t,3> pending{};
+                    if(send){
+                        if(d(1)>3 || (d(3) && !arg(2)))throw HttpError{87};if(d(3)>64*1024*1024)throw HttpError{8};if(busy({2,4}))throw HttpError{4317};
+                        std::vector<std::uint8_t> payload(d(3));if(d(3))memory.read(GuestAddress{arg(2)},payload);
+                        const auto [error,ticket]=socket.send(d(1),payload);if(error)throw HttpError{error};pending={2,ticket,deadline(object.input.timeouts[2])};
+                    }else{
+                        const auto payload=close_payload(static_cast<std::uint16_t>(d(1)),arg(2),d(3));
+                        if(shutdown){
+                            if(busy({2,4}) || socket.close_sent())throw HttpError{4317};
+                            const auto [error,ticket]=socket.send_close(static_cast<std::uint16_t>(d(1)),payload);if(error)throw HttpError{error};pending={4,ticket,deadline(object.input.timeouts[2])};
+                        }else{
+                            if(busy({3}))throw HttpError{4317};std::uint64_t ticket=0;
+                            if(!socket.close_sent()){const auto [error,sent]=socket.send_close(static_cast<std::uint16_t>(d(1)),payload);if(error)throw HttpError{error};ticket=sent;}
+                            // 關閉時丟棄未讀資料，只等伺服器的 close；等待上限為 WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT（秒）。
+                            socket.discard_data();pending={3,ticket,deadline(static_cast<std::int64_t>(object.input.websocket_close_timeout)*1000)};
+                        }
+                    }
+                    operation=object.websocket_operations.emplace(thread,pending).first;
+                }
+                const auto& [kind,ticket,limit]=operation->second;std::uint16_t status=0;std::vector<std::uint8_t> reason;
+                const bool done=kind==3?(socket.close_status(status,reason) && socket.written()>=ticket):socket.written()>=ticket;
+                if(done){finish();if(close){object.closed=true;socket.cancel();}}
+                else if(const auto error=socket.error()){finish();if(close){object.closed=true;socket.cancel();}throw HttpError{error};}
+                else if(websocket_clock()>=limit){finish();if(close){object.closed=true;socket.cancel();}throw HttpError{12002};}
+                else {park(arg(0),operation->second);return std::nullopt;}
+            }
+        }catch(const HttpError& error){code=error.code;}catch(const MemoryFault&){code=998;}catch(const std::bad_alloc&){code=8;}
+        if(completing){last_error_=code;arg.return_to(state,0);}else arg.return_to(state,code);
+        return std::nullopt;
+    }
     try {
         if(service.symbol=="InternetQueryDataAvailable" && (d(2) || arg(3)))throw HttpError{87};
         if(service.symbol=="InternetReadFile" || service.symbol=="InternetWriteFile"){if(!arg(3))throw HttpError{87};memory.store(GuestAddress{arg(3)},32,0);}
@@ -282,7 +389,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
             }else if(symbol=="WinHttpCloseHandle"){
                 std::vector<std::uint64_t> closing{arg(0)};for(std::size_t i=0;i<closing.size();++i)for(const auto& [id,item]:handles)if(item.parent==closing[i])closing.push_back(id);for(auto id:closing){
                     close_http_callbacks(state,memory,id);
-                    auto& request=handles.at(id);if(request.pending){request.pending->cancel();account_http_io(request);
+                    auto& request=handles.at(id);
+                    if(request.websocket){for(const auto& [thread,operation]:request.websocket_operations){(void)operation;if(thread!=threads_.current)runtime_.http.canceled_websocket_operations[thread]=id;}
+                        request.websocket->cancel();account_http_io(request);}
+                    if(request.pending){request.pending->cancel();account_http_io(request);
                         if(!request.pending->done())canceled_http_io_.push_back({request.pending,request.io_accounted});
                         else account_http_io(request);
                     }handles.erase(id);
@@ -424,6 +534,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                     object.response=object.pending->take();account_http_io(object);debug_http_response(object.input,object.response);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
                 }
                 else if(symbol=="WinHttpSendRequest"){
+                    if(object.upgraded || object.websocket)throw HttpError{12019};if(object.input.websocket && object.input.method!="GET")throw HttpError{87};
                     if(object.pending || (object.sent && !object.received && object.total!=d(5)))throw HttpError{12019};if(d(5)>16*1024*1024 || d(4)>d(5) || (d(4) && !arg(3)))throw HttpError{87};
                     auto headers=object.input.headers;if(arg(1))add_headers(headers,text(arg(1),d(2)),0xa0000000);
                     for(const auto& [name,value]:headers){const auto key=lower(name);if(key=="transfer-encoding")throw HttpError{50};if(key=="content-length"){std::uint64_t amount=0;const auto parsed=std::from_chars(value.data(),value.data()+value.size(),amount);if(parsed.ec!=std::errc{} || parsed.ptr!=value.data()+value.size() || amount!=d(5))throw HttpError{87};}}
@@ -434,7 +545,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                 }else if(symbol=="WinHttpReceiveResponse"){
                     if(arg(1))throw HttpError{87};if(!object.sent || object.received || object.input.body.size()!=object.total)throw HttpError{12019};
                     if(!object.pending)throw HttpError{12019};if(!object.pending->done()){auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;thread.wait.handles={arg(0)};threads_.yield=true;notify_concurrency_changed();return std::nullopt;}
-                    object.response=object.pending->take();account_http_io(object);debug_http_response(object.input,object.response);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
+                    object.response=object.pending->take();account_http_io(object);debug_http_response(object.input,object.response);
+                    // 101 升級：連線改由 WebSocket 物件持有，I/O 計數沿用請求的基線。
+                    if(object.input.websocket && !object.response.error && object.response.status==101){object.websocket=object.pending->upgrade();object.websocket_io_accounted=object.io_accounted;}
+                    object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
                 }else if(symbol=="WinHttpReadData" || symbol=="WinHttpQueryDataAvailable"){
                     if(!object.received)throw HttpError{12019};const bool read=symbol=="WinHttpReadData";const auto count=read?std::min<std::size_t>(d(2),object.response.body.size()-std::min(object.cursor,object.response.body.size())):object.response.body.size()-std::min(object.cursor,object.response.body.size());const auto output=arg(read?3:1);if(!output && (read || !inet))throw HttpError{87};if(output)memory.check(GuestAddress{output},4,Access::Write);
                     if(read && count){memory.check(GuestAddress{arg(1)},count,Access::Write);memory.write(GuestAddress{arg(1)},std::span(object.response.body).subspan(object.cursor,count));object.cursor+=count;}if(output)memory.store(GuestAddress{output},32,count);result=1;

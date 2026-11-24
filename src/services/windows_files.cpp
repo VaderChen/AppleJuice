@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #if defined(__APPLE__)
 #include <sys/fsgetpath.h>
@@ -131,7 +132,8 @@ bool crt_find_data(GuestMemory& memory,std::uint64_t output,const DirectoryEntry
     const bool size64=symbol.ends_with("64");const unsigned time_start=time64?8U:4U,time_unit=time64?8U:4U;
     const unsigned size_start=time_start+3*time_unit,name_start=size_start+(size64?8U:4U),alignment=time64 || size64?8U:4U;
     const unsigned extent=(name_start+(wide?520U:260U)+alignment-1)/alignment*alignment;
-    auto name=wide?utf16_bytes(utf8_to_utf16(entry.name)):std::vector<std::uint8_t>(entry.name.begin(),entry.name.end());
+    const auto narrow=wide?std::string{}:utf8_to_ansi(entry.name);
+    auto name=wide?utf16_bytes(utf8_to_utf16(entry.name)):std::vector<std::uint8_t>(narrow.begin(),narrow.end());
     if(!wide)name.push_back(0);if(name.size()>(wide?520U:260U))return false;
     std::vector<std::uint8_t> bytes(extent);const auto put=[&](unsigned at,std::uint64_t value,unsigned count){for(unsigned i=0;i<count;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
     const auto& info=entry.metadata;put(0,info.attributes&0x37U,4);put(size_start,info.size,size64?8U:4U);
@@ -152,7 +154,8 @@ void stream_data(GuestMemory& memory,std::uint64_t address,const DirectoryEntry&
     std::copy(name.begin(),name.end(),bytes.begin()+8);memory.write(GuestAddress{address},bytes);
 }
 void find_data(GuestMemory& memory,std::uint64_t address,const DirectoryEntry& entry,bool wide) {
-    auto name=wide?utf16_bytes(utf8_to_utf16(entry.name)):std::vector<std::uint8_t>(entry.name.begin(),entry.name.end());
+    const auto narrow=wide?std::string{}:utf8_to_ansi(entry.name);
+    auto name=wide?utf16_bytes(utf8_to_utf16(entry.name)):std::vector<std::uint8_t>(narrow.begin(),narrow.end());
     if(!wide)name.push_back(0);
     if(name.size()>(wide?520U:260U))throw HostCallFault("FindFirstFile 名稱超過 WIN32_FIND_DATA 容量");
     memory.write(GuestAddress{address},std::vector<std::uint8_t>(wide?592U:320U));
@@ -171,7 +174,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
     std::u16string guest_path;
     try {
         if(!frame(0))return invalid(87);
-        guest_path=service.symbol=="CreateFileA"?utf8_to_utf16(read_ansi(memory,frame(0))):read_utf16(memory,GuestAddress{frame(0)});
+        guest_path=service.symbol=="CreateFileA"?ansi_to_utf16(read_ansi(memory,frame(0))):read_utf16(memory,GuestAddress{frame(0)});
         if(auto resolved=detail::globalroot_file_path(std::u16string_view(guest_path));!resolved.empty())guest_path=std::move(resolved);
         if(service.symbol=="CreateFile2") {
             values={frame(0),frame(1),frame(2),0,frame(3),0x80,0};
@@ -461,7 +464,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         try{
             if(!arg(0) || (full && u32(1)))return failed(87);
             if(full)memory.check(GuestAddress{arg(2)},36,Access::Write);
-            const auto path=symbol.back()=='W'?read_utf16(memory,GuestAddress{arg(0)},32768):utf8_to_utf16(read_ansi(memory,arg(0)));
+            const auto path=symbol.back()=='W'?read_utf16(memory,GuestAddress{arg(0)},32768):ansi_to_utf16(read_ansi(memory,arg(0)));
             const auto file=query_native_file_attributes(state,memory,path,full);
             if(file.error)return failed(file.error);
             if(full)attributes(arg(2),file.metadata);
@@ -481,7 +484,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         if(crt_find){
             if(!close && (!arg(1) || (first && !arg(0))))return invalid();
             if(first){
-                const auto path=symbol.starts_with("_w")?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+                const auto path=symbol.starts_with("_w")?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
                 if((symbol.starts_with("_w")?utf8_to_utf16(path).size():path.size())>=260)error(22);
                 else if(runtime_.directory_searches.size()>=1024)error(12);
                 else{
@@ -501,7 +504,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         }else{
             const bool chmod=symbol=="_chmod" || symbol=="_wchmod";
             if(!arg(0) || (!chmod && (u32(1)&~6U)))return invalid();
-            const auto path=symbol.starts_with("_w")?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+            const auto path=symbol.starts_with("_w")?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
             const auto file=filesystem_.information(path);auto status=file.error;
             if(!status && chmod){
                 if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許 CRT 修改宿主檔案屬性");
@@ -514,7 +517,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
     if(symbol=="GetBinaryTypeA" || symbol=="GetBinaryTypeW"){
         if(!arg(0) || !arg(1))fail(87);
         else {
-            const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+            const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
             const auto file=filesystem_.open_library_reader(path);
             if(file.error)fail(file.error);
             else try {
@@ -676,7 +679,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         if(link && !runtime_.network.external_io)throw HostCallFault("比較模式不允許 CreateHardLink 宿主寫入");
         try{
             if(!arg(0) || (link && (!arg(1) || arg(2))))fail(87);
-            else {const auto text=[&](unsigned i){return wide?read_utf16(memory,GuestAddress{arg(i)}):utf8_to_utf16(read_ansi(memory,arg(i),32767));};
+            else {const auto text=[&](unsigned i){return wide?read_utf16(memory,GuestAddress{arg(i)}):ansi_to_utf16(read_ansi(memory,arg(i),32767));};
                 const auto path=text(0);const auto existing=link?text(1):std::u16string{};
                 const auto long_path=[](const std::u16string& value){return value.size()>=260 && !value.starts_with(u"\\\\?\\");};
                 if(path.empty() || (link && existing.empty()))fail(2);
@@ -706,7 +709,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
     }
     if(symbol=="CopyFileExA" || symbol=="CopyFileExW"){
         if(!arg(0) || !arg(1)){fail(87);arg.return_to(state,0);return std::nullopt;}
-        const auto path=[&](unsigned i){return symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(i)})):read_ansi(memory,arg(i));};
+        const auto path=[&](unsigned i){return symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(i)})):ansi_to_utf8(read_ansi(memory,arg(i)));};
         return start_file_transfer(state,memory,path(0),path(1),u32(5),arg(2),arg(3),arg(4));
     }
     if(symbol=="CopyFileA" || symbol=="CopyFileW") {
@@ -714,7 +717,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         if(!arg(0) || !arg(1))fail(87);
         else {
             const bool wide=symbol.back()=='W';
-            const auto path=[&](unsigned index){return wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(index)})):read_ansi(memory,arg(index));};
+            const auto path=[&](unsigned index){return wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(index)})):ansi_to_utf8(read_ansi(memory,arg(index)));};
             const auto from=path(0),to=path(1);const auto source=filesystem_.information(from),target=filesystem_.information(to);
             const auto sharing_conflict=[&](const FileInformation& info,std::uint32_t needed,std::uint32_t offered) {
                 if(info.error)return false;
@@ -732,7 +735,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
             else result=1;
         }
     } else if(symbol.starts_with("SetFileAttributes")) {
-        const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+        const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
         const auto error=filesystem_.set_attributes(path,u32(1));if(error)fail(error);else result=1;
     } else if(symbol=="FindFirstStreamW") {
         result=UINT64_MAX;
@@ -763,7 +766,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         else {auto& search=found->second;find_data(memory,arg(1),search.entries[search.cursor],symbol.back()=='W');++search.cursor;result=1;}
     } else if(symbol.starts_with("FindFirstFile")) {
         const bool wide=symbol.back()=='W',extended=symbol.starts_with("FindFirstFileEx");
-        const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+        const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
         result=UINT64_MAX;
         if(extended && (u32(1)>1 || u32(3)>1 || arg(4) || (u32(5)&~7U)))last_error_=87;
         else if(runtime_.directory_searches.size()>=1024)last_error_=8;
@@ -845,14 +848,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         if(!runtime_.network.external_io && filesystem_.writable())throw HostCallFault("比較模式不允許宿主檔案替換");
         if(!arg(0)||!arg(1)||arg(4)||arg(5)||(u32(3)&~6U))fail(87);
         else {
-            const auto path=[&](unsigned i){return symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(i)})):read_ansi(memory,arg(i));};
+            const auto path=[&](unsigned i){return symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(i)})):ansi_to_utf8(read_ansi(memory,arg(i)));};
             const auto error=filesystem_.replace(path(0),path(1),arg(2)?path(2):std::string{},u32(3));if(error)fail(error);else result=1;
         }
     } else if (symbol.starts_with("CreateDirectory") || symbol.starts_with("RemoveDirectory") || symbol.starts_with("DeleteFile") || symbol.starts_with("MoveFile") ||
         symbol.ends_with("mkdir") || symbol.ends_with("rmdir") || symbol=="remove" || symbol=="_wremove" || symbol.ends_with("unlink") || symbol.ends_with("rename")) {
         if(filesystem_.writable() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許宿主檔案建立、移動或刪除");
         const bool crt=service.family=="crt",wide=crt?symbol.starts_with("_w"):symbol.back()=='W';
-        const auto path=[&](unsigned i){return wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(i)})):read_ansi(memory,arg(i));};
+        const auto path=[&](unsigned i){return wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(i)})):ansi_to_utf8(read_ansi(memory,arg(i)));};
         const bool template_directory=symbol=="CreateDirectoryExA" || symbol=="CreateDirectoryExW";
         const auto from=template_directory && (!arg(0) || !arg(1))?std::string{}:path(template_directory?1:0);std::uint32_t error=0;
         const bool directory=symbol.starts_with("RemoveDirectory") || symbol.ends_with("rmdir"),moving=symbol.starts_with("MoveFile") || symbol.ends_with("rename");
@@ -1069,7 +1072,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
                 if(stream.native)file=stream.native->information();else file.metadata=stream.metadata;}
             if(pipe){file.metadata.created=file.metadata.accessed=file.metadata.modified=UINT64_C(116444736000000000);file.metadata.attributes=0x80;file.metadata.links=1;}
         } else {
-            const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+            const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
             file=filesystem_.information(path);
         }
         if (file.error) {

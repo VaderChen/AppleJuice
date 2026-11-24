@@ -113,7 +113,7 @@ std::vector<unsigned> metal_free_buffers(const MetalShader& shader,const std::ar
     std::set<unsigned> occupied;
     if(shader.buffer_views_slot!=UINT32_MAX)occupied.insert(shader.buffer_views_slot);
     if(shader.buffer_sizes_slot!=UINT32_MAX)occupied.insert(shader.buffer_sizes_slot);
-    for(const auto& b:shader.bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9)){occupied.insert(b.native_slot);if(b.counter_slot!=UINT32_MAX)occupied.insert(b.counter_slot);}
+    for(const auto& b:shader.bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=14)){occupied.insert(b.native_slot);if(b.counter_slot!=UINT32_MAX)occupied.insert(b.counter_slot);}
     if(slots)for(int slot:*slots)if(slot>=0)occupied.insert(static_cast<unsigned>(slot));
     std::vector<unsigned> result;for(unsigned i=0;i<31 && result.size()<count;++i)if(!occupied.contains(i))result.push_back(i);
     if(result.size()!=count)throw std::invalid_argument("Metal 幾何階段 buffer binding 配額不足");return result;
@@ -177,7 +177,7 @@ MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDesc
         p=std::make_shared<MetalGeometryPipeline>();p->vertex=d.stages[0].shader;p->geometry=d.stages[2].shader;
         auto free=metal_free_buffers(vs,&slots,2);p->capture_buffer=free[0];p->capture_params=free[1];
         free=metal_free_buffers(gs,nullptr,5);p->input_buffer=free[0];p->index_buffer=free[1];p->output_buffer=free[2];p->params_buffer=free[3];p->counts_buffer=free[4];
-        NSError* error=nil;auto options=[MTLCompileOptions new];options.fastMathEnabled=NO;id<MTLLibrary> library=nil;
+        NSError* error=nil;auto options=metal_d3d_compile_options(vs.modern_math);id<MTLLibrary> library=nil;
         if(capture_vs){
         auto capture=vs.source;const auto fn=metal_function_text(capture,"xlatMtlMain");
         std::string vertex_id,instance_id,extra;
@@ -451,7 +451,7 @@ std::shared_ptr<const MetalGeometryMesh> MetalGl::graphics_geometry_mesh(const G
         code<<"}}\n";
         const auto program=code.str();
         source_timing.finish();
-        NSError* error=nil;auto options=[MTLCompileOptions new];options.fastMathEnabled=NO;
+        NSError* error=nil;auto options=metal_d3d_compile_options();
         id<MTLLibrary> library=nil;
         {MetalStallScope timing("geometry_mesh_library",gs->serial,2);
         library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:program.c_str()] options:options error:&error];}

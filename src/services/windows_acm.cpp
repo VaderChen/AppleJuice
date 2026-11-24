@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/audio_adpcm.hpp"
 #include "x64arm/audio_ima_adpcm.hpp"

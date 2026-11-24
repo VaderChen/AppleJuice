@@ -10,6 +10,7 @@
 // - mmTaskCreate／mmTaskBlock／mmTaskSignal／mmTaskYield／mmGetCurrentTask：驅動程式的工作執行緒。工作即執行緒（HTASK 為執行緒 ID）；
 //   mmTaskCreate 以 CreateThread 從內部入口 TaskStart 開始，再以客體回呼執行 lpfn(dwInst)（TASKCALLBACK 未指定呼叫慣例，回呼框架不依賴被呼叫端清理堆疊），mmTaskSignal 張貼 WM_USER 執行緒訊息，mmTaskBlock 以 GetMessage 等候並分派視窗訊息直到收到 WM_USER。
 // 所有驅動程式碼皆以客體呼叫執行（DllMain、DriverProc 與回呼可重入任何 API）。
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
@@ -112,7 +113,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_installable_driver(GuestSta
         }
         // OpenDriver／OpenDriverA
         const bool wide=name=="OpenDriver";
-        const auto text=[&](std::uint64_t address){return wide?read_utf16(m,GuestAddress{address},32767):utf8_to_utf16_lossy(read_ansi(m,address,32767));};
+        const auto text=[&](std::uint64_t address){return wide?read_utf16(m,GuestAddress{address},32767):ansi_to_utf16_lossy(read_ansi(m,address,32767));};
         if(!call(0))co_return finish(0);
         const auto driver_name=text(call(0));const std::u16string section=call(1)?text(call(1)):std::u16string(u"Drivers32");
         if(driver_name.empty())co_return finish(0);

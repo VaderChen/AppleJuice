@@ -22,7 +22,7 @@
             if(!(file.access&(0x40000000U|0x10000000U|2U)) && (file.access&4U))position=file.native->information().metadata.size;
             try{write(*file.native,position);}catch(...){cursor=position;throw;}cursor=position;file.metadata=file.native->information().metadata;
         }else {
-            const auto path=destination==4?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(4)})):read_ansi(memory,arg(4));
+            const auto path=destination==4?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(4)})):ansi_to_utf8(read_ansi(memory,arg(4)));
             const auto opened=filesystem_.open_host(path,0x40000000U,2,0,0);if(opened.error || !opened.file)throw CertificateError{opened.error?opened.error:2U};
             std::uint64_t position=0;write(*opened.file,position);if(const auto error=opened.file->flush())throw CertificateError{error};
         }

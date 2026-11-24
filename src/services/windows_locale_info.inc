@@ -76,8 +76,8 @@ std::optional<LocaleInfo> locale_information(const Locale& locale,std::uint32_t 
         const auto function=type==2 || type==0x72 || type==0x73?uloc_getDisplayName:
             type==6 || type==8 || type==0x1002?uloc_getDisplayCountry:uloc_getDisplayLanguage;
         return text(locale_info_text([&](UChar* buffer,int count,UErrorCode* error){return function(id.c_str(),display,buffer,count,error);}));}
-    // 虛擬 Windows 的 ANSI／OEM 預設為 UTF-8，與 GetACP／GetOEMCP 一致。
-    case 0xb:case 0x1004:return locale_info_number(65001);
+    // ANSI／OEM 預設碼頁與 GetACP／GetOEMCP 一致（程序碼頁）。
+    case 0xb:case 0x1004:return locale_info_number(process_ansi_codepage());
     default:break;
     }
     UErrorCode error=U_ZERO_ERROR;

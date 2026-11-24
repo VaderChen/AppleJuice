@@ -1,5 +1,6 @@
 // 色彩管理共用儲存、ICC 工具，以及 gdi32 的 ICM 函式：GetICMProfileA／W、SetICMProfileA／W、EnumICMProfilesA／W、
 // UpdateICMRegKeyA／W（UpdateICMRegKey 為 A 版別名）。DC 的輸出設定檔隨 DC 狀態保存；顯示 DC 的裝置為 \\.\DISPLAY1。
+#include "ansi_codepage.hpp"
 #include "windows_icm_store.hpp"
 #include "service_callback_task.hpp"
 #include <algorithm>
@@ -184,7 +185,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_icm(GuestState& state,Guest
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto fail=[&](std::uint32_t error){last_error_=error;return finish(0);};
-    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16(read_ansi(memory,pointer));};
+    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):ansi_to_utf16(read_ansi(memory,pointer));};
     const auto valid_dc=[&](std::uint64_t h){return gui_.contexts.contains(h) || gui_.dc_objects.contains(h) || (h>=0x10000000 && gui_.windows.contains(h-0x10000000));};
     IcmStore store(*this,state,memory);
     // DC 的輸出設定檔：先看 SetICMProfile，再看顯示裝置預設（第一個關聯，沒有時為 sRGB）。
@@ -196,7 +197,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_icm(GuestState& state,Guest
         if(name.starts_with("GetICMProfile")){
             // {hdc, LPDWORD 字元數, 緩衝區}：緩衝區為 NULL 時只回報所需字元數（含 NUL）。
             if(!valid_dc(arg(0)))return fail(6);if(!arg(1))return fail(87);const auto profile=dc_profile(arg(0));if(!profile)return fail(icm_error_not_associated);
-            std::vector<std::uint8_t> bytes;if(wide)bytes=utf16_bytes(*profile);else {const auto narrow=utf16_to_utf8(*profile);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
+            std::vector<std::uint8_t> bytes;if(wide)bytes=utf16_bytes(*profile);else {const auto narrow=utf16_to_ansi(*profile);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
             const auto needed=static_cast<std::uint32_t>(bytes.size()/(wide?2:1)),capacity=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)},32));
             memory.store(GuestAddress{arg(1)},32,needed);if(!arg(2))return finish(1);if(capacity<needed)return fail(122);
             memory.write(GuestAddress{arg(2)},bytes);return finish(1);
@@ -217,7 +218,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_icm(GuestState& state,Guest
                 const auto buffer=allocate_heap(m,largest);if(!buffer){last_error_=8;call.return_to(s,0);co_return std::nullopt;}
                 std::uint32_t result=1;
                 for(const auto& path:profiles){
-                    std::vector<std::uint8_t> bytes;if(wide)bytes=utf16_bytes(path);else {const auto narrow=utf16_to_utf8(path);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
+                    std::vector<std::uint8_t> bytes;if(wide)bytes=utf16_bytes(path);else {const auto narrow=utf16_to_ansi(path);bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}
                     m.write(GuestAddress{buffer},bytes);result=static_cast<std::uint32_t>(co_await service_callback::call(call(1),{buffer,call(2)}));if(!result)break;
                 }
                 (void)free_heap(m,buffer,s);call.return_to(s,result);co_return std::nullopt;

@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/registry_store.hpp"
@@ -120,7 +121,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mpr(GuestState& state,Guest
     };
     try{
         refresh_file_security_context();if(!mpr_)mpr_=std::make_shared<MprState>();if(!mpr_->backend)mpr_->backend=make_native_backend();const auto scope=filesystem_.network_scope();
-        const auto text=[&](std::uint64_t pointer){return !pointer?std::u16string{}:wide?read_utf16(memory,GuestAddress{pointer},32767):utf8_to_utf16_lossy(read_ansi(memory,pointer,131068));};
+        const auto text=[&](std::uint64_t pointer){return !pointer?std::u16string{}:wide?read_utf16(memory,GuestAddress{pointer},32767):ansi_to_utf16_lossy(read_ansi(memory,pointer,131068));};
         const auto encode=[&](std::u16string_view value){if(wide)return utf16_bytes(value);const auto s=utf16_to_utf8(value);std::vector<std::uint8_t> bytes(s.begin(),s.end());bytes.push_back(0);return bytes;};
         if(symbol.starts_with("WNetSetLastError") || symbol=="NPSSetExtendedErrorA"){
             const auto provider=symbol=="NPSSetExtendedErrorA"?std::u16string(provider_name):text(arg(2));
@@ -230,7 +231,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mpr(GuestState& state,Guest
                 };
                 char16_t filter=0;
                 if(call(1)){
-                    const auto device=wide?read_utf16(mem,GuestAddress{call(1)},32767):utf8_to_utf16_lossy(read_ansi(mem,call(1),131068));
+                    const auto device=wide?read_utf16(mem,GuestAddress{call(1)},32767):ansi_to_utf16_lossy(read_ansi(mem,call(1),131068));
                     if(device.size()!=2 || device[1]!=u':')co_return finish(1200);
                     filter=canonical(device)[0];
                     if(filter<u'a' || filter>u'z')co_return finish(1200);

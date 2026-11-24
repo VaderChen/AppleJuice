@@ -55,7 +55,14 @@ std::vector<std::uint8_t> sign_pkcs7(std::span<const std::uint8_t> content,bool 
 std::uint32_t verify_pkcs7_signer(PKCS7* message,int index,EVP_PKEY* key,std::span<const std::uint8_t> content){
     auto* signers=PKCS7_get_signer_info(message);if(!signers || index<0 || index>=sk_PKCS7_SIGNER_INFO_num(signers))return 0x8009100eU;
     auto* info=sk_PKCS7_SIGNER_INFO_value(signers,index);const auto* md=EVP_get_digestbyobj(info->digest_alg->algorithm);if(!md)return 0x80091002U;
-    const auto digest=message_digest(md,content);const std::span signature(ASN1_STRING_get0_data(info->enc_digest),static_cast<std::size_t>(ASN1_STRING_length(info->enc_digest)));
+    // PKCS#7 v1.5：內含內容不是 data 時（例如 Authenticode 的 SpcIndirectDataContent），雜湊對象是內容 DER 的 contents octets，不含標籤與長度。
+    const auto digested=[&]()->std::span<const std::uint8_t>{
+        auto* inner=PKCS7_type_is_signed(message)?message->d.sign->contents:nullptr;
+        if(!inner || PKCS7_type_is_data(inner) || !inner->d.other || content.size()<2 || (content[0]&0x1fU)==0x1fU)return content;
+        std::size_t header=2;if(content[1]&0x80U){const std::size_t count=content[1]&0x7fU;if(!count || count>4 || content.size()<2+count)return content;header=2+count;}
+        return content.subspan(header);
+    }();
+    const auto digest=message_digest(md,digested);const std::span signature(ASN1_STRING_get0_data(info->enc_digest),static_cast<std::size_t>(ASN1_STRING_length(info->enc_digest)));
     if(sk_X509_ATTRIBUTE_num(info->auth_attr)>0){
         auto* attribute=PKCS7_get_signed_attribute(info,NID_pkcs9_messageDigest);if(!attribute || attribute->type!=V_ASN1_OCTET_STRING)return 0x80091007U;
         const auto* value=attribute->value.octet_string;if(static_cast<std::size_t>(ASN1_STRING_length(value))!=digest.size() || !std::equal(digest.begin(),digest.end(),ASN1_STRING_get0_data(value)))return 0x80091007U;

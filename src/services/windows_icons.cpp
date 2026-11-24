@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_icon.hpp"
 #include "x64arm/windows_palette.hpp"
@@ -182,7 +183,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_icon_api(GuestState& state,
             else if(flags&0x10U){
                 if(instance || name<=65535)last_error_=87;
                 else {
-                    const auto path=symbol.ends_with('W')?read_utf16(memory,GuestAddress{name}):utf8_to_utf16_lossy(read_ansi(memory,name));
+                    const auto path=symbol.ends_with('W')?read_utf16(memory,GuestAddress{name}):ansi_to_utf16_lossy(read_ansi(memory,name));
                     const auto file=filesystem_.open(utf16_to_utf8(path));
                     if(file.error)last_error_=file.error;
                     else if(from_cursor_file && file.bytes->size()>=4 && (*file.bytes)[0]==0 && (*file.bytes)[1]==0 && (*file.bytes)[2]==1)last_error_=193;
@@ -226,7 +227,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_icon_api(GuestState& state,
             const bool query=simple?index==-1:private_api?!large:index==-1 && !large && !small;
             if(!path_pointer || (!query && count>4096) || (flags&~0x8041U)){last_error_=87;result=private_api || simple?0:UINT32_MAX;}
             else {
-                const auto path=wide?read_utf16(memory,GuestAddress{path_pointer}):utf8_to_utf16_lossy(read_ansi(memory,path_pointer));const bool builtin=is_stock_icon_path(path);
+                const auto path=wide?read_utf16(memory,GuestAddress{path_pointer}):ansi_to_utf16_lossy(read_ansi(memory,path_pointer));const bool builtin=is_stock_icon_path(path);
                 if(!query && !simple){for(const auto out:{large,small})if(out){memory.check(GuestAddress{out},static_cast<std::size_t>(count)*unit,Access::Write);for(std::uint32_t i=0;i<count;++i)memory.store(GuestAddress{out+i*unit},static_cast<std::uint8_t>(unit*8),0);}if(ids){memory.check(GuestAddress{ids},static_cast<std::size_t>(count)*4,Access::Write);for(std::uint32_t i=0;i<count;++i)memory.store(GuestAddress{ids+i*4},32,UINT32_MAX);}}
                 const auto file=builtin?FileSnapshot{}:filesystem_.open(utf16_to_utf8(path));
                 if(!builtin && file.error){last_error_=file.error;result=simple || (private_api && query)?0:UINT32_MAX;}
@@ -278,7 +279,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_icons(GuestState& sta
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto d=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
-    const auto read=[&](std::uint64_t at)->std::u16string{if(!at)return {};return narrow?utf8_to_utf16_lossy(read_ansi(memory,at,32768)):read_utf16(memory,GuestAddress{at},32768);};
+    const auto read=[&](std::uint64_t at)->std::u16string{if(!at)return {};return narrow?ansi_to_utf16_lossy(read_ansi(memory,at,32768)):read_utf16(memory,GuestAddress{at},32768);};
     const auto write=[&](std::uint64_t at,const std::u16string& text,std::size_t capacity)->bool{
         if(narrow){const auto bytes=utf16_to_utf8_lossy(text);if(bytes.size()>=capacity)return false;std::vector<std::uint8_t> data(bytes.begin(),bytes.end());data.push_back(0);memory.write(GuestAddress{at},data);return true;}
         if(text.size()>=capacity)return false;memory.write(GuestAddress{at},utf16_bytes(text));return true;};

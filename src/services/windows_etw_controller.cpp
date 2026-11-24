@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/system_performance.hpp"
 #include "x64arm/unicode.hpp"
@@ -56,7 +57,7 @@ etw::Filter filter(const GuestMemory& memory,std::uint64_t descriptor){
 std::optional<std::uint32_t> WindowsServices::invoke_etw_controller(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');const auto shape=etw::guest::layout(x86_);
     const auto finish=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
-    const auto text=[&](std::uint64_t address){if(!address)throw etw::guest::Fault{87};return wide?read_utf16(memory,GuestAddress{address}):utf8_to_utf16(read_ansi(memory,address,32767));};
+    const auto text=[&](std::uint64_t address){if(!address)throw etw::guest::Fault{87};return wide?read_utf16(memory,GuestAddress{address}):ansi_to_utf16(read_ansi(memory,address,32767));};
     const auto deadline=[&](EtwSessionInfo& session){const auto seconds=session.flush_timer?session.flush_timer:session.mode&0x100U?1U:0U;
         session.deadline=seconds && runtime_.clock_ticks<=UINT64_MAX-std::uint64_t{seconds}*10000000?runtime_.clock_ticks+std::uint64_t{seconds}*10000000:UINT64_MAX;};
     const auto used=[&](std::uint64_t handle){const auto core=runtime_.traces.session(handle);std::size_t count=core->backlog.size()+(core->pending.empty()?0U:1U);

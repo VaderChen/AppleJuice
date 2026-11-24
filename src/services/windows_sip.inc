@@ -33,7 +33,7 @@ std::string sip_guid_text(const SipGuid& g){
     char text[39];std::snprintf(text,sizeof(text),"{%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X}",g[3],g[2],g[1],g[0],g[5],g[4],g[7],g[6],g[8],g[9],g[10],g[11],g[12],g[13],g[14],g[15]);return text;
 }
 std::optional<SipGuid> sip_guid_parse(std::u16string_view text){
-    const auto narrow=utf16_to_utf8(text);unsigned v[11]{};
+    const auto narrow=utf16_to_ansi(text);unsigned v[11]{};
     if(narrow.size()!=38 || std::sscanf(narrow.c_str(),"{%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x}",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7],&v[8],&v[9],&v[10])!=11)return std::nullopt;
     SipGuid g{};for(unsigned i=0;i<4;++i)g[i]=static_cast<std::uint8_t>(v[0]>>(i*8));g[4]=static_cast<std::uint8_t>(v[1]);g[5]=static_cast<std::uint8_t>(v[1]>>8);
     g[6]=static_cast<std::uint8_t>(v[2]);g[7]=static_cast<std::uint8_t>(v[2]>>8);for(unsigned i=0;i<8;++i)g[8+i]=static_cast<std::uint8_t>(v[3+i]);return g;
@@ -131,7 +131,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_sip(GuestState& state,Guest
                         const auto handle=file_handle?file_handle:opened;if(!by_name && (!handle || handle==invalid_handle))continue;
                         auto dll_bytes=utf16_bytes(dll);const auto dll_at=allocate_heap(m,dll_bytes.size());if(!dll_at)continue;m.write(GuestAddress{dll_at},dll_bytes);
                         const auto module=co_await service_callback::call_value(api("kernel32.dll","LoadLibraryW"),{dll_at});(void)free_heap(m,dll_at,s);if(!module)continue;
-                        auto narrow=utf16_to_utf8(function);std::vector<std::uint8_t> name_bytes(narrow.begin(),narrow.end());name_bytes.push_back(0);
+                        auto narrow=utf16_to_ansi(function);std::vector<std::uint8_t> name_bytes(narrow.begin(),narrow.end());name_bytes.push_back(0);
                         const auto name_at=allocate_heap(m,name_bytes.size());if(!name_at)continue;m.write(GuestAddress{name_at},name_bytes);
                         const auto entry=co_await service_callback::call_value(api("kernel32.dll","GetProcAddress"),{module,name_at});(void)free_heap(m,name_at,s);if(!entry)continue;
                         m.write(GuestAddress{guid_buffer},std::array<std::uint8_t,16>{});
@@ -168,7 +168,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_sip(GuestState& state,Guest
                     const auto dll_bytes=utf16_bytes(dll);const auto dll_at=allocate_heap(m,dll_bytes.size());if(!dll_at){last_error_=8;inner.return_to(s,0);co_return std::optional<std::uint32_t>{};}
                     m.write(GuestAddress{dll_at},dll_bytes);const auto module=co_await service_callback::call_value(api("LoadLibraryW"),{dll_at});(void)free_heap(m,dll_at,s);
                     if(!module){inner.return_to(s,0);co_return std::optional<std::uint32_t>{};}if(!first_module)first_module=module;
-                    const auto narrow=utf16_to_utf8(function);std::vector<std::uint8_t> name_bytes(narrow.begin(),narrow.end());name_bytes.push_back(0);
+                    const auto narrow=utf16_to_ansi(function);std::vector<std::uint8_t> name_bytes(narrow.begin(),narrow.end());name_bytes.push_back(0);
                     const auto name_at=allocate_heap(m,name_bytes.size());if(!name_at){last_error_=8;inner.return_to(s,0);co_return std::optional<std::uint32_t>{};}
                     m.write(GuestAddress{name_at},name_bytes);const auto entry=co_await service_callback::call_value(api("GetProcAddress"),{module,name_at});(void)free_heap(m,name_at,s);
                     if(!entry){inner.return_to(s,0);co_return std::optional<std::uint32_t>{};}
@@ -217,7 +217,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_sip(GuestState& state,Guest
                 const auto dll_bytes=utf16_bytes(provider.first);const auto dll_at=allocate_heap(m,dll_bytes.size());if(!dll_at){last_error_=8;inner.return_to(s,0);co_return std::optional<std::uint32_t>{};}
                 m.write(GuestAddress{dll_at},dll_bytes);const auto module=co_await service_callback::call_value(api("LoadLibraryW"),{dll_at});(void)free_heap(m,dll_at,s);
                 if(!module){inner.return_to(s,0);co_return std::optional<std::uint32_t>{};}
-                const auto narrow=utf16_to_utf8(provider.second);std::vector<std::uint8_t> name_bytes(narrow.begin(),narrow.end());name_bytes.push_back(0);
+                const auto narrow=utf16_to_ansi(provider.second);std::vector<std::uint8_t> name_bytes(narrow.begin(),narrow.end());name_bytes.push_back(0);
                 const auto name_at=allocate_heap(m,name_bytes.size());if(!name_at){last_error_=8;inner.return_to(s,0);co_return std::optional<std::uint32_t>{};}
                 m.write(GuestAddress{name_at},name_bytes);const auto entry=co_await service_callback::call_value(api("GetProcAddress"),{module,name_at});(void)free_heap(m,name_at,s);
                 if(!entry){last_error_=trust_subject_unknown;inner.return_to(s,0);co_return std::optional<std::uint32_t>{};}

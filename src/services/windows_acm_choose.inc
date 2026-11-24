@@ -23,7 +23,7 @@
         }
         const auto read_text=[&](std::uint64_t ptr,unsigned limit){
             return !ptr?std::u16string{}:wide_out?read_utf16(memory,GuestAddress{ptr},limit):
-                                                   utf8_to_utf16_lossy(read_ansi(memory,ptr,limit));
+                                                   ansi_to_utf16_lossy(read_ansi(memory,ptr,limit));
         };
         const auto name_buffer=slot(abi.name());
         if(name_buffer){

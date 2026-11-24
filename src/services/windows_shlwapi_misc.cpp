@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "gui_timing_layout.h"
 #include "mapi_property_tag.h"
 #include "x64arm/security_descriptor.hpp"
@@ -604,7 +605,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         shell_thread_ref_objects_.insert(object);memory.store(GuestAddress{arg(1)},pointer_bits,object);return done(0);
     }
     const bool wide=name.ends_with('W');
-    const auto text_at=[&](std::uint64_t address)->std::u16string{if(!address)return {};return wide?read_utf16(memory,GuestAddress{address},32768):utf8_to_utf16_lossy(read_ansi(memory,address,32768));};
+    const auto text_at=[&](std::uint64_t address)->std::u16string{if(!address)return {};return wide?read_utf16(memory,GuestAddress{address},32768):ansi_to_utf16_lossy(read_ansi(memory,address,32768));};
     const auto write_text=[&](std::uint64_t address,std::size_t capacity,const std::u16string& value)->std::size_t{
         // 至多寫入 capacity-1 個單位並補 NUL；A 版為 UTF-8 且不切斷字元。回傳寫入的單位數（不含 NUL）。
         if(!capacity)return 0;if(wide){const auto count=std::min(value.size(),capacity-1);auto bytes=utf16_bytes(value.substr(0,count));memory.write(GuestAddress{address},bytes);return count;}
@@ -1031,7 +1032,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
             if(load)path+=u"\\InProcServer32";
             else if(call(1)){
                 path+=u'\\';
-                path+=symbol=="#343"?utf8_to_utf16_lossy(read_ansi(m,call(1))):read_utf16(m,GuestAddress{call(1)});
+                path+=symbol=="#343"?ansi_to_utf16_lossy(read_ansi(m,call(1))):read_utf16(m,GuestAddress{call(1)});
             }
             const auto key=temporary.text(path);
             if(!key){last_error_=8;co_return finish(load?0:0x8007000eU);}
@@ -1373,7 +1374,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
             const auto found=shell_thread_refs_.find(threads_.current);if(found==shell_thread_refs_.end())co_return finish(0x80004002U);
             const auto object=found->second;shell_thread_refs_.erase(found);(void)co_await service_callback::call(method(object,2),{object});co_return finish(0);
         }
-        const auto text_at=[&](std::uint64_t address)->std::u16string{if(!address)return {};return wide?read_utf16(m,GuestAddress{address},32768):utf8_to_utf16_lossy(read_ansi(m,address,32768));};
+        const auto text_at=[&](std::uint64_t address)->std::u16string{if(!address)return {};return wide?read_utf16(m,GuestAddress{address},32768):ansi_to_utf16_lossy(read_ansi(m,address,32768));};
         if(symbol=="#542" || symbol=="WhichPlatform"){
             const auto library=temporary.text(u"shell32.dll"),info=temporary.allocate(20),proc=temporary.allocate(14);
             if(!library || !proc || !info)co_return finish(0);
@@ -1457,7 +1458,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
                 co_return finish(0x80070057U);
             const auto capacity=unicode?status(call(5)):std::min(status(call(5)),260U);
             if(capacity<7)co_return finish(0x80004005U);
-            const auto read=[&](std::uint64_t address){return unicode?read_utf16(m,GuestAddress{address}):utf8_to_utf16_lossy(read_ansi(m,address));};
+            const auto read=[&](std::uint64_t address){return unicode?read_utf16(m,GuestAddress{address}):ansi_to_utf16_lossy(read_ansi(m,address));};
             const auto file=temporary.text(read(call(0)));
             const auto resource=read(call(3));
             std::u16string url=u"res://";

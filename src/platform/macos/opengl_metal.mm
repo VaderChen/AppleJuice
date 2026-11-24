@@ -205,7 +205,8 @@ class MetalGl final:public NativeOpenGlContext {
     // 放大器不可用（macOS 13 以前或裝置不支援）時 present_scale_ 維持 1，由系統依視圖大小縮放。
     id present_scaler_=nil;id<MTLTexture> present_upscaled_=nil,present_upscaled_generated_=nil;unsigned present_scale_=1;
     // 畫面內插（見 metal_frame_interpolation.inc）：graphics_present 取得生成畫面後交給 swap 先行呈現。尺寸改變時重建。
-    std::unique_ptr<MetalFrameInterpolation> interpolation_;std::atomic<bool> interpolation_active_{false};bool interpolation_tried_=false; // interpolation_active_：這個表面已建立內插器（才強制垂直同步、每幀取兩個 drawable）。
+    std::unique_ptr<MetalFrameInterpolation> interpolation_;std::atomic<bool> interpolation_active_{false};bool interpolation_tried_=false;
+    bool interpolation_fed_=false; // 交換鏈呈現（graphics_present）已把這張畫面交給內插器；直接呼叫 swap 的 D3D9／OpenGL 由 swap 自己交付。 // interpolation_active_：這個表面已建立內插器（才強制垂直同步、每幀取兩個 drawable）。
     id<MTLTexture> interpolated_=nil;static inline std::atomic<std::uint64_t> interpolated_frames_{0},interpolation_missed_{0};
     CFTimeInterval present_last_=0,present_interval_=0;
     // 遊戲自己的升頻（XeSS／FSR）啟用時停用內建的補幀與 2 倍放大：drawable 回到交換鏈尺寸（由系統縮放到視窗大小），
@@ -348,7 +349,9 @@ class MetalGl final:public NativeOpenGlContext {
     std::map<std::string,id<MTLComputePipelineState>> stream_copy_pipelines_;
     std::uint64_t stream_gpu_draws_{},stream_gpu_bytes_{},geometry_mesh_draws_{};
     id<MTLComputePipelineState> indirect_count_pipeline_{};std::uint64_t indirect_count_masks_{},indirect_count_batches_{};
+    id<MTLComputePipelineState> occlusion_resolve_pipeline_{};bool occlusion_resolve_failed_{};
     std::map<std::string,std::shared_ptr<MetalTessellationPipeline>> tessellation_pipelines_;
+    bool reduction_pipelines_flushed_{}; // MIN／MAX 模擬旗標翻轉後已清除管線快取。
     std::map<std::string,std::string> tessellation_failures_;
     // MetalFX 時間性升頻器：每個呼叫端歷史編號一個，格式或尺寸改變時重建（歷史隨之清空）。
     struct TemporalScaler {std::string key;id scaler;std::array<id<MTLTexture>,4> staging{};};
@@ -548,6 +551,15 @@ private:
     // 連續 dispatch 共用的 compute encoder（序列 dispatch：每個 dispatch 等前一個完成才開始，等同 D3D12 dispatch 間的 UAV 屏障）；
     // 任何其他編碼或提交經 end_open_render 結束它。X64ARM_METAL_COMPUTE_COALESCE=0 每次 dispatch 各建 encoder。
     id<MTLComputeCommandEncoder> open_compute_;std::uint64_t compute_encoders_{},coalesced_dispatches_{};
+    // blit encoder；非同步 GPU 剖析時在起訖取樣（與 compute 同樣 2 個取樣點），讓複製與上傳也計入各標籤的 GPU 時間。
+    id<MTLBlitCommandEncoder> blit_encoder(){
+        if(const auto base=profile_reserve(true)){
+            auto descriptor=[MTLBlitPassDescriptor blitPassDescriptor];auto attachment=descriptor.sampleBufferAttachments[0];
+            attachment.sampleBuffer=profile_buffer_;attachment.startOfEncoderSampleIndex=*base;attachment.endOfEncoderSampleIndex=*base+1;
+            return [commands_ blitCommandEncoderWithDescriptor:descriptor];
+        }
+        return [commands_ blitCommandEncoder];
+    }
     id<MTLComputeCommandEncoder> compute_encoder(){
         static const bool coalesce=[] {const auto* text=std::getenv("X64ARM_METAL_COMPUTE_COALESCE");return !text || std::string_view(text)!="0";}();
         if(open_compute_ && coalesce){++coalesced_dispatches_;return open_compute_;}
@@ -689,6 +701,7 @@ private:
             // 非同步剖析：標籤在 CPU 端先切成各 encoder 的鍵，回呼只解析時間戳。
             struct SegmentKey {std::string key;unsigned base{};bool compute{};std::uint64_t vertices{};};
             auto segment_keys=std::make_shared<std::vector<SegmentKey>>();
+            auto label_names=std::make_shared<std::vector<std::pair<int,std::string>>>(); // 長命令緩衝診斷：全部標籤與所屬取樣段（-1＝第一段之前）。
             id<MTLCounterSampleBuffer> segment_samples=nil;unsigned segment_used=0;id<MTLDevice> profile_device=device_;
             if(profile_async && profile_buffer_ && !profile_segments_.empty()){
                 for(std::size_t i=0;i<profile_segments_.size();++i){
@@ -700,6 +713,10 @@ private:
                     segment_keys->push_back({metal_gpu_profile_key(part),segment.base,segment.compute,vertices});
                 }
                 segment_samples=profile_buffer_;segment_used=profile_used_;
+                for(std::size_t i=0,segment=0;i<flight.labels.size();++i){
+                    while(segment<profile_segments_.size() && profile_segments_[segment].label<=i)++segment;
+                    label_names->push_back({static_cast<int>(segment)-1,flight.labels[i].name});
+                }
             }
             profile_buffer_=nil;profile_used_=0;profile_segments_.clear();
             // 時間線診斷（X64ARM_METAL_TIMELINE=<檔案>）：每個命令緩衝的開始編碼、提交、GPU 起訖（同為宿主秒）與提交原因、累計 encoder／繪製數，
@@ -727,6 +744,21 @@ private:
                         const auto* stamps=static_cast<const MTLCounterResultTimestamp*>(resolved.bytes);
                         const auto valid=[&](unsigned i){return stamps[i].timestamp!=MTLCounterErrorValue && stamps[i].timestamp!=0;};
                         double sampled=0;
+                        // 診斷：GPU 時間超過 X64ARM_METAL_GPU_PROFILE_LONG_MS（預設 10）的命令緩衝，逐 encoder 記錄相對起訖（前 40 個），找出緩衝內的空檔與重負載 encoder。
+                        static const double long_seconds=[] {const auto* text=std::getenv("X64ARM_METAL_GPU_PROFILE_LONG_MS");return (text?std::strtod(text,nullptr):10.0)/1000.0;}();
+                        static std::atomic<unsigned> long_dumps{0};
+                        std::FILE* long_file=nullptr;std::uint64_t long_origin=0;
+                        // X64ARM_METAL_GPU_PROFILE_LONG_TRIGGER=<檔案>：該檔案出現後才開始記錄（避開讀取階段的大量上傳）。
+                        static const char* const long_trigger=std::getenv("X64ARM_METAL_GPU_PROFILE_LONG_TRIGGER");
+                        if(end-start>=long_seconds && (!long_trigger || access(long_trigger,F_OK)==0) && long_dumps.fetch_add(1)<40){
+                            long_file=std::fopen((std::string(metal_gpu_profile_path())+".long").c_str(),"a");
+                            for(const auto& segment:*segment_keys)for(unsigned i=0;i<(segment.compute?2U:4U);++i)if(valid(segment.base+i) && (!long_origin || stamps[segment.base+i].timestamp<long_origin))long_origin=stamps[segment.base+i].timestamp;
+                            std::uint64_t long_last=0;for(const auto& segment:*segment_keys)for(unsigned i=0;i<(segment.compute?2U:4U);++i)if(valid(segment.base+i))long_last=std::max<std::uint64_t>(long_last,stamps[segment.base+i].timestamp);
+                            // 以完成時的新取樣換算宿主時間：第一個 encoder 開始前、最後一個 encoder 結束後各有多少命令緩衝時間。
+                            MTLTimestamp cpu_now=0,gpu_now=0;[profile_device sampleTimestamps:&cpu_now gpuTimestamp:&gpu_now];const double host_now=CACurrentMediaTime();
+                            const auto host=[&](std::uint64_t tick){return host_now-static_cast<double>(static_cast<std::int64_t>(gpu_now-tick))*scale;};
+                            if(long_file)std::fprintf(long_file,"=== cb %.3f ms segments %zu head %.3f ms tail %.3f ms\n",1000*(end-start),segment_keys->size(),1000*(host(long_origin)-start),1000*(end-host(long_last)));
+                        }
                         for(const auto& segment:*segment_keys){
                             const auto b=segment.base;std::uint64_t first=~std::uint64_t{0},last=0,vertex_ticks=0,fragment_ticks=0;
                             const unsigned count=segment.compute?2U:4U;
@@ -736,8 +768,10 @@ private:
                                 if(valid(b+2) && valid(b+3) && stamps[b+3].timestamp>stamps[b+2].timestamp)fragment_ticks=stamps[b+3].timestamp-stamps[b+2].timestamp;
                             }
                             const double seconds=last>first?static_cast<double>(last-first)*scale:0;sampled+=seconds;
+                            if(long_file && last>=first && first>=long_origin)std::fprintf(long_file,"%9.3f %9.3f %8.3f %s\n",1000*static_cast<double>(first-long_origin)*scale,1000*static_cast<double>(last-long_origin)*scale,1000*seconds,segment.key.c_str());
                             metal_gpu_profile_add(segment.key.empty()?std::string("?"):segment.key,seconds,segment.vertices,vertex_ticks,fragment_ticks);
                         }
+                        if(long_file){for(const auto& [segment,name]:*label_names)std::fprintf(long_file,"  L %3d %s\n",segment,name.c_str());std::fclose(long_file);}
                         metal_gpu_profile_add("= command-buffer",end-start,0,0,0);
                         metal_gpu_profile_add("= unsampled",std::max(0.0,(end-start)-sampled),0,0,0);
                     }
@@ -1058,7 +1092,20 @@ public:
         return !layer_ || !interval_ || pending<drawable_limit_;
     }
     bool swap_interval(std::int32_t n)override{if(n<0 || n>1)return false;if(n)finish_immediate_present();interval_=n;if(layer_)layer_.displaySyncEnabled=n!=0 || interpolation_active_.load(std::memory_order_relaxed);return true;}
-    bool swap()override{@autoreleasepool{const auto request=timing_ && layer_?CACurrentMediaTime():0;bind();if(layer_)raster_overlays(true);begin_commands();auto front_copy=[commands_ blitCommandEncoder];MetalEncoderScope front_copy_scope{front_copy};[front_copy copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:front_ destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];front_copy_scope.end();if(layer_ && !interval_ && immediate_present_enabled() && !immediate_unavailable_ && present_scale_==1 && !interpolation_active_.load(std::memory_order_relaxed)){
+    bool swap()override{@autoreleasepool{const auto request=timing_ && layer_?CACurrentMediaTime():0;bind();if(layer_)raster_overlays(true);begin_commands();
+        // 畫面內插：D3D9 與 OpenGL 直接呼叫 swap，沒有經過交換鏈呈現；在這裡把完成的畫面交給內插器（條件與交換鏈路徑相同）。
+        if(!interpolation_fed_){
+            interpolated_=nil;
+            if(metal_frame_interpolation_wanted() && !external_upscaler_ && layer_){
+                if(!interpolation_tried_){
+                    interpolation_tried_=true;interpolation_=metal_frame_interpolation_create(device_,width_,height_,color_.pixelFormat);
+                    if(interpolation_){finish_immediate_present();interpolation_active_.store(true,std::memory_order_release);layer_.displaySyncEnabled=YES;}
+                }
+                if(interpolation_)interpolated_=interpolation_->encode(commands_,color_);
+            }
+        }
+        interpolation_fed_=false;
+        auto front_copy=[commands_ blitCommandEncoder];MetalEncoderScope front_copy_scope{front_copy};[front_copy copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:front_ destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];front_copy_scope.end();if(layer_ && !interval_ && immediate_present_enabled() && !immediate_unavailable_ && present_scale_==1 && !interpolation_active_.load(std::memory_order_relaxed)){
             if(!immediate_presenter_)try{immediate_presenter_=std::make_unique<MetalImmediatePresenter>(device_,layer_,width_,height_);}catch(const std::bad_alloc&){immediate_unavailable_=true;}
             if(immediate_presenter_){
                 const auto index=immediate_presenter_->prepare();auto encoder=[commands_ blitCommandEncoder];MetalEncoderScope scope{encoder};
@@ -1173,6 +1220,9 @@ public:
         draw({},types[input.topology-1],false,0,&fixed);
     }}
     std::shared_ptr<GraphicsResource> graphics_resource(const GraphicsResourceDesc&)override;
+    std::shared_ptr<GraphicsHeap> graphics_heap(std::uint64_t,bool)override;
+    std::shared_ptr<GraphicsResource> graphics_resource_placed(const GraphicsResourceDesc&,const std::shared_ptr<GraphicsHeap>&,std::uint64_t)override;
+    GraphicsResourceAllocation graphics_resource_allocation(const GraphicsResourceDesc&)override;
     std::shared_ptr<GraphicsResource> graphics_buffer_alias(std::shared_ptr<void>,std::span<std::uint8_t>)override;
     void graphics_submission_depth(std::uint32_t depth)override{if(!flight_explicit_)flight_limit_=std::clamp<std::size_t>(depth,1,16);}
     GraphicsView graphics_drawable(bool depth)override{
@@ -1201,9 +1251,12 @@ public:
     void graphics_write_region(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t,std::array<std::uint32_t,6>)override;
     std::vector<std::uint8_t> graphics_read(const GraphicsView&)override;
     bool graphics_descriptor(const GraphicsView&,std::uint32_t,std::array<std::uint64_t,2>&,std::shared_ptr<void>&)override;
+    bool graphics_sampler_descriptor(const std::shared_ptr<GraphicsSampler>&,std::uint64_t&,std::shared_ptr<void>&)override;
+    std::uint32_t graphics_sampler_flags(const std::shared_ptr<GraphicsSampler>& object)override{const auto* sampler=dynamic_cast<const MetalSampler*>(object.get());return sampler?sampler->reduction_flags:0U;}
     void metal_make_resident(MetalResource*,id<MTLResource>);
     void metal_commit_residency();
     id residency_set_;bool residency_dirty_{};id<MTLTexture> null_texture_;
+    std::shared_ptr<GraphicsSampler> null_sampler_; // 取樣器堆積鏡像的空項目
     std::vector<std::uint8_t> graphics_read_completed(const GraphicsView&)override;
     void graphics_copy(const GraphicsView&,const GraphicsView&,std::array<std::uint32_t,3>,std::array<std::uint32_t,6>)override;
     bool graphics_copy_buffer_texture(const GraphicsView&,const GraphicsView&,std::uint64_t,std::uint32_t,std::uint32_t,std::array<std::uint32_t,6>,bool)override;
@@ -1217,6 +1270,7 @@ public:
     void graphics_dispatch(const GraphicsStage&,std::array<std::uint32_t,3>)override;
     void graphics_dispatch_indirect(const GraphicsStage&,const std::shared_ptr<GraphicsResource>&,std::uint32_t)override;
     bool graphics_indirect_count_masks(std::span<const GraphicsIndirectCountMask>,const std::shared_ptr<GraphicsResource>&)override;
+    bool graphics_resolve_occlusion(std::span<const GraphicsOcclusionQuery>,const std::shared_ptr<GraphicsResource>&,std::uint64_t,bool)override;
     void graphics_handoff(NativeGraphics&,const GraphicsView&)override;
     void graphics_mips(const GraphicsView&)override;
     void graphics_present(const GraphicsView&)override;
@@ -1238,7 +1292,11 @@ public:
     // 命令執行緒的中繼 fence：語義同 graphics_fence／graphics_fence_pending，只是旗標由呼叫端先建立。
     void fence_relay(std::shared_ptr<std::atomic<bool>> relay,bool flush_first){
         if(flush_first && commands_)flush(false);else reap();
-        if(commands_){if(!commands_relays_)commands_relays_=std::make_shared<MetalFenceRelays>();commands_relays_->attach(std::move(relay));return;}
+        if(commands_){
+            // 診斷：X64ARM_TRACE_FENCE_RELAY=1 時記錄掛到尚未提交批次的完成旗標（之後要有人 flush 才會觸發）。
+            if(static const bool trace=std::getenv("X64ARM_TRACE_FENCE_RELAY")!=nullptr;trace){static std::atomic<unsigned> lines{};
+                if(lines.fetch_add(1,std::memory_order_relaxed)<200)std::fprintf(stderr,"[fence_relay] 掛到未提交批次 context=%p flush_first=%d\n",static_cast<void*>(this),flush_first?1:0);}
+            if(!commands_relays_)commands_relays_=std::make_shared<MetalFenceRelays>();commands_relays_->attach(std::move(relay));return;}
         if(flights_.empty() || !flights_.back().relays){relay->store(true,std::memory_order_release);return;}
         flights_.back().relays->attach(std::move(relay));
     }
@@ -1264,6 +1322,11 @@ public:
     bool graphics_stream_output(const GraphicsDraw&,const MetalShader&,id<MTLBuffer>,unsigned,unsigned,unsigned);
     std::shared_ptr<GraphicsShader> graphics_translate_shader(std::uint32_t,std::span<const std::uint8_t>,GLSLCrossDependencyData*);
     MetalTessellationDraw graphics_tessellation(const GraphicsDraw&,const std::string&);
+    MetalTessellationDraw graphics_modern_tessellation(const GraphicsDraw&);
+    std::shared_ptr<MetalTessellationPipeline> graphics_modern_tessellation_pipeline(const GraphicsDraw&);
+    MetalTessellationDraw graphics_modern_tessellation_indirect(const GraphicsDraw&,const std::shared_ptr<MetalTessellationPipeline>&);
+    bool graphics_modern_tessellation_indirect_ready(const GraphicsDraw&);
+    id<MTLComputePipelineState> tessellation_indirect_args_;
     std::shared_ptr<MetalPooledBuffer> graphics_scratch_buffer(std::uint64_t bytes,bool shared);
     std::uint64_t execute(GlOperation op,std::span<const std::uint64_t> a,std::span<const std::uint8_t> data,std::span<std::uint8_t> output)override;
 };

@@ -569,13 +569,13 @@
     const savedArguments = selected().arguments;
     $('arguments').value = '--draft-only'; $('arguments').dispatchEvent(new Event('input', { bubbles: true }));
     await click('tab-workspace'); check('顯示開關位於執行頁', !$('workspace').hidden && $('present-upscale').closest('.run-switches') !== null && $('present-upscale').getAttribute('role') === 'switch');
-    await click('present-upscale'); await click('present-interpolation');
-    check('顯示開關切換即儲存', selected().presentUpscale === true && selected().presentInterpolation === true);
+    await click('present-upscale'); await click('present-interpolation'); await click('performance-hud');
+    check('顯示開關切換即儲存', selected().presentUpscale === true && selected().presentInterpolation === true && selected().performanceHud === true);
     check('顯示開關不儲存啟動參數草稿', selected().arguments === savedArguments && $('arguments').value === '--draft-only');
-    check('顯示開關不影響同名 EXE', state.programs.find(p => p.id === same.id).presentUpscale !== true && state.programs.find(p => p.id === same.id).presentInterpolation !== true);
+    check('顯示開關不影響同名 EXE', state.programs.find(p => p.id === same.id).presentUpscale !== true && state.programs.find(p => p.id === same.id).presentInterpolation !== true && state.programs.find(p => p.id === same.id).performanceHud !== true);
     await capture('run-display-switches.png');
-    await click('present-upscale'); await click('present-interpolation');
-    check('顯示開關可關閉', selected().presentUpscale !== true && selected().presentInterpolation !== true);
+    await click('present-upscale'); await click('present-interpolation'); await click('performance-hud');
+    check('顯示開關可關閉', selected().presentUpscale !== true && selected().presentInterpolation !== true && selected().performanceHud !== true);
     $('arguments').value = savedArguments; $('arguments').dispatchEvent(new Event('input', { bubbles: true }));
     await click('run'); await until(() => selected().status === 'exited', 'hello EXE 結束');
     await until(() => text(hello.id).includes('Hello from Windows x64 EXE on ARM64!'), '真實 EXE 輸出');

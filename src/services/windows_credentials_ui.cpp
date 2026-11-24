@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/private_key_store.hpp"
@@ -110,7 +111,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_credential_ui(GuestState& s
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');
     const bool dword_result=name.starts_with("CredUI");
     std::uint64_t result=0;const auto fail=[&](std::uint32_t error){last_error_=error;result=dword_result?error:0;};
-    const auto text=[&](std::uint64_t at){return wide?read_utf16(memory,GuestAddress{at},65535):utf8_to_utf16_lossy(read_ansi(memory,at,65535));};
+    const auto text=[&](std::uint64_t at){return wide?read_utf16(memory,GuestAddress{at},65535):ansi_to_utf16_lossy(read_ansi(memory,at,65535));};
     try{
         if(name.starts_with("CredUIParseUserName")){
             const auto done=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
@@ -153,7 +154,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_credential_ui(GuestState& s
                 prompt.user_output=arg(4);prompt.password_output=arg(6);prompt.user_capacity=static_cast<std::uint32_t>(arg(5));prompt.password_capacity=static_cast<std::uint32_t>(arg(7));
                 const auto bounded=[&](std::uint64_t at,std::uint32_t capacity){
                     if(!capacity || capacity>65536U)throw CredentialFailure{87};
-                    return wide?read_utf16(memory,GuestAddress{at},capacity):utf8_to_utf16_lossy(read_ansi(memory,at,capacity));
+                    return wide?read_utf16(memory,GuestAddress{at},capacity):ansi_to_utf16_lossy(read_ansi(memory,at,capacity));
                 };
                 user=bounded(arg(4),prompt.user_capacity);password=bounded(arg(6),prompt.password_capacity);
                 if((flags&0x200U) && user.empty())return done(87);
@@ -236,7 +237,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_credential_ui(GuestState& s
                 else {
                     // 沒有網域輸出時，使用者名稱以 DOMAIN\user 回傳。
                     auto user=value->user;if(!arg(5) && !value->domain.empty())user=value->domain+u"\\"+user;
-                    const auto encode=[&](const std::u16string& s){if(wide)return utf16_bytes(s);auto narrow=utf16_to_utf8(s);std::vector<std::uint8_t> out(narrow.begin(),narrow.end());out.push_back(0);return out;};
+                    const auto encode=[&](const std::u16string& s){if(wide)return utf16_bytes(s);auto narrow=utf16_to_ansi(s);std::vector<std::uint8_t> out(narrow.begin(),narrow.end());out.push_back(0);return out;};
                     const unsigned unit=wide?2:1;bool fits=true;
                     const std::array<std::tuple<std::u16string,std::uint64_t,std::uint64_t>,3> outputs{{{user,arg(3),arg(4)},{value->domain,arg(5),arg(6)},{value->password,arg(7),arg(8)}}};
                     for(const auto& [content,buffer,count]:outputs){

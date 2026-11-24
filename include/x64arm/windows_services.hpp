@@ -167,6 +167,10 @@ public:
         owner_.store(0,std::memory_order_seq_cst);
         if(waiters_.load(std::memory_order_seq_cst))owner_.notify_one();
     }
+    // 診斷用快照（不取鎖）：目前擁有者（0 為未持有）、等待者數與呼叫端自身的識別。
+    std::uintptr_t owner_snapshot() const noexcept {return owner_.load(std::memory_order_relaxed);}
+    unsigned waiter_snapshot() const noexcept {return static_cast<unsigned>(waiters_.load(std::memory_order_relaxed));}
+    static std::uintptr_t caller_id() noexcept {return self_id();}
 private:
     // 執行緒識別：arm64 macOS 的 TPIDRRO_EL0 是執行緒 TSD 基底（低 3 位元是 CPU 編號），不必經 dyld stub 呼叫 pthread_self。
     static std::uintptr_t self_id() noexcept {
@@ -277,6 +281,8 @@ public:
     bool wait_may_be_ready(const std::vector<std::uint64_t>& handles,bool all,std::uint64_t thread_id);
     bool resident_runnable_waiting(std::span<GuestState* const>) const override;
     void trace_guest_thread_waits(std::FILE* out,const GuestMemory* memory=nullptr) const;
+    // 診斷傾印附帶：各 D3D12 fence 的完成值、已提交值與尚未觸發的事件登記（事件 handle@目標值），對照執行緒等待的 handle。
+    void trace_d3d12_fences(std::FILE* out) const;
     // 診斷（X64ARM_TRACE_THREAD_DUMP）：事件操作環形紀錄，傾印時列出等待中 handle 最近的操作。
     void trace_event_operation(char operation,std::uint64_t handle,std::uint64_t thread,std::uint64_t caller) const;
     GuestState* resident_idle_replacement(GuestState&,GuestMemory&,std::span<GuestState* const>) override;
@@ -1200,6 +1206,7 @@ private:
     void cancel_http_connection_probe(std::uint64_t thread);
     std::optional<std::uint32_t> invoke_autoproxy(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool http_ready(std::uint64_t) const;
+    bool http_ready(const std::vector<std::uint64_t>&) const;
     bool http_waiting() const;
     std::optional<std::uint32_t> invoke_http(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_url_cache(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1783,6 +1790,10 @@ private:
     mutable std::uint64_t resident_wait_deadline_{UINT64_MAX}; // 只在協調執行緒讀寫。
     struct ResolveWaitStats {std::uint64_t calls{},skipped{},changed{};} resolve_wait_stats_; // 逾時路徑等待解析的次數（X64ARM_SERVICE_COUNTS 輸出）。
     std::uint64_t resident_full_poll_ticks_{}; // 上次完整排程輪詢外部完成（wake_threads）的單調時間；物件等待停駐的保險用。
+    // 主程式清單決定的相容版本（GetVersion(Ex)、VerifyVersionInfo、PEB 的 OS 版本欄位）：未宣告 Windows 8.1／10 的 supportedOS 時為 6.2.9200，
+    // 與 Windows 8.1 之後的行為相同。RtlGetVersion／RtlGetNtVersionNumbers／RtlVerifyVersionInfo 與 KUSER_SHARED_DATA 維持真實版本。
+    struct CompatibilityVersion {std::uint32_t major{10},minor{0},build{19045};} compat_version_;
+    void resolve_compat_version(const GuestMemory& memory);
     std::map<std::uint64_t,GuestAddress> resident_service_requests_;
     std::uint64_t thread_id(std::uint64_t handle) const;
     std::uint32_t thread_identifier(std::uint64_t) const;
@@ -2862,6 +2873,14 @@ private:
     std::uint64_t com_moniker_table(GuestMemory&,unsigned which);
     std::uint64_t create_com_moniker(GuestMemory&,ComMoniker value);
     bool begin_moniker_com(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // DirectShow 濾鏡圖與音訊轉譯濾鏡（windows_directshow.cpp）。
+    bool begin_directshow_com(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_directshow(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::uint64_t directshow_vtable(GuestMemory&,std::string_view family);
+    std::uint64_t create_directshow_object(GuestMemory&,const std::array<std::uint8_t,16>& clsid);
+    bool directshow_active()const;
+    void poll_directshow(GuestMemory&);
+    std::shared_ptr<struct DirectShowState> directshow_;
     // oleaut32 StdPicture：type 為 PICTYPE_*（-1 未初始化），尺寸為 HIMETRIC；WMF 另存 placeable 標頭的邏輯範圍；format 為原始檔格式。
     struct OlePicture {
         std::uint32_t references{1};std::int16_t type{-1};std::uint64_t handle{},palette{},current_dc{};

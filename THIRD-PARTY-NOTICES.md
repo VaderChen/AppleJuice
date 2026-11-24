@@ -11,6 +11,7 @@ AppleJuice 的[自訂授權](LICENSE.md)適用於著作權人有權提供的自�
 | Zydis／Zycore | [Zydis](x64kernel/share/AppleJuiceKernel/licenses/Zydis-LICENSE)、[Zycore](x64kernel/share/AppleJuiceKernel/licenses/Zycore-LICENSE) |
 | Berkeley SoftFloat | [SoftFloat](x64kernel/share/AppleJuiceKernel/licenses/SoftFloat-LICENSE) |
 | OpenSSL | [OpenSSL](third_party/OPENSSL-LICENSE) |
+| curl 8.23.0（libcurl，靜態連結，只啟用 HTTP／HTTPS） | [curl](third_party/CURL-LICENSE) |
 | ICU | [ICU](third_party/ICU-LICENSE) |
 | libgsm 1.0.24 | [GSM 6.10](third_party/GSM-LICENSE) |
 | FFmpeg 8.1.2（libavformat、libavcodec 與 libavutil。提供 MPEG 解多工、H.264、MPEG、VC-1、WMV 與 WMA 解碼，以及 Video 1 編解碼。LGPL 2.1+，靜態連結。完整建置來源隨附） | [FFmpeg](third_party/FFMPEG-LICENSE) |

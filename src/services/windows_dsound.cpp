@@ -1,3 +1,4 @@
+#include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -304,7 +305,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dsound(GuestState& state,Gu
                     const auto append=[&](std::u16string_view text){
                         const auto offset=bytes.size();
                         for(const auto c:text){if(wide){bytes.push_back(static_cast<std::uint8_t>(c));bytes.push_back(static_cast<std::uint8_t>(c>>8));}}
-                        if(!wide){const auto narrow=utf16_to_utf8(std::u16string(text));bytes.insert(bytes.end(),narrow.begin(),narrow.end());}
+                        if(!wide){const auto narrow=utf16_to_ansi(std::u16string(text));bytes.insert(bytes.end(),narrow.begin(),narrow.end());}
                         bytes.push_back(0);if(wide)bytes.push_back(0);return offset;
                     };
                     struct Pending {std::size_t guid,description,endpoint;};std::vector<Pending> pending;

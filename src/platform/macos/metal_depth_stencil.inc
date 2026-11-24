@@ -10,6 +10,40 @@ void metal_depth_transfer(id<MTLDevice> device,id<MTLCommandQueue> queue,const G
         throw std::invalid_argument("深度／模板平面傳輸的資源不合法");
     const auto [x,y,width,height]=region;const bool combined=texture.pixelFormat==MTLPixelFormatDepth32Float_Stencil8;
     const bool packed24=resource.desc.format>=44 && resource.desc.format<=47;
+    const bool depth_plane=(view.flags&graphics_view_depth_plane)!=0,stencil_plane=(view.flags&graphics_view_stencil_plane)!=0;
+    if(stencil_plane && !combined)throw std::invalid_argument("沒有 stencil 平面的深度資源不能傳輸 stencil 平面");
+    if(depth_plane || stencil_plane){
+        // D3D12 平面式子資源：只傳一個平面，客體資料每像素 4（深度）或 1（stencil）位元組。
+        const unsigned bpp=stencil_plane?1U:4U;
+        if(!width || !height || x+width>std::max(1U,resource.desc.width>>view.level) || y+height>std::max(1U,resource.desc.height>>view.level) ||
+           row<std::uint64_t{width}*bpp || data.size()<std::uint64_t{row}*(height-1)+std::uint64_t{width}*bpp)
+            throw std::invalid_argument("深度／模板平面傳輸越界");
+        const unsigned host_bytes=stencil_plane?1U:texture.pixelFormat==MTLPixelFormatDepth16Unorm?2U:4U;
+        const std::size_t pitch=(std::size_t{width}*host_bytes+255)&~std::size_t{255},plane=pitch*height;
+        auto lease=reserve_gpu_memory(plane);
+        auto buffer=[device newBufferWithLength:plane options:MTLResourceStorageModeShared];if(!buffer)throw std::bad_alloc{};
+        auto* bytes=static_cast<std::uint8_t*>(buffer.contents);
+        if(upload)for(unsigned iy=0;iy<height;++iy)for(unsigned ix=0;ix<width;++ix){
+            const auto* src=data.data()+std::size_t{iy}*row+ix*bpp;auto* dst=bytes+iy*pitch+ix*host_bytes;
+            if(stencil_plane)*dst=*src;
+            else if(packed24){std::uint32_t value=0;std::memcpy(&value,src,4);const float depth=static_cast<float>(value&0xffffffU)/16777215.0F;std::memcpy(dst,&depth,4);}
+            else std::memcpy(dst,src,host_bytes);
+        }
+        auto command=[queue commandBuffer];if(!command)throw std::runtime_error("深度／模板 command buffer 建立失敗");
+        auto encoder=[command blitCommandEncoder];MetalEncoderScope scope{encoder};if(!encoder)throw std::runtime_error("深度／模板 blit encoder 建立失敗");
+        const auto option=!combined?MTLBlitOptionNone:stencil_plane?MTLBlitOptionStencilFromDepthStencil:MTLBlitOptionDepthFromDepthStencil;
+        if(upload)[encoder copyFromBuffer:buffer sourceOffset:0 sourceBytesPerRow:pitch sourceBytesPerImage:plane sourceSize:MTLSizeMake(width,height,1) toTexture:texture destinationSlice:view.slice destinationLevel:view.level destinationOrigin:MTLOriginMake(x,y,0) options:option];
+        else [encoder copyFromTexture:texture sourceSlice:view.slice sourceLevel:view.level sourceOrigin:MTLOriginMake(x,y,0) sourceSize:MTLSizeMake(width,height,1) toBuffer:buffer destinationOffset:0 destinationBytesPerRow:pitch destinationBytesPerImage:plane options:option];
+        scope.end();track_gpu_commands(command);[command commit];[command waitUntilCompleted];
+        if(command.status==MTLCommandBufferStatusError)throw std::runtime_error("深度／模板平面傳輸失敗："+std::string(command.error.localizedDescription.UTF8String));
+        if(!upload)for(unsigned iy=0;iy<height;++iy)for(unsigned ix=0;ix<width;++ix){
+            const auto* src=bytes+iy*pitch+ix*host_bytes;auto* dst=data.data()+std::size_t{iy}*row+ix*bpp;
+            if(stencil_plane)*dst=*src;
+            else if(packed24){float depth=0;std::memcpy(&depth,src,4);const auto value=static_cast<std::uint32_t>(std::llround(std::clamp(static_cast<double>(depth),0.0,1.0)*16777215.0));std::memcpy(dst,&value,4);}
+            else{std::memset(dst,0,bpp);std::memcpy(dst,src,host_bytes);}
+        }
+        return;
+    }
     const unsigned depth_bytes=texture.pixelFormat==MTLPixelFormatDepth16Unorm?2U:4U,bpp=graphics_format_bytes(resource.desc.format);
     if(!width || !height || x+width>std::max(1U,resource.desc.width>>view.level) || y+height>std::max(1U,resource.desc.height>>view.level) ||
        row<std::uint64_t{width}*bpp || data.size()<std::uint64_t{row}*(height-1)+std::uint64_t{width}*bpp)
@@ -92,10 +126,22 @@ id<MTLTexture> metal_shader_texture(const GraphicsView& view){
     if(volume || type==MTLTextureType2D || type==MTLTextureType2DMultisample)slices=1;else if(type==MTLTextureTypeCube)slices=6;
     else if(type==MTLTextureTypeCubeArray)slices=std::max(6U,slices/6*6); // Metal 要求 Cube 陣列的 slice 數是 6 的倍數。
     const std::uint32_t mips=std::max(1U,resource.desc.levels),level=std::min(view.level,mips-1),levels=view.levels && view.levels<=mips-level?view.levels:mips-level;
-    if(level || levels!=resource.desc.levels || slice || (!volume && slices!=resource.desc.layers) || pixel_format!=texture.pixelFormat || stencil || rgb32 || replicate_red || red_only || type!=texture.textureType)
-    return resource.shader_view((__bridge const void*)texture,{2,static_cast<std::uint32_t>(pixel_format),static_cast<std::uint32_t>(type),(rgb32?1U:0U)|(stencil?2U:0U)|(replicate_red?4U:0U)|(red_only?8U:0U),level|(levels<<16),slice|(slices<<16)},[&]()->id<MTLTexture>{
+    const std::uint32_t mapping=view.swizzle&0x1fffU;
+    if(level || levels!=resource.desc.levels || slice || (!volume && slices!=resource.desc.layers) || pixel_format!=texture.pixelFormat || stencil || rgb32 || replicate_red || red_only || mapping || type!=texture.textureType)
+    return resource.shader_view((__bridge const void*)texture,{2,static_cast<std::uint32_t>(pixel_format),static_cast<std::uint32_t>(type),(rgb32?1U:0U)|(stencil?2U:0U)|(replicate_red?4U:0U)|(red_only?8U:0U)|(mapping<<4),level|(levels<<16),slice|(slices<<16)},[&]()->id<MTLTexture>{
         id<MTLTexture> made=nil;
-        if(replicate_red){
+        if(mapping){
+            // 先依格式得到 D3D 看到的四個分量（RGB32 的 A 為 1、stencil 在 G 等），再套用 D3D12 的 Shader4ComponentMapping。
+            std::array<MTLTextureSwizzle,4> base{MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleAlpha};
+            if(replicate_red)base={MTLTextureSwizzleRed,MTLTextureSwizzleRed,MTLTextureSwizzleRed,MTLTextureSwizzleRed};
+            else if(red_only)base={MTLTextureSwizzleRed,MTLTextureSwizzleZero,MTLTextureSwizzleZero,MTLTextureSwizzleOne};
+            else if(rgb32)base[3]=MTLTextureSwizzleOne;
+            else if(stencil)base={MTLTextureSwizzleZero,MTLTextureSwizzleRed,MTLTextureSwizzleZero,MTLTextureSwizzleOne};
+            std::array<MTLTextureSwizzle,4> channel{};
+            for(unsigned c=0;c<4;++c){const auto source=(mapping>>(3*c))&7U;channel[c]=source<4?base[source]:source==4?MTLTextureSwizzleZero:MTLTextureSwizzleOne;}
+            const auto swizzle=MTLTextureSwizzleChannelsMake(channel[0],channel[1],channel[2],channel[3]);
+            made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(level,levels) slices:NSMakeRange(slice,slices) swizzle:swizzle];
+        }else if(replicate_red){
             const auto swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleRed,MTLTextureSwizzleRed,MTLTextureSwizzleRed);
             made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(level,levels) slices:NSMakeRange(slice,slices) swizzle:swizzle];
         }else if(red_only){
