@@ -449,6 +449,7 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {icu_number_service_descriptors(), true, "icu_number_service_descriptors", &WindowsServices::invoke_icu_number},
             {icu_date_format_service_descriptors(), true, "icu_date_format_service_descriptors", &WindowsServices::invoke_icu_date_format},
             {icu_formatted_service_descriptors(), true, "icu_formatted_service_descriptors", &WindowsServices::invoke_icu_formatted},
+            {icu_collation_service_descriptors(), true, "icu_collation_service_descriptors", &WindowsServices::invoke_icu_collation},
             {icu_bidi_service_descriptors(), true, "icu_bidi_service_descriptors", &WindowsServices::invoke_icu_guest_text},
             {icu_modern_number_service_descriptors(), true, "icu_modern_number_service_descriptors", &WindowsServices::invoke_icu_modern_number},
             {icu_charset_detection_service_descriptors(), true, "icu_charset_detection_service_descriptors", &WindowsServices::invoke_icu_charset_detection},

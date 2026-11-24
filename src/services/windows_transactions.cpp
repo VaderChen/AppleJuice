@@ -350,7 +350,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_transactions(GuestState& st
             if(view(operation.to,key).exists){fail(183);return finish();}
             if(!operation.source.empty()){const auto source=filesystem_.information(operation.source);
                 if(source.error){fail(source.error);return finish();}if(!(source.metadata.attributes&0x10)){fail(267);return finish();}}
-            try{(void)read_security_attributes(memory,arg(2),x86_,false);operation.security=file_creation_descriptor(memory,arg(2));}
+            try{(void)read_security_attributes(memory,arg(2),x86_,false,false);operation.security=file_creation_descriptor(memory,arg(2),false);}
             catch(const SecurityDescriptorError& error){fail(error.code);return finish();}
             transaction->names[key]={true,true,{},split_path(operation.to).second};
         }else throw HostCallFault("未知的交易式檔案入口");

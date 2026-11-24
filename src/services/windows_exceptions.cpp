@@ -388,7 +388,16 @@ void WindowsServices::begin_exception(GuestState& state, GuestMemory& memory, st
             if(mapping && (mapping->permissions&permission(Access::Execute)) && module_image(target,true))std::cerr<<"[exception_stack_candidate] offset="<<slot*unit<<" code=0x"<<std::hex<<target<<std::dec<<'\n';
         }catch(const MemoryFault&){break;}
     }
-    if (exceptions_.stack.size() >= 16 || parameters.size() > 15) throw HostCallFault("例外巢狀深度或參數數目超過上限");
+    // 新例外起點已在某些回呼框架之上：那些回呼（含其派送）已被客體自行續行跨過，先比照 NtContinue 結束它們，不能累積成巢狀例外。
+    if(!runtime_.callbacks.empty()){const auto origin=state;abandon_callbacks_above(state,memory,origin.reg(Gpr::Rsp));state=origin;}
+    if (exceptions_.stack.size() >= 16 || parameters.size() > 15) {
+        // 診斷：列出仍在作用中的派送（代碼、起點、階段、回呼深度），以辨識未隨續行結束的派送。
+        for(std::size_t i=0;i<exceptions_.stack.size();++i){const auto& item=exceptions_.stack[i];
+            std::fprintf(stderr,"[exception_depth] slot=%zu code=%#x rip=%#llx rsp=%#llx stage=%u callback_depth=%zu native_stack=%#llx callbacks_now=%zu new_code=%#x new_rsp=%#llx\n",i,item.code,
+                static_cast<unsigned long long>(item.original.rip.value),static_cast<unsigned long long>(item.original.reg(Gpr::Rsp)),static_cast<unsigned>(item.stage),item.callback_depth,
+                static_cast<unsigned long long>(item.native_stack),runtime_.callbacks.size(),code,static_cast<unsigned long long>(state.reg(Gpr::Rsp)));}
+        throw HostCallFault("例外巢狀深度或參數數目超過上限");
+    }
     auto area=exception_base_.value;
     if(!threads_.items.empty()){
         auto& thread=threads_.items.at(threads_.current);area=thread.exception_area;
@@ -525,16 +534,27 @@ std::optional<bool> WindowsServices::append_exception_frame(GuestState& state,Gu
     dispatch.frames.push_back({dispatch.walk,pc,unwind,dispatch.walk_callback_depth,dispatch.walk_exception_depth,dispatch.walk_scope_index});
     dispatch.walk_scope_index=0;return true;
 }
+namespace {
+// 展開階段的工作 CONTEXT：RtlUnwindEx 呼叫端提供的緩衝；沒有時（SEH filter／C++ catch 等引擎發起的展開）用派送區的 walk_context。
+std::uint64_t unwind_context_record(const ExceptionDispatch& dispatch){
+    return dispatch.stage==ExceptionStage::Unwind && dispatch.unwind_context?dispatch.unwind_context:dispatch.walk_context;
+}
+}
 void WindowsServices::prepare_handler(GuestMemory& memory, ExceptionDispatch& dispatch, const ExceptionWalkFrame& frame, bool target) {
     const auto* image=unwind_image(memory,frame.pc,frame.unwind.function_entry);
     if(!image)throw HostCallFault("例外 handler 所屬映像已不存在");
     memory.write(GuestAddress{dispatch.dispatcher}, std::array<std::uint8_t, 80>{});
+    // 搜尋階段：DispatcherContext->ContextRecord 是展開到呼叫者後的狀態，handler 的 ContextRecord 參數是例外發生點。
+    // 展開階段（與 Windows RtlUnwindEx 相同）：兩者是同一份工作 CONTEXT，內容為正在被展開的框架本身（展開前）、Rax＝ReturnValue；
+    // .NET 在目標框架以它還原非揮發暫存器後跳進 catch，傳成呼叫者狀態會讓續行的受控程式碼讀到錯的暫存器。
+    const bool unwinding=dispatch.stage == ExceptionStage::Unwind;
+    const auto context_record=unwind_context_record(dispatch);
     const std::array<std::uint64_t, 9> fields{frame.pc, image->base, frame.unwind.function_entry, frame.unwind.establisher,
-        dispatch.stage == ExceptionStage::Unwind ? dispatch.target_ip : 0, dispatch.walk_context, frame.unwind.handler, frame.unwind.handler_data, 0};
+        unwinding ? dispatch.target_ip : 0, context_record, frame.unwind.handler, frame.unwind.handler_data, 0};
     for (std::size_t i = 0; i < fields.size(); ++i) memory.store(GuestAddress{dispatch.dispatcher + i * 8}, 64, fields[i]);
     memory.store(GuestAddress{dispatch.dispatcher+72},32,frame.scope_index);
-    write_context(memory, dispatch.walk_context, frame.unwind.caller);
-    if(dispatch.unwind_context)write_context(memory,dispatch.unwind_context,frame.context);
+    if(unwinding){auto current=frame.context;current.reg(Gpr::Rax)=dispatch.return_value;write_context(memory,context_record,current);}
+    else write_context(memory, dispatch.walk_context, frame.unwind.caller);
     memory.store(GuestAddress{dispatch.record + 4}, 32, dispatch.flags | (dispatch.stage == ExceptionStage::Unwind ? 2U | (target ? 32U : 0U) : 0));
 }
 std::optional<std::uint32_t> WindowsServices::finish_user_callback_exception(GuestState& state,GuestMemory& memory){
@@ -602,7 +622,7 @@ std::optional<std::uint32_t> WindowsServices::advance_exception(GuestState& stat
             const auto index = dispatch.index++; const auto& frame = dispatch.frames[index];
             if (frame.unwind.handler && (frame.unwind.handler_flags & 2)) {
                 prepare_handler(memory, dispatch, frame, index == dispatch.target_frame);
-                call(frame.unwind.handler, {dispatch.record, frame.unwind.establisher, dispatch.context, dispatch.dispatcher}); return std::nullopt;
+                call(frame.unwind.handler, {dispatch.record, frame.unwind.establisher, unwind_context_record(dispatch), dispatch.dispatcher}); return std::nullopt;
             }
         }
         if(dispatch.module_operation || dispatch.module_continue) {
@@ -704,14 +724,36 @@ std::optional<std::uint32_t> WindowsServices::resume_exception(GuestState& state
         state.rip=exception_entry_;return std::nullopt;
     }
     if (dispatch.stage == ExceptionStage::Search) {
-        if (result != 1) throw HostCallFault("尚未支援 nested／collided unwind disposition");
+        if(result==3){
+            // ExceptionCollidedUnwind（Windows RtlDispatchException 語義）：handler 已把 DispatcherContext 改成另一個框架
+            // （ControlPc、FunctionEntry、EstablisherFrame、展開前的 ContextRecord、LanguageHandler、HandlerData、ScopeIndex），
+            // 派送器以這些值重新呼叫 LanguageHandler，之後從該框架的呼叫者繼續往上。.NET 的 FixContextHandler 以此把
+            // NakedThrowHelper 換回原本發生硬體例外的受控框架；這一格框架也換成它，第二階段 RtlUnwind 才找得到目標。
+            const auto d=dispatch.dispatcher;
+            const auto control=memory.load(GuestAddress{d},64),entry=memory.load(GuestAddress{d+16},64),establisher=memory.load(GuestAddress{d+24},64);
+            const auto context_record=memory.load(GuestAddress{d+40},64),language=memory.load(GuestAddress{d+48},64),handler_data=memory.load(GuestAddress{d+56},64);
+            const auto scope=static_cast<std::uint32_t>(memory.load(GuestAddress{d+72},32));
+            const auto* image=unwind_image(memory,control,entry);
+            if(!image || !language || !context_record)throw HostCallFault("collided unwind 的 DispatcherContext 不完整");
+            auto current=read_context_registers(memory,context_record,dispatch.walk);current.rip=GuestAddress{control};
+            auto unwind=virtual_unwind(memory,*image,control,current,1U,entry);
+            unwind.handler=language;unwind.handler_data=handler_data;unwind.establisher=establisher;unwind.function_entry=entry;unwind.handler_flags|=3U;
+            auto& frame=dispatch.frames.back();
+            frame.context=current;frame.pc=control;frame.unwind=unwind;frame.scope_index=scope;
+            memory.store(GuestAddress{dispatch.record+4},32,dispatch.flags);
+            state=dispatch.consolidate_record?dispatch.consolidate_origin:dispatch.original;
+            start_callbacks(state,memory,{{language,{dispatch.record,establisher,dispatch.context,d}}},Continuation::Exception);
+            return std::nullopt;
+        }
+        if (result != 1) throw HostCallFault("尚未支援 nested exception disposition");
         dispatch.walk = dispatch.frames.back().unwind.caller; dispatch.unwound = true;
     } else if (dispatch.stage == ExceptionStage::Vectored && result != 0) throw HostCallFault("vectored handler 回傳值不合法");
     else if (dispatch.stage == ExceptionStage::Unwind) {
         if(result!=1)throw HostCallFault("unwind handler 回傳值不合法");
         if(dispatch.index-1==dispatch.target_frame && !dispatch.restore_jump) {
-            const auto& baseline=dispatch.frames[dispatch.target_frame].unwind.caller;
-            const auto changed=read_context(memory,dispatch.walk_context,baseline);
+            // 基準是交給 handler 的工作 CONTEXT（目標框架展開前、Rax＝ReturnValue，見 prepare_handler）。
+            auto baseline=dispatch.frames[dispatch.target_frame].context;baseline.reg(Gpr::Rax)=dispatch.return_value;
+            const auto changed=read_context(memory,unwind_context_record(dispatch),baseline);
             // 保留目標框架的暫存器；套用 personality handler 對 CONTEXT 的顯式修改。
             for(std::size_t i=0;i<changed.gpr.size();++i)if(changed.gpr[i]!=baseline.gpr[i])dispatch.target_context.gpr[i]=changed.gpr[i];
             for(std::size_t i=0;i<changed.xmm.size();++i)if(changed.xmm[i]!=baseline.xmm[i])dispatch.target_context.xmm[i]=changed.xmm[i];
@@ -721,7 +763,9 @@ std::optional<std::uint32_t> WindowsServices::resume_exception(GuestState& state
 }
 void WindowsServices::begin_unwind(GuestState& state, GuestMemory& memory, std::size_t target, std::uint64_t ip, std::uint64_t result) {
     auto& dispatch = exceptions_.stack.back();
-    if(!dispatch.consolidate_record)memory.check(GuestAddress{ip}, 1, Access::Execute);
+    // 與 Windows 相同不預先驗證 TargetIp：只有展開走到目標框架、而目標的 handler（帶 EXCEPTION_TARGET_UNWIND）沒有自行接手時
+    // 才以它續行，屆時位址無效就照常在客體端出錯。.NET 第二階段刻意傳 INVALID_RESUME_ADDRESS（0xBAD0），由目標框架的
+    // ProcessCLRException 直接跳進 catch funclet，不會回到 TargetIp。
     if (target >= dispatch.frames.size()) throw HostCallFault("unwind target frame 不合法");
     dispatch.target_frame = target; dispatch.target_ip = ip; dispatch.return_value = result;
     dispatch.target_context=dispatch.frames[target].context;
@@ -886,6 +930,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
         std::vector<std::uint64_t> parameters;
         for (unsigned i = 0; i < count; ++i) parameters.push_back(memory.load(GuestAddress{arg(3)+i*(x86_?4U:8U)},x86_?32:64));
         auto caller = state; arg.return_to(caller, 0);
+        if(!x86_){
+            // 與 Windows 相同，例外位址與 CONTEXT 的 RIP 落在 RaiseException 自身之內（RtlRaiseException 只往上展開一層），
+            // 不是呼叫者模組：.NET 的 VEH 以「IP 是否在執行引擎內」判斷致命錯誤，LinkFrameAndThrow 重新丟出的存取違規
+            // 若以呼叫者位址回報會被當成執行引擎內部故障。展開時此框架是葉框架（RSP 指向返回位址）；處理常式要求繼續執行
+            // 且未改 RIP 時回到呼叫者並彈出返回位址。
+            auto inside=state;
+            if(emit_debug_event(inside,memory,debugger::Exception{code,flags_value,0,inside.rip.value,parameters,true})!=debugger::handled){
+                begin_exception(inside, memory, code, flags_value, parameters);
+                auto& dispatch=exceptions_.stack.back();dispatch.api_exception_resume=caller.rip;dispatch.api_exception_pop=caller.reg(Gpr::Rsp)-state.reg(Gpr::Rsp);
+                state=inside;
+            }else state=caller;
+            return std::nullopt;
+        }
         if(emit_debug_event(caller,memory,debugger::Exception{code,flags_value,0,caller.rip.value,parameters,true})!=debugger::handled)
             begin_exception(caller, memory, code, flags_value, parameters);
         state = caller; return std::nullopt;
@@ -931,12 +988,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
         RuntimeImage leaf;leaf.base=arg(1);leaf.size=UINT64_MAX-leaf.base;
         const auto* image=arg(3)?unwind_image(memory,arg(2),arg(3)):&leaf;
         if (!image || image->base!=arg(1) || arg(0) > 3) throw HostCallFault("RtlVirtualUnwind 的 image／flags 尚未支援");
-        auto context = read_context(memory, arg(4), state);
+        // Windows 的 RtlVirtualUnwind 不看 ContextFlags（.NET 以未設 CONTEXT_AMD64 的 CONTEXT 展開受控框架）。
+        auto context = read_context_registers(memory, arg(4), state);
         const auto unwind = virtual_unwind(memory, *image, arg(2), context, static_cast<unsigned>(arg(0)), arg(3));
         if (unwind.function_entry != arg(3)) throw HostCallFault("RtlVirtualUnwind function entry 不符合 ControlPc");
         memory.check(GuestAddress{arg(4)}, 1232, Access::Write); memory.check(GuestAddress{arg(5)}, 8, Access::Write); memory.check(GuestAddress{arg(6)}, 8, Access::Write);
         if(arg(7))memory.check(GuestAddress{arg(7)},256,Access::Write);
-        write_context(memory, arg(4), unwind.caller); memory.store(GuestAddress{arg(5)}, 64, unwind.handler_data); memory.store(GuestAddress{arg(6)}, 64, unwind.establisher); result = unwind.handler;
+        write_context_registers(memory, arg(4), unwind.caller); memory.store(GuestAddress{arg(5)}, 64, unwind.handler_data); memory.store(GuestAddress{arg(6)}, 64, unwind.establisher); result = unwind.handler;
         // 未保存的暫存器保留傳入欄位；已保存者指向真實客體堆疊，不是複製的 CONTEXT。
         if(arg(7))for(unsigned i=0;i<16;++i){
             if(unwind.floating_sources[i])memory.store(GuestAddress{arg(7)+i*8},64,unwind.floating_sources[i]);

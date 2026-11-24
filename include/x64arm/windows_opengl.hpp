@@ -44,7 +44,19 @@ enum class GlOperation {
     // GetPixelMap {map,type}，output 為該表全部項目；DrawPixels {width,height,format,type}，data 依 GL_UNPACK_*；CopyPixels {x,y,width,height,type}。
     PixelTransfer,PixelMap,GetPixelMap,DrawPixels,CopyPixels,
     // 累積緩衝與邏輯運算：Accum {op,value 浮點位元}；ClearAccum {r,g,b,a 浮點位元}；LogicOp {opcode}。
-    Accum,ClearAccum,LogicOp
+    Accum,ClearAccum,LogicOp,
+    // framebuffer 物件（ARB／EXT_framebuffer_object、EXT_framebuffer_blit、EXT_framebuffer_multisample）：
+    // GenRenderbuffers 的 output 寫入名稱；DeleteRenderbuffers 的 data 為名稱陣列；RenderbufferStorage {target,samples,internalformat,width,height}；
+    // GetRenderbufferParameteriv {target,pname} 與 GetFramebufferAttachmentParameteriv {target,attachment,pname} 寫入 4 位元組；
+    // FramebufferRenderbuffer {target,attachment,renderbuffertarget,renderbuffer}；BlitFramebuffer {srcX0,srcY0,srcX1,srcY1,dstX0,dstY0,dstX1,dstY1,mask,filter}。
+    GenRenderbuffers,BindRenderbuffer,DeleteRenderbuffers,IsRenderbuffer,RenderbufferStorage,GetRenderbufferParameteriv,
+    FramebufferRenderbuffer,IsFramebuffer,GetFramebufferAttachmentParameteriv,BlitFramebuffer,
+    // GetAttribLocation {program}，data 為屬性名稱；IsShader／IsProgram {name}；BlendColor {r,g,b,a 浮點位元}；
+    // UniformMatrix2fv／3fv 與 UniformMatrix4fv 相同版面 {location,count,transpose}。
+    GetAttribLocation,IsShader,IsProgram,BlendColor,UniformMatrix2fv,UniformMatrix3fv,
+    // 泛用屬性的用戶端陣列（VAO 0 未綁定 ARRAY_BUFFER 時的 glVertexAttribPointer）：服務層在每次繪製前讀出客體記憶體，
+    // args {index}，data 為從指標起算、涵蓋本次繪製全部元素的位元組。
+    VertexAttribClientData
 };
 // GL_MAP1_*（0x0D90～0x0D98）與 GL_MAP2_*（0x0DB0～0x0DB8）每個控制點的分量數；其他值為 0。服務層、各後端與 GLU NURBS 共用。
 constexpr unsigned gl_map_components(std::uint32_t target){
@@ -104,11 +116,16 @@ struct OpenGlContext {
     std::vector<std::pair<std::uint32_t,OpenGlClientState>> client_stack;
     std::uint32_t program{};
     std::uint32_t vertex_array{};
+    // VAO 0 的泛用屬性用戶端陣列鏡像（後端無法讀取客體記憶體）：繪製時依此讀出頂點資料交給 VertexAttribClientData。
+    struct GenericClientArray {std::uint64_t pointer{};std::int32_t size{4},stride{};std::uint32_t type{0x1406},divisor{};bool client{},enabled{};};
+    std::array<GenericClientArray,16> generic_arrays{};
     std::map<std::uint32_t,std::array<OpenGlArray,6>> vertex_array_clients;
     std::uint32_t error{};std::int32_t interval{1};bool beginning{};
     // glSelectBuffer／glFeedbackBuffer 的客體緩衝與大小（以 32 位元字計）；render_mode 為服務層記錄的 GL_RENDER_MODE，用來在離開時寫回客體。
     std::uint64_t select_buffer{},feedback_buffer{};std::uint32_t select_size{},feedback_size{},feedback_type{},render_mode{0x1c00};bool select_set{},feedback_set{};
     std::map<std::uint32_t,std::uint64_t> strings;
+    // glGetStringi(GL_EXTENSIONS,i) 回傳的客體字串，依索引在第一次查詢時配置。
+    std::map<std::uint32_t,std::uint64_t> extension_strings;
     // 每個 context 保留 staging 容量；內容每次從客體重新讀入。
     std::vector<std::uint8_t> input_scratch,output_scratch,array_scratch,packed_scratch;
     std::vector<std::uint32_t> index_scratch;

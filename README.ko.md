@@ -142,7 +142,7 @@ AppleJuice에서 Steam을 선택하여 헤드폰 공간 믹싱, 2배 확대 표�
 
 AppleJuice 라이브러리에 등록된 게임은 EXE별로 저장한 표시 설정을 우선합니다. 미등록 게임은 런처의 현재 표시 설정을 상속하며 공간 오디오는 전역 설정입니다. 같은 처리를 다른 런처에도 적용하며 게임 이름별 예외는 사용하지 않습니다.
 
-## 실측 기록 / 2026-11-24 / 게임 총 34개
+## 실측 기록 / 2026-11-25 / 게임 총 36개
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="미작동·작업 중" title="미작동·작업 중"> 미작동·작업 중 · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="실행 가능" title="실행 가능"> 실행 가능 · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="저효율" title="저효율"> 저효율 · <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="원활 (MetalFX)" title="원활 (MetalFX)"> 원활 (MetalFX) · <img src="docs/images/support-levels/good.png" width="16" height="16" alt="원활" title="원활"> 원활
 
@@ -165,6 +165,7 @@ AppleJuice 라이브러리에 등록된 게임은 EXE별로 저장한 표시 설
 | 툼 레이더 (2013) | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 파이널 판타지 IX | x64 | D3D9(Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 파이널 판타지 VIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
+| 페르소나4 더 골든 | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | Geekbench 7 | x64 | CPU | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | Memelis' RPG | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | Romance of the Three Kingdoms VII with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
@@ -177,6 +178,7 @@ AppleJuice 라이브러리에 등록된 게임은 EXE별로 저장한 표시 설
 | 클레르 옵스퀴르: 33 원정대 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="원활 (MetalFX)" title="원활 (MetalFX)"> |
 | 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 사이버펑크 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
+| 스타듀 밸리 | x64 | OpenGL (MonoGame) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 컨트롤 얼티밋 에디션 | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 파이널 판타지 XIII | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 테일즈 오브 베르세리아 | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |

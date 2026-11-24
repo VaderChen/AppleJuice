@@ -126,11 +126,15 @@ std::optional<std::uint64_t> MetalGl::vertex_buffers_execute(GlOperation op,std:
         else if(op==GlOperation::VertexAttribDivisor)attribute.divisor=u(1);
         else if(op==GlOperation::VertexAttribPointer){
             if(n(1)<1 || n(1)>4 || n(4)<0){error(0x501);return 0;}if(u(2)<0x1400 || u(2)>0x1406){error(0x500);return 0;}
-            auto buffer=gl_buffer(0x8892);if(!buffer){error(0x502);return 0;}
-            attribute.buffer=buffer;attribute.components=u(1);attribute.type=u(2);attribute.normalized=u(3)!=0;attribute.stride=u(4);attribute.offset=args[5];
+            // 未綁定 ARRAY_BUFFER：VAO 0 的指標為用戶端陣列（相容設定檔），非零 VAO 只允許 NULL 指標。
+            auto buffer=gl_buffer(0x8892);if(!buffer && gl_.vertex_array && args[5]){error(0x502);return 0;}
+            attribute.buffer=buffer;attribute.client=!buffer;attribute.client_data.reset();attribute.components=u(1);attribute.type=u(2);attribute.normalized=u(3)!=0;attribute.stride=u(4);attribute.offset=args[5];
         }else{const auto count=op==GlOperation::VertexAttrib1f?1U:op==GlOperation::VertexAttrib2f?2U:op==GlOperation::VertexAttrib3f?3U:4U;auto& value=gl_.attribute_values[u(0)];value={0,0,0,1};for(unsigned i=0;i<count;++i)value[i]=std::bit_cast<float>(u(i+1));}
         return 1;
     }
+    case GlOperation::VertexAttribClientData:{
+        if(u(0)>=16){error(0x501);return 0;}auto& attribute=gl_.vao().attributes[u(0)];if(!attribute.client){error(0x502);return 0;}
+        auto bytes=std::make_shared<GlBuffer>();bytes->bytes.assign(data.begin(),data.end());bytes->created=true;attribute.client_data=std::move(bytes);return 1;}
     case GlOperation::GetVertexAttribiv:case GlOperation::GetVertexAttribfv:case GlOperation::GetVertexAttribPointerv:{
         if(u(0)>=16){error(0x501);return 0;}const auto& attribute=gl_.vao().attributes[u(0)];
         if(op==GlOperation::GetVertexAttribPointerv){if(u(1)!=0x8645){error(0x500);return 0;}if(output.size()!=4 && output.size()!=8){error(0x501);return 0;}std::memcpy(output.data(),&attribute.offset,output.size());return 1;}

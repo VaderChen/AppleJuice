@@ -519,7 +519,9 @@ private:
     std::shared_ptr<struct IcuDateFormatState> icu_date_format_;
     std::optional<std::uint32_t> invoke_icu_date_format(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<struct IcuFormattedState> icu_formatted_;
+    std::shared_ptr<struct IcuCollationState> icu_collation_;
     std::optional<std::uint32_t> invoke_icu_formatted(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_icu_collation(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint64_t adopt_icu_formatted_value(GuestState&,GuestMemory&,const UFormattedValue*,icu_abi::IcuStatus&);
     void refresh_icu_formatted_value(GuestState&,GuestMemory&,std::uint64_t,icu_abi::IcuStatus&);
     void release_icu_formatted_value(GuestState&,GuestMemory&,std::uint64_t);
@@ -862,6 +864,7 @@ private:
     std::optional<std::uint32_t> finish_system_call(GuestState&,GuestMemory&);
     void enter_process_instrumentation(GuestState&);
     void restore_user_context(GuestState&,GuestMemory&,const GuestState&);
+    void abandon_callbacks_above(GuestState&,GuestMemory&,std::uint64_t rsp);
     std::uint64_t native_dispatcher_entry(std::string_view) const;
     bool enter_user_apc(GuestState&,GuestMemory&,GuestCallback,std::uint64_t,bool);
     std::optional<std::uint32_t> finish_user_apc_entry(GuestState&,GuestMemory&);
@@ -3140,6 +3143,12 @@ private:
     // heads 為空表示尚未啟用 chunk，requests 累計一般路徑配置次數。
     struct GuestPrivateHeap {std::vector<std::uint64_t> heads;std::uint64_t requests{};};
     std::map<std::uint64_t,GuestPrivateHeap> guest_private_heaps_;
+    // HEAP_CREATE_ENABLE_EXECUTE 的私有 heap：區塊放在自己以 PAGE_EXECUTE_READWRITE 取得的 64 KiB 區域內（不與一般 heap 共頁），
+    // free／used 皆以位址排序；used 值為 {呼叫端要求的大小, 實際區塊大小}。
+    struct ExecutableHeap {std::vector<std::pair<std::uint64_t,std::uint64_t>> regions;std::map<std::uint64_t,std::uint64_t> free;std::map<std::uint64_t,std::pair<std::uint64_t,std::uint64_t>> used;};
+    std::map<std::uint64_t,ExecutableHeap> executable_heaps_;
+    // 以 HEAP_GENERATE_EXCEPTIONS 建立的 heap：配置失敗時引發 STATUS_NO_MEMORY。
+    std::set<std::uint64_t> exception_heaps_;
     // 頭表的生命期／HeapLock 與 chunk 登錄各有世代；配置／釋放只改 mutations，不重建描述元。
     std::uint64_t guest_heap_topology_generation_{1},guest_heap_chunk_generation_{1};
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_HEAP

@@ -479,6 +479,11 @@ std::optional<unsigned> context_service_arguments(std::string_view symbol) noexc
 // 持有者在其他 worker 上執行時，短暫等待通常比進協調者排隊便宜（Windows SRW 亦先自旋）；
 // 約 1～2 µs 後仍未釋放就交回協調者，不讓等待者佔住 worker。
 constexpr unsigned srw_spin_limit=512;
+// worker 上本程序互斥鎖的無競爭取得／釋放（X64ARM_WORKER_LOCAL_MUTEX=0 關閉，回到每次交回協調者）。
+inline bool worker_local_mutex_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_WORKER_LOCAL_MUTEX");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
 inline void spin_pause() noexcept {
 #if defined(__aarch64__)
     __builtin_arm_yield();
@@ -1122,6 +1127,20 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     }
     if(found==threads_.items.end() || found->second.teb!=teb)return false;
     auto& thread=found->second;const auto tid=found->first;const bool current=tid==threads_.current;
+    // 本程序互斥鎖是否有人在等：執行緒等待、執行緒池已登錄等待與已武裝的等待封包都算。worker 的本地取得／釋放遇到就交回協調者，
+    // 由協調者的 hand_off_released_mutex／resolve_thread_waits 依原本順序交接。
+    const auto local_mutex_waited=[&](std::uint64_t mutex_id){
+        const auto same_mutex=[&](std::uint64_t handle){
+            const auto other=runtime_.wait_objects.find(handle);
+            return other!=runtime_.wait_objects.end() && other->second.kind==WaitObject::Kind::Mutex && other->second.mutex==mutex_id;
+        };
+        for(const auto& [id,wait]:registered_waits_){(void)id;if(same_mutex(wait.target))return true;}
+        for(const auto& [id,wait]:wait_completion_packets_){(void)id;if(wait.phase==WaitCompletionPacketState::Phase::Armed && same_mutex(wait.target))return true;}
+        for(const auto& [id,other]:threads_.items){
+            (void)id;if(other.status==ThreadStatus::Waiting && std::any_of(other.wait.handles.begin(),other.wait.handles.end(),same_mutex))return true;
+        }
+        return false;
+    };
     if(const auto* runtime=x86_?detail::runtime_stub_descriptor(stub_base_,state.rip):nullptr;runtime && crt_x87_worker_service(*runtime)){
         // 全部 x87 例外已遮罩且沒有待處理例外時計算中不會拋出；先核對返回位址、堆疊參數與 errno 格位，
         // 之後的狀態提交不會再故障，不留下半套 x87 狀態給協調者重做。
@@ -1302,13 +1321,27 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     }else if(symbol=="ReleaseMutex"){
         // 共用（具名、跨程序）互斥鎖的無競爭釋放（X64ARM_WORKER_SHARED_MUTEX=0 關閉）：與協調者本地路徑相同的條件——最近 20 ms 內沒有人
         // 探查而拿不到（SharedMutex::wanted_recently，本程序與其他程序的等待者都會更新），且沒有已登錄等待或等待封包以它為對象。
-        // 釋放會推進 session 共用喚醒，逾期未探查的等待者由各自的協調者重新評估。本程序互斥鎖的狀態在協調者的表格，仍交回協調者。
+        // 釋放會推進 session 共用喚醒，逾期未探查的等待者由各自的協調者重新評估。
         // FINAL FANTASY XIII 戰鬥每幀約 850 組具名互斥鎖取得／釋放，原本每次往返協調者。
         static const bool shared_mutex=[] {const auto* value=std::getenv("X64ARM_WORKER_SHARED_MUTEX");return !value || std::string_view(value)!="0";}();
         const auto object=runtime_.wait_objects.find(first);
-        if(!shared_mutex || object==runtime_.wait_objects.end() || object->second.kind!=WaitObject::Kind::Mutex)return false;
+        if(object==runtime_.wait_objects.end() || object->second.kind!=WaitObject::Kind::Mutex)return false;
         const auto owned=runtime_.mutex_objects.find(object->second.mutex);
-        if(owned==runtime_.mutex_objects.end() || !owned->second.shared || owned->second.shared->wanted_recently(UINT64_C(20'000'000)))return false;
+        if(owned==runtime_.mutex_objects.end())return false;
+        if(!owned->second.shared){
+            // 本程序互斥鎖的釋放（X64ARM_WORKER_LOCAL_MUTEX=0 關閉）：遞迴持有只減次數；最後一次釋放時沒有任何等待者
+            // （執行緒、已登錄等待、等待封包）才在 worker 清除擁有者，有等待者交回協調者由 hand_off_released_mutex 直接交接。
+            // 未持有（ERROR_NOT_OWNER）由協調者回報。協調者只在獨占映射鎖或全停下改互斥鎖狀態，worker 之間以擁有者的原子操作同步。
+            if(!worker_local_mutex_enabled())return false;
+            auto& mutex=owned->second;std::atomic_ref owner(mutex.owner);
+            if(owner.load(std::memory_order_acquire)!=tid || !mutex.recursion)return false;
+            if(mutex.recursion>1){--mutex.recursion;result=1;}
+            else{
+                if(local_mutex_waited(object->second.mutex))return false;
+                mutex.recursion=0;owner.store(0,std::memory_order_release);result=1;
+            }
+        }else{
+        if(!shared_mutex || owned->second.shared->wanted_recently(UINT64_C(20'000'000)))return false;
         if(!wait_completion_packets_.empty())return false;
         for(const auto& [id,wait]:registered_waits_){
             (void)id;const auto other=runtime_.wait_objects.find(wait.target);
@@ -1319,6 +1352,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             if(owned->second.shared->release_locked(tid))return false; // 未持有等錯誤由協調者回報。
         }
         result=1;
+        }
     }else if(parallel_semaphore_service(symbol)){
         if(!first){
             auto* error=pointer(thread.teb+error_offset,4,2);if(!error)return false;
@@ -1335,7 +1369,14 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             result=0;
         }else{
             const auto object=runtime_.wait_objects.find(first);
-            if(object==runtime_.wait_objects.end() || object->second.kind!=WaitObject::Kind::Semaphore || !(object->second.access&2U) || runtime_.wait_lock_descriptor(object->second)>=0)return false;
+            if(object==runtime_.wait_objects.end() || object->second.kind!=WaitObject::Kind::Semaphore || !(object->second.access&2U))return false;
+            // 具名（跨程序共用）號誌（X64ARM_WORKER_SHARED_SEMAPHORE=0 關閉）：SharedEvent::release 自己在命名空間鎖下加計數並喚醒
+            // 其他程序，與完整路徑相同；本程序的等待者照本地號誌交給協調者稍後解析。超過上限等錯誤在改狀態前交回協調者回報。
+            // P4G 等移植作品把主機核心的具名號誌包成 CreateSemaphoreA（具名），每次釋放原本都要全停。
+            static const bool shared_semaphore=[] {const auto* value=std::getenv("X64ARM_WORKER_SHARED_SEMAPHORE");return !value || std::string_view(value)!="0";}();
+            const auto shared=runtime_.wait_state(object->second).shared_event;
+            if(shared && !shared_semaphore)return false;
+            if(!shared && runtime_.wait_lock_descriptor(object->second)>=0)return false;
             const auto increment=static_cast<std::uint32_t>(second);
             if(std::bit_cast<std::int32_t>(increment)<=0)return false;
             const auto same_object=[&](std::uint64_t handle){
@@ -1353,12 +1394,21 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             if(waiters && !complete_with_resolve(progress))return false;
             void* previous_count=nullptr;
             if(arguments[2] && !(previous_count=pointer(arguments[2],4,2)))return false;
+            if(shared){
+                if(increment>shared->maximum()-shared->count())return false; // 預檢上限（鎖內會再核對），ERROR_TOO_MANY_POSTS 由協調者回報。
+                std::uint32_t previous{};
+                if(shared->release(increment,&previous))return false;
+                detail::debug_semaphore(waiters?"w-shared-release-resolve":"w-shared-release",first,previous,previous+increment,tid);
+                if(previous_count)put(previous_count,previous,4);
+                result=1;
+            }else{
             auto& state_object=runtime_.wait_state(object->second);
             std::atomic_ref signal(state_object.count);auto count=signal.load(std::memory_order_acquire);
             do{if(increment>state_object.maximum-count)return false;}while(!signal.compare_exchange_weak(count,count+increment,std::memory_order_acq_rel));
             detail::debug_semaphore(waiters?"w-release-resolve":"w-release",first,count,count+increment,tid);
             if(previous_count)put(previous_count,count,4);
             result=1;
+            }
         }
     }else if(parallel_null_wait_service(symbol) && !first){
         if(active.empty() || state.processor_id>=64)return false;
@@ -1405,14 +1455,42 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
                 // 要阻塞的交回協調者登記等待（探查失敗已更新「有人要」時戳，擁有者下次釋放會走完整路徑）。見 ReleaseMutex 分支。
                 static const bool shared_mutex=[] {const auto* value=std::getenv("X64ARM_WORKER_SHARED_MUTEX");return !value || std::string_view(value)!="0";}();
                 const auto owned=runtime_.mutex_objects.find(object->second.mutex);
-                if(!shared_mutex || owned==runtime_.mutex_objects.end() || !owned->second.shared)return false;
+                if(owned==runtime_.mutex_objects.end())return false;
+                if(!owned->second.shared){
+                    // 本程序互斥鎖（X64ARM_WORKER_LOCAL_MUTEX=0 關閉）：與 acquire_wait_object 相同語義——本執行緒遞迴持有直接加一；
+                    // 無人持有、未被遺棄且沒有等待者時以擁有者 CAS 取得。被別人持有時零逾時回 WAIT_TIMEOUT，要阻塞、
+                    // 被遺棄（WAIT_ABANDONED）或已有等待者（釋放時由協調者交接）一律交回協調者。
+                    if(!worker_local_mutex_enabled())return false;
+                    auto& mutex=owned->second;std::atomic_ref owner(mutex.owner);
+                    const auto holder=owner.load(std::memory_order_acquire);
+                    if(holder==tid){if(mutex.recursion==UINT32_MAX)return false;++mutex.recursion;result=0;}
+                    else if(!holder){
+                        if(mutex.abandoned || local_mutex_waited(object->second.mutex))return false;
+                        std::uint64_t expected=0;
+                        if(owner.compare_exchange_strong(expected,tid,std::memory_order_acq_rel)){mutex.recursion=1;result=0;}
+                        else if(poll)result=0x102;
+                        else return false;
+                    }else if(poll)result=0x102;
+                    else return false;
+                }else{
+                if(!shared_mutex)return false;
                 SharedEventLock lock(owned->second.shared->lock_descriptor());
                 if(owned->second.shared->available_locked(tid))result=owned->second.shared->acquire_locked(tid)?0x80U:0U;
                 else if(poll)result=0x102;
                 else return false;
+                }
             }else{
             auto& waited=runtime_.wait_state(object->second);
-            if(waited.shared_event){
+            if(waited.shared_event && waited.kind==WaitObject::Kind::Semaphore){
+                // 具名號誌：在命名空間鎖下有計數就取一（與協調者 acquire_wait_object 相同），沒有時零逾時回 WAIT_TIMEOUT，
+                // 要阻塞交回協調者登記等待。X64ARM_WORKER_SHARED_SEMAPHORE=0 關閉。
+                static const bool shared_semaphore=[] {const auto* value=std::getenv("X64ARM_WORKER_SHARED_SEMAPHORE");return !value || std::string_view(value)!="0";}();
+                if(!shared_semaphore)return false;
+                SharedEventLock lock(waited.shared_event->lock_descriptor());
+                if(waited.shared_event->count()){waited.shared_event->consume_locked();result=0;}
+                else if(poll)result=0x102;
+                else return false;
+            }else if(waited.shared_event){
                 // 只讀手動重設事件的共用訊號。會消耗訊號的物件仍由原命名空間鎖保護。
                 if(!readonly_wait || waited.kind!=WaitObject::Kind::Event || !waited.shared_event->manual_reset())return false;
                 if(waited.signaled())result=0;

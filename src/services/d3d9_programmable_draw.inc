@@ -16,6 +16,10 @@
                                 if(owner.cached_resource && !owner.upload_rename && owner.upload_begin<owner.upload_end && owner.cached_resource->desc.width==owner.pixels.size()){
                                     GraphicsView view{owner.cached_resource};view.first=owner.upload_begin;
                                     object.native->graphics_write_unused(view,std::span<const std::uint8_t>(owner.pixels).subspan(owner.upload_begin,owner.upload_end-owner.upload_begin));
+                                }else if(d3d9_discard_rename() && owner.cached_resource && owner.cached_resource->desc.width==owner.pixels.size()){
+                                    // 改名（DISCARD 或一般鎖定）沿用 D3D11 Map(DISCARD) 的後端機制：內容相同略過、GPU 沒在用就地寫入、在用則換上池中
+                                    // 同長度的 backing（已編碼的繪製保有舊 backing），資源身分不變，不再每次新建 Metal 緩衝並整份清零。
+                                    object.native->graphics_write_discard(GraphicsView{owner.cached_resource},owner.pixels,0,0);
                                 }else{
                                     require(!owner.pixels.empty() && owner.pixels.size()<=UINT32_MAX);GraphicsResourceDesc d;d.width=static_cast<std::uint32_t>(owner.pixels.size());d.bind=bind;d.initialized=d.width;
                                     auto resource=object.native->graphics_resource(d);object.native->graphics_write(GraphicsView{resource},owner.pixels,0,0);owner.cached_resource=std::move(resource);
@@ -87,14 +91,14 @@
                                     static const bool reuse_constants=[] {const auto* v=std::getenv("X64ARM_D3D9_CONSTANT_REUSE");return !v || std::string_view(v)!="0";}();
                                     if(!reuse_constants){draw.stages[stage].constants[register_set]=buffer(values,4);continue;}
                                     auto& cached=object.constant_resources[stage][register_set];auto& last=object.constant_values[stage][register_set];
-                                    if(!cached || last!=values){cached=buffer(values,4);last=std::move(values);}
+                                    if(!cached || last!=values){if(d3d9_discard_rename() && cached && cached->desc.width==values.size())object.native->graphics_write_discard(GraphicsView{cached},values,0,0);else cached=buffer(values,4);last=std::move(values);}
                                     draw.stages[stage].constants[register_set]=cached;}}
                             {
                                 static const bool reuse_fixed=[] {const auto* v=std::getenv("X64ARM_D3D9_CONSTANT_REUSE");return !v || std::string_view(v)!="0";}();
                                 const auto fixed_buffer=[&](unsigned stage,std::vector<std::uint8_t>& values){
                                     if(!reuse_fixed)return buffer(values,4);
                                     auto& cached=object.fixed_constant_resources[stage];auto& last=object.fixed_constant_values[stage];
-                                    if(!cached || last!=values){cached=buffer(values,4);last=std::move(values);}
+                                    if(!cached || last!=values){if(d3d9_discard_rename() && cached && cached->desc.width==values.size())object.native->graphics_write_discard(GraphicsView{cached},values,0,0);else cached=buffer(values,4);last=std::move(values);}
                                     return cached;};
                                 if(fixed_vertex)draw.stages[0].constants[0]=fixed_buffer(0,fixed_constants);
                                 if(!fixed_pixel_constants.empty())draw.stages[1].constants[0]=fixed_buffer(1,fixed_pixel_constants);

@@ -282,7 +282,7 @@ std::optional<std::uint64_t> WindowsServices::open_native_file(GuestState& entry
     const auto invalid=[&](std::uint32_t error)->std::optional<std::uint64_t>{last_error_=error;return x86_?UINT32_MAX:UINT64_MAX;};
     if(disposition<1 || disposition>5 || (values[2]&~UINT64_C(7)))co_return invalid(87);
     if(flags&~0xfe3f01a7U)co_return invalid(50);
-    const auto security=read_security_attributes(memory,values[3],x86_,false);
+    const auto security=read_security_attributes(memory,values[3],x86_,false,false);
     auto path=full_windows_environment_path(requested,runtime_.current_directory,runtime_.environment);
     if(requested.empty())co_return invalid(123);
     if(path.starts_with(u"\\\\?\\") || path.starts_with(u"\\\\.\\"))path=u"\\??\\"+path.substr(4);

@@ -80,7 +80,8 @@ Matrix identity(){Matrix m{};m[0]=m[5]=m[10]=m[15]=1;return m;}
 // glEnable／glDisable／glIsEnabled／glGet* 共用的可切換能力：ALPHA_TEST、DEPTH_TEST、BLEND、SCISSOR_TEST、TEXTURE_2D、CULL_FACE、
 // STENCIL_TEST、RESCALE_NORMAL、POLYGON_OFFSET_*、光照相關，以及 GL_AUTO_NORMAL 與 GL_MAP1_*／GL_MAP2_* 求值器開關（由 GLU NURBS 與求值器讀取）。
 bool toggle_cap(unsigned cap){
-    return cap==0xb71 || cap==0xb90 || cap==0xbc0 || cap==0xbe2 || cap==0xc11 || cap==0xde1 || cap==0xde0 || cap==0xb44 || cap==0xb60 || cap==0x8037 || cap==0x2a01 || cap==0x2a02 ||
+    // GL_DITHER（1.1）與 GL_MULTISAMPLE（1.3）初值為啟用；Metal 不做抖動、多重取樣目標固定以多重取樣光柵化，狀態保存供查詢與堆疊還原。
+    return cap==0xb71 || cap==0xb90 || cap==0xbc0 || cap==0xbe2 || cap==0xc11 || cap==0xde1 || cap==0xde0 || cap==0xb44 || cap==0xb60 || cap==0x8037 || cap==0x2a01 || cap==0x2a02 || cap==0xbd0 || cap==0x809d ||
         lighting_cap(cap) || (cap>=0xc60 && cap<=0xc63) || cap==0xb24 || cap==0xb42 || cap==0xbf1 || cap==0xbf2 || cap==0xd80 || (cap>=0xd90 && cap<=0xd98) || (cap>=0xdb0 && cap<=0xdb8);
 }
 Matrix multiply(const Matrix& a,const Matrix& b){Matrix m{};for(unsigned c=0;c<4;++c)for(unsigned r=0;r<4;++r)for(unsigned k=0;k<4;++k)m[c*4+r]+=a[k*4+r]*b[c*4+k];return m;}
@@ -91,8 +92,20 @@ struct Fog {Vec color{};float density{1},start{},end{1},index{};unsigned mode{0x
 struct Texture {bool created{};id<MTLTexture> native;std::shared_ptr<GpuMemoryReservation> lease;unsigned min{0x2702},mag{0x2601},s{0x2901},t{0x2901},anisotropy{1},max_level{1000};std::map<unsigned,unsigned> formats;
     // GL_TEXTURE_PRIORITY 只是常駐提示；邊框色保存與查詢，Metal 取樣器僅有固定邊框色。
     float priority{1};std::array<float,4> border{};
+    // GL 1.2～1.4 的細節層級、比較取樣與自動 mipmap 參數：LOD 範圍與基底層級套到取樣器的 LOD 夾限，LOD 偏移套到 lodBias（macOS 26 起），
+    // 比較模式為 COMPARE_REF_TO_TEXTURE 時套用比較函式；GENERATE_MIPMAP 在第 0 層更新後重建其他層。
+    float lod_bias{},min_lod{-1000},max_lod{1000};unsigned base_level{},compare_mode{},compare_func{0x203},depth_mode{0x1909};bool generate_mipmap{};
     // 第一次綁定的目標（GL_TEXTURE_1D 0x0DE0／GL_TEXTURE_2D 0x0DE1）；之後綁到其他目標為 INVALID_OPERATION。1D 以高度 1 的 Metal 2D 貼圖保存。
     unsigned target{};};
+// GL_TEXTURE_BASE_LEVEL／MIN_LOD／MAX_LOD／MAX_LEVEL／LOD_BIAS 與比較模式套到 Metal 取樣器（固定與可程式化管線共用）。
+// Metal 的 LOD 以第 0 層為起點：基底層級併入下限，上限不超過 MAX_LEVEL；LOD 偏移從 macOS 26 起才有取樣器欄位。
+inline void gl_sampler_detail(MTLSamplerDescriptor* sampler,const Texture& t){
+    const float base=static_cast<float>(t.base_level);
+    sampler.lodMinClamp=std::max(sampler.lodMinClamp,std::max(0.F,base+t.min_lod));
+    sampler.lodMaxClamp=std::max(sampler.lodMinClamp,std::min({sampler.lodMaxClamp,base+t.max_lod,static_cast<float>(t.max_level)}));
+    if(t.compare_mode==0x884e)sampler.compareFunction=static_cast<MTLCompareFunction>(t.compare_func-0x200);
+    if(@available(macOS 26.0,*))sampler.lodBias=t.lod_bias;
+}
 struct TextureEnvironment {unsigned mode{};Vec color{};};
 struct GlStencil {unsigned function{0x207},reference{},read_mask{UINT32_MAX},write_mask{UINT32_MAX},fail{0x1e00},depth_fail{0x1e00},pass{0x1e00},clear{};};
 // glPixelTransfer（GL_PIXEL_MODE_BIT）：色彩與深度的縮放／偏移、索引位移與 MAP_COLOR／MAP_STENCIL。
@@ -116,7 +129,7 @@ struct State {
     unsigned cull_face{0x405},front_face{0x901};
     unsigned depth_func{0x201},blend_src{1},blend_dst{},binding{},matrix_mode{0x1700},draw_buffer{0x405},read_buffer{0x405};
     std::array<int,4> viewport{},scissor{};
-    std::set<unsigned> enabled;
+    std::set<unsigned> enabled{0xbd0,0x809d};
     // RGBA 像素格式下索引與邊旗標只保存、查詢與還原；光柵位置依模型視圖、投影與視埠換算成視窗座標。
     double current_index{1},clear_index{},raster_index{1},raster_distance{};bool edge_flag{true},raster_valid{true};
     Vec raster_position{0,0,0,1},raster_color{1,1,1,1},raster_texcoord{0,0,0,1};
@@ -451,6 +464,15 @@ private:
     MTLRenderPassDescriptor* gl_pass(unsigned clear_mask=0);
     unsigned gl_framebuffer_status(bool read=false);
     void gl_read_pixels(std::span<const std::uint64_t>,std::span<std::uint8_t>);
+    // framebuffer 物件（metal_gl_program.inc）：擴充清單、renderbuffer 儲存、附件查詢、blit 與樣本數。
+    static std::string gl_extensions();
+    unsigned gl_max_samples();
+    unsigned gl_framebuffer_samples(bool read);
+    void gl_renderbuffer_storage(std::span<const std::uint64_t>);
+    std::optional<unsigned> gl_attachment_parameter(std::span<const std::uint64_t>);
+    void gl_blit(std::span<const std::uint64_t>);
+    // 讀回貼圖區域：共享貼圖直接 getBytes，私有貼圖（深度模板、多重取樣解析後）先以 blit 複製到共享緩衝。
+    std::vector<std::uint8_t> gl_texture_bytes(id<MTLTexture>,unsigned level,MTLRegion,NSUInteger row_bytes,MTLBlitOption option=MTLBlitOptionNone);
     std::array<std::vector<Matrix>,3> matrices_{{{identity()},{identity()},{identity()}}};
     std::map<unsigned,int> pixel_{{0xcf5,4},{0xd05,4}};
     std::vector<std::map<unsigned,int>> pixel_stack_;
@@ -841,8 +863,9 @@ private:
     static MTLSamplerAddressMode address_mode(unsigned value){
         switch(value){case 0x2901:return MTLSamplerAddressModeRepeat;case 0x8370:return MTLSamplerAddressModeMirrorRepeat;case 0x812d:return MTLSamplerAddressModeClampToBorderColor;default:return MTLSamplerAddressModeClampToEdge;}
     }
-    static bool factor(unsigned x){return x<=1 || (x>=0x300 && x<=0x308);}
-    static MTLBlendFactor blend(unsigned x){switch(x){case 0:return MTLBlendFactorZero;case 1:return MTLBlendFactorOne;case 0x300:return MTLBlendFactorSourceColor;case 0x301:return MTLBlendFactorOneMinusSourceColor;case 0x302:return MTLBlendFactorSourceAlpha;case 0x303:return MTLBlendFactorOneMinusSourceAlpha;case 0x304:return MTLBlendFactorDestinationAlpha;case 0x305:return MTLBlendFactorOneMinusDestinationAlpha;case 0x306:return MTLBlendFactorDestinationColor;case 0x307:return MTLBlendFactorOneMinusDestinationColor;default:return MTLBlendFactorSourceAlphaSaturated;}}
+    // GL 1.1 因子加上 EXT_blend_color 的 CONSTANT_COLOR／ONE_MINUS_CONSTANT_COLOR／CONSTANT_ALPHA／ONE_MINUS_CONSTANT_ALPHA。
+    static bool factor(unsigned x){return x<=1 || (x>=0x300 && x<=0x308) || (x>=0x8001 && x<=0x8004);}
+    static MTLBlendFactor blend(unsigned x){switch(x){case 0:return MTLBlendFactorZero;case 1:return MTLBlendFactorOne;case 0x300:return MTLBlendFactorSourceColor;case 0x301:return MTLBlendFactorOneMinusSourceColor;case 0x302:return MTLBlendFactorSourceAlpha;case 0x303:return MTLBlendFactorOneMinusSourceAlpha;case 0x304:return MTLBlendFactorDestinationAlpha;case 0x305:return MTLBlendFactorOneMinusDestinationAlpha;case 0x306:return MTLBlendFactorDestinationColor;case 0x307:return MTLBlendFactorOneMinusDestinationColor;case 0x8001:return MTLBlendFactorBlendColor;case 0x8002:return MTLBlendFactorOneMinusBlendColor;case 0x8003:return MTLBlendFactorBlendAlpha;case 0x8004:return MTLBlendFactorOneMinusBlendAlpha;default:return MTLBlendFactorSourceAlphaSaturated;}}
     id<MTLRenderPipelineState> pipeline(bool clear,bool color_write=true,bool fixed=false,MTLPixelFormat color_format=MTLPixelFormatBGRA8Unorm,MTLPixelFormat depth_format=MTLPixelFormatDepth32Float_Stencil8,unsigned samples=1){
         // 邏輯運算與 GL_RETURN 取代混色。
         const bool logic=logic_active(clear,fixed);const bool blending=!clear && !logic && pixel_draw_.kind!=4 && state_.enabled.contains(0xbe2);const std::uint64_t flags=(logic?1ULL<<49:0)|(blending?1ULL:0ULL)|(std::uint64_t{state_.blend_src}<<1)|(std::uint64_t{state_.blend_dst}<<16)|(color_write?1ULL<<40:0)|(fixed?1ULL<<41:0)|(std::uint64_t{state_.color_mask&15U}<<42)|(std::uint64_t{pixel_draw_.kind}<<46);
@@ -877,6 +900,7 @@ private:
         if(fixed_targets_set_){pass.colorAttachments[0].level=fixed_color_.level;pass.colorAttachments[0].slice=fixed_color_.slice;graphics_pending_.push_back(fixed_color_.resource);if(fixed_depth_.resource){pass.depthAttachment.level=pass.stencilAttachment.level=fixed_depth_.level;pass.depthAttachment.slice=pass.stencilAttachment.slice=fixed_depth_.slice;graphics_pending_.push_back(fixed_depth_.resource);}}
         if(!clearing && fixed_visibility_){pass.visibilityResultBuffer=metal_resource(fixed_visibility_).buffer;graphics_pending_.push_back(fixed_visibility_);}
         auto enc=[commands_ renderCommandEncoderWithDescriptor:pass];MetalEncoderScope enc_scope{enc};[enc setRenderPipelineState:p];[enc setDepthStencilState:ds];[enc setStencilReferenceValue:clearing?state_.stencil.clear:fixed_targets_set_?(fixed_stencil_[1]&255):state_.stencil.reference];[enc setScissorRect:clip];
+        {const auto& k=gl_.blend_color;[enc setBlendColorRed:k[0] green:k[1] blue:k[2] alpha:k[3]];}
         if(!clearing && fixed_visibility_)[enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:fixed_visibility_offset_];
         const auto& v=state_.viewport;[enc setViewport:clearing?MTLViewport{0,0,static_cast<double>(target_width),static_cast<double>(target_height),0,1}:MTLViewport{static_cast<double>(v[0]),static_cast<double>(target_height)-v[1]-v[3],static_cast<double>(v[2]),static_cast<double>(v[3]),state_.depth_range[0],state_.depth_range[1]}];
         [enc setCullMode:state_.enabled.contains(0xb44)&&!clearing?(state_.cull_face==0x404?MTLCullModeFront:MTLCullModeBack):MTLCullModeNone];[enc setFrontFacingWinding:state_.front_face==0x901?MTLWindingCounterClockwise:MTLWindingClockwise];
@@ -905,7 +929,7 @@ private:
         unsigned enabled=0;auto& t=*bound_texture(texture_1d?0xde0U:0xde1U);auto default_sampler=[MTLSamplerDescriptor new];[enc setFragmentTexture:textures_.at(UINT32_MAX).native atIndex:0];[enc setFragmentSamplerState:cached_sampler_state(default_sampler) atIndex:0];
         if(!clearing && (state_.enabled.contains(0xde1) || texture_1d)){
             // 依 MAX_LEVEL 檢查實際 mip 完整度；單層 D3D 紋理也能使用 mip filter。
-            enabled=1;auto sampler=[MTLSamplerDescriptor new];sampler.maxAnisotropy=t.anisotropy;sampler.minFilter=t.min==0x2600 || t.min==0x2700 || t.min==0x2702?MTLSamplerMinMagFilterNearest:MTLSamplerMinMagFilterLinear;sampler.mipFilter=t.min<=0x2601?MTLSamplerMipFilterNotMipmapped:t.min<=0x2701?MTLSamplerMipFilterNearest:MTLSamplerMipFilterLinear;auto texture=fixed_targets_set_ && fixed_texture_.resource?metal_shader_texture(fixed_texture_):t.native;unsigned mip_levels=0;if(fixed_targets_set_ && fixed_texture_.resource){mip_levels=fixed_texture_.levels;graphics_pending_.push_back(fixed_texture_.resource);}else while(t.formats.contains(mip_levels))++mip_levels;sampler.lodMaxClamp=mip_levels?static_cast<float>(std::min(t.max_level,mip_levels-1)):0;sampler.magFilter=t.mag==0x2600?MTLSamplerMinMagFilterNearest:MTLSamplerMinMagFilterLinear;sampler.sAddressMode=address_mode(t.s);sampler.tAddressMode=texture_1d?MTLSamplerAddressModeClampToEdge:address_mode(t.t);
+            enabled=1;auto sampler=[MTLSamplerDescriptor new];sampler.maxAnisotropy=t.anisotropy;sampler.minFilter=t.min==0x2600 || t.min==0x2700 || t.min==0x2702?MTLSamplerMinMagFilterNearest:MTLSamplerMinMagFilterLinear;sampler.mipFilter=t.min<=0x2601?MTLSamplerMipFilterNotMipmapped:t.min<=0x2701?MTLSamplerMipFilterNearest:MTLSamplerMipFilterLinear;auto texture=fixed_targets_set_ && fixed_texture_.resource?metal_shader_texture(fixed_texture_):t.native;unsigned mip_levels=0;if(fixed_targets_set_ && fixed_texture_.resource){mip_levels=fixed_texture_.levels;graphics_pending_.push_back(fixed_texture_.resource);}else while(t.formats.contains(mip_levels))++mip_levels;sampler.lodMaxClamp=mip_levels?static_cast<float>(std::min(t.max_level,mip_levels-1)):0;gl_sampler_detail(sampler,t);sampler.magFilter=t.mag==0x2600?MTLSamplerMinMagFilterNearest:MTLSamplerMinMagFilterLinear;sampler.sAddressMode=address_mode(t.s);sampler.tAddressMode=texture_1d?MTLSamplerAddressModeClampToEdge:address_mode(t.t);
             const unsigned required=texture?std::min(t.max_level,static_cast<unsigned>(texture.mipmapLevelCount-1))+1:0;id<MTLTexture> sampled=(texture && (t.min<=0x2601 || mip_levels>=required))?texture:textures_.at(UINT32_MAX).native;
             // MAX_LEVEL 限制資源可見的 mip 範圍，而不只是 sampler LOD；各向異性 footprint 不得讀到未定義層。
             if(sampled==texture && required<texture.mipmapLevelCount){sampled=[texture newTextureViewWithPixelFormat:texture.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0,required) slices:NSMakeRange(0,1)];if(!sampled)throw std::runtime_error("Metal mip view 建立失敗");}
@@ -1022,7 +1046,14 @@ private:
         else if(pname==0x8894 || pname==0x8895 || pname==0x8f36 || pname==0x8f37 || pname==0x8a28){const auto buffer=gl_buffer(pname==0x8894?0x8892:pname==0x8895?0x8893:pname==0x8a28?0x8a11:pname);values={static_cast<double>(buffer?buffer->name:0)};}
         else if(pname==0x85b5)values={static_cast<double>(gl_.vertex_array)};
         else if(pname==0x84e0)values={static_cast<double>(0x84c0+gl_.active_texture)};
-        else if(pname==0x821b)values={1};else if(pname==0x821c)values={1};else if(pname==0x821d)values={0};
+        else if(pname==0x821b)values={1};else if(pname==0x821c)values={1};else if(pname==0x821d){std::istringstream list(gl_extensions());std::string name;double count=0;while(list>>name)++count;values={count};}
+        // framebuffer 物件、樣本數與混色常數。
+        else if(pname==0x8d57)values={static_cast<double>(gl_max_samples())};else if(pname==0x84e8)values={16384};else if(pname==0x8ca7)values={static_cast<double>(gl_.renderbuffer)};
+        else if(pname==0x8ca6)values={static_cast<double>(gl_.draw_framebuffer)};else if(pname==0x8caa)values={static_cast<double>(gl_.read_framebuffer)};
+        else if(pname==0x80a9 || pname==0x80a8){const auto samples=gl_framebuffer_samples(false);values={pname==0x80a8?(samples>1?1.:0.):static_cast<double>(samples>1?samples:0)};}
+        else if(pname==0x8005)vector(gl_.blend_color);else if(pname==0x8009)values={static_cast<double>(gl_.equation_rgb)};else if(pname==0x883d)values={static_cast<double>(gl_.equation_alpha)};
+        else if(pname==0x80c8)values={static_cast<double>(state_.blend_dst)};else if(pname==0x80c9)values={static_cast<double>(state_.blend_src)};
+        else if(pname==0x80ca)values={static_cast<double>(gl_.dst_alpha)};else if(pname==0x80cb)values={static_cast<double>(gl_.src_alpha)};
         else if(pname>=0xba6 && pname<=0xba8)vector(matrices_[pname-0xba6].back());
         else if(pname==0xba2)vector(state_.viewport);else if(pname==0xc10)vector(state_.scissor);else if(pname==0xb00)vector(state_.color);else if(pname==0xb03)vector(state_.texcoord);else if(pname==0xc22)vector(state_.clear);
         else if(pname==0xc01)values={static_cast<double>(state_.draw_buffer)};else if(pname==0xc02)values={static_cast<double>(state_.read_buffer)};else if(pname==0xc32)values={1};else if(pname==0xb54)values={0x1d01};else if(pname==0xbe0)values={static_cast<double>(state_.blend_dst)};else if(pname==0xbe1)values={static_cast<double>(state_.blend_src)};
@@ -1180,7 +1211,7 @@ public:
             if(!show(color_,present_upscaled_,true,0.0))return false;
         }flush(false);return true;}}
     OpenGlRendererInfo info()const override{return {"MacWin",std::string(device_.name.UTF8String)+" (Metal)","1.1 MacWin Metal subset",true};}
-    std::string string(unsigned name)override{const auto i=info();switch(name){case 0x1f00:return i.vendor;case 0x1f01:return i.renderer;case 0x1f02:return i.version;case 0x1f03:return {};case 0x8b8c:return "4.60 MacWin GLSL compiler";default:error(0x500);return {};}}
+    std::string string(unsigned name)override{const auto i=info();switch(name){case 0x1f00:return i.vendor;case 0x1f01:return i.renderer;case 0x1f02:return i.version;case 0x1f03:return gl_extensions();case 0x8b8c:return "4.60 MacWin GLSL compiler";default:error(0x500);return {};}}
     std::string statistics()const override{std::string reasons;for(const auto& [name,count]:gpu_write_reasons_)reasons+=name+":"+std::to_string(count)+",";
         std::string uploads;for(const auto& [key,count]:upload_kinds_)uploads+="b"+std::to_string(key>>1)+((key&1)?"full:":"part:")+std::to_string(count)+",";
         return "opengl_metal_interpolated="+std::to_string(interpolated_frames_.load())+"/"+std::to_string(interpolation_missed_.load())+" opengl_metal_upload_kinds="+uploads+" opengl_metal_gpu_write_reasons="+reasons+" opengl_metal_tess_side="+std::to_string(side_computes_)+" opengl_metal_tess_main="+std::to_string(tess_main_[0])+"/"+std::to_string(tess_main_[1])+"/"+std::to_string(tess_main_[2])+"/"+std::to_string(tess_main_[3])+"/"+std::to_string(tess_main_[4])+" opengl_backend=metal opengl_metal_draws="+std::to_string(draws_)+" opengl_metal_submissions="+std::to_string(submissions_)+" opengl_metal_inflight="+std::to_string(flights_.size())+" opengl_metal_inflight_limit="+std::to_string(flight_limit_)+" opengl_metal_inflight_peak="+std::to_string(flight_peak_)+" opengl_metal_render_encoders="+std::to_string(render_encoders_)+" opengl_metal_encoder_breaks="+[&]{std::string text;for(const auto& [why,count]:encoder_breaks_)text+=why+":"+std::to_string(count)+",";return text.empty()?std::string("none"):text;}()+" opengl_metal_coalesced_draws="+std::to_string(coalesced_draws_)+" metal_compute_encoders="+std::to_string(compute_encoders_)+" metal_coalesced_dispatches="+std::to_string(coalesced_dispatches_)+" metal_binds_skipped="+std::to_string(binds_skipped_)+" metal_binds_set="+std::to_string(binds_set_)+" metal_clears_folded="+std::to_string(clears_folded_)+" metal_clears_encoded="+std::to_string(clears_encoded_)+" metal_draw_timed="+std::to_string(draw_time_count_)+" metal_draw_ns="+[&]{std::string text;for(const auto value:draw_time_ns_)text+=std::to_string(value)+",";return text;}()+" opengl_metal_gpu_busy_ns="+std::to_string(gpu_busy_ns_->load(std::memory_order_relaxed))+" opengl_metal_waits="+std::to_string(wait_count_)+" opengl_metal_wait_ns="+std::to_string(wait_ns_)+" glsl_compiles="+std::to_string(gl_.compiles)+" glsl_links="+std::to_string(gl_.links)+" glsl_compile_ns="+std::to_string(gl_.compile_ns)+" glsl_link_ns="+std::to_string(gl_.link_ns)+" opengl_metal_resource_waits="+std::to_string(resource_wait_count_)+" gl_buffer_uploads="+std::to_string(gl_.buffer_uploads)+" gl_buffer_upload_bytes="+std::to_string(gl_.buffer_upload_bytes)+" gl_direct_vertex_bindings="+std::to_string(gl_.direct_vertex_bindings)+" gl_direct_index_draws="+std::to_string(gl_.direct_index_draws)+" gl_converted_vertices="+std::to_string(gl_.converted_vertices)+cache_statistics()+discard_pool_->statistics()+" metal_stream_output_gpu_draws="+std::to_string(stream_gpu_draws_)+" metal_stream_output_gpu_bytes="+std::to_string(stream_gpu_bytes_)+" metal_geometry_mesh_draws="+std::to_string(geometry_mesh_draws_)+" metal_indirect_count_masks="+std::to_string(indirect_count_masks_)+" metal_indirect_count_batches="+std::to_string(indirect_count_batches_)+"\n";}
@@ -1195,11 +1226,11 @@ public:
     OpenGlShareResult share_objects(NativeOpenGlContext& other)override{
         auto* source=dynamic_cast<MetalGl*>(&other);if(!source || source->device_!=device_)return OpenGlShareResult::Unsupported;
         if(textures_.same_group(source->textures_))return OpenGlShareResult::Shared;
-        if(!textures_.unused() || !lists_.unused() || !gl_.shaders.unused() || !gl_.programs.unused() || !gl_.buffers.unused() || compiling_)return OpenGlShareResult::Busy;
+        if(!textures_.unused() || !lists_.unused() || !gl_.shaders.unused() || !gl_.programs.unused() || !gl_.buffers.unused() || !gl_.renderbuffers.unused() || compiling_)return OpenGlShareResult::Busy;
         // 共用物件改由同一個 command queue 提交，跨 context 的上傳與取樣維持提交順序。
         flush(true);source->flush(false);queue_=source->queue_;
-        textures_.join(source->textures_);lists_.join(source->lists_);gl_.shaders.join(source->gl_.shaders);gl_.programs.join(source->gl_.programs);gl_.buffers.join(source->gl_.buffers);
-        next_list_.join(source->next_list_);next_texture_.join(source->next_texture_);gl_.next_object.join(source->gl_.next_object);gl_.next_buffer.join(source->gl_.next_buffer);
+        textures_.join(source->textures_);lists_.join(source->lists_);gl_.shaders.join(source->gl_.shaders);gl_.programs.join(source->gl_.programs);gl_.buffers.join(source->gl_.buffers);gl_.renderbuffers.join(source->gl_.renderbuffers);
+        next_list_.join(source->next_list_);next_texture_.join(source->next_texture_);gl_.next_object.join(source->gl_.next_object);gl_.next_buffer.join(source->gl_.next_buffer);gl_.next_renderbuffer.join(source->gl_.next_renderbuffer);
         return OpenGlShareResult::Shared;
     }
     std::shared_ptr<OpenGlBuffer> buffer_object(std::uint32_t name)override{const auto it=gl_.buffers.find(name);return it==gl_.buffers.end()?nullptr:it->second;}
@@ -1474,8 +1505,9 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
         case 0x2802:values[0]=static_cast<float>(t.s);break;case 0x2803:values[0]=static_cast<float>(t.t);break;
         case 0x813d:values[0]=static_cast<float>(t.max_level);break;case 0x84fe:values[0]=static_cast<float>(t.anisotropy);break;
         case 0x1004:count=4;values=t.border;break;case 0x8066:values[0]=t.priority;break;case 0x8067:values[0]=1;break;
-        case 0x8072:values[0]=0x2901;break;case 0x813a:values[0]=-1000;break;case 0x813b:values[0]=1000;break;
-        case 0x813c:case 0x884c:case 0x8191:break;case 0x884b:values[0]=0x1909;break;case 0x884d:values[0]=0x203;break;
+        case 0x8072:values[0]=0x2901;break;case 0x813a:values[0]=t.min_lod;break;case 0x813b:values[0]=t.max_lod;break;case 0x8501:values[0]=t.lod_bias;break;
+        case 0x813c:values[0]=static_cast<float>(t.base_level);break;case 0x884c:values[0]=static_cast<float>(t.compare_mode);break;case 0x8191:values[0]=t.generate_mipmap?1.F:0.F;break;
+        case 0x884b:values[0]=static_cast<float>(t.depth_mode);break;case 0x884d:values[0]=static_cast<float>(t.compare_func);break;
         default:error(0x500);break;}
         if(output.size()<count*4)throw std::invalid_argument("texture query bounds");
         for(unsigned i=0;i<count;++i){if(op==GlOperation::GetTexParameterfv)std::memcpy(output.data()+i*4,&values[i],4);else{const bool color=u(1)==0x1004 || u(1)==0x8066;const auto value=color?static_cast<std::int32_t>(std::clamp(std::round(static_cast<double>(values[i])*2147483647.0),-2147483648.0,2147483647.0)):static_cast<std::int32_t>(values[i]);std::memcpy(output.data()+i*4,&value,4);}}break;
@@ -1496,7 +1528,11 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
         const auto old_error=error_;error_=0;execute(GlOperation::ReadPixels,read,{},pixels);const auto read_error=error_;error_=old_error?old_error:read_error;if(read_error)break;
         const std::array<std::uint64_t,8> write{a[0],a[1],a[2],a[3],a[6],a[7],0x1908,0x1401};gl_texture(write,pixels,true);break;
     }
-    case GlOperation::TexParameteri:case GlOperation::TexParameterf:{if(u(1)==0x8066){const auto value=op==GlOperation::TexParameterf?f(2):static_cast<float>(std::max(-1.0,n(2)/2147483647.0));if(!bound_texture(u(0)))error(0x500);else bound_texture(u(0))->priority=std::clamp(value,0.F,1.F);break;}if(u(1)==0x84fe){const auto value=op==GlOperation::TexParameterf?f(2):static_cast<float>(n(2));if(!bound_texture(u(0)))error(0x500);else if(!std::isfinite(value) || value<1)error(0x501);else bound_texture(u(0))->anisotropy=static_cast<unsigned>(std::clamp(value,1.F,16.F));break;}if(op==GlOperation::TexParameterf && (!std::isfinite(f(2)) || f(2)<0 || f(2)>65535)){error(0x500);break;}const auto value=op==GlOperation::TexParameteri?u(2):static_cast<unsigned>(f(2));auto* bound=bound_texture(u(0));if(!bound){error(0x500);break;}auto& t=*bound;if(u(1)==0x813d){if(value>INT32_MAX)error(0x501);else t.max_level=value;}else if(u(1)==0x2801){if(value!=0x2600 && value!=0x2601 && (value<0x2700 || value>0x2703))error(0x500);else t.min=value;}else if(u(1)==0x2800){if(value!=0x2600 && value!=0x2601)error(0x500);else t.mag=value;}else if(u(1)==0x2802 || u(1)==0x2803){if(value!=0x2900 && value!=0x2901 && value!=0x812f && value!=0x812d && value!=0x8370)error(0x500);else (u(1)==0x2802?t.s:t.t)=value;}else error(0x500);break;}
+    case GlOperation::TexParameteri:case GlOperation::TexParameterf:{if(u(1)==0x8066){const auto value=op==GlOperation::TexParameterf?f(2):static_cast<float>(std::max(-1.0,n(2)/2147483647.0));if(!bound_texture(u(0)))error(0x500);else bound_texture(u(0))->priority=std::clamp(value,0.F,1.F);break;}if(u(1)==0x84fe){const auto value=op==GlOperation::TexParameterf?f(2):static_cast<float>(n(2));if(!bound_texture(u(0)))error(0x500);else if(!std::isfinite(value) || value<1)error(0x501);else bound_texture(u(0))->anisotropy=static_cast<unsigned>(std::clamp(value,1.F,16.F));break;}
+        if(u(1)==0x8501 || u(1)==0x813a || u(1)==0x813b){const auto value=op==GlOperation::TexParameterf?f(2):static_cast<float>(n(2));auto* bound=bound_texture(u(0));if(!bound){error(0x500);break;}if(!std::isfinite(value)){error(0x501);break;}(u(1)==0x8501?bound->lod_bias:u(1)==0x813a?bound->min_lod:bound->max_lod)=value;break;}
+        if(op==GlOperation::TexParameterf && (!std::isfinite(f(2)) || f(2)<0 || f(2)>65535)){error(0x500);break;}const auto value=op==GlOperation::TexParameteri?u(2):static_cast<unsigned>(f(2));auto* bound=bound_texture(u(0));if(!bound){error(0x500);break;}auto& t=*bound;if(u(1)==0x813d){if(value>INT32_MAX)error(0x501);else t.max_level=value;}else if(u(1)==0x813c){if(value>INT32_MAX)error(0x501);else t.base_level=value;}
+        else if(u(1)==0x884c){if(value!=0 && value!=0x884e)error(0x500);else t.compare_mode=value;}else if(u(1)==0x884d){if(value<0x200 || value>0x207)error(0x500);else t.compare_func=value;}
+        else if(u(1)==0x884b){if(value!=0x1909 && value!=0x8049 && value!=0x1906 && value!=0x1903)error(0x500);else t.depth_mode=value;}else if(u(1)==0x8191){t.generate_mipmap=value!=0;}else if(u(1)==0x2801){if(value!=0x2600 && value!=0x2601 && (value<0x2700 || value>0x2703))error(0x500);else t.min=value;}else if(u(1)==0x2800){if(value!=0x2600 && value!=0x2601)error(0x500);else t.mag=value;}else if(u(1)==0x2802 || u(1)==0x2803){if(value!=0x2900 && value!=0x2901 && value!=0x812f && value!=0x812d && value!=0x8370)error(0x500);else (u(1)==0x2802?t.s:t.t)=value;}else error(0x500);break;}
     case GlOperation::GetTexLevelParameteriv:case GlOperation::GetTexLevelParameterfv:texture_level(op,a,output);break;
     case GlOperation::TexImage2D:case GlOperation::TexSubImage2D:gl_texture(a,data,op==GlOperation::TexSubImage2D);break;
     case GlOperation::PixelStorei:if((u(0)<0xcf0 || u(0)>0xcf5) && (u(0)<0xd00 || u(0)>0xd05))error(0x500);else if(n(1)<0 || ((u(0)&15)==5 && u(1)!=1 && u(1)!=2 && u(1)!=4 && u(1)!=8))error(0x501);else pixel_[u(0)]=(u(0)&15)<=1?(u(1)?1:0):n(1);break;

@@ -64,6 +64,8 @@ struct ExceptionDispatch {
     // 非零續行入口只在處理常式未改變 RIP 時使用，保留合法的 CONTEXT 轉向。
     bool unwound{}, unhandled_called{}, restore_jump{}, api_exception_boundary{};
     GuestAddress api_exception_resume{};
+    // 續行時一併彈出的堆疊位元組（RaiseException 自身框架內引發時，回到呼叫者要彈出返回位址）。
+    std::uint64_t api_exception_pop{};
     MsvcCatch msvc;
     // exception_ptr 重拋所建立的獨立堆積物件；catch 解構完成後由共用 EH 回收。
     std::uint64_t msvc_owned_object{};
@@ -71,8 +73,8 @@ struct ExceptionDispatch {
 };
 inline void resume_api_exception_boundary(GuestState& state,const ExceptionDispatch& dispatch){
     const bool after_breakpoint=dispatch.code==0x80000003U && state.rip.value==dispatch.original.rip.value+1;
-    if(dispatch.api_exception_resume.value && (state.rip==dispatch.original.rip || after_breakpoint))
-        state.rip=dispatch.api_exception_resume;
+    if(dispatch.api_exception_resume.value && (state.rip==dispatch.original.rip || after_breakpoint)){
+        state.rip=dispatch.api_exception_resume;state.reg(Gpr::Rsp)+=dispatch.api_exception_pop;}
 }
 struct ExceptionState {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> vectors;

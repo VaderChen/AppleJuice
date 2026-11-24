@@ -277,19 +277,7 @@ std::optional<std::uint32_t> WindowsServices::finish_user_apc_entry(GuestState& 
     enter_callback(state,memory);return std::nullopt;
 }
 void WindowsServices::restore_user_context(GuestState& state,GuestMemory& memory,const GuestState& restored){
-        while(!runtime_.callbacks.empty() && restored.reg(Gpr::Rsp)>=((runtime_.callbacks.back().saved.reg(Gpr::Rsp)-256)&~UINT64_C(15))){
-            const auto& callback=runtime_.callbacks.back();
-            auto depth=std::min(callback.exception_depth,exceptions_.stack.size());
-            // Exception／ContinueException 的深度包含正在派送的那筆例外。
-            // NtContinue 跳過正常回呼返回時，必須一併結束它；不能留下
-            // 已完成的派送，讓每次成功續行都累積成新的巢狀例外。
-            if((callback.continuation==Continuation::Exception || callback.continuation==Continuation::ContinueException) &&
-               callback.exception_depth && callback.exception_depth<=exceptions_.stack.size()){
-                depth=callback.exception_depth-1;
-                if(x86_)leave_x86_exception_handler(memory,exceptions_.stack[depth]);
-            }
-            exceptions_.stack.resize(depth);sync_msvc_uncaught(memory);discard_callbacks(runtime_.callbacks.size()-1,state,memory);
-        }
+        abandon_callbacks_above(state,memory,restored.reg(Gpr::Rsp));
         // 準備例外的客體回呼可直接 NtContinue；離開的核心框架不能留在下一次派送。
         while(!exceptions_.stack.empty() && exceptions_.stack.back().native_stack && restored.reg(Gpr::Rsp)>=exceptions_.stack.back().native_stack+0x598){
             exceptions_.stack.pop_back();sync_msvc_uncaught(memory);
@@ -302,6 +290,23 @@ void WindowsServices::restore_user_context(GuestState& state,GuestMemory& memory
             calls.pop_back();
         }
         state=restored;
+}
+// 回呼的客體框架從 ((saved-256)&~15)-8 開始；堆疊指標在此之上的執行點已離開該回呼。NtContinue／RtlRestoreContext 續行，
+// 以及客體不經服務自行還原內容（CoreCLR 以組語還原非揮發暫存器後直接跳到 catch 續行點）後再發生的例外，都依此結束被跨過的回呼與派送。
+void WindowsServices::abandon_callbacks_above(GuestState& state,GuestMemory& memory,std::uint64_t rsp){
+        while(!runtime_.callbacks.empty() && rsp>=((runtime_.callbacks.back().saved.reg(Gpr::Rsp)-256)&~UINT64_C(15))){
+            const auto& callback=runtime_.callbacks.back();
+            auto depth=std::min(callback.exception_depth,exceptions_.stack.size());
+            // Exception／ContinueException 的深度包含正在派送的那筆例外。
+            // NtContinue 跳過正常回呼返回時，必須一併結束它；不能留下
+            // 已完成的派送，讓每次成功續行都累積成新的巢狀例外。
+            if((callback.continuation==Continuation::Exception || callback.continuation==Continuation::ContinueException) &&
+               callback.exception_depth && callback.exception_depth<=exceptions_.stack.size()){
+                depth=callback.exception_depth-1;
+                if(x86_)leave_x86_exception_handler(memory,exceptions_.stack[depth]);
+            }
+            exceptions_.stack.resize(depth);sync_msvc_uncaught(memory);discard_callbacks(runtime_.callbacks.size()-1,state,memory);
+        }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_nt_continuation(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall call(state,memory,service);const auto name=service.symbol;const auto bits=static_cast<std::uint8_t>(x86_?32:64);const unsigned unit=x86_?4U:8U;

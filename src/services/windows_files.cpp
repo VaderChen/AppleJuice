@@ -213,7 +213,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
         if(!(sharing&2U))return invalid(32);
         if(flags&~0xfa3f01a7U)return invalid(87);
         if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許開啟宿主卷能力");
-        const auto attributes=read_security_attributes(memory,values[3],x86_,false);
+        const auto attributes=read_security_attributes(memory,values[3],x86_,false,false);
         const auto access=object_security_access(security::relative_descriptor(detail::volume_device_security()),static_cast<std::uint32_t>(values[1]),detail::volume_access_mapping);
         if(!filesystem_.writable() && (access&0x000d0116U))return invalid(19);
         if(!file_table_has_room(files_.size()))return invalid(8);
@@ -242,7 +242,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
     std::uint64_t returned=UINT64_MAX;
     if(!null_device && filesystem_.writable() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許開啟可寫宿主檔案");
     CreationSecurity security;std::uint32_t security_error=0;
-    try{security=read_security_attributes(memory,arg(3),x86_,false);}catch(const SecurityDescriptorError& error){security_error=error.code;}catch(const MemoryFault&){security_error=87;}
+    // CreateFile 家族只讀 lpSecurityDescriptor 與 bInheritHandle，不檢查 nLength（.NET 的 FileStream 傳入全零結構）。
+    try{security=read_security_attributes(memory,arg(3),x86_,false,false);}catch(const SecurityDescriptorError& error){security_error=error.code;}catch(const MemoryFault&){security_error=87;}
     // FILE_FLAG_NO_BUFFERING（0x20000000）只要求呼叫端以磁區對齊讀寫並略過系統快取，不改變資料內容；宿主照常讀寫。
     // Steam 驗證下載暫存檔以此旗標開檔，拒絕時整個更新被判為「磁碟讀取錯誤」。
     const std::uint32_t read_access=null_device?0xf01f01ffU:filesystem_.writable()?0xc01f01bfU:0x801200a9U;constexpr std::uint32_t supported_flags=0xfe3f01a7U;
@@ -290,7 +291,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
                     return {details.key,file,details.metadata,0,true};
                 };
                 const auto opening=profile.now();
-                const auto opened=filesystem_.open_host(path,dword(1),dword(4),dword(5),dword(2),[&]{return file_creation_descriptor(memory,arg(3));},arg(6)?std::function<OpenHostFile()>{file_template}:std::function<OpenHostFile()>{});
+                const auto opened=filesystem_.open_host(path,dword(1),dword(4),dword(5),dword(2),[&]{return file_creation_descriptor(memory,arg(3),false);},arg(6)?std::function<OpenHostFile()>{file_template}:std::function<OpenHostFile()>{});
                 profile.add(profile.host_open_cpu,opening);
                 if(opened.error)last_error_=opened.error;
                 else {
@@ -603,8 +604,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
             const unsigned fixed=kind==1?64U:kind==2?68U:kind==3?94U:kind==12?12U:kind==37?104U:kind==38?80U:kind==60?88U:kind==63?114U:0U;
             const auto flags=extended?u32(8):0U;
             const bool stateless=(flags&0x10U)!=0,first=stateless || !file.directory->pattern.has_value();
-            const bool restart=extended?(flags&0x11U)!=0:arg(10)!=0;
-            const bool single=extended?(flags&2U)!=0:arg(8)!=0;
+            // ReturnSingleEntry／RestartScan 是 BOOLEAN：x64 呼叫端只寫入堆疊槽的低位元組，高位元組可能是殘值。
+            const bool restart=extended?(flags&0x11U)!=0:(arg(10)&0xffU)!=0;
+            const bool single=extended?(flags&2U)!=0:(arg(8)&0xffU)!=0;
             auto pattern=file.directory->pattern.value_or(u"*");
             if((file.native && file.native->volume_device()) || !(file.metadata.attributes&0x10))status=0xc0000103;
             else if(!(file.access&(0x80000000U|1U)))status=0xc0000022;

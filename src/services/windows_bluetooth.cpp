@@ -184,7 +184,7 @@ std::optional<std::uint32_t> WindowsServices::open_bluetooth(GuestState& state,G
         if(!prepare_bluetooth())return fail(50);auto& bt=*bluetooth_;bt.family.pump();
         const auto access=mapped_access(static_cast<std::uint32_t>(arguments[1])),share=static_cast<std::uint32_t>(arguments[2]),flags=static_cast<std::uint32_t>(arguments[5]);
         if(access&~0x1f01ffU)return fail(5);if(share&~7U || static_cast<std::uint32_t>(arguments[4])!=3U)return fail(87);
-        if(flags&~0x401f0080U)return fail(50);const auto security=read_security_attributes(memory,arguments[3],x86_,false);
+        if(flags&~0x401f0080U)return fail(50);const auto security=read_security_attributes(memory,arguments[3],x86_,false,false);
         const auto interfaces=bt.interfaces();const auto key=fold(path);const auto found=std::find_if(interfaces.begin(),interfaces.end(),[&](const auto& item){return fold(item.path)==key;});
         if(found==interfaces.end())return fail(2);
         const auto categories=[](std::uint32_t desired){return (desired&(1U|0x20U)?1U:0U)|(desired&(2U|4U)?2U:0U)|(desired&0x10000U?4U:0U);};

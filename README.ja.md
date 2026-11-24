@@ -142,7 +142,7 @@ AppleJuice で Steam を選択し、ヘッドフォン空間ミックス、2 倍
 
 AppleJuice のライブラリに登録したゲームは、EXE ごとの表示設定を優先します。未登録のゲームはランチャーの現在の表示設定を引き継ぎます。空間音声は全体設定です。同じ処理を他のランチャーにも適用し、ゲーム名による例外は設けません。
 
-## 動作確認の記録 / 2026-11-24 / 全 34 本のゲーム
+## 動作確認の記録 / 2026-11-25 / 全 36 本のゲーム
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="動作不可・対応中" title="動作不可・対応中"> 動作不可・対応中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="起動可" title="起動可"> 起動可　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="低効率" title="低効率"> 低効率　<img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="良好（MetalFX）" title="良好（MetalFX）"> 良好（MetalFX）　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好" title="良好"> 良好
 
@@ -163,6 +163,7 @@ AppleJuice のライブラリに登録したゲームは、EXE ごとの表示�
 | デビル メイ クライ 5 | x64 | D3D12 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | ファイナルファンタジーIX | x64 | D3D9（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | ファイナルファンタジーVIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| ペルソナ4 ザ・ゴールデン | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | ウィッチャー3 ワイルドハント 次世代版 | x64 | D3D12 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | 永恒的黄昏 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | 逆転裁判123 成歩堂セレクション | x86 | D3D11（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
@@ -182,6 +183,7 @@ AppleJuice のライブラリに登録したゲームは、EXE ごとの表示�
 | Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | サイバーパンク2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | テイルズ オブ ベルセリア | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
+| Stardew Valley | x64 | OpenGL（MonoGame） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | 三國志VIII with パワーアップキット | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | 三國志IX with パワーアップキット | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | 三國志X with パワーアップキット | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |

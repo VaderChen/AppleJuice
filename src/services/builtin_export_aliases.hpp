@@ -163,6 +163,13 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
 #undef ICU_FMT_ALIAS_icuuc
 #undef ICU_FMT_ALIAS_icuin
 #undef ICU_FMT_ALIAS_icu
+#define ICU_COLL_ALIAS_icuin(name) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_COLL_ALIAS_icuuc(name) {"icuuc.dll",#name,"icu.dll",#name},
+#define ICU_COLL_API(name,count,legacy) ICU_COLL_ALIAS_##legacy(name)
+#include "icu_collation_services.inc"
+#undef ICU_COLL_API
+#undef ICU_COLL_ALIAS_icuuc
+#undef ICU_COLL_ALIAS_icuin
 #define ICU_BIDI_API(name,count) {"icuuc.dll",#name,"icu.dll",#name},
 #include "icu_bidi_services.inc"
 #include "icu_bidi_transform_services.inc"

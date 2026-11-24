@@ -80,6 +80,40 @@ constexpr Command commands[]{
     {"glUniform3iv",GlOperation::Uniform3iv,3,0,0},
     {"glUniform4fv",GlOperation::Uniform4fv,3,0,0},
     {"glUniform4iv",GlOperation::Uniform4iv,3,0,0},
+    // 純量 uniform 由服務層組成單一元素的向量版本；x64 的浮點值在 XMM。
+    {"glUniform1f",GlOperation::Uniform1fv,2,2,0},
+    {"glUniform2f",GlOperation::Uniform2fv,3,6,0},
+    {"glUniform3f",GlOperation::Uniform3fv,4,14,0},
+    {"glUniform4f",GlOperation::Uniform4fv,5,30,0},
+    {"glUniform1i",GlOperation::Uniform1iv,2,0,0},
+    {"glUniform2i",GlOperation::Uniform2iv,3,0,0},
+    {"glUniform3i",GlOperation::Uniform3iv,4,0,0},
+    {"glUniform4i",GlOperation::Uniform4iv,5,0,0},
+    {"glUniformMatrix2fv",GlOperation::UniformMatrix2fv,4,0,0},
+    {"glUniformMatrix3fv",GlOperation::UniformMatrix3fv,4,0,0},
+    {"glGetAttribLocation",GlOperation::GetAttribLocation,2,0,0},
+    {"glIsShader",GlOperation::IsShader,1,0,0},
+    {"glIsProgram",GlOperation::IsProgram,1,0,0},
+    {"glBlendColor",GlOperation::BlendColor,4,15,0},
+    {"glBlendEquation",GlOperation::BlendEquationSeparate,1,0,0},
+    // GL 4.1／ARB_ES2_compatibility 的單精度版本：服務層轉成雙精度後共用既有操作。
+    {"glClearDepthf",GlOperation::ClearDepth,1,1,0},
+    {"glDepthRangef",GlOperation::DepthRange,2,3,0},
+    // framebuffer 物件：renderbuffer、附件查詢、blit 與多重取樣儲存。
+    {"glGenRenderbuffers",GlOperation::GenRenderbuffers,2,0,0},
+    {"glBindRenderbuffer",GlOperation::BindRenderbuffer,2,0,0},
+    {"glDeleteRenderbuffers",GlOperation::DeleteRenderbuffers,2,0,0},
+    {"glIsRenderbuffer",GlOperation::IsRenderbuffer,1,0,0},
+    {"glRenderbufferStorage",GlOperation::RenderbufferStorage,4,0,0},
+    {"glRenderbufferStorageMultisample",GlOperation::RenderbufferStorage,5,0,0},
+    {"glGetRenderbufferParameteriv",GlOperation::GetRenderbufferParameteriv,3,0,0},
+    {"glFramebufferRenderbuffer",GlOperation::FramebufferRenderbuffer,4,0,0},
+    {"glFramebufferTexture1D",GlOperation::FramebufferTexture2D,5,0,0},
+    {"glFramebufferTexture3D",GlOperation::FramebufferTexture2D,6,0,0},
+    {"glFramebufferTextureLayer",GlOperation::FramebufferTexture2D,5,0,0},
+    {"glIsFramebuffer",GlOperation::IsFramebuffer,1,0,0},
+    {"glGetFramebufferAttachmentParameteriv",GlOperation::GetFramebufferAttachmentParameteriv,4,0,0},
+    {"glBlitFramebuffer",GlOperation::BlitFramebuffer,10,0,0},
 
     {"glBegin",GlOperation::Begin,1,0,0},
     {"glEnd",GlOperation::End,0,0,0},
@@ -215,9 +249,25 @@ constexpr Command commands[]{
     {"glPrioritizeTextures",GlOperation::PrioritizeTextures,3,0,0},
     {"glAreTexturesResident",GlOperation::IsTexture,3,0,0},
 };
+// 擴充入口的別名：語義與核心入口相同（EXT_framebuffer_object 另接受 EXT_framebuffer_blit 的讀寫目標），服務層一律換成核心名稱處理。
+constexpr std::pair<std::string_view,std::string_view> command_aliases[]{
+    {"glGenRenderbuffersEXT","glGenRenderbuffers"},{"glBindRenderbufferEXT","glBindRenderbuffer"},{"glDeleteRenderbuffersEXT","glDeleteRenderbuffers"},
+    {"glIsRenderbufferEXT","glIsRenderbuffer"},{"glRenderbufferStorageEXT","glRenderbufferStorage"},{"glGetRenderbufferParameterivEXT","glGetRenderbufferParameteriv"},
+    {"glGenFramebuffersEXT","glGenFramebuffers"},{"glBindFramebufferEXT","glBindFramebuffer"},{"glDeleteFramebuffersEXT","glDeleteFramebuffers"},
+    {"glIsFramebufferEXT","glIsFramebuffer"},{"glCheckFramebufferStatusEXT","glCheckFramebufferStatus"},{"glFramebufferTexture1DEXT","glFramebufferTexture1D"},
+    {"glFramebufferTexture2DEXT","glFramebufferTexture2D"},{"glFramebufferTexture3DEXT","glFramebufferTexture3D"},{"glFramebufferRenderbufferEXT","glFramebufferRenderbuffer"},
+    {"glGetFramebufferAttachmentParameterivEXT","glGetFramebufferAttachmentParameteriv"},{"glGenerateMipmapEXT","glGenerateMipmap"},
+    {"glBlitFramebufferEXT","glBlitFramebuffer"},{"glRenderbufferStorageMultisampleEXT","glRenderbufferStorageMultisample"},
+    {"glBlendColorEXT","glBlendColor"},{"glBlendEquationEXT","glBlendEquation"},{"glBlendFuncSeparateEXT","glBlendFuncSeparate"},{"glBlendEquationSeparateEXT","glBlendEquationSeparate"},
+    {"glVertexAttribDivisorARB","glVertexAttribDivisor"},{"glDrawArraysInstancedARB","glDrawArraysInstanced"},{"glDrawElementsInstancedARB","glDrawElementsInstanced"},
+};
+std::string_view canonical_command(std::string_view name){
+    for(const auto& [alias,core]:command_aliases)if(alias==name)return core;
+    return name;
+}
 const Command* find_command(std::string_view name){
     static const auto index=[](){std::unordered_map<std::string_view,const Command*> result;result.reserve(std::size(commands));for(const auto& command:commands)result.emplace(command.name,&command);return result;}();
-    const auto it=index.find(name);return it==index.end()?nullptr:it->second;
+    const auto it=index.find(canonical_command(name));return it==index.end()?nullptr:it->second;
 }
 constexpr std::uint32_t invalid_enum=0x500,invalid_value=0x501,invalid_operation=0x502,out_of_memory=0x505;
 constexpr std::size_t transfer_limit=256U*1024U*1024U;
@@ -300,7 +350,7 @@ unsigned query_size(std::uint32_t p){
     if((p>=0xd10 && p<=0xd1f) || (p>=0xcb0 && p<=0xcb9))return 1; // GL_MAP_COLOR～GL_DEPTH_BIAS 與 GL_PIXEL_MAP_*_SIZE
     if(p==0xd70 || p==0xdf1 || p==0xdf2 || p==0xdf4)return 1; // NAME_STACK_DEPTH、FEEDBACK_BUFFER_SIZE／TYPE、SELECTION_BUFFER_SIZE
     switch(p){case 0xba6:case 0xba7:case 0xba8:return 16;
-    case 0xb00:case 0xb03:case 0xb04:case 0xb06:case 0xb07:case 0xba2:case 0xc10:case 0xc22:case 0xc23:case 0xb53:case 0xb66:case 0xb80:return 4;
+    case 0xb00:case 0xb03:case 0xb04:case 0xb06:case 0xb07:case 0xba2:case 0xc10:case 0xc22:case 0xc23:case 0xb53:case 0xb66:case 0xb80:case 0x8005:return 4;
     case 0xb02:return 3;
     case 0xb12:case 0xb22:case 0xb40:case 0xb70:case 0xd3a:case 0x846d:case 0x846e:return 2;
     default:break;}
@@ -316,6 +366,8 @@ unsigned query_size(std::uint32_t p){
     case 0xd30:case 0xd31:case 0xd32:case 0xd33:case 0xd34:case 0xd35:case 0xd36:case 0xd37:case 0xd38:case 0xd39:case 0xd3b:case 0xd50:case 0xd51:case 0xd52:case 0xd53:case 0xd54:case 0xd55:case 0xd56:case 0xd57:case 0xd58:case 0xd59:case 0xd5a:case 0xd5b:
     case 0x85b5:case 0x8f36:case 0x8f37:case 0x8a28:case 0x8642:
     case 0x84ff:case 0x8b4d:case 0x8872:case 0x8b4c:case 0x8869:case 0x8cdf:case 0x8824:case 0x8b8d:case 0x8894:case 0x8895:case 0x84e0:case 0x821b:case 0x821c:case 0x821d:
+    // framebuffer 物件與混色常數的查詢：MAX_SAMPLES、MAX_RENDERBUFFER_SIZE、RENDERBUFFER／DRAW／READ_FRAMEBUFFER_BINDING、SAMPLE_BUFFERS、SAMPLES、BLEND_EQUATION_RGB／ALPHA、BLEND_DST／SRC_RGB／ALPHA。
+    case 0x8d57:case 0x84e8:case 0x8ca7:case 0x8ca6:case 0x8caa:case 0x80a9:case 0x80a8:case 0x8009:case 0x883d:case 0x80c8:case 0x80c9:case 0x80ca:case 0x80cb:
     case 0xde0:case 0xde1:case 0x8068:case 0x8069:case 0x8074:case 0x8075:case 0x8076:case 0x8078:case 0x8086:case 0x8087:case 0x8088:case 0x808a:case 0x808b:case 0x808c:case 0x808d:case 0x808e:case 0x808f:case 0x8090:case 0x8091:case 0x8092:case 0x8093:return 1;
     default:return 0;}
 }
@@ -337,6 +389,7 @@ std::optional<std::size_t> pixel_bytes(const OpenGlClientState& client,std::int3
 std::span<const WindowsServiceDescriptor> opengl_service_descriptors(){
     static const auto table=[](){std::vector<WindowsServiceDescriptor> result;
         for(const auto& c:commands)result.push_back({c.name.starts_with("glu")?"glu32.dll":"opengl32.dll",c.name,c.arguments,c.double_mask});
+        for(const auto& [alias,core]:command_aliases){const auto* c=find_command(core);result.push_back({"opengl32.dll",alias,c->arguments,c->double_mask});}
         for(const auto& [name,variant]:variants()){
             const unsigned arguments=variant.vector?(variant.attribute==GlAttribute::Rect?2U:1U):variant.count;
             result.push_back({"opengl32.dll",name,arguments,!variant.vector && variant.type==0x140a?(1U<<arguments)-1U:0U});
@@ -378,7 +431,7 @@ std::span<const WindowsServiceDescriptor> opengl_service_descriptors(){
 }
 std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.symbol.starts_with("wglUseFont"))return invoke_wgl_fonts(state,memory,service); // windows_wgl_fonts.cpp
-    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
+    const WindowsCall arg(state,memory,service);const auto symbol=canonical_command(service.symbol);
     const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};const auto n=[&](unsigned i){return std::bit_cast<std::int32_t>(d(i));};
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto dc_window=[&](std::uint64_t dc)->std::uint64_t{const auto h=dc>=0x10000000?dc-0x10000000:0;return gui_.windows.contains(h)?h:0;};
@@ -516,10 +569,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
             GlOperation::Color3f,GlOperation::Color4f,GlOperation::Color4fv,GlOperation::TexCoord2f,GlOperation::TexCoord2fv,GlOperation::Materialf,GlOperation::Materialfv,
             GlOperation::CallList,GlOperation::CallLists,GlOperation::End});
     if(c.beginning && !immediate){error(c,invalid_operation);return finish(0);}
-    if(symbol=="glGetStringi"){error(c,d(0)==0x1f03?invalid_value:invalid_enum);return finish(0);}
+    // GL_EXTENSIONS 只列可程式化後端以 wglGetProcAddress 實際提供的擴充；其他後端的 host 擴充不能直接呼叫，維持空字串。
+    const auto extensions=[&]{return c.native->programmable()?c.native->string(0x1f03):std::string{};};
+    if(symbol=="glGetStringi"){
+        if(d(0)!=0x1f03){error(c,invalid_enum);return finish(0);}
+        if(const auto it=c.extension_strings.find(d(1));it!=c.extension_strings.end())return finish(it->second);
+        std::istringstream list(extensions());std::string name;for(std::uint32_t i=0;list>>name;++i)if(i==d(1)){
+            std::vector<std::uint8_t> bytes(name.begin(),name.end());bytes.push_back(0);const auto address=runtime_allocate(memory,bytes);c.extension_strings[d(1)]=address;return finish(address);}
+        error(c,invalid_value);return finish(0);
+    }
     if(symbol=="glGetString"){
         if(d(0)!=0x1f00 && d(0)!=0x1f01 && d(0)!=0x1f02 && d(0)!=0x1f03 && d(0)!=0x8b8c){error(c,invalid_enum);return finish(0);}
-        if(!c.strings.contains(d(0))){const auto value=d(0)==0x1f03?std::string{}:c.native->string(d(0));std::vector<std::uint8_t> bytes(value.begin(),value.end());bytes.push_back(0);c.strings[d(0)]=runtime_allocate(memory,bytes);}
+        if(!c.strings.contains(d(0))){const auto value=d(0)==0x1f03?extensions():c.native->string(d(0));std::vector<std::uint8_t> bytes(value.begin(),value.end());bytes.push_back(0);c.strings[d(0)]=runtime_allocate(memory,bytes);}
         return finish(c.strings.at(d(0)));
     }
     const auto array_index=[](std::uint32_t name)->int{switch(name){case 0x8074:return 0;case 0x8075:return 1;case 0x8076:return 2;case 0x8078:return 3;case 0x8079:return 4;case 0x8077:return 5;default:return -1;}};
@@ -701,6 +762,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
         return finish(1);
     }
     std::array<std::uint64_t,10> values{};for(unsigned i=0;i<service.arguments;++i)values[i]=(found->float_mask|found->double_mask)&(1U<<i)?floating_argument(i,(found->double_mask&(1U<<i))!=0):arg(i);
+    // 單精度 glClearDepthf／glDepthRangef 轉成既有操作的雙精度位元；glBlendEquation 兩個方程式相同；
+    // glRenderbufferStorage 補上 0 個樣本；glFramebufferTextureLayer 以 textarget 0 表示依貼圖型別附加圖層。
+    if(symbol=="glClearDepthf" || symbol=="glDepthRangef")for(unsigned i=0;i<service.arguments;++i)values[i]=std::bit_cast<std::uint64_t>(static_cast<double>(std::bit_cast<float>(static_cast<std::uint32_t>(values[i]))));
+    if(symbol=="glBlendEquation")values[1]=values[0];
+    if(symbol=="glRenderbufferStorage"){values[4]=values[3];values[3]=values[2];values[2]=values[1];values[1]=0;}
+    if(symbol=="glFramebufferTextureLayer"){values[5]=values[4];values[4]=values[3];values[3]=values[2];values[2]=0;}
     auto& input=c.input_scratch;auto& output=c.output_scratch;input.clear();output.clear();std::uint64_t output_address=0;
     const auto set_input=[&](std::uint64_t pointer,std::size_t length){read_reusable(memory,pointer,length,input);};
     const auto set_output=[&](std::uint64_t pointer,std::size_t length){memory.check(GuestAddress{pointer},length,Access::Write);output.resize(length);output_address=pointer;};
@@ -709,9 +776,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
         if(n(1)<0 || d(1)>4096){error(c,invalid_value);return finish(0);}const auto width=memory.execution_mode()==ExecutionMode::X86?4U:8U;
         for(unsigned i=0;i<d(1);++i){const auto pointer=memory.load(GuestAddress{arg(2)+static_cast<std::uint64_t>(i)*width},static_cast<std::uint8_t>(width*8));const auto length=arg(3)?std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{arg(3)+i*4},32))):-1;
             if(length<0){const auto source=read_ansi(memory,pointer,16U*1024U*1024U);input.insert(input.end(),source.begin(),source.end());}else{auto source=read_bytes(memory,pointer,static_cast<std::uint32_t>(length));input.insert(input.end(),source.begin(),source.end());}if(input.size()>16U*1024U*1024U){error(c,out_of_memory);return finish(0);}}
-    }else if(symbol=="glGetUniformLocation" || symbol=="glBindAttribLocation"){
-        const auto name=read_ansi(memory,arg(symbol=="glGetUniformLocation"?1:2),4096);input.assign(name.begin(),name.end());
-    }else if(symbol=="glGetShaderiv" || symbol=="glGetProgramiv" || symbol=="glGetBufferParameteriv")set_output(arg(2),4);
+    }else if(symbol=="glGetUniformLocation" || symbol=="glGetAttribLocation" || symbol=="glBindAttribLocation"){
+        const auto name=read_ansi(memory,arg(symbol=="glBindAttribLocation"?2:1),4096);input.assign(name.begin(),name.end());
+    }else if(symbol=="glGetShaderiv" || symbol=="glGetProgramiv" || symbol=="glGetBufferParameteriv" || symbol=="glGetRenderbufferParameteriv")set_output(arg(2),4);
+    else if(symbol=="glGetFramebufferAttachmentParameteriv")set_output(arg(3),4);
     else if(symbol=="glGetVertexAttribiv" || symbol=="glGetVertexAttribfv")set_output(arg(2),d(1)==0x8626?16:4);
     else if(symbol=="glGetVertexAttribPointerv")set_output(arg(2),memory.execution_mode()==ExecutionMode::X86?4:8);
     else if(symbol=="glGetBufferSubData"){
@@ -720,8 +788,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
     else if(symbol=="glGetShaderInfoLog" || symbol=="glGetProgramInfoLog"){
         if(n(1)<0 || d(1)>transfer_limit){error(c,invalid_value);return finish(0);}if(d(1))set_output(arg(3),d(1));if(arg(2))memory.check(GuestAddress{arg(2)},4,Access::Write);
     }else if(symbol.starts_with("glUniform")){
-        if(n(1)<0){error(c,invalid_value);return finish(0);}const bool matrix=symbol=="glUniformMatrix4fv";const unsigned components=matrix?16U:static_cast<unsigned>(symbol[9]-'0');if(n(0)!=-1)set_input(arg(matrix?3:2),static_cast<std::size_t>(d(1))*components*4);
-    }else if(symbol=="glGenVertexArrays" || symbol=="glDeleteVertexArrays" || symbol=="glGenBuffers" || symbol=="glGenFramebuffers" || symbol=="glDeleteBuffers" || symbol=="glDeleteFramebuffers" || symbol=="glDrawBuffers"){
+        const bool matrix=symbol.starts_with("glUniformMatrix");
+        if(!matrix && !symbol.ends_with('v')){
+            // 純量版本：參數依序組成一個元素（浮點值已由 float_mask 取出位元），再交給向量操作。
+            const unsigned components=static_cast<unsigned>(symbol[9]-'0');input.resize(components*4U);
+            for(unsigned i=0;i<components;++i){const auto word=static_cast<std::uint32_t>(values[1+i]);std::memcpy(input.data()+i*4,&word,4);}
+            values[1]=1;
+        }else{
+            if(n(1)<0){error(c,invalid_value);return finish(0);}
+            const unsigned order=matrix?static_cast<unsigned>(symbol[15]-'0'):0U,components=matrix?order*order:static_cast<unsigned>(symbol[9]-'0');
+            if(n(0)!=-1)set_input(arg(matrix?3:2),static_cast<std::size_t>(d(1))*components*4);
+        }
+    }else if(symbol=="glGenVertexArrays" || symbol=="glDeleteVertexArrays" || symbol=="glGenBuffers" || symbol=="glGenFramebuffers" || symbol=="glDeleteBuffers" || symbol=="glDeleteFramebuffers" || symbol=="glDrawBuffers" ||
+        symbol=="glGenRenderbuffers" || symbol=="glDeleteRenderbuffers"){
         if(n(0)<0 || d(0)>transfer_limit/4){error(c,invalid_value);return finish(0);}if(symbol.starts_with("glGen"))set_output(arg(1),d(0)*4);else set_input(arg(1),d(0)*4);
     }else if(symbol=="glBufferData" || symbol=="glBufferSubData"){
         const auto size=arg(symbol=="glBufferData"?1:2);if(size>transfer_limit){error(c,invalid_value);return finish(0);}if(symbol=="glBufferSubData" || arg(2))set_input(arg(symbol=="glBufferData"?2:3),static_cast<std::size_t>(size));
@@ -729,6 +808,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
         const bool indexed=symbol=="glDrawElements" || symbol=="glDrawElementsInstanced";const auto count=n(indexed?1:2);if(count<0 || (!indexed && n(1)<0) || (symbol.ends_with("Instanced") && n(indexed?4:3)<0)){error(c,invalid_value);return finish(0);}
         // EBO 屬於 VAO，也可能保留已刪除名稱的物件；以 renderer 的實際狀態決定是否讀取客體指標。
         if(indexed && !c.native->bound_buffer(0x8893)){if(d(2)!=0x1401 && d(2)!=0x1403 && d(2)!=0x1405){error(c,invalid_enum);return finish(0);}if(count)set_input(arg(3),static_cast<std::size_t>(count)*type_size(d(2)));}++c.draws;
+        // VAO 0 的泛用屬性用戶端陣列：依本次繪製的最大索引（實例屬性依實例數）讀出客體頂點資料交給後端。
+        if(!c.vertex_array && count>0 && std::any_of(c.generic_arrays.begin(),c.generic_arrays.end(),[](const auto& a){return a.client && a.enabled;})){
+            std::uint64_t last=0;const auto instances=symbol=="glDrawArraysInstanced"?d(3):symbol=="glDrawElementsInstanced"?d(4):1U;
+            if(indexed){
+                const auto unit=type_size(d(2));if(!unit){error(c,invalid_enum);return finish(0);}std::span<const std::uint8_t> bytes=input;const auto length=static_cast<std::uint64_t>(count)*unit;
+                if(const auto elements=c.native->bound_buffer(0x8893)){if(arg(3)>elements->bytes.size() || length>elements->bytes.size()-arg(3)){error(c,invalid_operation);return finish(0);}bytes=std::span<const std::uint8_t>(elements->bytes).subspan(static_cast<std::size_t>(arg(3)),static_cast<std::size_t>(length));}
+                for(std::size_t i=0;i+unit<=bytes.size();i+=unit){std::uint32_t value=0;std::memcpy(&value,bytes.data()+i,unit);last=std::max<std::uint64_t>(last,value);}
+            }else last=static_cast<std::uint64_t>(d(1))+static_cast<std::uint64_t>(count)-1;
+            for(unsigned i=0;i<16;++i){const auto& a=c.generic_arrays[i];if(!a.client || !a.enabled)continue;
+                const auto element=type_size(a.type)*static_cast<std::uint32_t>(a.size),stride=a.stride?static_cast<std::uint32_t>(a.stride):element;
+                const std::uint64_t elements=a.divisor?(std::max(instances,1U)-1)/a.divisor+1:last+1;const auto length=(elements-1)*stride+element;
+                if(length>transfer_limit){error(c,out_of_memory);return finish(0);}
+                auto& bytes=c.array_scratch;bytes.resize(static_cast<std::size_t>(length));
+                try{memory.read(GuestAddress{a.pointer},bytes);}catch(const MemoryFault&){error(c,invalid_value);return finish(0);}
+                c.native->execute(GlOperation::VertexAttribClientData,std::array<std::uint64_t,1>{i},bytes);
+            }
+        }
     }else if(symbol=="glBegin"){
         if(d(0)>9){error(c,invalid_enum);return finish(0);}c.beginning=true;++c.draws;
     }else if(symbol=="glEnd"){
@@ -751,7 +847,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
         unsigned count=1;switch(d(1)){
         case 0x1004:count=4;break;
         case 0x2800:case 0x2801:case 0x2802:case 0x2803:case 0x8072:case 0x8066:case 0x8067:
-        case 0x813a:case 0x813b:case 0x813c:case 0x813d:case 0x84fe:case 0x884b:case 0x884c:case 0x884d:case 0x8191:break;
+        case 0x813a:case 0x813b:case 0x813c:case 0x813d:case 0x84fe:case 0x884b:case 0x884c:case 0x884d:case 0x8191:case 0x8501:break;
         default:error(c,invalid_enum);return finish(0);}
         set_output(arg(2),count*4);
     }else if(symbol=="glTexImage2D" || symbol=="glTexSubImage2D"){
@@ -817,11 +913,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
     std::array<bool,6> deleted_client_buffers{};
     if(symbol=="glDeleteBuffers")for(std::size_t i=0;i<input.size();i+=4){std::uint32_t name;std::memcpy(&name,input.data()+i,4);const auto buffer=c.native->buffer_object(name);
         if(buffer)for(unsigned j=0;j<6;++j)if(c.client.arrays[j].buffer==buffer)deleted_client_buffers[j]=true;}
+    const bool client_pointer=symbol=="glVertexAttribPointer" && !c.native->bound_buffer(0x8892);
     std::uint64_t result=0;try{result=c.native->execute(found->operation,values,input,output);}catch(const std::bad_alloc&){
         if(std::getenv("X64ARM_GL_TRACE"))std::fprintf(stderr,"[gl-allocation-failed] operation=%u\n",static_cast<unsigned>(found->operation));
         error(c,out_of_memory);return finish(0);}
 
     if(symbol=="glUseProgram" && result)c.program=d(0);
+    // VAO 0 泛用屬性的用戶端陣列鏡像，只在後端接受後更新。
+    if(!c.vertex_array && result && d(0)<16 && (symbol=="glVertexAttribPointer" || symbol=="glEnableVertexAttribArray" || symbol=="glDisableVertexAttribArray" || symbol=="glVertexAttribDivisor")){
+        auto& g=c.generic_arrays[d(0)];
+        if(symbol=="glVertexAttribPointer"){g.client=client_pointer;g.pointer=arg(5);g.size=n(1);g.type=d(2);g.stride=n(4);}
+        else if(symbol=="glVertexAttribDivisor")g.divisor=d(1);else g.enabled=symbol=="glEnableVertexAttribArray";
+    }
     if(symbol=="glDeleteBuffers" && result)for(unsigned i=0;i<6;++i)if(deleted_client_buffers[i])c.client.arrays[i].buffer.reset();
     if(symbol=="glBindVertexArray" && result){
         c.vertex_array_clients[c.vertex_array]=c.client.arrays;c.vertex_array=d(0);
@@ -829,7 +932,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
     }
     if(symbol=="glDeleteVertexArrays" && result){for(std::size_t i=0;i<input.size();i+=4){std::uint32_t name;std::memcpy(&name,input.data()+i,4);if(!name)continue;
         if(c.vertex_array==name){c.vertex_array=0;auto [it,added]=c.vertex_array_clients.try_emplace(0);if(added)it->second=OpenGlClientState{}.arrays;c.client.arrays=it->second;}c.vertex_array_clients.erase(name);}}
-    if(!result && (symbol=="glGetBufferParameteriv" || symbol=="glGetBufferSubData" || symbol=="glGetVertexAttribiv" || symbol=="glGetVertexAttribfv" || symbol=="glGetVertexAttribPointerv"))output.clear();
+    if(!result && (symbol=="glGetBufferParameteriv" || symbol=="glGetBufferSubData" || symbol=="glGetVertexAttribiv" || symbol=="glGetVertexAttribfv" || symbol=="glGetVertexAttribPointerv" ||
+        symbol=="glGetRenderbufferParameteriv" || symbol=="glGetFramebufferAttachmentParameteriv"))output.clear();
     if((symbol=="glGetShaderInfoLog" || symbol=="glGetProgramInfoLog") && arg(2))memory.store(GuestAddress{arg(2)},32,result);
     if(!output.empty())memory.write(GuestAddress{output_address},output);
     return finish(result);

@@ -177,6 +177,7 @@ std::span<const WindowsServiceDescriptor> icu_date_pattern_service_descriptors()
 std::span<const WindowsServiceDescriptor> icu_number_service_descriptors();
 std::span<const WindowsServiceDescriptor> icu_date_format_service_descriptors();
 std::span<const WindowsServiceDescriptor> icu_formatted_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_collation_service_descriptors();
 std::span<const WindowsServiceDescriptor> icu_bidi_service_descriptors();
 std::span<const WindowsServiceDescriptor> icu_modern_number_service_descriptors();
 std::span<const WindowsServiceDescriptor> wlan_service_descriptors();

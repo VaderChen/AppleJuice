@@ -13,6 +13,9 @@
 #include <spirv_msl.hpp>
 #include <algorithm>
 #include <bit>
+#include <cctype>
+#include <optional>
+#include <sstream>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -39,8 +42,43 @@ public:
         default:unsupported=true;out.push_back(0);break;}}
     }
 };
+// 舊版 GLSL（未宣告版本或 1.10～1.30）：轉 SPIR-V 的 Vulkan 規則要求 1.40 以上。版本行改成 1.40，以前置巨集把 attribute／varying、
+// texture2D 等舊取樣函式與 gl_FragColor／gl_FragData 換成 1.40 的等價寫法；片段輸出宣告緊接在版本行後（前置文字只能有巨集）。
+// 驗證階段仍以原始版本與 OpenGL 規則檢查，所以語義錯誤照常回報。
+struct LegacyUpgrade {std::string text,preamble;};
+std::optional<LegacyUpgrade> legacy_upgrade(const GlslSource& source){
+    const auto& text=source.source;std::size_t at=0;
+    while(at<text.size()){
+        if(std::isspace(static_cast<unsigned char>(text[at])))++at;
+        else if(text.compare(at,2,"//")==0){at=text.find('\n',at);if(at==std::string::npos)at=text.size();}
+        else if(text.compare(at,2,"/*")==0){const auto end=text.find("*/",at+2);at=end==std::string::npos?text.size():end+2;}
+        else break;
+    }
+    int version=110;std::size_t line_begin=std::string::npos,line_end=std::string::npos;
+    if(text.compare(at,8,"#version")==0){
+        line_begin=at;line_end=text.find('\n',at);if(line_end==std::string::npos)line_end=text.size();
+        std::istringstream line(text.substr(at+8,line_end-at-8));std::string profile;line>>version>>profile;if(profile=="es")return std::nullopt;
+    }
+    if(version>=140)return std::nullopt;
+    const bool vertex=source.stage==0x8b31;
+    const std::string output=vertex?"":text.find("gl_FragData")!=std::string::npos?"out vec4 x64arm_FragData[8];\n":"out vec4 x64arm_FragColor;\n";
+    LegacyUpgrade result;
+    if(line_begin==std::string::npos)result.text="#version 140\n"+output+"#line 0\n"+text;
+    else result.text=text.substr(0,line_begin)+"#version 140\n"+output+"#line 1"+text.substr(line_end);
+    result.preamble=source.preamble+"#define attribute in\n#define varying "+(vertex?"out":"in")+"\n"
+        "#define texture1D texture\n#define texture2D texture\n#define texture3D texture\n#define textureCube texture\n"
+        "#define texture1DProj textureProj\n#define texture2DProj textureProj\n#define texture3DProj textureProj\n"
+        "#define texture1DLod textureLod\n#define texture2DLod textureLod\n#define texture3DLod textureLod\n#define textureCubeLod textureLod\n"
+        "#define texture1DProjLod textureProjLod\n#define texture2DProjLod textureProjLod\n#define texture3DProjLod textureProjLod\n"
+        "#define shadow1D(s,c) vec4(texture(s,c))\n#define shadow2D(s,c) vec4(texture(s,c))\n#define shadow1DProj(s,c) vec4(textureProj(s,c))\n#define shadow2DProj(s,c) vec4(textureProj(s,c))\n";
+    if(!vertex)result.preamble+=text.find("gl_FragData")!=std::string::npos?"#define gl_FragData x64arm_FragData\n":"#define gl_FragColor x64arm_FragColor\n";
+    return result;
+}
 std::unique_ptr<glslang::TShader> parse(const GlslSource& source,bool spirv,std::string& log,Defaults* defaults=nullptr){
-    auto shader=std::make_unique<glslang::TShader>(language(source.stage));const char* text=source.source.c_str();const auto size=static_cast<int>(source.source.size());shader->setStringsWithLengths(&text,&size,1);if(!source.preamble.empty())shader->setPreamble(source.preamble.c_str());
+    auto shader=std::make_unique<glslang::TShader>(language(source.stage));
+    // glslang 只在 parse 期間讀取來源與前置字串；升級後的文字留在本函式範圍即可。
+    const auto upgrade=spirv?legacy_upgrade(source):std::nullopt;const auto& body=upgrade?upgrade->text:source.source;const auto& preamble=upgrade?upgrade->preamble:source.preamble;
+    const char* text=body.c_str();const auto size=static_cast<int>(body.size());shader->setStringsWithLengths(&text,&size,1);if(!preamble.empty())shader->setPreamble(preamble.c_str());
     if(spirv){shader->setEnvInput(glslang::EShSourceGlsl,language(source.stage),glslang::EShClientVulkan,100);shader->setEnvInputVulkanRulesRelaxed();shader->setEnvClient(glslang::EShClientVulkan,glslang::EShTargetVulkan_1_1);shader->setEnvTarget(glslang::EShTargetSpv,glslang::EShTargetSpv_1_3);shader->setAutoMapBindings(true);shader->setAutoMapLocations(true);shader->setGlobalUniformBlockName("x64arm_uniforms");shader->setGlobalUniformSet(0);shader->setGlobalUniformBinding(0);}
     const auto flags=spirv?static_cast<EShMessages>(EShMsgSpvRules|EShMsgVulkanRules):EShMsgDefault;
     const bool ok=shader->parse(GetDefaultResources(),110,false,flags);if(!ok || !spirv){log+=shader->getInfoLog();log+=shader->getInfoDebugLog();}if(!ok)return {};

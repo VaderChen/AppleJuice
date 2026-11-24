@@ -142,7 +142,7 @@ Select Steam in AppleJuice, set Spatial headphone mixing, 2× upscaling and Fram
 
 For a game already in the AppleJuice library, its EXE's saved display settings take priority. Games outside the library inherit the launcher's current display settings. Spatial audio is a global preference. The same process applies to other launchers without game-specific rules.
 
-## Tested applications / 2026-11-24 / 34 games
+## Tested applications / 2026-11-25 / 36 games
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="Not working (WIP)" title="Not working (WIP)"> Not working (WIP) · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="Launches" title="Launches"> Launches · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="Slow" title="Slow"> Slow · <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="Works well (MetalFX)" title="Works well (MetalFX)"> Works well (MetalFX) · <img src="docs/images/support-levels/good.png" width="16" height="16" alt="Works well" title="Works well"> Works well
 
@@ -160,6 +160,7 @@ For a game already in the AppleJuice library, its EXE's saved display settings t
 | Geekbench 7 | x64 | CPU | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Memelis' RPG | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | OCTOPATH TRAVELER II | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
+| Persona 4 Golden | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Phoenix Wright: Ace Attorney Trilogy | x86 | D3D11 (Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Romance of the Three Kingdoms VII with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Romance of the Three Kingdoms XII with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
@@ -184,6 +185,7 @@ For a game already in the AppleJuice library, its EXE's saved display settings t
 | Romance of the Three Kingdoms IX with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Romance of the Three Kingdoms X with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Romance of the Three Kingdoms XI with Power Up Kit | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
+| Stardew Valley | x64 | OpenGL (MonoGame) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Steam | x64 | Chromium (CEF) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Tales of Berseria | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |

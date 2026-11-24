@@ -146,7 +146,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 
 已加入 AppleJuice 程式庫的遊戲，其 EXE 個別儲存的兩項顯示設定優先；尚未加入的遊戲沿用啟動器目前的顯示設定。空間混音為全域偏好。此流程同樣適用其他啟動器，不以遊戲名稱判斷。
 
-## 實測紀錄 / 2026-11-24 / 共 34 款遊戲
+## 實測紀錄 / 2026-11-25 / 共 36 款遊戲
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="無法運作、處理中" title="無法運作、處理中"> 無法運作、處理中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="可開啟" title="可開啟"> 可開啟　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="效率不高" title="效率不高"> 效率不高　<img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> 運作良好 (MetalFX)　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="運作良好" title="運作良好"> 運作良好
 
@@ -156,6 +156,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 七龍珠Z 卡卡洛特 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 三國志VII with 威力加強版 | x86 | GDI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 三國志XII with 威力加強版 | x86 | GDI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
+| 女神異聞錄4 黃金版 | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 不谙世事的猫艾露莎 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 天穗之咲稻姬 | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 巫師三：狂獵 次世代版 | x64 | D3D12 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
@@ -186,6 +187,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 三國志XI with 威力加強版 | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 星露谷物語 | x64 | OpenGL（MonoGame） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 電馭叛客 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 緋夜傳奇 | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 雙人成行 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |

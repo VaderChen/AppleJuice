@@ -475,6 +475,9 @@ void float_result(GuestState& state,bool x86,float value){
         state.x87_tag=static_cast<std::uint16_t>((state.x87_tag&~(3U<<(top*2)))|(x87_tag(state.x87[top])<<(top*2)));}
     else {const auto raw=std::bit_cast<std::uint32_t>(value);for(unsigned i=0;i<4;++i)state.xmm[0][i]=static_cast<std::uint8_t>(raw>>(8*i));}
 }
+// 動態頂點／索引緩衝改名與常數更新沿用後端 graphics_write_discard（D3D11 Map(DISCARD) 同一機制），不每次新建 Metal 緩衝。
+// 三國志 XI 每幀約 420 次 VertexBuffer Lock／Unlock，每次都新配置整份緩衝。X64ARM_D3D9_DISCARD_RENAME=0 關閉作對照。
+bool d3d9_discard_rename(){static const bool value=[] {const auto* text=std::getenv("X64ARM_D3D9_DISCARD_RENAME");return !text || std::string_view(text)!="0";}();return value;}
 }
 std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const bool shader_validator=service.symbol=="Direct3DShaderValidatorCreate9" || service.symbol.starts_with("ShaderValidator.");
@@ -712,7 +715,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
     const auto unbind_targets=[&](Object& device){for(auto& target:device.render_targets)bind_target(target,0);bind_target(device.depth_target,0);};
     const auto unbind=[&](Object& device){for(auto& shader:device.shaders)drop_binding(shader);drop_binding(device.vertex_declaration);drop_binding(device.texture);for(auto& texture:device.extra_textures)drop_binding(texture);drop_binding(device.vertex_buffer);drop_binding(device.index_buffer);for(auto& stream:device.extra_streams){drop_binding(stream.buffer);stream.offset=stream.stride=0;}device.stream_frequency.fill(1);device.stream_offset=device.stream_stride=0;};
     const auto saved_bindings=[](const Object& value){std::array<std::uint64_t,40> pointers{value.shaders[0],value.shaders[1],value.vertex_declaration,value.texture,value.vertex_buffer,value.index_buffer};std::copy(value.extra_textures.begin(),value.extra_textures.end(),pointers.begin()+6);for(unsigned i=0;i<15;++i)pointers[25+i]=value.extra_streams[i].buffer;return pointers;};
-    destroy=[&](const std::shared_ptr<Object>& value){
+    const auto destroy_body=[&](const std::shared_ptr<Object>& value){
         // 協調者本地呼叫時其他 worker 仍在執行：銷毀可能釋放客體 heap、還原全螢幕視窗或啟動私有資料回呼，
         // 物件已無引用與綁定，延到下一次完整 D3D9 呼叫依序銷毀（與 D3D11 本地路徑的延後銷毀契約相同）。
         if(d3d9_local_call_){bridge.deferred_destroys.push_back(value->root);return;}
@@ -740,11 +743,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
         if(value->lock_shadow)(void)free_heap(memory,value->lock_shadow,state);
         bridge.objects.erase(value->root);(void)free_heap(memory,value->root,state);
     };
-    release=[&](std::uint64_t address)->std::uint32_t{
+    const auto release_body=[&](std::uint64_t address)->std::uint32_t{
         const auto value=bridge.objects.at(address);require(value->references!=0);const auto remaining=--value->references;if(remaining)return remaining;
         if(!value->implicit && !value->bound)destroy(value);
         if(value->parent)release(value->parent);return 0;
     };
+    // release／destroy 只參照本體（reference_wrapper 放得進小物件緩衝），每次呼叫不配置堆積。
+    destroy=std::ref(destroy_body);release=std::ref(release_body);
     const auto create=[&](Kind kind,std::uint64_t parent=0,bool implicit=false,bool ex=false){
         // COM 物件數不設固定上限；客體 heap、宿主配置及 GPU backing 各自保留實際額度檢查。
         const auto key=std::pair{kind,ex};if(!bridge.tables.contains(key)){auto entries=methods(kind,ex);const auto address=runtime_allocate(memory,{},entries.size()*ps);

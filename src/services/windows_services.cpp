@@ -9,6 +9,9 @@
 #include "parallel_mapping_lock.hpp"
 #include "x64arm/resource_usage.hpp"
 #include "x64arm/windows_services.hpp"
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #include "crt_program_data.hpp"
 #include "windows_image_dump.hpp"
 #include "service_callback_task.hpp"
@@ -199,6 +202,8 @@ void WindowsServices::dump_service_counts() {
         std::fprintf(out,"[service_counts] mapping_lock writer_locks=%llu writer_hold_ns=%llu writer_drain_ns=%llu reader_waits=%llu reader_wait_ns=%llu reader_yields=%llu\n",
             static_cast<unsigned long long>(s.writer_locks.load()),static_cast<unsigned long long>(s.writer_hold_ns.load()),static_cast<unsigned long long>(s.writer_drain_ns.load()),
             static_cast<unsigned long long>(s.reader_waits.load()),static_cast<unsigned long long>(s.reader_wait_ns.load()),static_cast<unsigned long long>(s.reader_yields.load()));
+        // 位址含 ASLR 位移；附上主映像位移，離線以 atos -l <0x100000000+slide> 還原呼叫點。
+        std::fprintf(out,"[service_counts] image_slide=%#llx\n",static_cast<unsigned long long>(_dyld_get_image_vmaddr_slide(0)));
         for(const auto& site:detail::ParallelMappingLock::sites())if(const auto* address=site.address.load())
             std::fprintf(out,"[service_counts] mapping_lock_site address=%p locks=%llu drain_ns=%llu hold_ns=%llu\n",address,
                 static_cast<unsigned long long>(site.locks.load()),static_cast<unsigned long long>(site.drain_ns.load()),static_cast<unsigned long long>(site.hold_ns.load()));
@@ -2913,6 +2918,17 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
     // 一般檔案的 SetFilePointer／GetFileSize：與上方固定表的檔案位置查詢同一資格（《古墓奇兵：暗影》載入期間約 1.2 萬次原本每次全停）。
     if(!x86_ && local_file_io && descriptor.family=="kernel32.dll" && (descriptor.symbol=="SetFilePointer" || descriptor.symbol=="GetFileSize") && regular_file(state.reg(Gpr::Rcx)))
         return run_plain_local(descriptor.symbol,descriptor.family,[&]{return invoke_runtime(state,memory,descriptor);});
+    // OpenGL 沒有 worker 版：遊戲執行緒在 worker slot 時每個 GL 呼叫原本都要全體靜止（MonoGame 每幀上千次，Stardew Valley 4 vCPU
+    // 每秒約 5.8 萬次全停）。context 只由目前執行緒使用，服務只讀寫參數緩衝區與後端狀態，在協調者持獨占映射鎖本地執行；
+    // context 建立／刪除／切換、共用清單與狀態複製（改寫執行緒與 context 對應）以及 wglUseFont*（GDI 字型）留在完整路徑。
+    // 回呼、例外與終止由 run_plain_local 還原後交回完整路徑。X64ARM_LOCAL_OPENGL=0 關閉。
+    static const bool local_opengl=[] {const auto* value=std::getenv("X64ARM_LOCAL_OPENGL");return !value || std::string_view(value)!="0";}();
+    if(local_opengl && !x86_ && descriptor.family=="opengl32.dll"){
+        const auto symbol=descriptor.symbol;
+        const bool context_change=symbol.starts_with("wglCreate") || symbol=="wglDeleteContext" || symbol=="wglMakeCurrent" || symbol=="wglShareLists" ||
+            symbol=="wglCopyContext" || symbol.starts_with("wglUseFont");
+        if(!context_change)return run_plain_local(symbol,descriptor.family,[&]{return invoke_runtime(state,memory,descriptor);});
+    }
     if(region_delete || (!x86_ && plain_local_service(descriptor)))
         return run_plain_local(descriptor.symbol,descriptor.family,[&]{
             // 完整入口前後各觀察一次 GUI 資源尖峰；區域改走本地後，建立又刪除仍要反映在 GR_GDIOBJECTS_PEAK。
@@ -3050,15 +3066,19 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
             static const bool local_semaphore=[] {const auto* value=std::getenv("X64ARM_LOCAL_SEMAPHORE");return !value || std::string_view(value)!="0";}();
             if(!local_semaphore)return false;
             const auto found=runtime_.wait_objects.find(arg(0));
-            if(found==runtime_.wait_objects.end() || found->second.kind!=WaitObject::Kind::Semaphore || !(found->second.access&2U) ||
-               runtime_.wait_lock_descriptor(found->second)>=0)return false;
+            if(found==runtime_.wait_objects.end() || found->second.kind!=WaitObject::Kind::Semaphore || !(found->second.access&2U))return false;
             auto& object=runtime_.wait_state(found->second);
+            // 具名（跨程序共用）號誌：SharedEvent::release 自己在命名空間鎖下加計數並喚醒其他程序，與完整路徑相同，
+            // 不必為此全停（P4G 每秒數百次）。X64ARM_LOCAL_SHARED_SEMAPHORE=0 交回完整路徑。
+            static const bool local_shared_semaphore=[] {const auto* value=std::getenv("X64ARM_LOCAL_SHARED_SEMAPHORE");return !value || std::string_view(value)!="0";}();
+            const auto shared=object.shared_event;
+            if(shared?!local_shared_semaphore:runtime_.wait_lock_descriptor(found->second)>=0)return false;
             const auto increment=static_cast<std::uint32_t>(arg(1));
             // 診斷：X64ARM_TRACE_COORDINATED 時統計 ReleaseSemaphore 交回完整路徑的原因。
             static std::array<std::atomic<std::uint64_t>,4> release_refused{};
             const auto refuse_release=[&](unsigned reason){if(trace){const auto hits=release_refused[reason].fetch_add(1,std::memory_order_relaxed)+1;if(hits==1 || !(hits&0xffffU))std::fprintf(stderr,"[coordinated_release] reason=%u(0參數 1超過上限 2已登錄等待 3等待封包) hits=%llu handle=0x%llx increment=%u count=%u maximum=%u\n",reason,static_cast<unsigned long long>(hits),static_cast<unsigned long long>(arg(0)),increment,object.count,object.maximum);}return false;};
             if(std::bit_cast<std::int32_t>(increment)<=0)return refuse_release(0);
-            if(increment>object.maximum-object.count)return refuse_release(1);
+            if(shared?increment>shared->maximum()-shared->count():increment>object.maximum-object.count)return refuse_release(1);
             const auto previous=arg(2);
             if(previous){try{memory.check(GuestAddress{previous},4,Access::Write);}catch(...){return false;}}
             const auto same_object=[&](std::uint64_t handle){
@@ -3073,9 +3093,17 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
                 (void)id;if(other.status!=ThreadStatus::Waiting)continue;
                 if(std::any_of(other.wait.handles.begin(),other.wait.handles.end(),same_object)){waiters=true;break;}
             }
-            if(previous)memory.store(GuestAddress{previous},32,object.count);
-            detail::debug_semaphore(waiters?"c-release-resolve":"c-release",arg(0),object.count,object.count+increment,key);
-            object.count+=increment;value=1;
+            if(shared){
+                std::uint32_t before{};
+                if(shared->release(increment,&before))return false;
+                if(previous)memory.store(GuestAddress{previous},32,before);
+                detail::debug_semaphore(waiters?"c-shared-release-resolve":"c-shared-release",arg(0),before,before+increment,key);
+            }else{
+                if(previous)memory.store(GuestAddress{previous},32,object.count);
+                detail::debug_semaphore(waiters?"c-release-resolve":"c-release",arg(0),object.count,object.count+increment,key);
+                object.count+=increment;
+            }
+            value=1;
             if(waiters)(void)resolve_thread_waits(memory,ThreadWakeScope::Objects);
         }else if(wait_service){
             const bool multiple=symbol.find("Multiple")!=std::string_view::npos;
@@ -3751,7 +3779,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
         }
     }
     else if(symbol=="HeapCreate") {
-        if(dword(0)&~1U)fail(50);
+        // HEAP_NO_SERIALIZE(1)、HEAP_GENERATE_EXCEPTIONS(4)、HEAP_CREATE_ALIGN_16(0x10000)、HEAP_CREATE_ENABLE_EXECUTE(0x40000)；
+        // 本實作的區塊本來就 16 位元組對齊。其他旗標與 Windows 相同保留不用。
+        if(dword(0)&~0x50005U)fail(87);
         else if(arg(1)>memory.limit() || arg(2)>UINT64_MAX-4095 || (arg(2) && arg(1)>arg(2)))fail(8);
         else if(const auto header=allocate_heap(memory,0x100);!header)fail(8);
         else {
@@ -3759,12 +3789,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
             memory.write(GuestAddress{header},std::vector<std::uint8_t>(0x100));write_heap_header(memory,header,(dword(0)&1U)|0x1000U|(arg(2)?0U:2U));
             returned=header;runtime_.private_heaps.emplace(returned,std::pair{arg(2)?(arg(2)+4095)&~UINT64_C(4095):0,UINT64_C(0)});if(dword(0)&1)runtime_.unserialized_heaps.insert(returned);
             // 可成長私有 heap（如靜態 CRT 的 _crtheap）可改用級距配置區；有上限者維持一般 heap 的容量契約。
-            if(guest_heap_chunked_ && !arg(2) && guest_heap_private_requested()){
+            if(dword(0)&4U)exception_heaps_.insert(returned);
+            // 可執行 heap 的區塊放在自己的 RWX 區域，不進 chunk 級距配置區（快速路徑只處理一般頁面）。
+            if(dword(0)&0x40000U)executable_heaps_.emplace(returned,ExecutableHeap{});
+            else if(guest_heap_chunked_ && !arg(2) && guest_heap_private_requested()){
                 guest_private_heaps_.emplace(returned,GuestPrivateHeap{});++guest_heap_topology_generation_;}}
     } else if(symbol=="HeapDestroy") {
         const auto heap=runtime_.private_heaps.find(arg(0));
         if(heap==runtime_.private_heaps.end())fail(6);
-        else {std::vector<std::uint64_t> pointers;for(const auto& [pointer,owner]:runtime_.heap_owners)if(owner==arg(0))pointers.push_back(pointer);
+        else {
+            if(const auto exec=executable_heaps_.find(arg(0));exec!=executable_heaps_.end()){
+                for(const auto& [base,size]:exec->second.regions){(void)size;(void)nested_service(state,memory,"kernel32.dll","VirtualFree",{base,0,0x8000});}
+                executable_heaps_.erase(exec);}
+            exception_heaps_.erase(arg(0));std::vector<std::uint64_t> pointers;for(const auto& [pointer,owner]:runtime_.heap_owners)if(owner==arg(0))pointers.push_back(pointer);
             for(const auto pointer:pointers)(void)free_heap(memory,pointer,state);
             // 釋放時可能進入快速清單；移除 heap 前把它的區塊全部歸還，頁面與用量帳目隨之結清。
             flush_heap_quick(memory,arg(0));heap_quick_bins_.erase(arg(0));guest_heap_destroy(memory,arg(0));runtime_.private_heaps.erase(heap);runtime_.heap_locks.erase(arg(0));runtime_.unserialized_heaps.erase(arg(0));
@@ -3787,10 +3824,60 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
         const auto allocation=allocations_.find(pointer);const auto owner=runtime_.heap_owners.find(pointer);
         const bool owned=allocation!=allocations_.end() && (owner==runtime_.heap_owners.end()?heap==process_heap:owner->second==heap);
         const auto flags_value=dword(1);const auto allowed=symbol=="HeapAlloc"?9U:symbol=="HeapReAlloc"?0x19U:1U;
-        if(valid && (symbol=="HeapAlloc" || symbol=="HeapReAlloc") && (flags_value&4))throw HostCallFault("尚未支援 HEAP_GENERATE_EXCEPTIONS 的記憶體不足例外");
+        // HEAP_GENERATE_EXCEPTIONS（呼叫旗標或建立 heap 時指定）：配置成功照常返回，失敗時引發 STATUS_NO_MEMORY（不回 NULL）。
+        const bool generate_exceptions=valid && (symbol=="HeapAlloc" || symbol=="HeapReAlloc") && ((flags_value&4U) || exception_heaps_.contains(heap));
+        const auto masked_flags=flags_value&~4U;
+        const auto raise_no_memory=[&]()->std::optional<std::uint32_t>{
+            auto caller=state;frame.return_to(caller,0);const std::array<std::uint64_t,0> none{};
+            begin_exception(caller,memory,0xc0000017U,0,none);state=caller;return std::nullopt;};
+        if(const auto exec=executable_heaps_.find(heap);exec!=executable_heaps_.end()){
+            // 可執行 heap：16 位元組級距，首次適配；不足時以 64 KiB 為單位取得 PAGE_EXECUTE_READWRITE 區域。
+            auto& h=exec->second;
+            const auto take=[&](std::uint64_t requested)->std::uint64_t {
+                const auto block=(std::max<std::uint64_t>(requested,1)+15)&~UINT64_C(15);
+                if(requested>memory.limit())return 0;
+                auto it=std::find_if(h.free.begin(),h.free.end(),[&](const auto& range){return range.second>=block;});
+                if(it==h.free.end()){
+                    const auto region=(block+0xffff)&~UINT64_C(0xffff);
+                    const auto base=nested_service(state,memory,"kernel32.dll","VirtualAlloc",{0,region,0x3000,0x40});
+                    if(!base)return 0;
+                    h.regions.emplace_back(base,region);it=h.free.emplace(base,region).first;
+                }
+                const auto address=it->first,available=it->second;h.free.erase(it);
+                if(available>block)h.free.emplace(address+block,available-block);
+                h.used.emplace(address,std::pair{requested,block});
+                memory.fill(GuestAddress{address},0,static_cast<std::size_t>(block));
+                return address;};
+            const auto give_back=[&](std::uint64_t address){
+                const auto used=h.used.find(address);auto begin=address,size=used->second.second;h.used.erase(used);
+                auto next=h.free.lower_bound(begin);
+                if(next!=h.free.begin()){const auto previous=std::prev(next);if(previous->first+previous->second==begin){begin=previous->first;size+=previous->second;h.free.erase(previous);}}
+                next=h.free.lower_bound(begin);
+                if(next!=h.free.end() && begin+size==next->first){size+=next->second;h.free.erase(next);}
+                h.free.emplace(begin,size);};
+            const auto found=h.used.find(pointer);
+            if(symbol=="HeapValidate")returned=!(flags_value&~1U) && (!pointer || found!=h.used.end());
+            else if(masked_flags&~allowed){fail(87);if(symbol=="HeapSize")returned=x86_?UINT32_MAX:UINT64_MAX;}
+            else if(symbol=="HeapAlloc"){returned=take(arg(2));if(!returned){if(generate_exceptions)return raise_no_memory();fail(8);}}
+            else if(!pointer && symbol=="HeapFree")returned=1;
+            else if(found==h.used.end()){fail(87);if(symbol=="HeapSize")returned=x86_?UINT32_MAX:UINT64_MAX;}
+            else if(symbol=="HeapFree"){give_back(pointer);returned=1;}
+            else if(symbol=="HeapSize")returned=found->second.first;
+            else if(arg(3)<=found->second.second){
+                // 縮小或仍在原區塊內：原地調整；HEAP_ZERO_MEMORY 時新增的部分清零（區塊其餘部分本來就是 0 或舊資料）。
+                if((flags_value&8U) && arg(3)>found->second.first)memory.fill(GuestAddress{pointer+found->second.first},0,static_cast<std::size_t>(arg(3)-found->second.first));
+                found->second.first=arg(3);returned=pointer;}
+            else if(flags_value&0x10U){if(generate_exceptions)return raise_no_memory();fail(8);}
+            else {
+                const auto old_size=found->second.first;const auto moved=take(arg(3));
+                if(!moved){if(generate_exceptions)return raise_no_memory();fail(8);}
+                else {std::vector<std::uint8_t> bytes(static_cast<std::size_t>(old_size));memory.read(GuestAddress{pointer},bytes);memory.write(GuestAddress{moved},bytes);give_back(pointer);returned=moved;}
+            }
+            frame.return_to(state,returned);return std::nullopt;
+        }
         // 驗證失敗不設定 LastError，也不能先以尺寸查詢解讀尚未驗證的指標。
         if(symbol=="HeapValidate")returned=valid && !(flags_value&~allowed) && validate_heap(memory,heap,pointer);
-        else if(!valid || (flags_value&~allowed)){fail(87);if(symbol=="HeapSize")returned=x86_?UINT32_MAX:UINT64_MAX;}
+        else if(!valid || (masked_flags&~allowed)){fail(87);if(symbol=="HeapSize")returned=x86_?UINT32_MAX:UINT64_MAX;}
         else if(symbol=="HeapAlloc"){
             // x86 process heap 與可成長私有 heap 的小型配置由 chunk 級距配置區提供（O(1) 串列，不經位址搜尋與
             // 存活物件樹）；HeapFree／HeapSize／HeapReAlloc／HeapValidate 依位址與 chunk 擁有者辨識這些區塊。
@@ -3831,6 +3918,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
         else if(symbol=="HeapSize")returned=allocation->second;
         else if(arg(3)<=allocation->second)returned=pointer;
         else if(!(flags_value&0x10))returned=reallocate_heap(memory,pointer,arg(3),state);
+        if(generate_exceptions && !returned && valid && !(masked_flags&~allowed))return raise_no_memory();
     } else if (symbol == "CreateFileW" || symbol=="CreateFileA" || symbol=="CreateFile2") {
         // 診斷：X64ARM_TRACE_FILE_OPEN=1 列出開檔路徑、存取／共用／建立方式與結果（含 LastError）。
         static const bool trace_open=std::getenv("X64ARM_TRACE_FILE_OPEN")!=nullptr;

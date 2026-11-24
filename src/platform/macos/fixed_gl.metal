@@ -114,3 +114,31 @@ vertex O fixed_vertex_main(const device FixedV* vertices [[buffer(0)]],constant 
  position.z=2*position.z-position.w;position.z=(position.z+position.w)*0.5;
  O out;out.secondary=vertices[id].secondary;out.position=position;out.color=clamp(vertices[id].color,0.0f,1.0f);out.texcoord=vertices[id].texcoord;out.eyeZ=eye.z;out.point=1;out.stipple=0;return out;
 }
+
+// glBlitFramebuffer：全螢幕三角形，片段依目的像素中心反推來源位置（含鏡像、縮放與上下翻轉）。
+// p[0]＝目的矩形起點與每個目的像素對應的來源步長；p[1]＝來源矩形起點，z／w 為來源／目的是視窗時的翻轉高度（0 表示 framebuffer 物件，列序與 GL 相同）；
+// p[2]＝來源 mip 層的寬高與層級。遮罩、混色與深度模板測試都不套用（剪裁由 encoder 的剪裁矩形處理）。
+struct BlitPosition {float4 position [[position]];};
+vertex BlitPosition blit_vertex(uint id [[vertex_id]]){
+ const float2 uv=float2((id<<1)&2,id&2);BlitPosition out;out.position=float4(uv*2-1,0,1);return out;
+}
+static float2 blit_source(float4 position,constant float4* p){
+ const float2 g=float2(position.x,p[1].w>0?p[1].w-position.y:position.y);
+ float2 s=p[1].xy+(g-p[0].xy)*p[0].zw;if(p[1].z>0)s.y=p[1].z-s.y;return s;
+}
+static uint2 blit_texel(float4 position,constant float4* p){return uint2(clamp(floor(blit_source(position,p)),float2(0),p[2].xy-1));}
+fragment float4 blit_color(BlitPosition in [[stage_in]],texture2d<float> source [[texture(0)]],sampler smp [[sampler(0)]],constant float4* p [[buffer(0)]]){
+ return source.sample(smp,blit_source(in.position,p)/p[2].xy,level(p[2].w));
+}
+struct BlitDepth {float depth [[depth(any)]];};
+fragment BlitDepth blit_depth(BlitPosition in [[stage_in]],depth2d<float> depth [[texture(0)]],constant float4* p [[buffer(0)]]){
+ BlitDepth out;out.depth=depth.read(blit_texel(in.position,p),uint(p[2].w));return out;
+}
+struct BlitStencil {uint stencil [[stencil]];};
+fragment BlitStencil blit_stencil(BlitPosition in [[stage_in]],texture2d<uint> stencil [[texture(1)]],constant float4* p [[buffer(0)]]){
+ BlitStencil out;out.stencil=stencil.read(blit_texel(in.position,p),uint(p[2].w)).r;return out;
+}
+struct BlitDepthStencil {float depth [[depth(any)]];uint stencil [[stencil]];};
+fragment BlitDepthStencil blit_depth_stencil(BlitPosition in [[stage_in]],depth2d<float> depth [[texture(0)]],texture2d<uint> stencil [[texture(1)]],constant float4* p [[buffer(0)]]){
+ const uint2 t=blit_texel(in.position,p);const uint lod=uint(p[2].w);BlitDepthStencil out;out.depth=depth.read(t,lod);out.stencil=stencil.read(t,lod).r;return out;
+}

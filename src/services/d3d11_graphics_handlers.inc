@@ -522,7 +522,12 @@
             }
             else{
                 const bool array=dimension==3 || dimension==5 || dimension==7,msaa=dimension==6 || dimension==7;
-                require(d.dimension==2?(dimension==2 || dimension==3):d.dimension==3?(d.samples>1?msaa:(dimension==4 || dimension==5 || (srv && (dimension==9 || dimension==10)))):dimension==8);
+                // 單一樣本、單一 mip 的貼圖可用多重取樣維度建立 RTV／DSV（多重取樣資源本來就只有一層 mip，語義與第 0 層的 2D view 相同；
+                // DXVK 同樣接受）。《女神異聞錄 4 黃金版》開啟 MSAA 設定時對單一樣本的深度貼圖建立 TEXTURE2DMS 的 DSV。描述元欄位仍依
+                // 多重取樣版面讀取，後端改用一般 2D view；有多層 mip 的貼圖與 SRV（著色器端型別不同）仍拒絕。
+                const bool single_sample_msaa=msaa && d.dimension==3 && d.samples<=1 && d.levels==1 && (rtv || dsv);
+                require(d.dimension==2?(dimension==2 || dimension==3):d.dimension==3?(d.samples>1?msaa:(single_sample_msaa || dimension==4 || dimension==5 || (srv && (dimension==9 || dimension==10)))):dimension==8);
+                if(single_sample_msaa)v.dimension=dimension==6?4U:5U;
                 v.level=msaa?0:word(desc,base);v.levels=srv && !msaa?word(desc,12):1;
                 require(v.level<d.levels);
                 if(v.levels==UINT32_MAX){v.levels=d.levels-v.level;put_word(desc,12,v.levels);}if(!v.levels)v.levels=1;

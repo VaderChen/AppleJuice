@@ -1,7 +1,8 @@
         // Sprite 經共用 D3D9 DrawPrimitiveUP 繪製；字型共用既有 GDI 排版與原生字形光柵化。
         bool sprite_handled=symbol.starts_with("Sprite.") || symbol.starts_with("Font.") || symbol.starts_with("Line.") || symbol=="D3DXCreateSprite" || symbol=="D3DXCreateLine" || symbol.starts_with("D3DXCreateFont");
         std::vector<std::uint64_t> scratch_allocations;
-        struct ScratchCleanup {std::function<void()> cleanup;~ScratchCleanup(){cleanup();}} scratch_cleanup{[&](){for(auto pointer:scratch_allocations)(void)free_heap(memory,pointer,state);}};
+        const auto scratch_release=[&](){for(auto pointer:scratch_allocations)(void)free_heap(memory,pointer,state);};
+        struct ScratchCleanup {const decltype(scratch_release)& cleanup;~ScratchCleanup(){cleanup();}} scratch_cleanup{scratch_release};
         const auto temporary=[&](std::span<const std::uint8_t> bytes){const auto pointer=allocate_heap(memory,std::max<std::size_t>(bytes.size(),8));require(pointer!=0,out_of_memory);scratch_allocations.push_back(pointer);if(!bytes.empty())memory.write(GuestAddress{pointer},bytes);return pointer;};
         const auto local_call=[&](std::string_view family,std::string_view name,std::span<const std::uint64_t> arguments){
             auto local=state;const auto stack=temporary(std::vector<std::uint8_t>(128))+8;local.reg(Gpr::Rsp)=stack;

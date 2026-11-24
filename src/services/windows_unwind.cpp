@@ -4,6 +4,7 @@
 #include "x64arm/decoder.hpp"
 #include "x64arm/startup_profile.hpp"
 #include <algorithm>
+#include <optional>
 #include <set>
 
 namespace x64arm {
@@ -371,7 +372,28 @@ void write_context(GuestMemory& memory, std::uint64_t address, const GuestState&
     memory.store(GuestAddress{address + 280}, 32, state.mxcsr); memory.store(GuestAddress{address + 284}, 32, 0xffff);
     for (std::size_t i = 0; i < 16; ++i) memory.write(GuestAddress{address + 416 + i * 16}, state.xmm[i]);
 }
+namespace {
+GuestState read_context_flags(const GuestMemory& memory, std::uint64_t address, const GuestState& previous, std::optional<std::uint32_t> forced);
+}
 GuestState read_context(const GuestMemory& memory, std::uint64_t address, const GuestState& previous) {
+    return read_context_flags(memory,address,previous,std::nullopt);
+}
+GuestState read_context_registers(const GuestMemory& memory, std::uint64_t address, const GuestState& previous) {
+    if(memory.execution_mode()==ExecutionMode::X86)throw HostCallFault("RtlVirtualUnwind 僅支援 AMD64 CONTEXT");
+    // 只取控制與整數暫存器，再直接讀 XMM（展開會還原 XMM6～15）；MXCSR 與 x87 欄位不讀也不驗證（呼叫端可能未初始化）。
+    auto state=read_context_flags(memory,address,previous,0x100003U);
+    for (std::size_t i = 0; i < 16; ++i) memory.read(GuestAddress{address + 416 + i * 16}, state.xmm[i]);
+    return state;
+}
+void write_context_registers(GuestMemory& memory, std::uint64_t address, const GuestState& state) {
+    memory.check(GuestAddress{address},1232,Access::Write);
+    memory.store(GuestAddress{address + 68}, 32, state.rflags);
+    for (std::size_t i = 0; i < 16; ++i) memory.store(GuestAddress{address + 120 + i * 8}, 64, state.gpr[i]);
+    memory.store(GuestAddress{address + 248}, 64, state.rip.value);
+    for (std::size_t i = 0; i < 16; ++i) memory.write(GuestAddress{address + 416 + i * 16}, state.xmm[i]);
+}
+namespace {
+GuestState read_context_flags(const GuestMemory& memory, std::uint64_t address, const GuestState& previous, std::optional<std::uint32_t> forced) {
     if(memory.execution_mode()==ExecutionMode::X86){
         memory.check(GuestAddress{address},716,Access::Read);auto state=previous;state.rep_compare={};
         const auto flags=memory.load(GuestAddress{address},32);if(!(flags&0x10000))throw HostCallFault("CONTEXT 缺少 i386 標記");
@@ -401,7 +423,7 @@ GuestState read_context(const GuestMemory& memory, std::uint64_t address, const 
     }
     // CONTEXT 只包含架構狀態；外部還原後重新開始 REP，不能沿用宿主切片的續跑資訊。
     memory.check(GuestAddress{address}, 1232, Access::Read); auto state = previous;state.rep_compare={};
-    const auto flags_value = memory.load(GuestAddress{address + 48}, 32);
+    const auto flags_value = forced?*forced:static_cast<std::uint32_t>(memory.load(GuestAddress{address + 48}, 32));
     if (!(flags_value & 0x100000)) throw HostCallFault("CONTEXT 缺少 AMD64 標記");
     if(flags_value&0x10){
         std::array<std::uint64_t,6> debug{};for(std::size_t i=0;i<6;++i)debug[i]=memory.load(GuestAddress{address+72+i*8},64);
@@ -435,5 +457,6 @@ GuestState read_context(const GuestMemory& memory, std::uint64_t address, const 
         for (std::size_t i = 0; i < 16; ++i) memory.read(GuestAddress{address + 416 + i * 16}, state.xmm[i]);
     }
     return state;
+}
 }
 }
