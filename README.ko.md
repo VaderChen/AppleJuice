@@ -169,6 +169,7 @@ AppleJuice 라이브러리에 등록된 게임은 EXE별로 저장한 표시 설
 | Memelis' RPG | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | Romance of the Three Kingdoms VII with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | Romance of the Three Kingdoms XII with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
+| 위쳐 3: 와일드 헌트 차세대 | x64 | D3D12 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | WinRAR | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 고스트 오브 쓰시마 디렉터스 컷 | x64 | D3D12 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="원활 (MetalFX)" title="원활 (MetalFX)"> |
 | 라이즈 오브 더 툼 레이더 | x64 | D3D11 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="원활 (MetalFX)" title="원활 (MetalFX)"> |
@@ -179,7 +180,6 @@ AppleJuice 라이브러리에 등록된 게임은 EXE별로 저장한 표시 설
 | 컨트롤 얼티밋 에디션 | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 파이널 판타지 XIII | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 테일즈 오브 베르세리아 | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
-| 위쳐 3: 와일드 헌트 차세대 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | It Takes Two | x64 | D3D11(Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |

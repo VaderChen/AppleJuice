@@ -163,6 +163,7 @@ AppleJuice のライブラリに登録したゲームは、EXE ごとの表示�
 | デビル メイ クライ 5 | x64 | D3D12 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | ファイナルファンタジーIX | x64 | D3D9（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | ファイナルファンタジーVIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| ウィッチャー3 ワイルドハント 次世代版 | x64 | D3D12 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | 永恒的黄昏 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | 逆転裁判123 成歩堂セレクション | x86 | D3D11（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | 天穂のサクナヒメ | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
@@ -181,7 +182,6 @@ AppleJuice のライブラリに登録したゲームは、EXE ごとの表示�
 | Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | サイバーパンク2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | テイルズ オブ ベルセリア | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
-| ウィッチャー3 ワイルドハント 次世代版 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | 三國志VIII with パワーアップキット | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | 三國志IX with パワーアップキット | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | 三國志X with パワーアップキット | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
