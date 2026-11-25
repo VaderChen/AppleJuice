@@ -144,7 +144,11 @@ AppleJuice 라이브러리에 등록된 게임은 EXE별로 저장한 표시 설
 
 ## 실측 기록 / 2026-11-25 / 게임 총 37개
 
-<img src="docs/images/support-levels/good.png" width="16" height="16" alt="원활" title="원활"> 원활 26 · <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="원활 (MetalFX)" title="원활 (MetalFX)"> 원활 (MetalFX) 4 · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="저효율" title="저효율"> 저효율 13 · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="실행 가능" title="실행 가능"> 실행 가능 2 · <img src="docs/images/support-levels/none.png" width="16" height="16" alt="미작동·작업 중" title="미작동·작업 중"> 미작동·작업 중 2
+- <img src="docs/images/support-levels/good.png" width="16" height="16" alt="원활" title="원활"> 원활: 26
+- <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="원활 (MetalFX)" title="원활 (MetalFX)"> 원활 (MetalFX): 4
+- <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="저효율" title="저효율"> 저효율: 13
+- <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="실행 가능" title="실행 가능"> 실행 가능: 2
+- <img src="docs/images/support-levels/none.png" width="16" height="16" alt="미작동·작업 중" title="미작동·작업 중"> 미작동·작업 중: 2
 
 **[전체 목록 보기(언어 전환, 지원 수준별 탭)](https://vaderchen.github.io/AppleJuice/tested/?lang=ko)**
 

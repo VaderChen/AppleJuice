@@ -144,7 +144,11 @@ AppleJuice のライブラリに登録したゲームは、EXE ごとの表示�
 
 ## 動作確認の記録 / 2026-11-25 / 全 37 本のゲーム
 
-<img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好" title="良好"> 良好 26 · <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="良好（MetalFX）" title="良好（MetalFX）"> 良好（MetalFX） 4 · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="低効率" title="低効率"> 低効率 13 · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="起動可" title="起動可"> 起動可 2 · <img src="docs/images/support-levels/none.png" width="16" height="16" alt="動作不可・対応中" title="動作不可・対応中"> 動作不可・対応中 2
+- <img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好" title="良好"> 良好：26
+- <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="良好（MetalFX）" title="良好（MetalFX）"> 良好（MetalFX）：4
+- <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="低効率" title="低効率"> 低効率：13
+- <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="起動可" title="起動可"> 起動可：2
+- <img src="docs/images/support-levels/none.png" width="16" height="16" alt="動作不可・対応中" title="動作不可・対応中"> 動作不可・対応中：2
 
 **[一覧を見る（言語切り替え・対応状況別タブ）](https://vaderchen.github.io/AppleJuice/tested/?lang=ja)**
 
