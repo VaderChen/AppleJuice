@@ -16,45 +16,29 @@
 - **優先使用原生 ARM64 指令**：在維持 x86／x64 指令語義與程式行為正確的前提下，盡量使用 Apple Silicon 原生 ARM64 與 NEON 向量運算。
 - **運用原生硬體加速**：圖形與 GPU 運算優先使用 Metal，影片等工作負載盡量使用 macOS 原生框架與可用的硬體加速。
 
-## Geekbench 7 單核心整體時間
+## Geekbench 7 CPU 分數
 
-2026-11-02 更新：於 Apple M4 Pro、64 GiB 記憶體、macOS 27.0.1，以 Launcher 0.26.1102（build 122）重新量測 Geekbench 7.0.0 Pro（build 703423）的 16 個單核心測項；原生 ARM64 與 Rosetta 沿用 2026-10-23 的量測數值。全部循序執行，每個程序使用一個核心、一次暖機及三次正式迭代，三方官方工作量逐項相同。
+2026-11-25 在同一台 Apple M4 Pro（64 GB，macOS 27.2.1）測試 Geekbench 7.0.0 Pro（build 703423）。AppleJuice 使用 Launcher 0.26.1125（build 1313）執行 Windows x86_64 版，Rosetta 2 執行 macOS x86_64 版，原生使用 macOS ARM64 版。
 
-**各測項以自己的原生 ARM64 整體時間定為 1.0，倍率越低越快。** 整體時間從程序啟動量到結束，包含初始化、校準、暖機、正式測試及程序內結果寫入；不計入量測工具準備輸入、等待空閒與退出後清理的時間。四張圖採相同 Y 軸尺度，每張呈現四個測項。
+三方各取一輪完整測試。每個測項暖機一次、計分三次，圖表直接採用 Geekbench 匯出的官方分數，分數越高越好。1 CPU 涵蓋 16 個單核測項，2 CPU 與 4 CPU 各涵蓋 8 個多核測項。CPU 數依各測項實際使用的工作執行緒數標示。
 
-AppleJuice 執行 Windows x86_64 版本，Rosetta 執行 macOS x86_64 版本，原生執行 macOS ARM64 版本。AppleJuice 採全部有效程序的算術平均：各項兩次，共 32 次。原生 ARM64 各項一次；Rosetta 的 HDR 採三次重測平均，其餘測項各一次。三方量測時段與樣本數不同，且包含外部負載，圖表呈現實測狀態，不宣稱統計顯著。整體時間直接取自量測，未套用運算效率改善百分比。
+| CPU 配置 | AppleJuice | Rosetta 2 | 原生 ARM64 |
+|---:|---:|---:|---:|
+| 1 CPU | 1,387 | 1,281 | 3,057 |
+| 2 CPU | 2,251 | 2,100 | 5,604 |
+| 4 CPU | 4,137 | 3,990 | 10,784 |
 
-原生 ARM64 版本在開始測試前收集系統資訊約需 4.6 秒，Rosetta 約需 1.6 秒，因此部分測項的 Rosetta 整體時間短於原生；各測項的正式運算時間仍以原生最快。
+![1 CPU、2 CPU、4 CPU 的總分](docs/images/geekbench7-scores-2026-11-25/cpu.png)
 
-**Clang 進度更新：** AppleJuice 整體時間由 **17.96 秒降至 12.83 秒，縮短 28.56%**，原生正規化倍率由 **1.55× 降至 1.11×**。此項採截至目前已採用成品的四次有效正式程序平均；僅更新 Clang 的 AppleJuice 圖柱，原生／Rosetta 基準與其他測項維持原資料。
+### 各測項分數
 
-![整體時間倍率：File Compression、Navigation、HTML5 Browser、PDF Viewer](docs/images/geekbench7-single-core-2026-11-02/chart-1.png)
+![1 CPU · File Compression, Navigation, HTML5 Browser, PDF Viewer, Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-scores-2026-11-25/1-worker-1.png)
 
-![整體時間倍率：Photo Library、Clang、Text Processing、Asset Compression](docs/images/geekbench7-single-core-2026-11-02/chart-2.png)
+![1 CPU · HDR, Photo Editor, Ray Tracer, Structure from Motion, Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-scores-2026-11-25/1-worker-2.png)
 
-![整體時間倍率：HDR、Photo Editor、Ray Tracer、Structure from Motion](docs/images/geekbench7-single-core-2026-11-02/chart-3.png)
+![2 CPU · File Compression, Photo Library, Clang, Text Processing, Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-scores-2026-11-25/2-worker-1.png)
 
-![整體時間倍率：Game Physics、Video Encoder、Audio Encoder、Video Player](docs/images/geekbench7-single-core-2026-11-02/chart-4.png)
-
-## Geekbench 7 多核心整體時間
-
-2026-11-03 於同一台 Apple M4 Pro（macOS 27.0.1），以 Launcher 0.26.1103（build 1052，即 GitHub Release 版本）量測 Geekbench 7.0.0 Pro（build 703423）官方提供多核模式的 8 個測項，分別以 2 核與 4 核執行。三方使用相同的 worker 數、一次暖機及三次正式迭代，官方工作量逐項相同；同一核心數的原生 ARM64、Rosetta 與本專案在同一時段交錯量測。
-
-計算方式與單核圖相同：**各測項以自己的原生 ARM64 整體時間定為 1.0，倍率越低越快**，整體時間從程序啟動量到結束。2 核與 4 核共四張圖採相同 Y 軸尺度，每張呈現四個測項。
-
-本專案各項兩次取算術平均，原生 ARM64 與 Rosetta 各一次；正式量測前三方各先暖機一次，不計入結果。量測期間主機另有其他程式在執行；執行期間負載異常升高、受其他工作干擾的結果已排除並重新量測。圖表呈現實測狀態，不宣稱統計顯著。
-
-與單核相同，原生 ARM64 版本收集系統資訊較久，因此 File Compression、Text Processing、HDR 的 Rosetta 整體時間短於原生；各測項的正式運算時間仍以原生最快。
-
-**Clang 進度更新：** 以單核進度圖相同的已採用成品補測，2 核整體時間由 **90.54 秒降至 79.34 秒，縮短 12.37%**；4 核由 **55.33 秒降至 50.15 秒，縮短 9.37%**。原生正規化倍率分別由 **2.19× 降至 1.92×**、**2.12× 降至 1.92×**。每個核心數先暖機一個程序，再取兩次有效正式程序平均；每個程序一次暖機及三次正式迭代，客體記憶體為 8 GiB。僅更新 Clang 的 AppleJuice 圖柱，其他測項與原生／Rosetta 基準沿用原資料；新舊量測時段不同，新量測含背景客體負載，未偵測編譯或獨立探針干擾，不宣稱統計顯著。
-
-![2 核整體時間倍率：File Compression、Photo Library、Clang、Text Processing](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-1.png)
-
-![2 核整體時間倍率：Asset Compression、HDR、Photo Editor、Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-2.png)
-
-![4 核整體時間倍率：File Compression、Photo Library、Clang、Text Processing](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-1.png)
-
-![4 核整體時間倍率：Asset Compression、HDR、Photo Editor、Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-2.png)
+![4 CPU · File Compression, Photo Library, Clang, Text Processing, Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-scores-2026-11-25/4-worker-1.png)
 
 ## 開始使用
 

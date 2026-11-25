@@ -14,45 +14,29 @@ AppleJuice は、Apple Silicon Mac 上で対応する Windows アプリケーシ
 - **ネイティブ ARM64 命令を優先する**：x86／x64 命令の意味とアプリケーションの動作を保ちながら、Apple Silicon の ARM64 命令と NEON ベクトル演算を可能な限り使用します。
 - **ネイティブのハードウェアアクセラレーションを使う**：描画と GPU 計算には Metal を優先し、動画処理などには macOS のフレームワークと利用可能なハードウェア支援を活用します。
 
-## Geekbench 7 シングルコアの総経過時間
+## Geekbench 7 CPU スコア
 
-2026 年 11 月 2 日、Apple M4 Pro、メモリ 64 GiB、macOS 27.0.1 の環境で、AppleJuice Launcher 0.26.1102（build 122）を使って Geekbench 7.0.0 Pro（build 703423）の 16 個のシングルコア測定項目を測定しました。ネイティブ ARM64 と Rosetta の値は 2026 年 10 月 23 日の測定値です。すべて順番に実行し、各プロセスは 1 コアを使用し、ウォームアップ 1 回と本測定 3 回を行いました。公式の作業量は 3 者で項目ごとに同一です。
+2026年11月25日、同じ Apple M4 Pro（64 GB、macOS 27.2.1）で Geekbench 7.0.0 Pro（build 703423）を測定しました。AppleJuice では Launcher 0.26.1125（build 1313）で Windows x86_64 版を、Rosetta 2 では macOS x86_64 版を、ネイティブ環境では macOS ARM64 版を実行しました。
 
-**各項目のネイティブ ARM64 の総経過時間を 1.0 としています。倍率が低いほど高速です。** 総経過時間はプロセスの起動から終了までで、初期化、キャリブレーション、ウォームアップ、本測定、プロセス内の結果書き込みを含みます。計測ツールによる入力準備、アイドル待機、終了後の後処理は含みません。4 枚のグラフは同じ Y 軸スケールを使い、それぞれ 4 項目を示します。
+各環境で CPU 構成ごとに全項目を1回測定し、各項目はウォームアップ1回、計測3回としました。グラフの値は Geekbench が出力した公式スコアで、高いほど高速です。1 CPU はシングルコアの16項目、2 CPU と 4 CPU はマルチコア対応の8項目です。CPU 数は各項目で実際に使用したワーカースレッド数です。
 
-AppleJuice は Windows x86_64 版、Rosetta は macOS x86_64 版、ネイティブ実行は macOS ARM64 版を使用します。AppleJuice は有効な全プロセスの算術平均で、各項目 2 回、計 32 回です。ネイティブ ARM64 は各項目 1 回、Rosetta は HDR が 3 回の平均、その他の項目は各 1 回です。3 者の測定時期とサンプル数は異なり、外部負荷も含むため、グラフは実測結果を示すもので統計的な有意性は主張しません。総経過時間は測定値をそのまま使用し、演算効率の改善率は適用していません。
+| CPU 構成 | AppleJuice | Rosetta 2 | ネイティブ ARM64 |
+|---:|---:|---:|---:|
+| 1 CPU | 1,387 | 1,281 | 3,057 |
+| 2 CPU | 2,251 | 2,100 | 5,604 |
+| 4 CPU | 4,137 | 3,990 | 10,784 |
 
-ネイティブ ARM64 版はテスト開始前のシステム情報の収集に約 4.6 秒、Rosetta は約 1.6 秒かかります。そのため一部の項目では Rosetta の総経過時間がネイティブより短くなりますが、本測定の演算時間はすべての項目でネイティブが最速です。
+![1 CPU・2 CPU・4 CPU の総合スコア](docs/images/geekbench7-scores-2026-11-25/cpu.png)
 
-**Clang の進捗：** AppleJuice の総経過時間は **17.96 秒から 12.83 秒に短縮（28.56% 減）**し、ネイティブ比の倍率は **1.55× から 1.11×** に下がりました。この値は現時点で採用済みのビルドによる有効な本測定プロセス 4 回の平均です。更新したのは Clang の AppleJuice の棒のみで、ネイティブ／Rosetta の基準値とほかの測定項目は元のデータのままです。
+### 項目別スコア
 
-![総経過時間の倍率: File Compression, Navigation, HTML5 Browser, PDF Viewer](docs/images/geekbench7-single-core-2026-11-02/chart-1.png)
+![1 CPU · File Compression, Navigation, HTML5 Browser, PDF Viewer, Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-scores-2026-11-25/1-worker-1.png)
 
-![総経過時間の倍率: Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-single-core-2026-11-02/chart-2.png)
+![1 CPU · HDR, Photo Editor, Ray Tracer, Structure from Motion, Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-scores-2026-11-25/1-worker-2.png)
 
-![総経過時間の倍率: HDR, Photo Editor, Ray Tracer, Structure from Motion](docs/images/geekbench7-single-core-2026-11-02/chart-3.png)
+![2 CPU · File Compression, Photo Library, Clang, Text Processing, Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-scores-2026-11-25/2-worker-1.png)
 
-![総経過時間の倍率: Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-single-core-2026-11-02/chart-4.png)
-
-## Geekbench 7 マルチコアの総経過時間
-
-2026 年 11 月 3 日、同じ Apple M4 Pro（macOS 27.0.1）で、Launcher 0.26.1103（build 1052、GitHub Release 版）を使い、Geekbench 7.0.0 Pro（build 703423）が公式にマルチコアモードを提供する 8 項目を 2 コアと 4 コアでそれぞれ測定しました。3 者は同じワーカー数、ウォームアップ 1 回と本測定 3 回を使い、公式の作業量は項目ごとに同一です。同じコア数のネイティブ ARM64、Rosetta、AppleJuice は同じ時間帯に交互に測定しました。
-
-算出方法はシングルコアのグラフと同じです。**各項目のネイティブ ARM64 の総経過時間を 1.0 としています。倍率が低いほど高速です。** 総経過時間はプロセスの起動から終了までです。2 コアと 4 コアの計 4 枚のグラフは同じ Y 軸スケールを使い、それぞれ 4 項目を示します。
-
-AppleJuice は各項目 2 回の算術平均、ネイティブ ARM64 と Rosetta は各 1 回です。本測定の前に 3 者とも 1 回ウォームアップし、結果には含めていません。測定中はホストで他のプログラムも動作していました。実行中に他の作業の影響で負荷が大きく上昇した結果は除外し、測定し直しています。グラフは実測結果を示すもので、統計的な有意性は主張しません。
-
-シングルコアと同様に、ネイティブ ARM64 版はシステム情報の収集に時間がかかるため、File Compression、Text Processing、HDR では Rosetta の総経過時間がネイティブより短くなっています。本測定の演算時間はすべての項目でネイティブが最速です。
-
-**Clang の進捗：** シングルコアの進捗グラフと同じ採用済みビルドで再測定し、2 コアの総経過時間は **90.54 秒から 79.34 秒に短縮（12.37% 減）**、4 コアは **55.33 秒から 50.15 秒に短縮（9.37% 減）**しました。ネイティブ比の倍率はそれぞれ **2.19× から 1.92×**、**2.12× から 1.92×** に下がりました。コア数ごとに最初にウォームアップ用のプロセスを 1 回実行し、続く有効な本測定プロセス 2 回の平均を取りました。各プロセスはウォームアップ 1 回と本測定 3 回で、ゲストメモリは 8 GiB です。更新したのは Clang の AppleJuice の棒のみで、ほかの測定項目とネイティブ／Rosetta の基準値は元のデータのままです。新旧の測定は時間帯が異なり、新しい測定にはバックグラウンドのゲスト負荷が含まれます。ビルドや別のプローブによる干渉は検出されていませんが、統計的に有意とは主張しません。
-
-![2 コアの総経過時間の倍率: File Compression, Photo Library, Clang, Text Processing](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-1.png)
-
-![2 コアの総経過時間の倍率: Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-2.png)
-
-![4 コアの総経過時間の倍率: File Compression, Photo Library, Clang, Text Processing](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-1.png)
-
-![4 コアの総経過時間の倍率: Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-2.png)
+![4 CPU · File Compression, Photo Library, Clang, Text Processing, Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-scores-2026-11-25/4-worker-1.png)
 
 ## はじめに
 
