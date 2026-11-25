@@ -150,12 +150,12 @@ For a game already in the AppleJuice library, its EXE's saved display settings t
 | --- | --- | --- | :---: |
 | 7-Zip | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | BRAVELY DEFAULT II | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
+| DAVE THE DIVER | x64 | D3D11 (Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
+| Devil May Cry 5 | x64 | D3D12 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | DRAGON BALL Z: KAKAROT | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | DRAGON QUEST I & II HD-2D Remake | x64 | D3D12 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | DRAGON QUEST III HD-2D Remake | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | DRAGON QUEST VII Reimagined | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
-| DAVE THE DIVER | x64 | D3D11 (Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
-| Devil May Cry 5 | x64 | D3D12 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | FINAL FANTASY IX | x64 | D3D9 (Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | FINAL FANTASY VIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Geekbench 7 | x64 | CPU | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
@@ -166,7 +166,7 @@ For a game already in the AppleJuice library, its EXE's saved display settings t
 | Romance of the Three Kingdoms VII with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Romance of the Three Kingdoms XII with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Sakuna: Of Rice and Ruin | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
-| Stardew Valley | x64 | OpenGL (MonoGame) | <img src="docs/images/support-levels/good.png" width="16" height="16" alt="Works well" title="Works well"> |
+| Stardew Valley | x64 | OpenGL (MonoGame) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | The Witcher 3: Wild Hunt (Next-Gen) | x64 | D3D12 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Tomb Raider (2013) | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | WinRAR | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
@@ -180,11 +180,11 @@ For a game already in the AppleJuice library, its EXE's saved display settings t
 | Shadow of the Tomb Raider | x64 | D3D12 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="Works well (MetalFX)" title="Works well (MetalFX)"> |
 | 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Control Ultimate Edition | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
-| FINAL FANTASY XIII | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Cyberpunk 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
+| FINAL FANTASY XIII | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | It Takes Two | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
-| Romance of the Three Kingdoms VIII with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Romance of the Three Kingdoms IX with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
+| Romance of the Three Kingdoms VIII with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Romance of the Three Kingdoms X with Power Up Kit | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Romance of the Three Kingdoms XI with Power Up Kit | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Steam | x64 | Chromium (CEF) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
