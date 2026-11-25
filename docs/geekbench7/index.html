@@ -41,6 +41,20 @@ td:nth-child(4) .bar { background: var(--arm) }
   thead th { font-size: .8rem }
   tbody { font-size: .9rem }
 }
+.views { display: inline-flex; gap: .2rem; padding: .2rem; margin: .5rem 0; border: 1px solid var(--line); border-radius: .5rem; background: var(--soft) }
+.views a { padding: .38rem .95rem; border-radius: .3rem; text-decoration: none; color: var(--ink) }
+.views a[aria-current="page"] { background: var(--ink); color: var(--bg) }
+.chart-section { margin: 1.6rem 0 2.5rem }
+.chart-section h2 { margin: 0 0 .65rem; font-size: 1.3rem }
+.chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(22rem, 100%), 1fr)); gap: .75rem }
+.chart-grid figure { margin: 0; padding: .85rem 1rem 1rem; border: 1px solid var(--line); border-radius: .5rem }
+.chart-grid figcaption { margin-bottom: .5rem; font-weight: 650 }
+.plot-row { display: grid; grid-template-columns: 6.5em minmax(0, 1fr) 5ch; align-items: center; gap: .65rem; font-size: .88rem; margin-top: .2rem }
+.plot-row .track { border-inline-start: 1px solid var(--line); background: var(--soft) }
+.plot-row .fill { display: block; height: .75rem; background: var(--apple) }
+.plot-row:nth-of-type(2) .fill { background: var(--ros) }
+.plot-row:nth-of-type(3) .fill { background: var(--arm) }
+.plot-row .value { text-align: end; font-variant-numeric: tabular-nums }
 </style>
 </head>
 <body>
@@ -104,6 +118,8 @@ const translations = {
     "title": "Geekbench 7 各測項分數",
     "workload": "測項",
     "native": "原生 ARM64",
+    "chart": "長條圖",
+    "table": "表格",
     "method": "分數越高越好。每個測項暖機一次、計分三次。各組內的色條使用相同刻度。",
     "language": "顯示語言",
     "back": "返回 README",
@@ -129,6 +145,8 @@ const translations = {
   "en": {
     "locale": "en",
     "title": "Geekbench 7 workload scores",
+    "chart": "Bar charts",
+    "table": "Tables",
     "workload": "Workload",
     "native": "Native ARM64",
     "method": "Higher scores are better. Each workload ran once for warm-up and three times for scoring. Bars share a scale within each CPU configuration.",
@@ -156,6 +174,8 @@ const translations = {
   "ja": {
     "locale": "ja",
     "title": "Geekbench 7 項目別スコア",
+    "chart": "棒グラフ",
+    "table": "表",
     "workload": "測定項目",
     "native": "ネイティブ ARM64",
     "method": "スコアが高いほど高速です。各項目はウォームアップ1回、計測3回です。棒の長さは CPU 構成ごとに同じ尺度で表示します。",
@@ -183,6 +203,8 @@ const translations = {
   "ko": {
     "locale": "ko",
     "title": "Geekbench 7 항목별 점수",
+    "chart": "막대그래프",
+    "table": "표",
     "workload": "측정 항목",
     "native": "네이티브 ARM64",
     "method": "점수가 높을수록 성능이 좋습니다. 각 항목은 한 번 예열한 뒤 세 번 측정했습니다. 같은 CPU 구성 안에서는 막대 길이에 동일한 척도를 적용했습니다.",
@@ -226,6 +248,68 @@ back.textContent = "← " + text.back;
 if (lang !== "zh") back.href = "https://github.com/VaderChen/AppleJuice/blob/main/README." + lang + ".md";
 for (const header of document.querySelectorAll("[data-label]")) header.textContent = text[header.dataset.label];
 for (const cell of document.querySelectorAll("[data-workload]")) cell.textContent = text.names[Number(cell.dataset.workload)];
+// 圖表沿用已翻譯的表頭與資料列，避免維護第二份分數。
+const settings = new URLSearchParams(location.search);
+const tableView = settings.get("view") === "table";
+const urlFor = (language, asTable) => "?lang=" + language + (asTable ? "&view=table" : "");
+for (const link of document.querySelectorAll("nav a")) {
+  link.href = urlFor(new URL(link.href).searchParams.get("lang"), tableView);
+}
+const views = document.createElement("div");
+views.className = "views";
+for (const [label, asTable] of [[text.chart, false], [text.table, true]]) {
+  const link = document.createElement("a");
+  link.href = urlFor(lang, asTable);
+  link.textContent = label;
+  if (tableView === asTable) link.setAttribute("aria-current", "page");
+  views.append(link);
+}
+document.querySelector(".method").after(views);
+
+if (!tableView) {
+  for (const group of document.querySelectorAll(".group")) {
+    const table = group.querySelector("table");
+    const section = document.createElement("section");
+    section.className = "chart-section";
+    const heading = document.createElement("h2");
+    heading.textContent = table.caption.textContent;
+    const grid = document.createElement("div");
+    grid.className = "chart-grid";
+    const platforms = Array.from(table.tHead.rows[0].cells).slice(1);
+    const rows = Array.from(table.tBodies[0].rows);
+    const scores = rows.map(row => Array.from(row.cells).slice(1).map(cell =>
+      Number(cell.textContent.replaceAll(",", ""))));
+    const maximum = Math.max(...scores.flat());
+    rows.forEach((row, i) => {
+      const figure = document.createElement("figure");
+      const caption = document.createElement("figcaption");
+      caption.textContent = row.cells[0].textContent;
+      figure.append(caption);
+      platforms.forEach((platform, j) => {
+        const series = document.createElement("div");
+        series.className = "plot-row";
+        const name = document.createElement("span");
+        name.textContent = platform.textContent;
+        const track = document.createElement("span");
+        track.className = "track";
+        track.setAttribute("aria-hidden", "true");
+        const fill = document.createElement("span");
+        fill.className = "fill";
+        fill.style.width = (scores[i][j] / maximum * 100) + "%";
+        track.append(fill);
+        const value = document.createElement("span");
+        value.className = "value";
+        value.textContent = row.cells[j + 1].textContent;
+        series.append(name, track, value);
+        figure.append(series);
+      });
+      grid.append(figure);
+    });
+    section.append(heading, grid);
+    group.before(section);
+    group.hidden = true;
+  }
+}
 </script>
 </body>
 </html>
