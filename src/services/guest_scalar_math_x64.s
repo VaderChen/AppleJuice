@@ -57,7 +57,7 @@ Lreduce\@:
     cmovb ecx, r8d
     shl rax, cl
     sub r8d, ecx
-    mov edx, 0
+    xor edx, edx
     div r10
     mov rax, rdx
     test rax, rax
@@ -550,20 +550,24 @@ _guest_malloc_end:
 _guest__aligned_malloc:
     test rcx, rcx
     je Laligned_malloc_slow
-    lea rax, [rdx - 1]
-    cmp rax, 15
-    ja Laligned_malloc_slow
-    test rax, rdx
-    jne Laligned_malloc_slow
     mov r10, qword ptr [rip + Laligned_malloc_cell]
     test r10, r10
     je Laligned_malloc_slow
+    mov r9d, dword ptr [r10 + 36]
+    lea rax, [rdx - 1]
+    cmp rax, r9
+    ja Laligned_malloc_slow
+    test rax, rdx
+    jne Laligned_malloc_slow
     cmp rcx, qword ptr [r10 + 24]
     ja Laligned_malloc_slow
-    mov rax, rcx
-    // 入口已拒絕零大小；標頭與 payload 使用和 free 相同的級距。
+    mov eax, X64ARM_GUEST_HEAP_ALIGNED_HEADER
+    cmp rdx, rax
+    cmova rax, rdx
+    lea rax, [rcx + rax - X64ARM_GUEST_HEAP_ALIGNED_HEADER]
+    cmp rax, qword ptr [r10 + 24]
+    ja Laligned_malloc_slow
     add rax, X64ARM_GUEST_HEAP_ALIGNED_HEADER
-    jc Laligned_malloc_slow
     heap_size_class
     heap_cache_pop Laligned_malloc_hit, Laligned_malloc_global, r8, r11
 Laligned_malloc_global:
@@ -575,9 +579,21 @@ Laligned_malloc_global:
     mov qword ptr [r10 + rax*8 + 0x40], r11
     mov dword ptr [r10], 0
 Laligned_malloc_hit:
-    mov qword ptr [r8], rcx
-    mov qword ptr [r8 + 8], rdx
-    lea rax, [r8 + X64ARM_GUEST_HEAP_ALIGNED_HEADER]
+    mov qword ptr [r8], 0
+    mov eax, (X64ARM_GUEST_HEAP_ALIGNED_HEADER - 1)
+    lea r9, [rdx - 1]
+    cmp rdx, X64ARM_GUEST_HEAP_ALIGNED_HEADER
+    cmova rax, r9
+    lea r9, [r8 + rax + X64ARM_GUEST_HEAP_ALIGNED_HEADER]
+    not rax
+    and rax, r9
+    mov r9, rax
+    sub r9, r8
+    sub r9, X64ARM_GUEST_HEAP_ALIGNED_HEADER
+    shl r9, 32
+    or r9, rdx
+    mov qword ptr [rax - X64ARM_GUEST_HEAP_ALIGNED_HEADER], rcx
+    mov qword ptr [rax - 8], r9
     ret
 Laligned_malloc_empty:
     mov dword ptr [r10], 0
@@ -593,27 +609,44 @@ Laligned_malloc_slot:
 _guest__aligned_malloc_end:
 
 // free／_aligned_free：NULL 無動作；配置區指標（範圍與 chunk magic 皆符合）推回級距串列，其餘交回原服務。
-.macro heap_free_routine name, pointer=rcx, header=0
+.macro heap_free_routine name, pointer=rcx, aligned=0
 .p2align 6
 .globl _guest_\name
 _guest_\name:
     test rcx, rcx
     je Ldone\@
-.if \header
-    lea \pointer, [rcx - \header]
+.if \aligned
+    test cl, (X64ARM_GUEST_HEAP_ALIGNED_HEADER - 1)
+    jne Lslow\@
 .endif
     mov r10, qword ptr [rip + Lcell\@]
     test r10, r10
     je Lslow\@
-    mov rax, \pointer
+    mov rax, rcx
     sub rax, qword ptr [r10 + 8]
     cmp rax, qword ptr [r10 + 16]
     jae Lslow\@
-    mov r8, \pointer
+    mov r8, rcx
     and r8, -0x40000
     movabs r9, 0x50414548343658ab
     cmp qword ptr [r8], r9
     jne Lslow\@
+.if \aligned
+    lea rax, [r8 + 64 + X64ARM_GUEST_HEAP_ALIGNED_HEADER]
+    cmp rcx, rax
+    jb Lslow\@
+    mov edx, dword ptr [rcx - 4]
+    test dl, (X64ARM_GUEST_HEAP_ALIGNED_HEADER - 1)
+    jne Lslow\@
+    add edx, X64ARM_GUEST_HEAP_ALIGNED_HEADER
+    cmp rdx, qword ptr [r8 + 16]
+    jae Lslow\@
+    mov \pointer, rcx
+    sub \pointer, rdx
+    lea rax, [r8 + 64]
+    cmp \pointer, rax
+    jb Lslow\@
+.endif
     mov eax, dword ptr [r8 + 8]
     heap_cache_push \pointer, Lglobal\@, r9
     ret
@@ -637,7 +670,7 @@ Lslot\@:
 _guest_\name\()_end:
 .endm
 heap_free_routine free
-heap_free_routine _aligned_free, r11, 16
+heap_free_routine _aligned_free, r11, 1
 
 // _lock_locales／_unlock_locales：locale 鎖的客體快速路徑。cell 指向狀態格：+0 擁有者公開執行緒編號
 // （TEB+0x48）、+4 遞迴次數、+8 宿主登記的等待者數；0 表示未啟用，一律交回原服務。
@@ -733,6 +766,8 @@ _guest_HeapAlloc:
     mov rax, r8
     heap_size_class
     heap_cache_pop LHeapAlloc_got, LHeapAlloc_global, r9, r11
+LHeapAlloc_slow:
+    jmp qword ptr [rip + LHeapAlloc_slot]
 LHeapAlloc_global:
     heap_lock HeapAlloc, r9d
     mov r9, qword ptr [r10 + rax*8 + 0x40]
@@ -744,25 +779,24 @@ LHeapAlloc_global:
 LHeapAlloc_got:
     mov qword ptr [r9], 0
     mov rax, r9
-    test edx, 8
+    test dl, 8
     jne LHeapAlloc_zero
     ret
 LHeapAlloc_zero:
     // HEAP_ZERO_MEMORY：以 8-byte 寫入清除請求大小（級距大小為 16 的倍數，進位不超出區塊）。
-    lea r11, [r8 + 7]
-    shr r11, 3
+    lea rcx, [r8 + 7]
+    shr rcx, 3
     je LHeapAlloc_done
 LHeapAlloc_clear:
     mov qword ptr [r9], 0
     add r9, 8
-    dec r11
+    dec rcx
     jne LHeapAlloc_clear
 LHeapAlloc_done:
     ret
 LHeapAlloc_empty:
     mov dword ptr [r10], 0
-LHeapAlloc_slow:
-    jmp qword ptr [rip + LHeapAlloc_slot]
+    jmp LHeapAlloc_slow
     heap_lock_wait HeapAlloc
 .p2align 3
 LHeapAlloc_cell:

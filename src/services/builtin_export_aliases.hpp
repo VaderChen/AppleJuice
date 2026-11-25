@@ -189,6 +189,9 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
 #include "icu_idna_services.inc"
 #undef ICU_IDNA_QUERY
 #undef ICU_IDNA_API
+#define ICU_TIME_SCALE(name,wide) {"icuin.dll",#name,"icu.dll",#name},
+#include "icu_time_scale_services.inc"
+#undef ICU_TIME_SCALE
 #define ICU_MODERN_NUM_ALIAS_icu(name)
 #define ICU_MODERN_NUM_ALIAS_icuin(name) {"icuin.dll",#name,"icu.dll",#name},
 #define ICU_MODERN_NUM_API(name,count,wide,legacy) ICU_MODERN_NUM_ALIAS_##legacy(name)

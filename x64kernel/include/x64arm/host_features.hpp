@@ -36,4 +36,12 @@ inline bool host_arm64_rpres() {
     static const bool supported=host_arm64_afp() && host_features_detail::arm64_feature("hw.optional.arm.FEAT_RPRES");
     return supported;
 }
+inline bool host_arm64_dotprod() {
+    static const bool supported=host_features_detail::arm64_feature("hw.optional.arm.FEAT_DotProd");
+    return supported;
+}
+inline bool host_arm64_i8mm() {
+    static const bool supported=host_features_detail::arm64_feature("hw.optional.arm.FEAT_I8MM");
+    return supported;
+}
 }

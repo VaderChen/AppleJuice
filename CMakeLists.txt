@@ -235,7 +235,7 @@ target_sources(x64arm_windows PRIVATE src/services/windows_icu_character.cpp src
                                        src/services/windows_icu_number_objects.cpp src/services/windows_icu_date_format.cpp
                                        src/services/windows_icu_formatted.cpp src/services/windows_icu_modern_number.cpp
                                        src/services/windows_icu_charset_detection.cpp src/services/windows_icu_region.cpp
-                                       src/services/windows_icu_idna.cpp src/services/windows_icu_collation.cpp)
+                                       src/services/windows_icu_idna.cpp src/services/windows_icu_time_scale.cpp src/services/windows_icu_collation.cpp)
 add_library(x64arm_compound_file STATIC src/services/compound_file.cpp src/services/compound_file_read.cpp src/services/compound_file_write.cpp)
 target_include_directories(x64arm_compound_file PUBLIC include)
 target_link_libraries(x64arm_compound_file PRIVATE x64arm_options ICU::uc)

@@ -840,10 +840,14 @@ ExecutionPolicy WindowsServices::execution_policy(const GuestState &state) const
     // 宿主有其他工作負載時 vCPU worker 不再以繼承的 DEFAULT 被排到效率核或被搶占（《崛起》4 vCPU 敘利亞時好時壞 28～62 FPS）。
     // X64ARM_INTERACTIVE_QOS=0 關閉。
     static const bool interactive=[] {const auto* value=std::getenv("X64ARM_INTERACTIVE_QOS");return !value || std::string_view(value)!="0";}();
+    static const bool normal_qos=[] {const auto* value=std::getenv("X64ARM_NORMAL_QOS");return !value || std::string_view(value)!="0";}();
     const bool presented=interactive && __atomic_load_n(&present_thread_,__ATOMIC_RELAXED)!=0;
+    const bool foreground_normal=normal_qos &&
+        (!owner || owner->effective_priority(runtime_.process_priority_class,runtime_.process_background)>=0);
     return runtime_.process_priority_class==0x4000?ExecutionPolicy::Utility:
         runtime_.process_priority_class==0x8000?ExecutionPolicy::Responsive:
-        runtime_.process_priority_class==0x80?ExecutionPolicy::Interactive:presented?ExecutionPolicy::Responsive:ExecutionPolicy::Automatic;
+        runtime_.process_priority_class==0x80?ExecutionPolicy::Interactive:
+        (presented || foreground_normal)?ExecutionPolicy::Responsive:ExecutionPolicy::Automatic;
 }
 void WindowsServices::set_processor_count(GuestMemory &memory, unsigned count) {
     if (!count || count > (x86_ ? 32U : 64U) || count > host_physical_processors())

@@ -61,6 +61,8 @@
 #include "icu_region_guest.hpp"
 #include "guest_icu_idna_code.hpp"
 #include "icu_idna_guest.hpp"
+#include "guest_icu_time_scale_code.hpp"
+#include "icu_time_scale_guest.hpp"
 #include "guest_crt_mbc_code.hpp"
 #include "guest_crtdll_text_code.hpp"
 #include "crtdll_text_guest.hpp"
@@ -981,6 +983,8 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             std::span<const std::uint8_t>{icu_region::image_x64},u"[guest-icu-region]");
         initialize_guest_image(icu_idna::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_idna::image_x86}:
             std::span<const std::uint8_t>{icu_idna::image_x64},u"[guest-icu-idna]");
+        initialize_guest_image(icu_time_scale::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_time_scale::image_x86}:
+            std::span<const std::uint8_t>{icu_time_scale::image_x64},u"[guest-icu-time-scale]");
         static const bool mf_buffer_lowering=[] {const auto* v=std::getenv("X64ARM_GUEST_MF_BUFFER");return !v || std::string_view(v)!="0";}();
         if(mf_buffer_lowering && trace_services_.empty() && !startup_profile::enabled())
             mf_buffer::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value);
@@ -1453,6 +1457,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             static const bool charset_detection=read_setting("X64ARM_GUEST_ICU_CHARSET_DETECTION");
             static const bool region=read_setting("X64ARM_GUEST_ICU_REGION");
             static const bool idna=read_setting("X64ARM_GUEST_ICU_IDNA");
+            static const bool time_scale=read_setting("X64ARM_GUEST_ICU_TIME_SCALE");
             for(const auto base:{trie?icu_trie::image_address(x86_):0,string?icu_string::image_address(x86_):0,
                     text?icu_text::image_address(x86_):0,mapping?icu_case::image_address(x86_):0,
                     normalization?icu_normalization::image_address(x86_):0,
@@ -1462,7 +1467,8 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
                     date_format?icu_date_format::image_address(x86_):0,formatted?icu_formatted::image_address(x86_):0,
                     bidi?icu_bidi::image_address(x86_):0,
                     charset_detection?icu_charset_detection::image_address(x86_):0,
-                    region?icu_region::image_address(x86_):0,idna?icu_idna::image_address(x86_):0}){
+                    region?icu_region::image_address(x86_):0,idna?icu_idna::image_address(x86_):0,
+                    time_scale?icu_time_scale::image_address(x86_):0}){
                 if(!base)continue;
                 const auto image=runtime_.builtin_images.find(base);
                 if(image!=runtime_.builtin_images.end())
@@ -1649,6 +1655,7 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
                 icu_charset_detection::image_address(x86_),
                 icu_region::image_address(x86_),
                 icu_idna::image_address(x86_),
+                icu_time_scale::image_address(x86_),
                 windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,12),
                 x86_?crtdll_text::image_address:0})
             if(const auto image=runtime_.builtin_images.find(base);image!=runtime_.builtin_images.end())

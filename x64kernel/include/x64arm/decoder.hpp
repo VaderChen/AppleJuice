@@ -66,7 +66,10 @@ enum class Opcode {
     // RTM：不建立交易，XBEGIN 一律立即中止並跳至 fallback。
     TransactionBegin, TransactionEnd, TransactionAbort, TransactionTest,
     // VEX 浮點家族；沿用 avx_operation／avx_form／vector_bytes 描述，不移動既有 opcode。
-    AvxFloating, AvxFma, AvxMaskedMove, AvxGather, AvxPromoted, AvxHalf
+    AvxFloating, AvxFma, AvxMaskedMove, AvxGather, AvxPromoted, AvxHalf,
+    // AVX-VNNI 整數點積累加（VEX 128／256-bit，破壞式目的累加器）。
+    VectorDotUnsignedSignedBytes, VectorDotUnsignedSignedBytesSaturate,
+    VectorDotSignedWords, VectorDotSignedWordsSaturate
 };
 enum class TrailingBitOp : std::uint8_t { Blcfill, Blci, Blcic, Blcmsk, Blcs, Blsfill, Blsic, T1mskc, Tzmsk };
 enum class X87Op : std::uint8_t {
@@ -100,7 +103,7 @@ enum class AvxForm : std::uint8_t {
     None, Move, Unary, Binary, Extend, Broadcast, ZeroUpper, ZeroAll, VariableShift,
     UniformShift, UnaryImmediate, BinaryImmediate, BinaryMask, PermuteVariable,
     PermuteImmediate, PermuteLanes, InsertLane, ExtractLane, FusedScalar, FusedPacked,
-    Merge, Test, PermuteWithin
+    Merge, Test, PermuteWithin, Accumulate
 };
 struct Instruction {
     Opcode opcode{Opcode::Unsupported};

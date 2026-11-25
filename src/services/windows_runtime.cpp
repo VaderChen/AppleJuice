@@ -55,6 +55,7 @@ namespace x64arm {
 std::span<const WindowsServiceDescriptor> icu_charset_detection_service_descriptors();
 std::span<const WindowsServiceDescriptor> icu_region_service_descriptors();
 std::span<const WindowsServiceDescriptor> icu_idna_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_time_scale_service_descriptors();
 }
 
 namespace x64arm {
@@ -455,6 +456,7 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {icu_charset_detection_service_descriptors(), true, "icu_charset_detection_service_descriptors", &WindowsServices::invoke_icu_charset_detection},
             {icu_region_service_descriptors(), true, "icu_region_service_descriptors", &WindowsServices::invoke_icu_region},
             {icu_idna_service_descriptors(), true, "icu_idna_service_descriptors", &WindowsServices::invoke_icu_idna},
+            {icu_time_scale_service_descriptors(), true, "icu_time_scale_service_descriptors", &WindowsServices::invoke_icu_time_scale},
             {wlan_service_descriptors(), true, "wlan_service_descriptors", &WindowsServices::invoke_wlan},
             {font_package_service_descriptors(), true, "font_package_service_descriptors", &WindowsServices::invoke_font_package},
             {mci_service_descriptors(), false, "mci_service_descriptors", &WindowsServices::invoke_mci},
@@ -1298,6 +1300,11 @@ std::uint64_t guest_heap_request_limit() {
         return !setting || std::string_view(setting)!="0";}();
     return medium?guest_heap_limit:guest_heap_small_limit;
 }
+std::uint64_t guest_heap_aligned_limit() {
+    static const bool wide=[] {const auto* setting=std::getenv("X64ARM_GUEST_ALIGNED_HEAP_WIDE");
+        return !setting || std::string_view(setting)!="0";}();
+    return wide?UINT64_C(4096):guest_heap_aligned_header;
+}
 // callback 區的頁面偏移：0x80000 記憶體常式、0x81000 純量 CRT 常式、0x82000 執行緒常式、0x8b000 I/O、
 // 0x8c000 配置區狀態、0x8d000 CFG 常式、0x8e000–0x95fff CFG 表、0x96000 locale 鎖狀態。
 constexpr std::uint64_t guest_heap_state_page_offset=0x8c000,guest_locale_lock_page_offset=0x96000;
@@ -1332,11 +1339,23 @@ std::uint64_t guest_heap_block_size_impl(GuestMemory& memory,std::uint64_t addre
     return block;
 }
 AlignedAllocation guest_heap_aligned_allocation(GuestMemory& memory,std::uint64_t address) {
-    const auto base=address-guest_heap_aligned_header;
+    if(address<guest_heap_aligned_header || (address&(guest_heap_aligned_header-1)))
+        throw HostCallFault("對齊配置標頭不符");
+    const auto packed=memory.load(GuestAddress{address-8},64);
+    const auto alignment=packed&UINT64_C(0xffffffff),extra=packed>>32;
+    const auto max_alignment=guest_heap_aligned_limit();
+    const auto effective=std::max<std::uint64_t>(guest_heap_aligned_header,alignment);
+    if(!alignment || alignment>max_alignment || (alignment&(alignment-1)) || (address&(alignment-1)) ||
+       (extra&(guest_heap_aligned_header-1)) || extra>=effective || address<guest_heap_aligned_header+extra)
+        throw HostCallFault("對齊配置標頭不符");
+    const auto base=address-guest_heap_aligned_header-extra;
+    if((base&~(guest_heap_chunk-1))!=(address&~(guest_heap_chunk-1)) ||
+       ((base+guest_heap_aligned_header+effective-1)&~(effective-1))!=address)
+        throw HostCallFault("對齊配置標頭不符");
     const auto block=guest_heap_block_size_impl(memory,base);
-    const auto size=memory.load(GuestAddress{base},64),alignment=memory.load(GuestAddress{base+8},64);
-    if(block<=guest_heap_aligned_header || size>block-guest_heap_aligned_header ||
-       !alignment || alignment>16 || (alignment&(alignment-1)) || (address&(alignment-1)))
+    const auto size=memory.load(GuestAddress{address-guest_heap_aligned_header},64);
+    const auto overhead=address-base;
+    if(block<=overhead || size>block-overhead)
         throw HostCallFault("對齊配置標頭不符");
     return {base,size,alignment,0};
 }
@@ -1395,7 +1414,9 @@ bool WindowsServices::guest_heap_setup(GuestMemory& memory) {
         const auto state=GuestAddress{callback_return_.value+guest_heap_state_page_offset};
         std::vector<std::uint8_t> page(GuestMemory::guest_page_size,0);
         const auto put=[&](unsigned at,std::uint64_t value){for(unsigned n=0;n<8;++n)page[at+n]=static_cast<std::uint8_t>(value>>(8*n));};
-        put(8,base);put(16,0);put(24,guest_heap_request_limit()); // +16 已建立長度，隨補充增加
+        put(8,base);put(16,0);put(24,guest_heap_request_limit()); // +16 已建立長度，隨補充增加；+36 為對齊遮罩上限
+        const auto align_mask=static_cast<std::uint32_t>(guest_heap_aligned_limit()-1);
+        for(unsigned n=0;n<4;++n)page[36+n]=static_cast<std::uint8_t>(align_mask>>(8*n));
         memory.map(state,GuestMemory::guest_page_size,read_write,page);
         runtime_.virtual_regions.emplace(base,VirtualRegion{guest_heap_reservation,4U});
         guest_heap_state_=state;guest_heap_base_=base;guest_heap_size_=guest_heap_reservation;guest_heap_next_=base;
@@ -2801,21 +2822,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
                 // 直接終止客體；不得執行 CRT/FLS/TLS 清理或派送可攔截的 SEH/VEH。
                 return UINT32_C(0xc0000409);
             } else if (pointer && size <= previous_allocation->size) {
-                if(guest_heap_contains(pointer))memory.store(GuestAddress{previous_allocation->base},64,size);
+                if(guest_heap_contains(pointer))memory.store(GuestAddress{pointer-guest_heap_aligned_header},64,size);
                 else found->second.size = size;
                 result = pointer;
             } else {
                 const auto allocate = [&](std::uint64_t requested) -> std::uint64_t {
-                    // 與原生常式共享標頭，保存原始大小及對齊，供 msize／realloc／recalloc 使用。
+                    // 與原生常式共享標頭，保存原始大小及對齊／前置位移，供 msize／realloc／recalloc 使用。
                     // 額外保留至少一個 payload byte，避免 size=0 的回傳值落到下一區塊。
-                    if(!offset && alignment<=16 && requested<=guest_heap_request_limit()){
-                        const auto base=guest_heap_allocate(memory,std::max(UINT64_C(1),requested)+guest_heap_aligned_header);
+                    const auto max_aligned=guest_heap_aligned_limit();
+                    const auto effective_aligned=std::max<std::uint64_t>(guest_heap_aligned_header,alignment);
+                    const auto payload=std::max(UINT64_C(1),requested);
+                    if(!offset && alignment<=max_aligned && requested<=guest_heap_request_limit() &&
+                       payload+effective_aligned<=guest_heap_request_limit()+guest_heap_aligned_header){
+                        const auto base=guest_heap_allocate(memory,payload+effective_aligned);
                         if(base){
+                            const auto address=(base+guest_heap_aligned_header+effective_aligned-1)&~(effective_aligned-1);
+                            const auto extra=address-base-guest_heap_aligned_header;
                             try{
-                                memory.store(GuestAddress{base},64,requested);
-                                memory.store(GuestAddress{base+8},64,alignment);
+                                memory.store(GuestAddress{address-guest_heap_aligned_header},64,requested);
+                                memory.store(GuestAddress{address-8},64,(extra<<32)|alignment);
                             }catch(...){guest_heap_free(memory,base);throw;}
-                            return base+guest_heap_aligned_header;
+                            return address;
                         }
                     }
                     // 至少保留一個 pointer header，使回傳值與 malloc 的 base 必定不同。

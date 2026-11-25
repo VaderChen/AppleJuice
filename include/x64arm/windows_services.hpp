@@ -532,6 +532,7 @@ private:
     std::optional<std::uint32_t> invoke_icu_region(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<struct IcuIdnaState> icu_idna_;
     std::optional<std::uint32_t> invoke_icu_idna(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_icu_time_scale(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<NativeAngle> native_angle_;
     std::optional<std::uint32_t> invoke_angle(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<NativeV8> native_v8_;
