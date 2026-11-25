@@ -118,11 +118,11 @@ Select Steam in AppleJuice, set Spatial headphone mixing, 2× upscaling and Fram
 
 For a game already in the AppleJuice library, its EXE's saved display settings take priority. Games outside the library inherit the launcher's current display settings. Spatial audio is a global preference. The same process applies to other launchers without game-specific rules.
 
-## Tested applications / 2026-11-25 / 46 games / 5 tools
+## Tested applications / 2026-11-26 / 46 games / 5 tools
 
-- <img src="docs/images/support-levels/good.png" width="16" height="16" alt="Works well" title="Works well"> Works well: 27
+- <img src="docs/images/support-levels/good.png" width="16" height="16" alt="Works well" title="Works well"> Works well: 29
 - <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="Works well (MetalFX)" title="Works well (MetalFX)"> Works well (MetalFX): 5
-- <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="Slow" title="Slow"> Slow: 10
+- <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="Slow" title="Slow"> Slow: 8
 - <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="Launches" title="Launches"> Launches: 2
 - <img src="docs/images/support-levels/none.png" width="16" height="16" alt="Not working (WIP)" title="Not working (WIP)"> Not working (WIP): 2
 

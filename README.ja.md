@@ -118,11 +118,11 @@ AppleJuice で Steam を選択し、ヘッドフォン空間ミックス、2 倍
 
 AppleJuice のライブラリに登録したゲームは、EXE ごとの表示設定を優先します。未登録のゲームはランチャーの現在の表示設定を引き継ぎます。空間音声は全体設定です。同じ処理を他のランチャーにも適用し、ゲーム名による例外は設けません。
 
-## 動作確認の記録 / 2026-11-25 / 全 46 本のゲーム / ツール 5 本
+## 動作確認の記録 / 2026-11-26 / 全 46 本のゲーム / ツール 5 本
 
-- <img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好" title="良好"> 良好：27
+- <img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好" title="良好"> 良好：29
 - <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="良好（MetalFX）" title="良好（MetalFX）"> 良好（MetalFX）：5
-- <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="低効率" title="低効率"> 低効率：10
+- <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="低効率" title="低効率"> 低効率：8
 - <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="起動可" title="起動可"> 起動可：2
 - <img src="docs/images/support-levels/none.png" width="16" height="16" alt="動作不可・対応中" title="動作不可・対応中"> 動作不可・対応中：2
 
