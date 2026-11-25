@@ -145,8 +145,8 @@ For a game already in the AppleJuice library, its EXE's saved display settings t
 ## Tested applications / 2026-11-25 / 37 games
 
 - <img src="docs/images/support-levels/good.png" width="16" height="16" alt="Works well" title="Works well"> Works well: 26
-- <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="Works well (MetalFX)" title="Works well (MetalFX)"> Works well (MetalFX): 4
-- <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="Slow" title="Slow"> Slow: 13
+- <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="Works well (MetalFX)" title="Works well (MetalFX)"> Works well (MetalFX): 5
+- <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="Slow" title="Slow"> Slow: 12
 - <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="Launches" title="Launches"> Launches: 2
 - <img src="docs/images/support-levels/none.png" width="16" height="16" alt="Not working (WIP)" title="Not working (WIP)"> Not working (WIP): 2
 
