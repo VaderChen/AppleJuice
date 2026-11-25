@@ -28,15 +28,7 @@ Each configuration contributed one full run, with one warm-up and three scored i
 
 ![CPU scores for 1 CPU, 2 CPU and 4 CPU](docs/images/geekbench7-scores-2026-11-25/cpu.png)
 
-### Workload scores
-
-![1 CPU · File Compression, Navigation, HTML5 Browser, PDF Viewer, Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-scores-2026-11-25/1-worker-1.png)
-
-![1 CPU · HDR, Photo Editor, Ray Tracer, Structure from Motion, Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-scores-2026-11-25/1-worker-2.png)
-
-![2 CPU · File Compression, Photo Library, Clang, Text Processing, Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-scores-2026-11-25/2-worker-1.png)
-
-![4 CPU · File Compression, Photo Library, Clang, Text Processing, Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-scores-2026-11-25/4-worker-1.png)
+[View workload scores](https://vaderchen.github.io/AppleJuice/geekbench7/?lang=en)
 
 ## Getting started
 

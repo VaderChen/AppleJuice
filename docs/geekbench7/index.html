@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Geekbench 7 各測項分數 · AppleJuice</title>
+<style>
+:root { color-scheme: light dark; --bg: #fff; --ink: #1f2328; --muted: #59636e; --line: #d1d9e0; --soft: #f6f8fa; --accent: #0969da; --apple: #b45226; --ros: #16767d; --arm: #546684 }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0d1117; --ink: #f0f6fc; --muted: #a6afb9; --line: #3d444d; --soft: #151b23; --accent: #85b9ff; --apple: #ec935e; --ros: #5ac1c4; --arm: #9db3d4 }
+}
+* { box-sizing: border-box }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 1rem/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif }
+main { max-width: 58rem; margin: auto; padding: 1.6rem 1rem 3rem }
+header, nav { display: flex; align-items: center; flex-wrap: wrap; gap: .45rem }
+header { justify-content: space-between; margin-bottom: 2rem }
+a { color: var(--accent); text-underline-offset: .2em }
+nav { gap: 0; border: 1px solid var(--line); border-radius: .45rem; overflow: hidden }
+nav a { padding: .42rem .7rem; text-decoration: none; color: var(--ink) }
+nav a + a { border-inline-start: 1px solid var(--line) }
+nav a[aria-current="true"] { background: var(--ink); color: var(--bg) }
+nav a:hover { text-decoration: underline }
+nav a:focus-visible { outline-offset: -3px }
+h1 { font-size: clamp(1.55rem, 4vw, 2.15rem); line-height: 1.2; margin: 0 }
+.spec, .method { color: var(--muted); margin: .65rem 0 }
+.spec { font-size: .9rem }
+.group { overflow-x: auto; margin-top: 1.75rem }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums }
+caption { text-align: start; font-size: 1.25rem; font-weight: 700; padding-bottom: .5rem }
+th, td { text-align: end; padding: .45rem .8rem; border-bottom: 1px solid var(--line) }
+thead { background: var(--soft) }
+thead th { font-size: .9rem; vertical-align: bottom }
+th:first-child { text-align: start; width: 40% }
+tbody th { font-weight: 500 }
+td { width: 20% }
+.bar { height: .18rem; background: var(--apple); width: var(--width); margin: .15rem 0 0 auto }
+td:nth-child(3) .bar { background: var(--ros) }
+td:nth-child(4) .bar { background: var(--arm) }
+@media (max-width: 34rem) {
+  th, td { padding: .45rem .3rem }
+  thead th { font-size: .8rem }
+  tbody { font-size: .9rem }
+}
+</style>
+</head>
+<body>
+<main>
+<header><a id="back" href="https://github.com/VaderChen/AppleJuice#readme">← 返回 README</a>
+<nav aria-label="顯示語言">
+<a href="?lang=zh" hreflang="zh-Hant" lang="zh-Hant" aria-current="true">繁體中文</a><a href="?lang=en" hreflang="en" lang="en">English</a><a href="?lang=ja" hreflang="ja" lang="ja">日本語</a><a href="?lang=ko" hreflang="ko" lang="ko">한국어</a>
+</nav></header>
+<h1>Geekbench 7 各測項分數</h1>
+<p class="spec">Apple M4 Pro · 64 GB · macOS 27.2.1 · Geekbench 7.0.0 Pro (703423) · Launcher 0.26.1125 (1313) · <time datetime="2026-11-25">2026-11-25</time></p>
+<p class="method">分數越高越好。每個測項暖機一次、計分三次。各組內的色條使用相同刻度。</p>
+<div class="group" role="region" tabindex="0" aria-labelledby="cpu-1">
+<table><caption id="cpu-1">1 CPU</caption>
+<thead><tr><th scope="col" data-label="workload">測項</th><th scope="col">AppleJuice</th><th scope="col">Rosetta 2</th><th scope="col" data-label="native">原生 ARM64</th></tr></thead><tbody>
+<tr><th scope="row" data-workload="0" title="File Compression">檔案壓縮</th><td>1,590<div class="bar" aria-hidden="true" style="--width:34.64%"></div></td><td>1,826<div class="bar" aria-hidden="true" style="--width:39.78%"></div></td><td>2,653<div class="bar" aria-hidden="true" style="--width:57.80%"></div></td></tr>
+<tr><th scope="row" data-workload="1" title="Navigation">路線規劃</th><td>2,484<div class="bar" aria-hidden="true" style="--width:54.12%"></div></td><td>2,986<div class="bar" aria-hidden="true" style="--width:65.05%"></div></td><td>3,205<div class="bar" aria-hidden="true" style="--width:69.83%"></div></td></tr>
+<tr><th scope="row" data-workload="2" title="HTML5 Browser">HTML5 瀏覽器</th><td>1,356<div class="bar" aria-hidden="true" style="--width:29.54%"></div></td><td>1,568<div class="bar" aria-hidden="true" style="--width:34.16%"></div></td><td>3,114<div class="bar" aria-hidden="true" style="--width:67.84%"></div></td></tr>
+<tr><th scope="row" data-workload="3" title="PDF Viewer">PDF 檢視器</th><td>1,646<div class="bar" aria-hidden="true" style="--width:35.86%"></div></td><td>2,503<div class="bar" aria-hidden="true" style="--width:54.53%"></div></td><td>3,603<div class="bar" aria-hidden="true" style="--width:78.50%"></div></td></tr>
+<tr><th scope="row" data-workload="4" title="Photo Library">相片圖庫</th><td>847<div class="bar" aria-hidden="true" style="--width:18.45%"></div></td><td>781<div class="bar" aria-hidden="true" style="--width:17.02%"></div></td><td>2,953<div class="bar" aria-hidden="true" style="--width:64.34%"></div></td></tr>
+<tr><th scope="row" data-workload="5" title="Clang">Clang</th><td>1,423<div class="bar" aria-hidden="true" style="--width:31.00%"></div></td><td>1,980<div class="bar" aria-hidden="true" style="--width:43.14%"></div></td><td>3,153<div class="bar" aria-hidden="true" style="--width:68.69%"></div></td></tr>
+<tr><th scope="row" data-workload="6" title="Text Processing">文字處理</th><td>1,266<div class="bar" aria-hidden="true" style="--width:27.58%"></div></td><td>1,538<div class="bar" aria-hidden="true" style="--width:33.51%"></div></td><td>2,790<div class="bar" aria-hidden="true" style="--width:60.78%"></div></td></tr>
+<tr><th scope="row" data-workload="7" title="Asset Compression">素材壓縮</th><td>1,369<div class="bar" aria-hidden="true" style="--width:29.83%"></div></td><td>1,157<div class="bar" aria-hidden="true" style="--width:25.21%"></div></td><td>2,977<div class="bar" aria-hidden="true" style="--width:64.86%"></div></td></tr>
+<tr><th scope="row" data-workload="8" title="HDR">HDR</th><td>1,060<div class="bar" aria-hidden="true" style="--width:23.09%"></div></td><td>705<div class="bar" aria-hidden="true" style="--width:15.36%"></div></td><td>2,985<div class="bar" aria-hidden="true" style="--width:65.03%"></div></td></tr>
+<tr><th scope="row" data-workload="9" title="Photo Editor">相片編輯</th><td>1,029<div class="bar" aria-hidden="true" style="--width:22.42%"></div></td><td>476<div class="bar" aria-hidden="true" style="--width:10.37%"></div></td><td>2,832<div class="bar" aria-hidden="true" style="--width:61.70%"></div></td></tr>
+<tr><th scope="row" data-workload="10" title="Ray Tracer">光線追蹤</th><td>1,377<div class="bar" aria-hidden="true" style="--width:30.00%"></div></td><td>1,138<div class="bar" aria-hidden="true" style="--width:24.79%"></div></td><td>2,480<div class="bar" aria-hidden="true" style="--width:54.03%"></div></td></tr>
+<tr><th scope="row" data-workload="11" title="Structure from Motion">多視角三維重建</th><td>1,686<div class="bar" aria-hidden="true" style="--width:36.73%"></div></td><td>1,162<div class="bar" aria-hidden="true" style="--width:25.32%"></div></td><td>3,628<div class="bar" aria-hidden="true" style="--width:79.04%"></div></td></tr>
+<tr><th scope="row" data-workload="12" title="Game Physics">遊戲物理</th><td>1,593<div class="bar" aria-hidden="true" style="--width:34.71%"></div></td><td>1,635<div class="bar" aria-hidden="true" style="--width:35.62%"></div></td><td>3,058<div class="bar" aria-hidden="true" style="--width:66.62%"></div></td></tr>
+<tr><th scope="row" data-workload="13" title="Video Encoder">影片編碼</th><td>1,343<div class="bar" aria-hidden="true" style="--width:29.26%"></div></td><td>929<div class="bar" aria-hidden="true" style="--width:20.24%"></div></td><td>3,069<div class="bar" aria-hidden="true" style="--width:66.86%"></div></td></tr>
+<tr><th scope="row" data-workload="14" title="Audio Encoder">音訊編碼</th><td>1,305<div class="bar" aria-hidden="true" style="--width:28.43%"></div></td><td>1,304<div class="bar" aria-hidden="true" style="--width:28.41%"></div></td><td>2,412<div class="bar" aria-hidden="true" style="--width:52.55%"></div></td></tr>
+<tr><th scope="row" data-workload="15" title="Video Player">影片播放</th><td>1,449<div class="bar" aria-hidden="true" style="--width:31.57%"></div></td><td>1,018<div class="bar" aria-hidden="true" style="--width:22.18%"></div></td><td>4,590<div class="bar" aria-hidden="true" style="--width:100.00%"></div></td></tr>
+</tbody></table></div>
+<div class="group" role="region" tabindex="0" aria-labelledby="cpu-2">
+<table><caption id="cpu-2">2 CPU</caption>
+<thead><tr><th scope="col" data-label="workload">測項</th><th scope="col">AppleJuice</th><th scope="col">Rosetta 2</th><th scope="col" data-label="native">原生 ARM64</th></tr></thead><tbody>
+<tr><th scope="row" data-workload="0" title="File Compression">檔案壓縮</th><td>2,802<div class="bar" aria-hidden="true" style="--width:46.45%"></div></td><td>3,454<div class="bar" aria-hidden="true" style="--width:57.26%"></div></td><td>5,410<div class="bar" aria-hidden="true" style="--width:89.69%"></div></td></tr>
+<tr><th scope="row" data-workload="4" title="Photo Library">相片圖庫</th><td>1,708<div class="bar" aria-hidden="true" style="--width:28.32%"></div></td><td>1,576<div class="bar" aria-hidden="true" style="--width:26.13%"></div></td><td>5,792<div class="bar" aria-hidden="true" style="--width:96.02%"></div></td></tr>
+<tr><th scope="row" data-workload="5" title="Clang">Clang</th><td>2,646<div class="bar" aria-hidden="true" style="--width:43.87%"></div></td><td>3,840<div class="bar" aria-hidden="true" style="--width:63.66%"></div></td><td>6,032<div class="bar" aria-hidden="true" style="--width:100.00%"></div></td></tr>
+<tr><th scope="row" data-workload="6" title="Text Processing">文字處理</th><td>2,121<div class="bar" aria-hidden="true" style="--width:35.16%"></div></td><td>2,950<div class="bar" aria-hidden="true" style="--width:48.91%"></div></td><td>5,326<div class="bar" aria-hidden="true" style="--width:88.30%"></div></td></tr>
+<tr><th scope="row" data-workload="7" title="Asset Compression">素材壓縮</th><td>2,649<div class="bar" aria-hidden="true" style="--width:43.92%"></div></td><td>2,264<div class="bar" aria-hidden="true" style="--width:37.53%"></div></td><td>5,908<div class="bar" aria-hidden="true" style="--width:97.94%"></div></td></tr>
+<tr><th scope="row" data-workload="8" title="HDR">HDR</th><td>2,009<div class="bar" aria-hidden="true" style="--width:33.31%"></div></td><td>1,344<div class="bar" aria-hidden="true" style="--width:22.28%"></div></td><td>5,761<div class="bar" aria-hidden="true" style="--width:95.51%"></div></td></tr>
+<tr><th scope="row" data-workload="9" title="Photo Editor">相片編輯</th><td>1,793<div class="bar" aria-hidden="true" style="--width:29.72%"></div></td><td>913<div class="bar" aria-hidden="true" style="--width:15.14%"></div></td><td>5,538<div class="bar" aria-hidden="true" style="--width:91.81%"></div></td></tr>
+<tr><th scope="row" data-workload="10" title="Ray Tracer">光線追蹤</th><td>2,575<div class="bar" aria-hidden="true" style="--width:42.69%"></div></td><td>2,207<div class="bar" aria-hidden="true" style="--width:36.59%"></div></td><td>5,125<div class="bar" aria-hidden="true" style="--width:84.96%"></div></td></tr>
+</tbody></table></div>
+<div class="group" role="region" tabindex="0" aria-labelledby="cpu-4">
+<table><caption id="cpu-4">4 CPU</caption>
+<thead><tr><th scope="col" data-label="workload">測項</th><th scope="col">AppleJuice</th><th scope="col">Rosetta 2</th><th scope="col" data-label="native">原生 ARM64</th></tr></thead><tbody>
+<tr><th scope="row" data-workload="0" title="File Compression">檔案壓縮</th><td>4,544<div class="bar" aria-hidden="true" style="--width:37.54%"></div></td><td>6,206<div class="bar" aria-hidden="true" style="--width:51.27%"></div></td><td>9,833<div class="bar" aria-hidden="true" style="--width:81.24%"></div></td></tr>
+<tr><th scope="row" data-workload="4" title="Photo Library">相片圖庫</th><td>3,114<div class="bar" aria-hidden="true" style="--width:25.73%"></div></td><td>2,987<div class="bar" aria-hidden="true" style="--width:24.68%"></div></td><td>10,886<div class="bar" aria-hidden="true" style="--width:89.94%"></div></td></tr>
+<tr><th scope="row" data-workload="5" title="Clang">Clang</th><td>4,589<div class="bar" aria-hidden="true" style="--width:37.91%"></div></td><td>7,459<div class="bar" aria-hidden="true" style="--width:61.62%"></div></td><td>12,104<div class="bar" aria-hidden="true" style="--width:100.00%"></div></td></tr>
+<tr><th scope="row" data-workload="6" title="Text Processing">文字處理</th><td>4,007<div class="bar" aria-hidden="true" style="--width:33.10%"></div></td><td>5,537<div class="bar" aria-hidden="true" style="--width:45.75%"></div></td><td>10,544<div class="bar" aria-hidden="true" style="--width:87.11%"></div></td></tr>
+<tr><th scope="row" data-workload="7" title="Asset Compression">素材壓縮</th><td>5,293<div class="bar" aria-hidden="true" style="--width:43.73%"></div></td><td>4,494<div class="bar" aria-hidden="true" style="--width:37.13%"></div></td><td>11,709<div class="bar" aria-hidden="true" style="--width:96.74%"></div></td></tr>
+<tr><th scope="row" data-workload="8" title="HDR">HDR</th><td>3,435<div class="bar" aria-hidden="true" style="--width:28.38%"></div></td><td>2,308<div class="bar" aria-hidden="true" style="--width:19.07%"></div></td><td>10,017<div class="bar" aria-hidden="true" style="--width:82.76%"></div></td></tr>
+<tr><th scope="row" data-workload="9" title="Photo Editor">相片編輯</th><td>3,523<div class="bar" aria-hidden="true" style="--width:29.11%"></div></td><td>1,810<div class="bar" aria-hidden="true" style="--width:14.95%"></div></td><td>10,625<div class="bar" aria-hidden="true" style="--width:87.78%"></div></td></tr>
+<tr><th scope="row" data-workload="10" title="Ray Tracer">光線追蹤</th><td>5,144<div class="bar" aria-hidden="true" style="--width:42.50%"></div></td><td>4,470<div class="bar" aria-hidden="true" style="--width:36.93%"></div></td><td>10,746<div class="bar" aria-hidden="true" style="--width:88.78%"></div></td></tr>
+</tbody></table></div>
+</main>
+<script>
+const translations = {
+  "zh": {
+    "locale": "zh-Hant",
+    "title": "Geekbench 7 各測項分數",
+    "workload": "測項",
+    "native": "原生 ARM64",
+    "method": "分數越高越好。每個測項暖機一次、計分三次。各組內的色條使用相同刻度。",
+    "language": "顯示語言",
+    "back": "返回 README",
+    "names": [
+      "檔案壓縮",
+      "路線規劃",
+      "HTML5 瀏覽器",
+      "PDF 檢視器",
+      "相片圖庫",
+      "Clang",
+      "文字處理",
+      "素材壓縮",
+      "HDR",
+      "相片編輯",
+      "光線追蹤",
+      "多視角三維重建",
+      "遊戲物理",
+      "影片編碼",
+      "音訊編碼",
+      "影片播放"
+    ]
+  },
+  "en": {
+    "locale": "en",
+    "title": "Geekbench 7 workload scores",
+    "workload": "Workload",
+    "native": "Native ARM64",
+    "method": "Higher scores are better. Each workload ran once for warm-up and three times for scoring. Bars share a scale within each CPU configuration.",
+    "language": "Language",
+    "back": "Back to README",
+    "names": [
+      "File Compression",
+      "Navigation",
+      "HTML5 Browser",
+      "PDF Viewer",
+      "Photo Library",
+      "Clang",
+      "Text Processing",
+      "Asset Compression",
+      "HDR",
+      "Photo Editor",
+      "Ray Tracer",
+      "Structure from Motion",
+      "Game Physics",
+      "Video Encoder",
+      "Audio Encoder",
+      "Video Player"
+    ]
+  },
+  "ja": {
+    "locale": "ja",
+    "title": "Geekbench 7 項目別スコア",
+    "workload": "測定項目",
+    "native": "ネイティブ ARM64",
+    "method": "スコアが高いほど高速です。各項目はウォームアップ1回、計測3回です。棒の長さは CPU 構成ごとに同じ尺度で表示します。",
+    "language": "表示言語",
+    "back": "README に戻る",
+    "names": [
+      "ファイル圧縮",
+      "経路探索",
+      "HTML5 ブラウザー",
+      "PDF ビューアー",
+      "フォトライブラリ",
+      "Clang",
+      "テキスト処理",
+      "アセット圧縮",
+      "HDR",
+      "写真編集",
+      "レイトレーシング",
+      "多視点画像による3D復元",
+      "ゲーム物理演算",
+      "動画エンコード",
+      "音声エンコード",
+      "動画再生"
+    ]
+  },
+  "ko": {
+    "locale": "ko",
+    "title": "Geekbench 7 항목별 점수",
+    "workload": "측정 항목",
+    "native": "네이티브 ARM64",
+    "method": "점수가 높을수록 성능이 좋습니다. 각 항목은 한 번 예열한 뒤 세 번 측정했습니다. 같은 CPU 구성 안에서는 막대 길이에 동일한 척도를 적용했습니다.",
+    "language": "표시 언어",
+    "back": "README로 돌아가기",
+    "names": [
+      "파일 압축",
+      "경로 탐색",
+      "HTML5 브라우저",
+      "PDF 뷰어",
+      "사진 라이브러리",
+      "Clang",
+      "텍스트 처리",
+      "에셋 압축",
+      "HDR",
+      "사진 편집",
+      "레이 트레이싱",
+      "다중 시점 3D 복원",
+      "게임 물리",
+      "동영상 인코딩",
+      "오디오 인코딩",
+      "동영상 재생"
+    ]
+  }
+};
+const query = new URLSearchParams(location.search).get("lang");
+const preferred = navigator.language.toLowerCase().split("-")[0];
+const lang = Object.hasOwn(translations, query) ? query : Object.hasOwn(translations, preferred) ? preferred : "en";
+const text = translations[lang];
+document.documentElement.lang = text.locale;
+document.title = text.title + " · AppleJuice";
+document.querySelector("h1").textContent = text.title;
+document.querySelector(".method").textContent = text.method;
+document.querySelector("nav").setAttribute("aria-label", text.language);
+for (const link of document.querySelectorAll("nav a")) {
+  if (link.lang === text.locale) link.setAttribute("aria-current", "true");
+  else link.removeAttribute("aria-current");
+}
+const back = document.querySelector("#back");
+back.textContent = "← " + text.back;
+if (lang !== "zh") back.href = "https://github.com/VaderChen/AppleJuice/blob/main/README." + lang + ".md";
+for (const header of document.querySelectorAll("[data-label]")) header.textContent = text[header.dataset.label];
+for (const cell of document.querySelectorAll("[data-workload]")) cell.textContent = text.names[Number(cell.dataset.workload)];
+</script>
+</body>
+</html>

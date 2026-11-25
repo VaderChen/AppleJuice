@@ -28,15 +28,7 @@ AppleJuice는 Apple Silicon Mac에서 지원되는 Windows 프로그램을 실�
 
 ![1 CPU, 2 CPU, 4 CPU 종합 점수](docs/images/geekbench7-scores-2026-11-25/cpu.png)
 
-### 항목별 점수
-
-![1 CPU · File Compression, Navigation, HTML5 Browser, PDF Viewer, Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-scores-2026-11-25/1-worker-1.png)
-
-![1 CPU · HDR, Photo Editor, Ray Tracer, Structure from Motion, Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-scores-2026-11-25/1-worker-2.png)
-
-![2 CPU · File Compression, Photo Library, Clang, Text Processing, Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-scores-2026-11-25/2-worker-1.png)
-
-![4 CPU · File Compression, Photo Library, Clang, Text Processing, Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-scores-2026-11-25/4-worker-1.png)
+[항목별 점수 보기](https://vaderchen.github.io/AppleJuice/geekbench7/?lang=ko)
 
 ## 시작하기
 

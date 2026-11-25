@@ -28,15 +28,7 @@ AppleJuice は、Apple Silicon Mac 上で対応する Windows アプリケーシ
 
 ![1 CPU・2 CPU・4 CPU の総合スコア](docs/images/geekbench7-scores-2026-11-25/cpu.png)
 
-### 項目別スコア
-
-![1 CPU · File Compression, Navigation, HTML5 Browser, PDF Viewer, Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-scores-2026-11-25/1-worker-1.png)
-
-![1 CPU · HDR, Photo Editor, Ray Tracer, Structure from Motion, Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-scores-2026-11-25/1-worker-2.png)
-
-![2 CPU · File Compression, Photo Library, Clang, Text Processing, Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-scores-2026-11-25/2-worker-1.png)
-
-![4 CPU · File Compression, Photo Library, Clang, Text Processing, Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-scores-2026-11-25/4-worker-1.png)
+[項目別スコアを見る](https://vaderchen.github.io/AppleJuice/geekbench7/?lang=ja)
 
 ## はじめに
 
