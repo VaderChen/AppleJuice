@@ -151,6 +151,7 @@ AppleJuice のライブラリに登録したゲームは、EXE ごとの表示�
 | 7-Zip | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | Geekbench 7 | x64 | CPU | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | Memelis' RPG | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| Stardew Valley | x64 | OpenGL（MonoGame） | <img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好" title="良好"> |
 | WinRAR | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | イースVIII -Lacrimosa of DANA- | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | オクトパストラベラーII | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
@@ -184,7 +185,6 @@ AppleJuice のライブラリに登録したゲームは、EXE ごとの表示�
 | Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | サイバーパンク2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | テイルズ オブ ベルセリア | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
-| Stardew Valley | x64 | OpenGL（MonoGame） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | 三國志VIII with パワーアップキット | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | 三國志IX with パワーアップキット | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | 三國志X with パワーアップキット | x86 | GDI | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |

@@ -169,6 +169,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 勇者鬥惡龍III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 勇者鬥惡龍VII Reimagined | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 勇氣默示錄 2 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
+| 星露谷物語 | x64 | OpenGL（MonoGame） | <img src="docs/images/support-levels/good.png" width="16" height="16" alt="運作良好" title="運作良好"> |
 | 惡魔獵人 5 | x64 | D3D12 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 潛水員戴夫 | x64 | D3D11（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 逆轉裁判123 成步堂精選集 | x86 | D3D11（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
@@ -188,7 +189,6 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 三國志XI with 威力加強版 | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
-| 星露谷物語 | x64 | OpenGL（MonoGame） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 電馭叛客 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 緋夜傳奇 | x64 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 雙人成行 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
