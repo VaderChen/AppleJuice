@@ -48,9 +48,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_extra(GuestState& state
         if(const auto handler=current_invalid_parameter_handler()){start_callbacks(state,memory,{{handler,{0,0,0,0,0}}},Continuation::Return,result);return std::nullopt;}
         return done(result);
     };
-    const auto real=[&](unsigned index,bool single){
+    const auto real_bits=[&](unsigned index,bool single){
         std::uint64_t raw=0;
         if(x86_)raw=arg(index);else for(unsigned i=0;i<(single?4U:8U);++i)raw|=std::uint64_t(state.xmm[index][i])<<(8*i);
+        return raw;
+    };
+    const auto real=[&](unsigned index,bool single){
+        const auto raw=real_bits(index,single);
         return single?static_cast<double>(std::bit_cast<float>(static_cast<std::uint32_t>(raw))):std::bit_cast<double>(raw);
     };
     const auto give=[&](double value,bool single){windows_floating_return(state,x86_,value,single);return done(0);};
@@ -213,12 +217,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_extra(GuestState& state
         if(name=="_Cbuild"){
             // _Dcomplex 為 16 位元組結構：呼叫端提供的隱含結果指標為第一個參數，實部與虛部隨後。
             const auto output=arg(0);if(!output)return done(0);
-            memory.store(GuestAddress{output},64,std::bit_cast<std::uint64_t>(real(1,false)));memory.store(GuestAddress{output+8},64,std::bit_cast<std::uint64_t>(real(2,false)));
+            const auto re=real_bits(1,false),im=real_bits(2,false);
+            memory.check(GuestAddress{output},16,Access::Write);
+            memory.store(GuestAddress{output},64,re);memory.store(GuestAddress{output+8},64,im);
             return done(output);
         }
         if(name=="_FCbuild"){
             // _Fcomplex 為 8 位元組結構：Win64 由 RAX、Win32 由 EDX:EAX 回傳。
-            const auto re=std::bit_cast<std::uint32_t>(static_cast<float>(real(0,true))),im=std::bit_cast<std::uint32_t>(static_cast<float>(real(1,true)));
+            const auto re=static_cast<std::uint32_t>(real_bits(0,true)),im=static_cast<std::uint32_t>(real_bits(1,true));
             return done(std::uint64_t{re}|(std::uint64_t{im}<<32),true);
         }
     }catch(const MemoryFault&){return invalid(0);}

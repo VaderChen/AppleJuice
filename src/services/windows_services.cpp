@@ -63,7 +63,16 @@
 #include "icu_idna_guest.hpp"
 #include "guest_icu_time_scale_code.hpp"
 #include "icu_time_scale_guest.hpp"
+#include "guest_icu_numbering_system_code.hpp"
+#include "icu_numbering_system_guest.hpp"
+#include "guest_icu_gender_code.hpp"
+#include "icu_gender_guest.hpp"
+#include "guest_icu_display_names_code.hpp"
+#include "icu_display_names_guest.hpp"
+#include "guest_icu_resources_code.hpp"
+#include "icu_resources_guest.hpp"
 #include "guest_crt_mbc_code.hpp"
+#include "guest_crt_complex_code.hpp"
 #include "guest_crtdll_text_code.hpp"
 #include "crtdll_text_guest.hpp"
 #include "crt_mbc_contract.h"
@@ -128,6 +137,8 @@ namespace x64arm::detail {void peek_idle_invalidate() noexcept;}
 namespace x64arm::detail {ParallelMappingLock& parallel_mapping_mutex() noexcept;void stream_timing_dump(std::FILE*) noexcept;}
 namespace x64arm {
 namespace {
+constexpr std::size_t crt_complex_slot=25;
+static_assert(crt_complex_slot<windows_address_layout::private_code_slots);
 // 診斷（X64ARM_DEBUG_HOST_FAULT=<檔案>，預設關閉）：宿主 SIGSEGV／SIGBUS 時把訊號、位址與呼叫堆疊附加到檔案，再交給原本的處理程序
 // （客體記憶體錯誤仍由既有處理程序承接）。用於子程序在宿主層級崩潰、沒有留下停止原因的情形。
 struct sigaction host_fault_previous[2];int host_fault_fd=-1;
@@ -951,6 +962,9 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
                 const auto* enabled=std::getenv("X64ARM_GUEST_CRT_MBC");
                 return !enabled || std::string_view(enabled)!="0";
             }();
+            const auto complex_base=windows_address_layout::private_code_address(memory.execution_mode(),crt_complex_slot);
+            initialize_guest_image(complex_base,x86_?std::span<const std::uint8_t>{crt_complex::image_x86}:
+                std::span<const std::uint8_t>{crt_complex::image_x64},u"[guest-crt-complex]");
             if(mbc_lowering){
                 const auto base=windows_address_layout::private_code_address(memory.execution_mode(),12);
                 initialize_guest_image(base,x86_?std::span<const std::uint8_t>{crt_mbc::image_x86}:
@@ -985,6 +999,14 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             std::span<const std::uint8_t>{icu_idna::image_x64},u"[guest-icu-idna]");
         initialize_guest_image(icu_time_scale::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_time_scale::image_x86}:
             std::span<const std::uint8_t>{icu_time_scale::image_x64},u"[guest-icu-time-scale]");
+        initialize_guest_image(icu_numbering_system::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_numbering_system::image_x86}:
+            std::span<const std::uint8_t>{icu_numbering_system::image_x64},u"[guest-icu-numbering-system]");
+        initialize_guest_image(icu_gender::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_gender::image_x86}:
+            std::span<const std::uint8_t>{icu_gender::image_x64},u"[guest-icu-gender]");
+        initialize_guest_image(icu_display_names::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_display_names::image_x86}:
+            std::span<const std::uint8_t>{icu_display_names::image_x64},u"[guest-icu-display-names]");
+        initialize_guest_image(icu_resources::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_resources::image_x86}:
+            std::span<const std::uint8_t>{icu_resources::image_x64},u"[guest-icu-resources]");
         static const bool mf_buffer_lowering=[] {const auto* v=std::getenv("X64ARM_GUEST_MF_BUFFER");return !v || std::string_view(v)!="0";}();
         if(mf_buffer_lowering && trace_services_.empty() && !startup_profile::enabled())
             mf_buffer::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value);
@@ -1359,10 +1381,12 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         if(symbol=="_mbctype")return GuestAddress{runtime_base_.value+CRT_MBC_PROCESS_TYPES};
         if(symbol=="_mbcasemap")return GuestAddress{runtime_base_.value+CRT_MBC_PROCESS_CASE};
         if(allow_resident){
-            const auto base=windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,12);
-            if(const auto image=runtime_.builtin_images.find(base);image!=runtime_.builtin_images.end())
-                if(const auto entry=image->second.export_names.find(std::string(symbol));entry!=image->second.export_names.end())
-                    return GuestAddress{base+entry->second};
+            for(const auto slot:{std::size_t{12},crt_complex_slot}){
+                const auto base=windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,slot);
+                if(const auto image=runtime_.builtin_images.find(base);image!=runtime_.builtin_images.end())
+                    if(const auto entry=image->second.export_names.find(std::string(symbol));entry!=image->second.export_names.end())
+                        return GuestAddress{base+entry->second};
+            }
         }
         const std::array data{
             std::pair{"__argc", 0U}, std::pair{"__argv", 8U},
@@ -1458,6 +1482,10 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             static const bool region=read_setting("X64ARM_GUEST_ICU_REGION");
             static const bool idna=read_setting("X64ARM_GUEST_ICU_IDNA");
             static const bool time_scale=read_setting("X64ARM_GUEST_ICU_TIME_SCALE");
+            static const bool numbering_system=read_setting("X64ARM_GUEST_ICU_NUMBERING_SYSTEM");
+            static const bool gender=read_setting("X64ARM_GUEST_ICU_GENDER");
+            static const bool display_names=read_setting("X64ARM_GUEST_ICU_DISPLAY_NAMES");
+            static const bool resources=read_setting("X64ARM_GUEST_ICU_RESOURCES");
             for(const auto base:{trie?icu_trie::image_address(x86_):0,string?icu_string::image_address(x86_):0,
                     text?icu_text::image_address(x86_):0,mapping?icu_case::image_address(x86_):0,
                     normalization?icu_normalization::image_address(x86_):0,
@@ -1468,7 +1496,11 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
                     bidi?icu_bidi::image_address(x86_):0,
                     charset_detection?icu_charset_detection::image_address(x86_):0,
                     region?icu_region::image_address(x86_):0,idna?icu_idna::image_address(x86_):0,
-                    time_scale?icu_time_scale::image_address(x86_):0}){
+                    time_scale?icu_time_scale::image_address(x86_):0,
+                    numbering_system?icu_numbering_system::image_address(x86_):0,
+                    gender?icu_gender::image_address(x86_):0,
+                    display_names?icu_display_names::image_address(x86_):0,
+                    resources?icu_resources::image_address(x86_):0}){
                 if(!base)continue;
                 const auto image=runtime_.builtin_images.find(base);
                 if(image!=runtime_.builtin_images.end())
@@ -1656,7 +1688,12 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
                 icu_region::image_address(x86_),
                 icu_idna::image_address(x86_),
                 icu_time_scale::image_address(x86_),
+                icu_numbering_system::image_address(x86_),
+                icu_gender::image_address(x86_),
+                icu_display_names::image_address(x86_),
+                icu_resources::image_address(x86_),
                 windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,12),
+                windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,crt_complex_slot),
                 x86_?crtdll_text::image_address:0})
             if(const auto image=runtime_.builtin_images.find(base);image!=runtime_.builtin_images.end())
                 for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}

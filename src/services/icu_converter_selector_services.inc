@@ -1,0 +1,6 @@
+ICU_SELECTOR_API(ucnvsel_close,1)
+ICU_SELECTOR_API(ucnvsel_open,5)
+ICU_SELECTOR_API(ucnvsel_openFromSerialized,3)
+ICU_SELECTOR_API(ucnvsel_selectForString,4)
+ICU_SELECTOR_API(ucnvsel_selectForUTF8,4)
+ICU_SELECTOR_API(ucnvsel_serialize,4)

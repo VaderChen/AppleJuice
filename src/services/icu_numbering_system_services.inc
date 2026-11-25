@@ -1,0 +1,8 @@
+ICU_NUMBERING_API(unumsys_open,2)
+ICU_NUMBERING_API(unumsys_openByName,2)
+ICU_NUMBERING_API(unumsys_openAvailableNames,1)
+ICU_NUMBERING_API(unumsys_close,1)
+ICU_NUMBERING_QUERY(unumsys_getName,1)
+ICU_NUMBERING_QUERY(unumsys_getRadix,1)
+ICU_NUMBERING_QUERY(unumsys_isAlgorithmic,1)
+ICU_NUMBERING_QUERY(unumsys_getDescription,4)

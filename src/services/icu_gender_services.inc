@@ -1,0 +1,2 @@
+ICU_GENDER_API(ugender_getInstance,2)
+ICU_GENDER_QUERY(ugender_getListGender,4)

@@ -48,6 +48,7 @@ inline constexpr std::pair<std::string_view,std::string_view> crt_export_aliases
     {"_wtoi_l","_wtoi"},{"_wtol_l","_wtol"},{"_wtoll","_wtoi64"},{"_wtoll_l","_wtoi64"},{"_wtoi64_l","_wtoi64"},
     {"_logb","logb"},{"_logbf","logbf"},{"_nextafterf","nextafterf"},
     {"__initialize_lconv_for_unsigned_char","__lconv_init"},
+    {"_LCbuild","_Cbuild"},{"_LCmulcc","_Cmulcc"},{"_LCmulcr","_Cmulcr"},{"norml","norm"},
     {"_cabs","cabs"},{"cabsl","cabs"},{"cargl","carg"},{"creall","creal"},{"cimagl","cimag"},
     {"ccosl","ccos"},{"csinl","csin"},{"ctanl","ctan"},{"cacosl","cacos"},{"casinl","casin"},{"catanl","catan"},
     {"ccoshl","ccosh"},{"csinhl","csinh"},{"ctanhl","ctanh"},{"cacoshl","cacosh"},{"casinhl","casinh"},{"catanhl","catanh"},
@@ -166,7 +167,9 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
 #define ICU_COLL_ALIAS_icuin(name) {"icuin.dll",#name,"icu.dll",#name},
 #define ICU_COLL_ALIAS_icuuc(name) {"icuuc.dll",#name,"icu.dll",#name},
 #define ICU_COLL_API(name,count,legacy) ICU_COLL_ALIAS_##legacy(name)
+#define ICU_COLL_RESIDENT ICU_COLL_API
 #include "icu_collation_services.inc"
+#undef ICU_COLL_RESIDENT
 #undef ICU_COLL_API
 #undef ICU_COLL_ALIAS_icuuc
 #undef ICU_COLL_ALIAS_icuin
@@ -192,6 +195,40 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
 #define ICU_TIME_SCALE(name,wide) {"icuin.dll",#name,"icu.dll",#name},
 #include "icu_time_scale_services.inc"
 #undef ICU_TIME_SCALE
+#define ICU_NUMBERING_API(name,count) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_NUMBERING_QUERY(name,count) {"icuin.dll",#name,"icu.dll",#name},
+#include "icu_numbering_system_services.inc"
+#undef ICU_NUMBERING_QUERY
+#undef ICU_NUMBERING_API
+#define ICU_GENDER_API(name,count) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_GENDER_QUERY(name,count) {"icuin.dll",#name,"icu.dll",#name},
+#include "icu_gender_services.inc"
+#undef ICU_GENDER_QUERY
+#undef ICU_GENDER_API
+#define ICU_LDN_API(name,count) {"icuuc.dll",#name,"icu.dll",#name},
+#define ICU_LDN_QUERY(name,count) {"icuuc.dll",#name,"icu.dll",#name},
+#include "icu_display_names_services.inc"
+#undef ICU_LDN_QUERY
+#undef ICU_LDN_API
+#define ICU_RES_API(name,count) {"icuuc.dll",#name,"icu.dll",#name},
+#define ICU_RES_QUERY(name,count) {"icuuc.dll",#name,"icu.dll",#name},
+#include "icu_resources_services.inc"
+#undef ICU_RES_QUERY
+#undef ICU_RES_API
+#define ICU_SELECTOR_API(name,count) {"icuuc.dll",#name,"icu.dll",#name},
+#include "icu_converter_selector_services.inc"
+#undef ICU_SELECTOR_API
+#define ICU_SPOOF_API(name,count) {"icuin.dll",#name,"icu.dll",#name},
+#include "icu_spoof_services.inc"
+#undef ICU_SPOOF_API
+#define ICU_MESSAGE_API(name,count) {"icuin.dll",#name,"icu.dll",#name},
+#include "icu_message_services.inc"
+#undef ICU_MESSAGE_API
+#define ICU_REGEX_API(name) {"icuin.dll",#name,"icu.dll",#name},
+#define ICU_REGEX_SCALAR ICU_REGEX_API
+#include "icu_regex_services.inc"
+#undef ICU_REGEX_SCALAR
+#undef ICU_REGEX_API
 #define ICU_MODERN_NUM_ALIAS_icu(name)
 #define ICU_MODERN_NUM_ALIAS_icuin(name) {"icuin.dll",#name,"icu.dll",#name},
 #define ICU_MODERN_NUM_API(name,count,wide,legacy) ICU_MODERN_NUM_ALIAS_##legacy(name)

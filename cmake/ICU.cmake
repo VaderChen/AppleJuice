@@ -37,6 +37,15 @@ ExternalProject_Add(x64arm_icu_build
   INSTALL_COMMAND ""
   BUILD_BYPRODUCTS "${X64ARM_ICU_BUILD}/lib/libicuuc.a" "${X64ARM_ICU_BUILD}/lib/libicui18n.a" "${X64ARM_ICU_BUILD}/lib/libicudata.a"
   LOG_CONFIGURE TRUE LOG_BUILD TRUE)
+ExternalProject_Add_Step(x64arm_icu_build regex_native_indices
+  COMMAND "${CMAKE_COMMAND}"
+    "-DICU_INDEX_SOURCE=${x64arm_icu_source_SOURCE_DIR}/source/i18n/uregex.cpp"
+    -P "${CMAKE_CURRENT_LIST_DIR}/FixICURegexIndices.cmake"
+  COMMAND "${CMAKE_COMMAND}"
+    "-DICU_INDEX_SOURCE=${x64arm_icu_source_SOURCE_DIR}/source/common/utext.cpp"
+    -P "${CMAKE_CURRENT_LIST_DIR}/FixICURegexIndices.cmake"
+  DEPENDS "${CMAKE_CURRENT_LIST_DIR}/FixICURegexIndices.cmake"
+  DEPENDEES configure DEPENDERS build)
 foreach(component uc i18n data)
   add_library(ICU::${component} STATIC IMPORTED GLOBAL)
   set_target_properties(ICU::${component} PROPERTIES

@@ -45,6 +45,7 @@ struct ComplexOperation {
 constexpr ComplexOperation complex_operations[]{
 #define COMPLEX_REAL(name,kind) {#name,X64armComplex##kind,false,true},{#name "f",X64armComplex##kind,true,true}
 #define COMPLEX_UNARY(name,kind) {#name,X64armComplex##kind},{#name "f",X64armComplex##kind,true}
+    COMPLEX_REAL(norm,Norm),
     COMPLEX_REAL(cabs,Abs),COMPLEX_REAL(carg,Arg),COMPLEX_REAL(creal,Real),COMPLEX_REAL(cimag,Imag),
     COMPLEX_UNARY(ccos,Cos),COMPLEX_UNARY(csin,Sin),COMPLEX_UNARY(ctan,Tan),
     COMPLEX_UNARY(cacos,Acos),COMPLEX_UNARY(casin,Asin),COMPLEX_UNARY(catan,Atan),
@@ -52,6 +53,8 @@ constexpr ComplexOperation complex_operations[]{
     COMPLEX_UNARY(cacosh,Acosh),COMPLEX_UNARY(casinh,Asinh),COMPLEX_UNARY(catanh,Atanh),
     COMPLEX_UNARY(cexp,Exp),COMPLEX_UNARY(clog,Log),COMPLEX_UNARY(clog10,Log10),
     COMPLEX_UNARY(csqrt,Sqrt),COMPLEX_UNARY(conj,Conj),COMPLEX_UNARY(cproj,Proj),
+    {"_Cmulcc",X64armComplexMultiply,false,false,true},{"_FCmulcc",X64armComplexMultiply,true,false,true},
+    {"_Cmulcr",X64armComplexScale,false,false,true},{"_FCmulcr",X64armComplexScale,true,false,true},
     {"cpow",X64armComplexPow,false,false,true},{"cpowf",X64armComplexPow,true,false,true}
 #undef COMPLEX_UNARY
 #undef COMPLEX_REAL
@@ -203,8 +206,10 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         for(const auto& operation:complex_operations){
             // 16-byte 結果在兩種 ABI 都有第一個隱藏指標；8-byte 結果使用 RAX／EDX:EAX。
             const unsigned inputs=operation.binary?2U:1U,hidden=!operation.single && !operation.real?1U:0U;
-            const auto mask=(1U<<inputs)-1;
-            result.push_back({"crt",operation.name,inputs+hidden,operation.single?mask:0U,operation.single?0U:mask<<hidden});
+            const bool scale=operation.kind==X64armComplexScale;
+            const auto complex_mask=((1U<<(scale?1U:inputs))-1U)<<hidden;
+            const auto wide=operation.single?complex_mask:(scale?1U<<(hidden+1):0U);
+            result.push_back({"crt",operation.name,inputs+hidden,wide,operation.single?0U:complex_mask});
         }
         return result;
     }();
@@ -720,6 +725,58 @@ std::optional<std::uint32_t> WindowsServices::invoke_x87_crt_math(GuestState& st
     if(!integral){const auto destination=(state.x87_status>>11)&7U;const auto out=f64_to_extF80({std::bit_cast<std::uint64_t>(value)});state.x87[destination]={out.signif,out.signExp};state.x87_tag=static_cast<std::uint16_t>((state.x87_tag&~(3U<<(destination*2)))|(x87_tag(state.x87[destination])<<(destination*2)));}
     arg.return_to(state,integer,integral);return std::nullopt;
 }
+namespace {
+void invoke_complex_operation(const ComplexOperation& operation, const WindowsCall& arg, GuestState& state,
+        GuestMemory& memory, bool x86, std::uint64_t errno_cell) {
+#if defined(__clang__)
+#pragma STDC FENV_ACCESS ON
+#endif
+    // 純結構算術只提交浮點狀態；CRT 的 errno 由需要數學錯誤回報的函式管理。
+    if(operation.kind==X64armComplexScale || operation.kind==X64armComplexMultiply || operation.kind==X64armComplexNorm)
+        errno_cell=0;
+    const auto execute=[&]<class T>(){
+        constexpr bool single=sizeof(T)==4;
+        const bool hidden=!single && !operation.real;
+        const unsigned first=hidden?1U:0U;
+        const auto input=[&](unsigned index)->std::complex<T>{
+            if constexpr(single){const auto bits=arg(index);return {std::bit_cast<float>(static_cast<std::uint32_t>(bits)),std::bit_cast<float>(static_cast<std::uint32_t>(bits>>32))};}
+            else {const auto pointer=arg(index);memory.check(GuestAddress{pointer},16,Access::Read);
+                return {std::bit_cast<double>(memory.load(GuestAddress{pointer},64)),std::bit_cast<double>(memory.load(GuestAddress{pointer+8},64))};}
+        };
+        // 先取得完整輸入再寫回，保留輸出與輸入重疊及精確記憶體故障契約。
+        const auto x=input(first);
+        std::complex<T> y{};
+        if(operation.kind==X64armComplexScale){
+            const auto i=first+1;
+            if constexpr(single)y.real(x86?std::bit_cast<float>(static_cast<std::uint32_t>(arg(i))):scalar_float(state,i));
+            else y.real(x86?std::bit_cast<double>(arg(i)):scalar(state,i));
+        }else if(operation.binary)y=input(first+1);
+        const auto output=hidden?arg(0):0;
+        if(hidden)memory.check(GuestAddress{output},16,Access::Write);
+        Environment environment(x86?static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13:state.mxcsr);
+        const auto result=host_complex(operation.kind,x,y);
+        if(operation.real){
+            if(x86)conversion_result(state,true,result.real(),single);
+            else {
+                const auto bits=[&] {if constexpr(single)return std::uint64_t{std::bit_cast<std::uint32_t>(result.real())};else return std::bit_cast<std::uint64_t>(result.real());}();
+                for(unsigned n=0;n<sizeof(T);++n)state.xmm[0][n]=static_cast<std::uint8_t>(bits>>(n*8));
+            }
+            commit_math_environment(state,memory,errno_cell,x86,environment);
+            arg.return_to(state,0);
+        }else if constexpr(single){
+            const auto bits=std::bit_cast<std::uint32_t>(result.real())|(std::uint64_t{std::bit_cast<std::uint32_t>(result.imag())}<<32);
+            commit_math_environment(state,memory,errno_cell,x86,environment);
+            arg.return_to(state,bits,true);
+        }else {
+            commit_math_environment(state,memory,errno_cell,x86,environment);
+            memory.store(GuestAddress{output},64,std::bit_cast<std::uint64_t>(result.real()));
+            memory.store(GuestAddress{output+8},64,std::bit_cast<std::uint64_t>(result.imag()));
+            arg.return_to(state,output);
+        }
+    };
+    if(operation.single)execute.template operator()<float>();else execute.template operator()<double>();
+}
+}
 std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
 #if defined(__clang__)
 #pragma STDC FENV_ACCESS ON
@@ -741,41 +798,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
         }
     }
     if(const auto* operation=complex_operation(symbol)){
-        const auto execute=[&]<class T>(){
-            constexpr bool single=sizeof(T)==4;
-            const bool hidden=!single && !operation->real;
-            const unsigned first=hidden?1U:0U;
-            const auto input=[&](unsigned index)->std::complex<T>{
-                if constexpr(single){const auto bits=arg(index);return {std::bit_cast<float>(static_cast<std::uint32_t>(bits)),std::bit_cast<float>(static_cast<std::uint32_t>(bits>>32))};}
-                else {const auto pointer=arg(index);memory.check(GuestAddress{pointer},16,Access::Read);
-                    return {std::bit_cast<double>(memory.load(GuestAddress{pointer},64)),std::bit_cast<double>(memory.load(GuestAddress{pointer+8},64))};}
-            };
-            // 先取得完整輸入再寫回，保留輸出與輸入重疊及精確記憶體故障契約。
-            const auto x=input(first),y=operation->binary?input(first+1):std::complex<T>{};
-            const auto output=hidden?arg(0):0;
-            if(hidden)memory.check(GuestAddress{output},16,Access::Write);
-            Environment environment(x86_?static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13:state.mxcsr);
-            const auto result=host_complex(operation->kind,x,y);
-            if(operation->real){
-                if(x86_)conversion_result(state,true,result.real(),single);
-                else {
-                    const auto bits=[&] {if constexpr(single)return std::uint64_t{std::bit_cast<std::uint32_t>(result.real())};else return std::bit_cast<std::uint64_t>(result.real());}();
-                    for(unsigned n=0;n<sizeof(T);++n)state.xmm[0][n]=static_cast<std::uint8_t>(bits>>(n*8));
-                }
-                commit_math_environment(state,memory,runtime_.errno_cell,x86_,environment);
-                arg.return_to(state,0);
-            }else if constexpr(single){
-                const auto bits=std::bit_cast<std::uint32_t>(result.real())|(std::uint64_t{std::bit_cast<std::uint32_t>(result.imag())}<<32);
-                commit_math_environment(state,memory,runtime_.errno_cell,x86_,environment);
-                arg.return_to(state,bits,true);
-            }else {
-                commit_math_environment(state,memory,runtime_.errno_cell,x86_,environment);
-                memory.store(GuestAddress{output},64,std::bit_cast<std::uint64_t>(result.real()));
-                memory.store(GuestAddress{output+8},64,std::bit_cast<std::uint64_t>(result.imag()));
-                arg.return_to(state,output);
-            }
-        };
-        if(operation->single)execute.template operator()<float>();else execute.template operator()<double>();
+        invoke_complex_operation(*operation,arg,state,memory,x86_,runtime_.errno_cell);
         return std::nullopt;
     }
     if(symbol=="_fpreset"){

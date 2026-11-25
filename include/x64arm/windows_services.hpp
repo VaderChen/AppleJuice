@@ -41,6 +41,7 @@ struct UFieldPositionIterator;
 struct UFormattedValue;
 
 namespace x64arm {
+namespace icu_text { struct Projection; }
 namespace icu_abi {struct IcuStatus;}
 namespace dns_detail {struct Record;}
 namespace wlan {class Backend;}
@@ -520,6 +521,8 @@ private:
     std::optional<std::uint32_t> invoke_icu_date_format(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<struct IcuFormattedState> icu_formatted_;
     std::shared_ptr<struct IcuCollationState> icu_collation_;
+    void detach_icu_search_break(std::uint64_t);
+    std::optional<std::uint32_t> invoke_icu_string_search(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_icu_formatted(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_icu_collation(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint64_t adopt_icu_formatted_value(GuestState&,GuestMemory&,const UFormattedValue*,icu_abi::IcuStatus&);
@@ -533,6 +536,23 @@ private:
     std::shared_ptr<struct IcuIdnaState> icu_idna_;
     std::optional<std::uint32_t> invoke_icu_idna(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_icu_time_scale(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuNumberingSystemState> icu_numbering_systems_;
+    std::optional<std::uint32_t> invoke_icu_numbering_system(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_icu_gender(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuDisplayNamesState> icu_display_names_;
+    std::optional<std::uint32_t> invoke_icu_display_names(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuResourceBundleState> icu_resources_;
+    std::optional<std::uint32_t> invoke_icu_resources(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuConverterSelectorState> icu_converter_selectors_;
+    std::optional<std::uint32_t> invoke_icu_converter_selector(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuSpoofState> icu_spoof_;
+    std::optional<std::uint32_t> invoke_icu_spoof(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<struct IcuRegexState> icu_regex_;
+    std::optional<std::uint32_t> invoke_icu_regex(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_icu_regex(GuestState&,GuestMemory&,const WindowsServiceDescriptor&,
+                                                  std::shared_ptr<const icu_text::Projection>);
+    std::shared_ptr<struct IcuMessageState> icu_messages_;
+    std::optional<std::uint32_t> invoke_icu_message(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<NativeAngle> native_angle_;
     std::optional<std::uint32_t> invoke_angle(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<NativeV8> native_v8_;

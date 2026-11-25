@@ -4,7 +4,8 @@ enum X64armComplexKind {
     X64armComplexAbs,X64armComplexArg,X64armComplexReal,X64armComplexImag,
     X64armComplexCos,X64armComplexSin,X64armComplexTan,X64armComplexAcos,X64armComplexAsin,X64armComplexAtan,
     X64armComplexCosh,X64armComplexSinh,X64armComplexTanh,X64armComplexAcosh,X64armComplexAsinh,X64armComplexAtanh,
-    X64armComplexExp,X64armComplexLog,X64armComplexLog10,X64armComplexPow,X64armComplexSqrt,X64armComplexConj,X64armComplexProj
+    X64armComplexExp,X64armComplexLog,X64armComplexLog10,X64armComplexPow,X64armComplexSqrt,X64armComplexConj,X64armComplexProj,
+    X64armComplexMultiply,X64armComplexScale,X64armComplexNorm
 };
 #ifdef __cplusplus
 extern "C" {

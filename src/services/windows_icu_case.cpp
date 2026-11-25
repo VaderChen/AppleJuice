@@ -173,6 +173,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_icu_case(GuestState& state,
     auto* object=found==cases.end()?nullptr:&found->second;
     const auto retire=[&](std::uint64_t handle){
         if(handle && icu_breaks_){
+            detach_icu_search_break(handle);
             icu_breaks_->objects.erase(handle);
             (void)free_heap(memory,handle,state);
         }

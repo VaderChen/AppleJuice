@@ -2,12 +2,19 @@
 #include <complex.h>
 #include <math.h>
 #pragma STDC FENV_ACCESS ON
+#pragma STDC FP_CONTRACT OFF
+#include "crt_complex_arithmetic.h"
 
 /* 不使用 a + I*b 建構，避免額外乘法破壞無限大、NaN 與負零。 */
-#define DEFINE_COMPLEX(width,type,suffix) \
+#define DEFINE_COMPLEX(width,type,suffix,tag) \
 void x64arm_complex_##width(enum X64armComplexKind kind,const type input[4],type output[2]) { \
     type complex x=__builtin_complex(input[0],input[1]),y=__builtin_complex(input[2],input[3]),value; \
     switch(kind) { \
+    case X64armComplexNorm:output[0]=crt_norm_##tag((CrtComplex##tag){input[0],input[1]});output[1]=0;return; \
+    case X64armComplexMultiply:case X64armComplexScale:{ \
+        const CrtComplex##tag a={input[0],input[1]},b={input[2],input[3]}; \
+        const CrtComplex##tag r=kind==X64armComplexScale?crt_scale_##tag(a,b.real):crt_product_##tag(a,b); \
+        output[0]=r.real;output[1]=r.imag;return; } \
     case X64armComplexAbs:output[0]=cabs##suffix(x);output[1]=0;return; \
     case X64armComplexArg:output[0]=carg##suffix(x);output[1]=0;return; \
     case X64armComplexReal:output[0]=input[0];output[1]=0;return; \
@@ -35,6 +42,6 @@ void x64arm_complex_##width(enum X64armComplexKind kind,const type input[4],type
     } \
     output[0]=creal##suffix(value);output[1]=cimag##suffix(value); \
 }
-DEFINE_COMPLEX(double,double,)
-DEFINE_COMPLEX(float,float,f)
+DEFINE_COMPLEX(double,double,,d)
+DEFINE_COMPLEX(float,float,f,f)
 #undef DEFINE_COMPLEX

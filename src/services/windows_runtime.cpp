@@ -56,6 +56,14 @@ std::span<const WindowsServiceDescriptor> icu_charset_detection_service_descript
 std::span<const WindowsServiceDescriptor> icu_region_service_descriptors();
 std::span<const WindowsServiceDescriptor> icu_idna_service_descriptors();
 std::span<const WindowsServiceDescriptor> icu_time_scale_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_numbering_system_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_gender_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_display_names_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_resources_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_converter_selector_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_spoof_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_regex_service_descriptors();
+std::span<const WindowsServiceDescriptor> icu_message_service_descriptors();
 }
 
 namespace x64arm {
@@ -457,6 +465,14 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {icu_region_service_descriptors(), true, "icu_region_service_descriptors", &WindowsServices::invoke_icu_region},
             {icu_idna_service_descriptors(), true, "icu_idna_service_descriptors", &WindowsServices::invoke_icu_idna},
             {icu_time_scale_service_descriptors(), true, "icu_time_scale_service_descriptors", &WindowsServices::invoke_icu_time_scale},
+            {icu_numbering_system_service_descriptors(), true, "icu_numbering_system_service_descriptors", &WindowsServices::invoke_icu_numbering_system},
+            {icu_gender_service_descriptors(), true, "icu_gender_service_descriptors", &WindowsServices::invoke_icu_gender},
+            {icu_display_names_service_descriptors(), true, "icu_display_names_service_descriptors", &WindowsServices::invoke_icu_display_names},
+            {icu_resources_service_descriptors(), true, "icu_resources_service_descriptors", &WindowsServices::invoke_icu_resources},
+            {icu_converter_selector_service_descriptors(), true, "icu_converter_selector_service_descriptors", &WindowsServices::invoke_icu_converter_selector},
+            {icu_spoof_service_descriptors(), true, "icu_spoof_service_descriptors", &WindowsServices::invoke_icu_spoof},
+            {icu_regex_service_descriptors(), true, "icu_regex_service_descriptors", &WindowsServices::invoke_icu_regex},
+            {icu_message_service_descriptors(), true, "icu_message_service_descriptors", &WindowsServices::invoke_icu_message},
             {wlan_service_descriptors(), true, "wlan_service_descriptors", &WindowsServices::invoke_wlan},
             {font_package_service_descriptors(), true, "font_package_service_descriptors", &WindowsServices::invoke_font_package},
             {mci_service_descriptors(), false, "mci_service_descriptors", &WindowsServices::invoke_mci},

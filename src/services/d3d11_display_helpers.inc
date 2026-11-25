@@ -40,6 +40,8 @@
             auto mode=native_gui_->current_display_mode();if(word(swap->desc,x86_?56:64)&2U)mode=closest_display_mode(swap->target_mode);if(!mode)return not_found;
             if(!target)target=create_output(swap_adapter(swap));else hold(target);
             if(!enter_graphics_fullscreen(*swap,mode)){release(target);return 0x887a0022U;}
+            // 交換鏈的目標模式回報實際生效的顯示模式（未切換實體模式時是桌面模式），應用程式依此決定緩衝大小。
+            if(const auto actual=native_gui_->current_display_mode())mode=actual;
             const auto previous=swap->fullscreen_output;swap->fullscreen_output=target;if(previous)release(previous);
             swap->target_mode=display_mode_bytes(*mode,word(swap->desc,16));put_word(swap->desc,x86_?48:56,0);return 0;
         };

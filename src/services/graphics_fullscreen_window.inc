@@ -21,6 +21,11 @@
         auto& window=found->second;
         if(!id.fullscreen){id.windowed_rect={window.x,window.y,static_cast<std::int32_t>(window.width),static_cast<std::int32_t>(window.height)};id.windowed_style=window.style;id.windowed_ex_style=window.ex_style;id.windowed_insets=window.frame_insets;}
         window.style=(window.style&~0x00cf0000U)|0x80000000U;window.frame_insets=std::array<std::uint32_t,4>{};
-        const auto rect=gui_screen_area();notify_swap_window(id.window,rect[0],rect[1],static_cast<std::uint32_t>(rect[2]-rect[0]),static_cast<std::uint32_t>(rect[3]-rect[1]));
+        // 全螢幕視窗蓋滿實際生效的顯示模式：切換實體模式後，螢幕框架要稍後才更新，直接用原生回報的目前模式尺寸
+        //（客體自訂的 ChangeDisplaySettings 模式仍以螢幕範圍為準）。
+        gui_area_cached_={};auto rect=gui_screen_area();
+        if(!gui_.display_mode && native_gui_)if(const auto actual=native_gui_->current_display_mode();actual && actual->width && actual->height){
+            rect[2]=rect[0]+static_cast<std::int32_t>(actual->width);rect[3]=rect[1]+static_cast<std::int32_t>(actual->height);}
+        notify_swap_window(id.window,rect[0],rect[1],static_cast<std::uint32_t>(rect[2]-rect[0]),static_cast<std::uint32_t>(rect[3]-rect[1]));
         id.fullscreen=true;return true;
     };

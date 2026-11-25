@@ -1,6 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "icu_break_binary.hpp"
-#include "icu_break_projection.hpp"
+#include "icu_text_input_task.hpp"
 #include "icu_break_state.hpp"
 #include "icu_guest_abi.hpp"
 #include "icu_text_guest.hpp"
@@ -55,47 +55,7 @@ std::shared_ptr<const std::u16string> load_text(GuestMemory& memory,std::uint64_
     return text;
 }
 
-icu_break::SharedProjection load_projection(GuestMemory& memory,std::uint64_t address,UErrorCode& error){
-    icu_text::Snapshot header{};
-    memory.read(GuestAddress{address},{reinterpret_cast<std::uint8_t*>(&header),sizeof(header)});
-    if(header.native_length>INT32_MAX || header.count>header.native_length ||
-       bool(header.count)!=bool(header.native_length)){
-        error=U_INVALID_FORMAT_ERROR;
-        return {};
-    }
-    const auto size=std::size_t{header.count}*sizeof(icu_text::CodePoint);
-    const GuestAddress records{address+sizeof(header)};
-    if(size)memory.check(records,size,Access::Read);
-    std::vector<icu_text::CodePoint> points(header.count);
-    if(size)memory.read(records,{reinterpret_cast<std::uint8_t*>(points.data()),size});
-    auto result=std::make_shared<icu_break::Projection>();
-    result->units.reserve(header.count);
-    result->native_offsets.reserve(std::size_t{header.count}+1);
-    std::uint32_t prior=0;
-    for(std::size_t i=0;i<points.size();++i){
-        const auto [offset,code]=points[i];
-        if((i==0?offset!=0:offset<=prior) || offset>=header.native_length || code>0x10ffff){
-            error=U_INVALID_FORMAT_ERROR;
-            return {};
-        }
-        const auto length=code<=0xffff?1U:2U;
-        if(result->units.size()>std::size_t{INT32_MAX}-length){
-            error=U_INDEX_OUTOFBOUNDS_ERROR;
-            return {};
-        }
-        const auto index=static_cast<std::int32_t>(offset);
-        result->native_offsets.push_back(index);
-        if(length==1)result->units.push_back(static_cast<UChar>(code));
-        else{
-            result->units.push_back(U16_LEAD(code));
-            result->native_offsets.push_back(index);
-            result->units.push_back(U16_TRAIL(code));
-        }
-        prior=offset;
-    }
-    result->native_offsets.push_back(static_cast<std::int32_t>(header.native_length));
-    return result;
-}
+
 }
 
 std::span<const WindowsServiceDescriptor> icu_break_service_descriptors(){
@@ -125,30 +85,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_icu_break(GuestState& state
                 const auto base=icu_text::image_address(x86_);
                 const auto& image=runtime_.builtin_images.at(base);
                 const auto target=base+image.export_names.at(icu_text::project_export);
-                const auto output=co_await service_callback::call_value(target,{call(1),status.address.value});
-                struct Release {
-                    WindowsServices& self;
-                    GuestMemory& memory;
-                    GuestState& state;
-                    std::uint64_t address;
-                    ~Release(){if(address)(void)self.free_heap(memory,address,state);}
-                } release{*this,m,s,output};
-                status.value=static_cast<UErrorCode>(signed_argument(m.load(status.address,32)));
-                if(U_FAILURE(status.value))co_return finish();
-                auto* object=icu_breaks_->find(handle);
-                if(!object || !output){
-                    status.value=object?U_MEMORY_ALLOCATION_ERROR:U_ILLEGAL_ARGUMENT_ERROR;
-                    status.commit();co_return finish();
-                }
-                const auto projection=load_projection(m,output,status.value);
+                const auto projection=co_await icu_text::project_input(m,target,call(1),status,
+                    [&](std::uint64_t address){(void)free_heap(m,address,s);});
                 if(projection){
-                    UText local=UTEXT_INITIALIZER;
-                    if(icu_break::open_projection(&local,projection,&status.value)){
-                        if(service.symbol=="ubrk_refreshUText")ubrk_refreshUText(object->get(),&local,&status.value);
-                        else ubrk_setUText(object->get(),&local,&status.value);
-                        if(U_SUCCESS(status.value))object->text.reset();
+                    auto* object=icu_breaks_->find(handle);
+                    if(!object)status.value=U_ILLEGAL_ARGUMENT_ERROR;
+                    else if(projection->native_offsets.back()>INT32_MAX)status.value=U_INDEX_OUTOFBOUNDS_ERROR;
+                    else{
+                        icu_text::LocalText local;
+                        if(icu_text::open_projection(&local.value,projection,&status.value)){
+                            if(service.symbol=="ubrk_refreshUText")ubrk_refreshUText(object->get(),&local.value,&status.value);
+                            else ubrk_setUText(object->get(),&local.value,&status.value);
+                            if(U_SUCCESS(status.value))object->text.reset();
+                        }
                     }
-                    utext_close(&local);
                 }
                 status.commit();
                 co_return finish();
@@ -170,6 +120,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_icu_break(GuestState& state
         return finish(descriptor->query(object?object->get():nullptr,call));
     if(name=="ubrk_close"){
         if(object && !object->case_owner){
+            detach_icu_search_break(call(0));
             icu_breaks_->objects.erase(call(0));
             (void)free_heap(memory,call(0),state);
         }
