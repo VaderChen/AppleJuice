@@ -83,8 +83,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gray_string(GuestState& sta
             RasterBlit options;options.operation=0xe2;auto& brush=options.brush;const auto handle=operation.brush;
             brush.color=handle==0xb012?dc.dc_brush_color:gui_.brushes.contains(handle)?gui_.brushes.at(handle):handle==0xb000?0xffffffU:handle==0xb001?0xc0c0c0U:handle==0xb002?0x808080U:handle==0xb003?0x404040U:0U;
             brush.hatch=gui_.brush_hatches.contains(handle)?gui_.brush_hatches.at(handle):-1;brush.pattern_opaque=dc.mode==2;brush.pattern_background=dc.background;brush.pattern_color=dc.color;brush.brush_origin=dc.brush_origin;
-            std::shared_ptr<RasterSurface> pattern;
-            if(gui_.brush_patterns.contains(handle)){const auto& bitmap=gui_.brush_patterns.at(handle);brush.pattern_brush=handle;brush.pattern_monochrome=bitmap.bits_per_pixel==1;pattern=make_hardware_raster(bitmap.width,bitmap.height,bitmap.pixels);}
+            auto pattern=gdi_brush_raster(handle,operation.dc,brush);
             const std::array<std::int32_t,4> destination{operation.x,operation.y,operation.x+operation.width,operation.y+operation.height},rectangle{0,0,operation.width,operation.height};
             target->blit(*stencil,destination,rectangle,dc,UINT32_MAX,options,pattern.get());
             if(operation.dc>=0x10000000 && gui_.windows.contains(operation.dc-0x10000000))present_gui(operation.dc-0x10000000);

@@ -2,6 +2,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/native_pdf.hpp"
 #include "x64arm/windows_printing.hpp"
+#include "x64arm/windows_transform.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/registry_store.hpp"
 #include "x64arm/windows_security_attributes.hpp"
@@ -15,7 +16,7 @@ namespace x64arm {
 struct PrintingState {
     struct Device : PrinterSettings {
         bool information{};
-        std::uint64_t bitmap{},abort_proc{};unsigned job{},pending{};bool active{},page{},cancelled{};
+        std::uint64_t bitmap{},abort_proc{},spool_owner{};unsigned job{},pending{};bool active{},page{},cancelled{};
         bool legacy{},implicit_page{},banding{};
         std::uint32_t access{8};std::u16string datatype{u"RAW"},default_datatype{u"RAW"};
         std::vector<std::uint8_t> spool;std::vector<std::size_t> page_ends;bool explicit_pages{};
@@ -31,6 +32,20 @@ struct PrintingState {
         std::array<std::uint64_t,3> revisions{};
     };
     std::map<std::uint64_t,Device> devices,handles;std::map<std::uint64_t,Notice> notices;unsigned next_job{1};
+    bool rendering(unsigned job) const {
+        return std::any_of(devices.begin(),devices.end(),[job](const auto& item){
+            return item.second.active && item.second.job==job;
+        });
+    }
+    unsigned available_job() {
+        while(next_job<=INT32_MAX && rendering(next_job))++next_job;
+        return next_job;
+    }
+    Device* spool_target(const Device& dc) {
+        const auto it=handles.find(dc.spool_owner);
+        if(it==handles.end() || !it->second.active || it->second.job!=dc.job)return nullptr;
+        return &it->second;
+    }
     // 印表機暫停或工作暫停時，EndDocPrinter／ScheduleJob 完成的工作留在佇列，恢復後依序輸出。印表機設定（SetPrinter 第 2、8、9 級）在本程序有效。
     std::vector<Device> queue;bool paused{};std::uint32_t status{},priority{1},default_priority{1};
     std::u16string comment{u"CoreGraphics PDF"},location;std::optional<PrinterSettings> defaults;
@@ -101,10 +116,16 @@ std::uint64_t WindowsServices::create_printer_dc(GuestMemory& memory,std::uint64
     PrintingState::Device device;device.information=information;if(const auto error=read_printer_settings(memory,mode,wide,device)){last_error_=error;return 0;}
     const auto dc=gui_.next_object++,bitmap=gui_.next_object++;device.bitmap=bitmap;
     gui_.bitmaps.emplace(bitmap,GuiBitmap{device.width,device.height,std::vector<std::uint32_t>(static_cast<std::size_t>(device.width)*device.height,0xffffffffU)});
-    try{GuiDc context;context.bitmap=bitmap;gui_.contexts.emplace(dc,std::move(context));printing_->devices.emplace(dc,std::move(device));}catch(...){gui_.bitmaps.erase(bitmap);gui_.contexts.erase(dc);throw;}return dc;
+    try{GuiDc context;context.information=information;context.bitmap=bitmap;gui_.contexts.emplace(dc,std::move(context));printing_->devices.emplace(dc,std::move(device));}catch(...){gui_.bitmaps.erase(bitmap);gui_.contexts.erase(dc);throw;}return dc;
 }
 void WindowsServices::delete_printer_dc(std::uint64_t dc){
-    if(!is_printer_dc(dc))return;if(printing_->devices.at(dc).active)printing_changed(0x400);const auto bitmap=printing_->devices.at(dc).bitmap;rasters_.erase(bitmap);raster_shared_.erase(bitmap);gui_.bitmaps.erase(bitmap);printing_->devices.erase(dc);
+    if(!is_printer_dc(dc))return;
+    auto& device=printing_->devices.at(dc);
+    if(device.active){
+        if(auto* target=printing_->spool_target(device))target->cancelled=true;
+        printing_changed(0x400);
+    }
+    const auto bitmap=device.bitmap;rasters_.erase(bitmap);raster_shared_.erase(bitmap);gui_.bitmaps.erase(bitmap);printing_->devices.erase(dc);
 }
 std::optional<std::uint32_t> WindowsServices::printer_device_cap(std::uint64_t dc,unsigned cap)const{
     if(!is_printer_dc(dc))return {};const auto& device=printing_->devices.at(dc);
@@ -114,6 +135,8 @@ std::optional<std::uint32_t> WindowsServices::printer_device_cap(std::uint64_t d
 }
 std::span<const WindowsServiceDescriptor> printing_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"win32u.dll","NtGdiStartDoc",4},{"win32u.dll","NtGdiStartPage",1},{"win32u.dll","NtGdiEndPage",1},
+        {"win32u.dll","NtGdiEndDoc",1},{"win32u.dll","NtGdiAbortDoc",1},{"win32u.dll","NtGdiCancelDC",1},{"win32u.dll","NtGdiResetDC",5},
         {"gdi32.dll","StartDocA",2},{"gdi32.dll","StartDocW",2},{"gdi32.dll","StartPage",1},{"gdi32.dll","EndPage",1},{"gdi32.dll","EndDoc",1},{"gdi32.dll","AbortDoc",1},{"gdi32.dll","CancelDC",1},{"gdi32.dll","SetAbortProc",2},
         {"winspool.drv","GetDefaultPrinterA",2},{"winspool.drv","GetDefaultPrinterW",2},
         {"winspool.drv","EnumFormsA",6},{"winspool.drv","EnumFormsW",6},{"winspool.drv","GetFormA",6},{"winspool.drv","GetFormW",6},
@@ -143,40 +166,119 @@ std::span<const WindowsServiceDescriptor> printing_service_descriptors(){
         {"winspool.drv","SetPrinterA",4,0,0,0xa},{"winspool.drv","SetPrinterW",4,0,0,0xa},{"winspool.drv","ResetPrinterA",2},{"winspool.drv","ResetPrinterW",2},
         {"winspool.drv","ReadPrinter",4,0,0,0x4},{"winspool.drv","SeekPrinter",5,0x2,0,0x18},{"winspool.drv","FreePrinterNotifyInfo",1},{"winspool.drv","SpoolerInit",0},
         {"spoolss.dll","StartDocPrinterA",3},{"spoolss.dll","StartDocPrinterW",3},{"spoolss.dll","StartPagePrinter",1},{"spoolss.dll","WritePrinter",4},{"spoolss.dll","EndPagePrinter",1},{"spoolss.dll","EndDocPrinter",1},{"spoolss.dll","AbortPrinter",1},
+        {"win32u.dll","NtGdiExtEscape",8,0,0,0x5c},{"win32u.dll","NtGdiDrawEscape",4,0,0,0x06},
         {"gdi32.dll","ResetDCA",2},{"gdi32.dll","ResetDCW",2},{"gdi32.dll","ExtEscape",6},{"gdi32.dll","DrawEscape",4},{"gdi32.dll","NamedEscape",7}
     };return table;
 }
 std::span<const WindowsServiceDescriptor> printing_escape_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{{"gdi32.dll","Escape",5}};return table;
 }
+std::optional<std::uint32_t> WindowsServices::invoke_gdi_escape(GuestState& state,GuestMemory& memory,const WindowsCall& arg,std::string_view symbol){
+    const auto dc=arg(0);
+    const bool native_ext=symbol=="NtGdiExtEscape",named=symbol=="NamedEscape";
+    const bool drawing=symbol=="NtGdiDrawEscape" || symbol=="DrawEscape",legacy=symbol=="Escape";
+    const unsigned index=native_ext?3U:named?2U:1U;
+    const auto code=static_cast<std::uint32_t>(arg(index));
+    const auto input_size=static_cast<std::int32_t>(arg(index+1));
+    const auto input=arg(index+2);
+    const auto output_size=drawing || legacy?0:static_cast<std::int32_t>(arg(index+3));
+    const auto output=drawing?0:arg(legacy?4:index+4);
+    const auto finish=[&](std::uint32_t value,unsigned error=0){
+        if(error)last_error_=error;
+        arg.return_to(state,value);
+        return std::optional<std::uint32_t>{};
+    };
+    if(input_size<0 || output_size<0)return finish(UINT32_MAX,87);
+    const auto driver=native_ext || named?arg(1):0;
+    if(named && !driver)return finish(UINT32_MAX,87);
+    if((dc || !driver) && !gui_.contexts.contains(dc))return finish(UINT32_MAX,6);
+    bool printer=is_printer_dc(dc);
+    try{
+        if(native_ext){
+            const auto length=static_cast<std::int32_t>(arg(2));
+            if(length<0 || length>32768 || (length!=0)!=static_cast<bool>(driver))return finish(UINT32_MAX,87);
+        }
+        if(driver){
+            auto text=native_ext?read_utf16_counted(memory,GuestAddress{driver},static_cast<std::size_t>(arg(2))):
+                                 read_utf16(memory,GuestAddress{driver});
+            if(!text.empty() && !text.back())text.pop_back();
+            text=printer_forms::fold(std::move(text));
+            const bool pdf=text==u"win64 pdf" || text==u"winspool";
+            const bool display=text==u"display" || text==u"\\\\.\\display1";
+            if((!pdf && !display) || (dc && pdf!=printer))return finish(0);
+            if(pdf && (!native_gui_ || !runtime_.network.external_io))return finish(0);
+            printer=pdf;
+        }
+        if(code==8 && legacy && input_size<2)return finish(0);
+        if(input_size){
+            if(!input)return finish(UINT32_MAX,87);
+            memory.check(GuestAddress{input},static_cast<std::size_t>(input_size),Access::Read);
+        }
+        // QUERYESCSUPPORT 只讀取待查代碼，輸出緩衝區不參與查詢。
+        if(code==8){
+            if(input_size<(legacy?2:4))return finish(UINT32_MAX,87);
+            const auto query=memory.load(GuestAddress{input},input_size<4?16:32);
+            if(drawing)return finish(printer && (query==8 || query==25));
+            if(query==8)return finish(1);
+            if(!printer)return finish(0);
+            return finish(query==25 || (dc && query>=12 && query<=14) ||
+                          (legacy && (query==1 || query==2 || query==3 || (query>=9 && query<=11))));
+        }
+        if(!printer)return finish(0);
+        if(!drawing && code>=12 && code<=14){
+            if(!dc)return finish(UINT32_MAX,6);
+            if(!output || (!legacy && output_size<8))return finish(UINT32_MAX,87);
+            memory.check(GuestAddress{output},8,Access::Write);
+            const auto first=110U+(code-12)*2;
+            memory.store(GuestAddress{output},32,*printer_device_cap(dc,first));
+            memory.store(GuestAddress{output+4},32,*printer_device_cap(dc,first+1));
+            return finish(1);
+        }
+        if(code!=25)return finish(0);
+        if(!dc)return finish(UINT32_MAX,6);
+        if(input_size!=20)return finish(UINT32_MAX,87);
+        const auto coord=[&](unsigned offset){return static_cast<std::int32_t>(memory.load(GuestAddress{input+offset},32));};
+        GuiDraw draw;draw.kind=GuiDraw::Kind::Fill;
+        draw.x=coord(0);draw.y=coord(4);draw.right=coord(8);draw.bottom=coord(12);
+        const auto style=memory.load(GuestAddress{input+16},16),density=memory.load(GuestAddress{input+18},16);
+        if(style>2 || (style==2 && density>100))return finish(UINT32_MAX,87);
+        const auto black=style==0?100U:style==1?0U:static_cast<unsigned>(density);
+        auto& context=gui_.contexts.at(dc);
+        draw.transform=gui_device_transform(context);
+        auto surface=raster_surface(memory,dc);
+        if(!surface)return finish(UINT32_MAX,last_error_?last_error_:50);
+        // PCL 規則使用邏輯座標，忽略應用程式的裁剪區。每百個網點依指定百分比分配黑白。
+        draw.color=black==0?0xffffffU:0;
+        std::shared_ptr<RasterSurface> pattern;
+        if(black!=0 && black!=100){
+            std::array<std::uint32_t,100> tile{};
+            for(unsigned i=0;i<tile.size();++i)tile[i]=(i*37U)%100U<black?0xff000000U:0xffffffffU;
+            pattern=make_hardware_raster(10,10,tile);
+        }
+        surface->draw(draw,pattern.get());
+        accumulate_dc_bounds(context,draw);
+        return finish(1);
+    }catch(const MemoryFault&){return finish(UINT32_MAX,998);}
+    catch(const std::invalid_argument&){return finish(UINT32_MAX,87);}
+    catch(const std::length_error&){return finish(UINT32_MAX,87);}
+    catch(const std::bad_alloc&){return finish(UINT32_MAX,8);}
+}
 std::optional<std::uint32_t> WindowsServices::invoke_printing(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.family=="winspool.drv" || service.family=="spoolss.dll")return invoke_spooler(state,memory,service);
     const WindowsCall arg(state,memory,service);auto name=service.symbol;
+    const bool native=service.family=="win32u.dll";
+    if(native){
+        name.remove_prefix(5);
+        if(name=="StartDoc")name="StartDocW";
+        else if(name=="ResetDC")name="ResetDCW";
+    }
+    const bool native_bool=native && name!="StartDocW";
     const bool legacy=name=="Escape";const auto escape=legacy?static_cast<std::uint32_t>(arg(1)):0U;
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
-    const auto failure=[&](unsigned error){last_error_=error;return finish(name=="CancelDC" || name.starts_with("ResetDC")?0:UINT32_MAX);};
-    if(name=="DrawEscape"){
-        // 繪圖跳脫：原生顯示與 PDF 驅動都沒有繪圖跳脫，QUERYESCSUPPORT 對任何代碼皆回報不支援，其他跳脫回 0（未實作）。
-        if(!gui_.contexts.contains(arg(0)))return failure(6);
-        if(static_cast<std::int32_t>(arg(2))<0)return failure(87);
-        if(static_cast<std::uint32_t>(arg(1))==8 && (static_cast<std::uint32_t>(arg(2))<4 || !arg(3)))return failure(87);
-        return finish(0);
-    }
-    if(name=="NamedEscape"){
-        // 依驅動名稱送出跳脫（hdc 可為 NULL）：與 ExtEscape 相同的支援集合，只有 QUERYESCSUPPORT 本身。
-        if(!arg(1))return failure(87);
-        if(arg(0) && !gui_.contexts.contains(arg(0)))return failure(6);
-        if(static_cast<std::int32_t>(arg(3))<0 || static_cast<std::int32_t>(arg(5))<0)return failure(87);
-        if(static_cast<std::uint32_t>(arg(2))==8){if(static_cast<std::uint32_t>(arg(3))<4 || !arg(4))return failure(87);return finish(memory.load(GuestAddress{arg(4)},32)==8?1:0);}
-        return finish(0);
-    }
-    if(name=="ExtEscape"){
-        if(!gui_.contexts.contains(arg(0)))return failure(6);
-        if(static_cast<std::int32_t>(arg(2))<0 || static_cast<std::int32_t>(arg(4))<0)return failure(87);
-        if(static_cast<std::uint32_t>(arg(1))==8){if(static_cast<std::uint32_t>(arg(2))<4 || !arg(3))return failure(87);const auto code=memory.load(GuestAddress{arg(3)},32);return finish(code==8?1:0);}
-        // 原生 PDF driver 不接受 PostScript / JPEG / PNG passthrough；由 GDI raster API 產生頁面。
-        return finish(0);
-    }
+    const auto failure=[&](unsigned error){last_error_=error;return finish(native_bool || name=="CancelDC" || name.starts_with("ResetDC")?0:UINT32_MAX);};
+    if(name=="DrawEscape" || name=="ExtEscape" || name=="NamedEscape" ||
+       (legacy && (escape==8 || (escape>=12 && escape<=14) || escape==25)))
+        return invoke_gdi_escape(state,memory,arg,service.symbol);
     if(legacy){
         if(!gui_.contexts.contains(arg(0)))return failure(6);
         const auto count=static_cast<std::int32_t>(arg(2));if(count<0)return failure(87);
@@ -185,33 +287,41 @@ std::optional<std::uint32_t> WindowsServices::invoke_printing(GuestState& state,
             if(count && !arg(3))return failure(87);std::vector<std::uint8_t> data(static_cast<std::size_t>(count));if(count)memory.read(GuestAddress{arg(3)},data);
             return finish(record_metafile_escape(arg(0),15,data)?1:0);
         }
-        if(escape==8){
-            if(count<2)return finish(0);if(!arg(3))return failure(87);
-            const auto code=memory.load(GuestAddress{arg(3)},count<4?16:32);
-            const bool printer=is_printer_dc(arg(0));
-            return finish(code==8 || (printer && (code==1 || code==2 || code==3 || (code>=9 && code<=14))));
-        }
-        if(escape>=12 && escape<=14){
-            if(!is_printer_dc(arg(0)))return finish(0);if(!arg(4))return failure(87);
-            const unsigned first=escape==12?110:escape==13?112:114;
-            memory.check(GuestAddress{arg(4)},8,Access::Write);
-            memory.store(GuestAddress{arg(4)},32,*printer_device_cap(arg(0),first));
-            memory.store(GuestAddress{arg(4)+4},32,*printer_device_cap(arg(0),first+1));return finish(1);
-        }
         switch(escape){case 1:name="EndPage";break;case 2:name="AbortDoc";break;
         case 3:name="NextBand";break;case 9:name="SetAbortProc";break;
         case 10:name="StartDocA";break;case 11:name="EndDoc";break;
         default:return finish(0);}
     }
     if(!is_printer_dc(arg(0)))return failure(6);auto& device=printing_->devices.at(arg(0));
+    if((name=="CancelDC" || name=="AbortDoc") && device.active && device.spool_owner)
+        if(auto* owner=printing_->spool_target(device))owner->cancelled=true;
     if(name=="CancelDC"){device.cancelled=true;printing_changed(0x200);return finish(1);}
     if(name=="AbortDoc"){if(device.active)printing_changed(0x400);device.active=device.page=device.implicit_page=device.banding=false;device.cancelled=true;device.pages.clear();device.bytes=0;return finish(1);}
     if(device.pending)return failure(170);
     if(name=="SetAbortProc"){const auto procedure=arg(legacy?3:1);if(!procedure)return failure(87);if(!handles(GuestAddress{procedure}))memory.check(GuestAddress{procedure},1,Access::Execute);device.abort_proc=procedure;return finish(1);}
     try{
         if(name.starts_with("ResetDC")){
-            if(device.active || !gui_.saved_contexts[arg(0)].empty())return failure(170);auto changed=device;if(const auto error=read_printer_settings(memory,arg(1),name.ends_with('W'),changed))return failure(error);
-            GuiBitmap bitmap{changed.width,changed.height,std::vector<std::uint32_t>(static_cast<std::size_t>(changed.width)*changed.height,0xffffffffU)};gui_.bitmaps.at(changed.bitmap)=std::move(bitmap);rasters_.erase(changed.bitmap);device=std::move(changed);return finish(arg(0));
+            if(device.page || !gui_.saved_contexts[arg(0)].empty())return failure(170);
+            const auto banding=native?arg(2):0,driver=native?arg(3):0,pdev=native?arg(4):0;
+            const unsigned unit=x86_?4:8;
+            const std::uint8_t width=x86_?32:64;
+            if(banding)memory.check(GuestAddress{banding},4,Access::Write);
+            if(pdev)memory.check(GuestAddress{pdev},unit,Access::Write);
+            if(driver){
+                memory.check(GuestAddress{driver},unit*6,Access::Read);
+                const auto driver_name=memory.load(GuestAddress{driver+unit},width);
+                if(driver_name && printer_forms::fold(read_utf16(memory,GuestAddress{driver_name}))!=u"win64 pdf")return failure(1797);
+            }
+            PrinterSettings changed=device;
+            if(const auto error=read_printer_settings(memory,arg(1),name.ends_with('W'),changed))return failure(error);
+            GuiBitmap bitmap{changed.width,changed.height,std::vector<std::uint32_t>(static_cast<std::size_t>(changed.width)*changed.height,0xffffffffU)};
+            gui_.bitmaps.at(device.bitmap)=std::move(bitmap);
+            rasters_.erase(device.bitmap);raster_shared_.erase(device.bitmap);
+            static_cast<PrinterSettings&>(device)=std::move(changed);
+            GuiDc context;context.information=device.information;context.bitmap=device.bitmap;gui_.contexts.at(arg(0))=std::move(context);
+            if(banding)memory.store(GuestAddress{banding},32,0);
+            if(pdev)memory.store(GuestAddress{pdev},width,0);
+            return finish(native?1:arg(0));
         }
         if(name.starts_with("StartDoc")){
             if(device.active || device.information)return failure(1906);const auto info=arg(legacy?4:1);
@@ -231,11 +341,34 @@ std::optional<std::uint32_t> WindowsServices::invoke_printing(GuestState& state,
                 }else if(count)return failure(87);
             }
             auto output=utf16_to_utf8(read(pointer(2)));if(output=="FILE:")return failure(50);
-            if(printing_->next_job>INT32_MAX)return failure(8);device.job=printing_->next_job++;
+            const auto banding=native?arg(2):0;
+            if(banding)memory.check(GuestAddress{banding},4,Access::Write);
+            const auto assigned=native?static_cast<std::uint32_t>(arg(3)):0U;
+            std::uint64_t owner=0;
+            if(assigned){
+                if(assigned>INT32_MAX || printing_->rendering(assigned))return failure(87);
+                for(const auto& queued:printing_->queue)if(queued.job==assigned)return failure(170);
+                for(const auto& [handle,target]:printing_->handles){
+                    if(!target.active || target.job!=assigned)continue;
+                    if(target.cancelled || target.datatype!=u"RAW" || !target.spool.empty() ||
+                       !target.spool_path.empty() || target.spool_handle || target.explicit_pages)return failure(170);
+                    owner=handle;
+                    break;
+                }
+            }
+            const auto job=assigned?assigned:printing_->available_job();
+            if(job>INT32_MAX)return failure(8);
+            if(output.empty())output="C:\\x64arm-print-"+std::to_string(::getpid())+"-"+std::to_string(job)+".pdf";
+            device.spool_owner=owner;device.job=job;
+            if(!assigned)++printing_->next_job;
+            if(banding)memory.store(GuestAddress{banding},32,0);
             device.title=std::move(title);device.output=std::move(output);
-            if(device.output.empty())device.output="C:\\x64arm-print-"+std::to_string(::getpid())+"-"+std::to_string(device.job)+".pdf";
             device.submitted=runtime_.system_filetime();device.active=true;device.page=device.cancelled=device.implicit_page=device.banding=false;device.legacy=legacy;device.pages.clear();device.bytes=0;device.pending=legacy?5:4;
         }else{
+            if(device.spool_owner){
+                const auto* target=printing_->spool_target(device);
+                if(!target || target->cancelled)device.cancelled=true;
+            }
             if(!device.active || device.information || device.cancelled)return failure(device.cancelled?995:1906);
             if(name=="StartPage"){if(device.page)return failure(1906);device.pending=1;}
             else if(name=="EndPage"){if(!device.page)return failure(1906);if(legacy)device.legacy=true;device.pending=2;}
@@ -249,13 +382,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_printing(GuestState& state,
             }
             else return failure(50);
         }
-        if(device.abort_proc){try{start_callbacks(state,memory,{{device.abort_proc,{arg(0),0}}},Continuation::PrintAbort,arg(0));}catch(...){device.pending=0;throw;}return std::nullopt;}
-        return resume_printing(state,memory,arg(0),1);
+        if(!native && device.abort_proc){try{start_callbacks(state,memory,{{device.abort_proc,{arg(0),0}}},Continuation::PrintAbort,arg(0));}catch(...){device.pending=0;throw;}return std::nullopt;}
+        return finish_print_operation(state,memory,arg(0),1,native_bool);
     }catch(const std::bad_alloc&){device.pending=0;return failure(8);}catch(const std::length_error&){device.pending=0;return failure(8);}catch(const std::domain_error&){device.pending=0;return failure(50);}
     catch(const std::invalid_argument&){device.pending=0;return failure(87);}
+    catch(const MemoryFault&){if(!native)throw;device.pending=0;return failure(998);}
 }
 std::optional<std::uint32_t> WindowsServices::resume_printing(GuestState& state,GuestMemory& memory,std::uint64_t dc,std::uint64_t callback){
-    const auto finish=[&](unsigned value,unsigned error=0){if(error)last_error_=error;complete_call(state,memory,value);return std::optional<std::uint32_t>{};};
+    return finish_print_operation(state,memory,dc,callback,false);
+}
+std::optional<std::uint32_t> WindowsServices::finish_print_operation(GuestState& state,GuestMemory& memory,std::uint64_t dc,std::uint64_t callback,bool native_bool){
+    const auto finish=[&](unsigned value,unsigned error=0){if(error)last_error_=error;complete_call(state,memory,native_bool && error?0:value);return std::optional<std::uint32_t>{};};
     if(!is_printer_dc(dc))return finish(UINT32_MAX,6);auto& device=printing_->devices.at(dc);const auto action=device.pending;device.pending=0;
     if(!callback || device.cancelled || !device.active){if(device.active)printing_changed(0x400);device.active=device.page=device.implicit_page=device.banding=false;device.cancelled=true;device.pages.clear();device.bytes=0;return finish(UINT32_MAX-1,995);}
     try{
@@ -271,8 +408,25 @@ std::optional<std::uint32_t> WindowsServices::resume_printing(GuestState& state,
         };
         if(action==2){const auto error=end_page();return error?finish(UINT32_MAX,error):finish(1);}
         if(action==6){const auto error=end_page();if(error)return finish(UINT32_MAX,error);}
-        if(action==3 || action==6){const auto bytes=native_pdf_document(device.pages,device.title,device.copies,device.collate);auto file=filesystem_.open_host(device.output,0x40000000,2,0,1);if(file.error)return finish(UINT32_MAX,file.error);
-            std::size_t at=0;while(at<bytes.size()){const auto write=file.file->write(std::span(bytes).subspan(at),at);if(write.error || !write.bytes)return finish(UINT32_MAX,write.error?write.error:29);at+=static_cast<std::size_t>(write.bytes);}if(const auto error=file.file->flush())return finish(UINT32_MAX,error);
+        if(action==3 || action==6){
+            auto bytes=native_pdf_document(device.pages,device.title,device.copies,device.collate);
+            if(device.spool_owner){
+                auto* target=printing_->spool_target(device);
+                if(!target || target->cancelled)return finish(UINT32_MAX,995);
+                target->page_ends.assign(device.pages.size(),bytes.size());
+                target->bytes=bytes.size();target->spool=std::move(bytes);
+                device.spool_owner=0;
+            }else{
+                auto file=filesystem_.open_host(device.output,0x40000000,2,0,1);
+                if(file.error)return finish(UINT32_MAX,file.error);
+                std::size_t at=0;
+                while(at<bytes.size()){
+                    const auto write=file.file->write(std::span(bytes).subspan(at),at);
+                    if(write.error || !write.bytes)return finish(UINT32_MAX,write.error?write.error:29);
+                    at+=static_cast<std::size_t>(write.bytes);
+                }
+                if(const auto error=file.file->flush())return finish(UINT32_MAX,error);
+            }
             device.active=device.page=device.implicit_page=device.banding=false;device.pages.clear();device.bytes=0;printing_changed(0x400);return finish(1);}
         return finish(UINT32_MAX,1906);
     }catch(const std::bad_alloc&){return finish(UINT32_MAX,8);}catch(const std::length_error&){return finish(UINT32_MAX,8);}catch(const std::domain_error&){return finish(UINT32_MAX,50);}
@@ -330,7 +484,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
     if(name.find("PrinterData")!=std::string_view::npos || name.starts_with("EnumPrinterKey") || name.starts_with("DeletePrinterKey"))return invoke_printer_data(state,memory,service);
     const auto copy=[&](const PrinterBuffer& buffer,std::uint64_t target,std::uint64_t capacity,std::uint64_t needed){if(!needed)return fail(87);memory.store(GuestAddress{needed},32,buffer.bytes.size());if(capacity<buffer.bytes.size())return fail(122);if(!target && !buffer.bytes.empty())return fail(87);if(!buffer.bytes.empty())memory.write(GuestAddress{target},buffer.bytes);return finish(1);};
     // 本程序的列印工作：進行中（GDI DC 與 winspool 控制代碼）與佇列中的工作，依工作編號排序。
-    const auto all_jobs=[&]{std::vector<PrintingState::Device*> jobs;for(auto* list:{&printing_->devices,&printing_->handles})for(auto& [handle,device]:*list){(void)handle;if(device.active)jobs.push_back(&device);}
+    const auto all_jobs=[&]{std::vector<PrintingState::Device*> jobs;for(auto* list:{&printing_->devices,&printing_->handles})for(auto& [handle,device]:*list){(void)handle;if(device.active && !device.spool_owner)jobs.push_back(&device);}
         for(auto& device:printing_->queue)jobs.push_back(&device);std::sort(jobs.begin(),jobs.end(),[](const auto* a,const auto* b){return a->job<b->job;});return jobs;};
     const auto print_job=[&](unsigned id)->PrintingState::Device*{for(auto* device:all_jobs())if(device->job==id)return device;return nullptr;};
     // JOB_INFO_1／JOB_INFO_2：GetJob 與 EnumJobs 共用；at 為結構在緩衝中的位移。
@@ -465,13 +619,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
                 memory.check(GuestAddress{arg(2)},unit*3,Access::Read);const auto pointer=[&](unsigned index){return memory.load(GuestAddress{arg(2)+index*unit},width);};
                 const auto type=pointer(2)?datatype(string(pointer(2))):device.default_datatype;if(type!=u"RAW" && type!=u"TEXT")return fail(1804);
                 auto title=string(pointer(0));auto output=utf16_to_utf8(string(pointer(1)));if(output=="FILE:")return fail(50);
-                if(printing_->next_job>INT32_MAX)return fail(8);const auto job=printing_->next_job++;
+                if(printing_->available_job()>INT32_MAX)return fail(8);const auto job=printing_->next_job++;
                 if(output.empty())output="C:\\x64arm-print-"+std::to_string(::getpid())+"-"+std::to_string(job)+".pdf";
                 device.title=std::move(title);device.output=std::move(output);device.datatype=type;device.job=job;device.submitted=runtime_.system_filetime();
                 device.active=true;device.page=device.cancelled=device.explicit_pages=false;device.spool.clear();device.page_ends.clear();device.bytes=0;printing_changed(0x100);return finish(job);
             }
             if(!device.active)return fail(3003);
             if(name=="AbortPrinter"){discard();return finish(1);}
+            if(printing_->rendering(device.job))return fail(170);
             if(name=="StartPagePrinter"){if(device.page)return fail(1906);device.page=true;device.explicit_pages=true;printing_changed(0x200);return finish(1);}
             if(name=="EndPagePrinter"){if(!device.page)return fail(1906);device.page_ends.push_back(device.spool.size());device.page=false;printing_changed(0xa00);return finish(1);}
             if(name=="WritePrinter"){
@@ -539,7 +694,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
         PrinterBuffer buffer(level==1?(x86_?64:96):(x86_?104:160),target,x86_,wide);write_job(buffer,0,**found,level,static_cast<unsigned>(found-jobs.begin())+1);
         return copy(buffer,target,capacity,needed);
     }
-    const unsigned jobs=static_cast<unsigned>(std::count_if(printing_->devices.begin(),printing_->devices.end(),[](const auto& item){return item.second.active;})+std::count_if(printing_->handles.begin(),printing_->handles.end(),[](const auto& item){return item.second.active;})+static_cast<std::ptrdiff_t>(printing_->queue.size()));unsigned size=0;
+    const unsigned jobs=static_cast<unsigned>(std::count_if(printing_->devices.begin(),printing_->devices.end(),[](const auto& item){return item.second.active && !item.second.spool_owner;})+std::count_if(printing_->handles.begin(),printing_->handles.end(),[](const auto& item){return item.second.active;})+static_cast<std::ptrdiff_t>(printing_->queue.size()));unsigned size=0;
     switch(level){case 1:size=unit*4;break;case 2:size=x86_?84:136;break;case 4:size=unit*3;break;case 5:size=x86_?20:32;break;case 6:size=4;break;case 7:size=unit*2;break;case 8:case 9:size=unit;break;default:return fail(124);}
     PrinterBuffer buffer(size,target,x86_,wide);PrintingState::Device defaults;if(printing_->defaults)static_cast<PrinterSettings&>(defaults)=*printing_->defaults;
     const std::uint32_t printer_status=(printing_->paused?1U:0U)|printing_->status;

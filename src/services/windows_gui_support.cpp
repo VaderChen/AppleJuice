@@ -166,12 +166,13 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"win32u.dll","NtUserGetAtomName",2},{"win32u.dll","NtUserGetClipboardFormatName",3},{"win32u.dll","NtUserRegisterWindowMessage",1},{"user32.dll","RegisterWindowMessageA",1},{"user32.dll","RegisterWindowMessageW",1},
         {"gdi32.dll","GetCharWidth32A",4},{"gdi32.dll","GetCharWidth32W",4},
         {"gdi32.dll","GetCharABCWidthsFloatA",4},{"gdi32.dll","GetCharABCWidthsFloatW",4},
-        {"gdi32.dll","GetObjectA",3},{"gdi32.dll","GetObjectW",3},
+        {"gdi32.dll","GetObjectA",3},{"gdi32.dll","GetObjectW",3},{"win32u.dll","NtGdiExtGetObjectW",3,0,0,2},
         {"gdi32.dll","CreateFontA",14},{"gdi32.dll","CreateFontW",14},{"gdi32.dll","CreateFontIndirectA",1},{"gdi32.dll","CreateFontIndirectW",1},
+        {"win32u.dll","NtGdiGetTextExtent",5,0,0,0x14},{"win32u.dll","NtGdiGetTextExtentExW",8,0,0,0x8c},
         {"gdi32.dll","GetTextExtentPoint32A",4},{"gdi32.dll","GetTextExtentPoint32W",4},
         {"gdi32.dll","GetTextExtentPointA",4},{"gdi32.dll","GetTextExtentPointW",4},
         {"gdi32.dll","GetTextExtentExPointA",7},{"gdi32.dll","GetTextExtentExPointW",7},
-        {"gdi32.dll","GetTextMetricsA",2},{"gdi32.dll","GetTextMetricsW",2},{"gdi32.dll","GetDeviceCaps",2}
+        {"gdi32.dll","GetTextMetricsA",2},{"gdi32.dll","GetTextMetricsW",2}
     };return table;
 }
 namespace {
@@ -382,7 +383,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     if(service.symbol.starts_with("PropertySheet"))return invoke_property_sheet(state,memory,service);
     if(service.symbol=="IsWindowUnicode" || service.symbol=="GetNextDlgTabItem" || service.symbol=="GetNextDlgGroupItem")return invoke_ui_helpers(state,memory,service);
     if(intercept_gui_cbt(state,memory,service))return std::nullopt;
-    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');std::uint64_t result=0;
+    const WindowsCall arg(state,memory,service);auto symbol=service.symbol;
+    if(symbol=="NtGdiExtGetObjectW")symbol="GetObjectW";
+
+    if(symbol=="NtGdiGetTextExtent" || symbol=="NtGdiGetTextExtentExW"){
+        const bool ex=symbol=="NtGdiGetTextExtentExW";
+        const auto flags=arg(ex?7:4);
+        if(flags>1){last_error_=87;arg.return_to(state,0);return std::nullopt;}
+        if(flags==1)return invoke_fonts(state,memory,service);
+        symbol=ex?"GetTextExtentExPointW":"GetTextExtentPoint32W";
+    }
+    const bool wide=symbol.ends_with('W');std::uint64_t result=0;
     const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
     const auto read=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):ansi_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
     const auto selected_font=[&](){const auto dc=gui_.contexts.find(arg(0));return gui_font(gui_,dc==gui_.contexts.end()?0xb011:dc->second.font);};
@@ -1338,15 +1349,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             if(thread.teb)memory.store(cell,width,thread.message_extra);
         }
     }
-    else if(symbol.starts_with("GetCharWidth32") || symbol.starts_with("GetCharABCWidthsFloat")){
-        // DBCS 的 ACP 下 A 版字元碼可為雙位元組（高位元組為前導位元組），依字型字元集解碼。
-        const bool dbcs=!wide && !process_ansi_is_utf8();
-        if(d(2)<d(1) || d(2)>65535 || (!wide && !dbcs && d(2)>255))fail(87);
-        else {const bool abc=symbol.starts_with("GetCharABC");memory.check(GuestAddress{arg(3)},static_cast<std::size_t>(d(2)-d(1)+1)*(abc?12:4),Access::Write);const auto font=selected_font();
-            const auto narrow_character=[&](std::uint64_t code){std::string bytes;if(code>255)bytes.push_back(static_cast<char>(code>>8));bytes.push_back(static_cast<char>(code&255));return gdi_decode_ansi_text(bytes,font.charset);};
-            for(std::uint64_t i=0;i<=d(2)-d(1);++i){const auto p=arg(3)+i*(abc?12:4);const auto character=wide?std::u16string(1,static_cast<char16_t>(d(1)+i)):dbcs?narrow_character(d(1)+i):cp1252_to_utf16(std::string(1,static_cast<char>(d(1)+i)));const auto width=text_width(font,character);
-                if(abc){memory.store(GuestAddress{p},32,0);memory.store(GuestAddress{p+4},32,std::bit_cast<std::uint32_t>(static_cast<float>(width)));memory.store(GuestAddress{p+8},32,0);}else memory.store(GuestAddress{p},32,static_cast<std::uint32_t>(width));}result=1;}
-    }
+    else if(symbol.starts_with("GetCharWidth32") || symbol.starts_with("GetCharABCWidthsFloat"))
+        return invoke_fonts(state,memory,service);
     else if(symbol=="SelectObject"){auto& value=gui_.dc_objects[arg(0)];result=value?value:0xb011;value=arg(1);}
     else if(symbol=="CreateFontA" || symbol=="CreateFontW"){
         std::vector<std::uint8_t> bytes(wide?92:60);for(unsigned i=0;i<5;++i)for(unsigned j=0;j<4;++j)bytes[i*4+j]=static_cast<std::uint8_t>(d(i)>>(j*8));for(unsigned i=5;i<13;++i)bytes[20+i-5]=static_cast<std::uint8_t>(d(i));
@@ -1354,10 +1358,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         result=gui_.next_object++;gui_.fonts[result]=std::move(bytes);if(const auto font=gui_font(gui_,result);font.native)gui_.font_natives[result]=font.native;
     }
     else if(symbol.starts_with("CreateFontIndirect")){const auto bytes=wide?92U:60U;std::vector<std::uint8_t> data(bytes);memory.read(GuestAddress{arg(0)},data);result=gui_.next_object++;gui_.fonts[result]=std::move(data);if(const auto font=gui_font(gui_,result);font.native)gui_.font_natives[result]=font.native;}
-    else if(symbol.starts_with("GetObject")){
+    else if(symbol=="GetObjectA" || symbol=="GetObjectW")try{
         const auto bitmap=gui_.bitmaps.find(arg(0));
-        if(bitmap!=gui_.bitmaps.end()){
-            const auto& item=bitmap->second;const auto bitmap_size=x86_?24U:32U,dib_size=x86_?84U:104U;const auto size=item.dib_address && s32(arg(1))>=static_cast<std::int32_t>(dib_size)?dib_size:bitmap_size;
+        if(bitmap!=gui_.bitmaps.end() || arg(0)==0xb015){
+            GuiBitmap stock_bitmap;
+            stock_bitmap.width=stock_bitmap.height=stock_bitmap.bits_per_pixel=1;stock_bitmap.stride=2;
+            const auto& item=bitmap==gui_.bitmaps.end()?stock_bitmap:bitmap->second;const auto bitmap_size=x86_?24U:32U,dib_size=x86_?84U:104U;const auto size=item.dib_address && s32(arg(1))>=static_cast<std::int32_t>(dib_size)?dib_size:bitmap_size;
             if(!arg(2))result=bitmap_size;
             else if(s32(arg(1))>=static_cast<std::int32_t>(size)){
                 // BITMAP / DIBSECTION 依客體指標寬度對齊；A/W 佈局相同。
@@ -1378,17 +1384,39 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
                 else {const auto text=utf16_to_ansi(family);const auto count=ansi_prefix_length(text,31);std::copy_n(text.begin(),count,data.begin()+28);}
             }else {data[0]=0xf3;data[1]=data[2]=data[3]=0xff;data[16]=0x90;data[17]=1;}
             if(!arg(2))result=size;else if(d(1)>=size){memory.write(GuestAddress{arg(2)},data);result=size;}
-        }else if(gui_.pens.contains(arg(0))){
-            const auto extended=gui_.extended_pens.find(arg(0));const bool ext=extended!=gui_.extended_pens.end();const unsigned size=ext?(x86_?24:28):16;
-            if(!arg(2))result=size;else if(d(1)>=size){std::vector<std::uint8_t> bytes(size);const auto put=[&](unsigned at,unsigned value){for(unsigned i=0;i<4;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
-                put(0,ext?extended->second.style:gui_.pen_widths.at(arg(0))?0:5);put(4,ext?extended->second.width:static_cast<unsigned>(gui_.pen_widths.at(arg(0))));if(ext)put(8,extended->second.brush_style);put(12,gui_.pens.at(arg(0)));memory.write(GuestAddress{arg(2)},bytes);result=size;}
+        }else if(gui_.pens.contains(arg(0)) || (arg(0)>=0xb006 && arg(0)<=0xb008) || arg(0)==0xb013){
+            const auto h=arg(0);
+            const auto found=gui_.pen_definitions.find(h);
+            GuiState::PenDefinition pen;
+            if(found!=gui_.pen_definitions.end())pen=found->second;
+            else{
+                pen.style=h==0xb008?5U:0U;
+                pen.width=gui_.pen_widths.contains(h)?static_cast<unsigned>(gui_.pen_widths.at(h)):1U;
+            }
+            const auto color=gui_.pens.contains(h)?gui_.pens.at(h):h==0xb006?0xffffffU:0U;
+            const unsigned entries=x86_?24U:28U;
+            const bool null_extended=h==0xb008 && arg(2) && d(1)==(x86_?28U:32U);
+            const auto size=null_extended?d(1):pen.extended?entries+4*pen.count:16U;
+            if(!arg(2))result=size;
+            else if(d(1)>=size){
+                std::vector<std::uint8_t> bytes(size);
+                const auto put=[&](unsigned at,std::uint64_t value,unsigned count=4){
+                    for(unsigned i=0;i<count;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(i*8));
+                };
+                put(0,pen.style);put(4,null_extended?0:pen.width);put(12,color);
+                if(pen.extended || null_extended){
+                    put(8,pen.brush_style);put(16,pen.client_hatch,x86_?4:8);put(entries-4,pen.count);
+                    for(unsigned i=0;i<pen.count;++i)put(entries+4*i,pen.entries[i]);
+                }
+                memory.write(GuestAddress{arg(2)},bytes);result=size;
+            }
         }else if(gui_.brushes.contains(arg(0)) || (arg(0)>=0xb000 && arg(0)<=0xb005) || arg(0)==0xb012){
             // LOGBRUSH：lbStyle（BS_SOLID 0／BS_NULL 1／BS_HATCHED 2／BS_PATTERN 3）、lbColor、lbHatch（ULONG_PTR：陰影樣式或圖樣點陣圖）。
             const unsigned size=x86_?12U:16U;const auto handle=arg(0);std::uint32_t style=0,color=0;std::uint64_t hatch=0;
             if(const auto found=gui_.brushes.find(handle);found!=gui_.brushes.end()){
                 color=found->second;
                 if(const auto hatched=gui_.brush_hatches.find(handle);hatched!=gui_.brush_hatches.end()){style=2;hatch=static_cast<std::uint32_t>(hatched->second);}
-                else if(const auto dib=gui_.brush_dib_patterns.find(handle);dib!=gui_.brush_dib_patterns.end()){style=5;color=static_cast<std::uint32_t>(dib->second[0]);hatch=dib->second[1];}
+                else if(const auto dib=gui_.brush_dib_patterns.find(handle);dib!=gui_.brush_dib_patterns.end()){style=5;color=0;hatch=dib->second[1];}
                 else if(gui_.brush_patterns.contains(handle)){style=3;color=0;if(const auto source=gui_.brush_pattern_sources.find(handle);source!=gui_.brush_pattern_sources.end())hatch=source->second;}
             }else if(handle==0xb005)style=1;
             else if(handle==0xb012)color=0xffffff;   // DC_BRUSH 的預設色
@@ -1396,8 +1424,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             if(!arg(2))result=size;
             else if(d(1)>=size){memory.store(GuestAddress{arg(2)},32,style);memory.store(GuestAddress{arg(2)+4},32,color);memory.store(GuestAddress{arg(2)+8},x86_?32:64,hatch);result=size;}
         }else fail(6);
-    } else if(symbol.starts_with("GetTextExtent")){
-        const bool ex=symbol.starts_with("GetTextExtentEx");const auto count=d(2);if(count>1048576)throw HostCallFault("GDI 文字長度超過上限");memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(count)*(wide?2:1),Access::Read);
+    }catch(const MemoryFault&){fail(998);}
+    else if(symbol.starts_with("GetTextExtent"))try{
+        const bool ex=symbol.starts_with("GetTextExtentEx");const auto count=d(2);if(!gui_.contexts.contains(arg(0)) && !gui_.dc_objects.contains(arg(0)) &&
+           !(arg(0)>=0x10000000 && gui_.windows.contains(arg(0)-0x10000000))){
+            fail(6);arg.return_to(state,0);return std::nullopt;
+        }
+        if(count>1048576 || (count && !arg(1)) || !arg(ex?6:3)){
+            fail(87);arg.return_to(state,0);return std::nullopt;
+        }
+        if(count)memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(count)*(wide?2:1),Access::Read);
         const auto p=arg(ex?6:3);memory.check(GuestAddress{p},8,Access::Write);
         if(ex){if(arg(4))memory.check(GuestAddress{arg(4)},4,Access::Write);if(arg(5))memory.check(GuestAddress{arg(5)},static_cast<std::size_t>(count)*4,Access::Write);}
         const auto font=selected_font();const auto metrics=font_metrics(font);std::u16string text;std::vector<std::size_t> ends;
@@ -1415,44 +1451,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             std::int32_t accumulated=0;for(std::size_t i=0;i<advances.size();++i){accumulated+=i<spacing.size()?spacing[i]:0;advances[i]+=accumulated;}
             std::uint32_t fit=0;for(std::size_t i=0;i<count;++i){const auto end=wide?i+1:ends[i];const auto extent=end?advances[end-1]:0;if(arg(5))memory.store(GuestAddress{arg(5)+i*4},32,static_cast<std::uint32_t>(extent));if(extent<=s32(arg(3)) && (wide || i+1==count || ends[i+1]!=end))fit=static_cast<std::uint32_t>(i+1);}
             if(arg(4))memory.store(GuestAddress{arg(4)},32,fit);}result=1;
-    } else if(symbol.starts_with("GetTextMetrics")){
-        const auto font=selected_font();const auto metrics=font_metrics(font);const auto p=arg(1);memory.write(GuestAddress{p},std::vector<std::uint8_t>(wide?60:56));
-        for(const auto [offset,value]:std::array<std::pair<unsigned,std::int32_t>,10>{{{0,metrics.height},{4,metrics.ascent},{8,metrics.descent},{16,metrics.external_leading},{20,metrics.average_width},{24,metrics.maximum_width},{28,font.weight?font.weight:400},{32,0},{36,96},{40,96}}})memory.store(GuestAddress{p+offset},32,static_cast<std::uint32_t>(value));
-        const auto chars=wide?2U:1U;memory.store(GuestAddress{p+44},static_cast<std::uint8_t>(chars*8),32);memory.store(GuestAddress{p+44+chars},static_cast<std::uint8_t>(chars*8),wide?65535:255);memory.store(GuestAddress{p+44+chars*2},static_cast<std::uint8_t>(chars*8),'?');memory.store(GuestAddress{p+44+chars*3},static_cast<std::uint8_t>(chars*8),' ');
-        const auto flags=p+44+chars*4;memory.store(GuestAddress{flags},8,font.italic?1:0);memory.store(GuestAddress{flags+1},8,font.underline?1:0);memory.store(GuestAddress{flags+2},8,font.strikeout?1:0);memory.store(GuestAddress{flags+3},8,(font.pitch_family&0xf0)|4|(metrics.fixed_pitch?0:1));memory.store(GuestAddress{flags+4},8,font.charset);result=1;
-    } else if(symbol=="GetDeviceCaps"){if(const auto cap=printer_device_cap(arg(0),d(1)))result=*cap;else {
-        // 顯示 DC。實體尺寸與現代 Windows 相同由解析度與 96 DPI 推算（遊戲用 HORZSIZE／VERTSIZE 算螢幕比例，回 0 會得到 NaN）。
-        const auto screen=gui_screen_area();
-        const auto millimeters=[](std::int64_t pixels){return static_cast<std::uint32_t>((pixels*254+480)/960);};
-        const std::uint32_t minus_one=UINT32_MAX;
-        // SetVirtualResolution 設定的虛擬值只影響 HORZRES／VERTRES／HORZSIZE／VERTSIZE；桌面解析度仍為實體值。
-        const auto context=gui_.contexts.find(arg(0));const auto virtual_values=context==gui_.contexts.end()?std::array<std::int32_t,4>{}:context->second.virtual_resolution;
-        const bool virtual_set=virtual_values[0]>0;
-        switch(d(1)){
-        case 0:result=0x4000;break;                       // DRIVERVERSION
-        case 2:result=1;break;                            // TECHNOLOGY：DT_RASDISPLAY
-        case 4:result=virtual_set?static_cast<std::uint32_t>(virtual_values[2]):millimeters(screen[2]);break; // HORZSIZE
-        case 6:result=virtual_set?static_cast<std::uint32_t>(virtual_values[3]):millimeters(screen[3]);break; // VERTSIZE
-        case 8:result=virtual_set?static_cast<std::uint32_t>(virtual_values[0]):static_cast<std::uint32_t>(screen[2]);break; // HORZRES
-        case 118:result=static_cast<std::uint32_t>(screen[2]);break; // DESKTOPHORZRES
-        case 10:result=virtual_set?static_cast<std::uint32_t>(virtual_values[1]):static_cast<std::uint32_t>(screen[3]);break; // VERTRES
-        case 117:result=static_cast<std::uint32_t>(screen[3]);break; // DESKTOPVERTRES
-        case 12:result=gui_.display_mode?(*gui_.display_mode)[2]:32;break; // BITSPIXEL
-        case 14:result=1;break;                           // PLANES
-        case 16:case 18:case 24:result=minus_one;break;   // NUMBRUSHES、NUMPENS、NUMCOLORS：超過 8 位元色時為 -1
-        case 28:result=0x1ff;break;                       // CURVECAPS
-        case 30:result=0xfe;break;                        // LINECAPS
-        case 32:result=0xff;break;                        // POLYGONALCAPS
-        case 34:result=0x7e07;break;                      // TEXTCAPS
-        case 36:result=1;break;                           // CLIPCAPS：CP_RECTANGLE
-        case 40:case 42:result=36;break;                  // ASPECTX、ASPECTY
-        case 44:result=51;break;                          // ASPECTXY
-        case 88:case 90:result=96;break;                  // LOGPIXELSX、LOGPIXELSY
-        case 108:result=24;break;                         // COLORRES
-        case 116:result=gui_.display_mode && (*gui_.display_mode)[3]?(*gui_.display_mode)[3]:60;break; // VREFRESH
-        default:result=0;break;                           // RASTERCAPS 與印表機專用項目等：沒有對應能力
-        }
-    }}
+    }catch(const MemoryFault&){fail(998);}
+    else if(symbol.starts_with("GetTextMetrics"))return invoke_fonts(state,memory,service);
     else return invoke_gui_extra(state,memory,service);
     arg.return_to(state,result);return std::nullopt;
 }

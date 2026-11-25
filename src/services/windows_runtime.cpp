@@ -111,6 +111,8 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
         
         {"kernel32.dll", "GetCommandLineA", 0}, {"kernel32.dll", "GetCurrentProcessId", 0},
         {"kernel32.dll", "GetACP", 0}, {"kernel32.dll", "GetStartupInfoA", 1}, {"kernel32.dll", "GetStartupInfoW", 1},
+        {"msvcrt.dll", "_get_environ", 1,0,0,0,true}, {"msvcrt.dll", "_get_wenviron", 1,0,0,0,true},
+        {"ucrtbase.dll", "_query_app_type", 0,0,0,0,true},
         {"crt", "__p___argc", 0}, {"crt", "__p___argv", 0}, {"crt", "__p__environ", 0},
         {"crt", "_get_printf_count_output", 0}, {"crt", "_set_printf_count_output", 1},
         {"crt", "_set_fmode", 1}, {"crt", "_get_fmode", 1}, {"crt", "__p__fmode", 0}, {"crt", "__p__commode", 0}, {"crt", "__p__adjust_fdiv", 0}, {"crt", "_errno", 0},
@@ -2605,6 +2607,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
     else if (symbol == "__p__wcmdln") result = runtime_base_.value + 104;
     else if (symbol == "__p___argv") result = runtime_.argv_cell;
     else if (symbol == "__p___wargv") result = runtime_.wargv_cell;
+    else if (symbol == "_get_environ" || symbol == "_get_wenviron") {
+        const auto cell = symbol == "_get_environ" ? runtime_.environ_cell : runtime_.wenviron_cell;
+        const auto width = static_cast<std::uint8_t>(x86_ ? 32 : 64);
+        memory.store(GuestAddress{arg(0)}, width, memory.load(GuestAddress{cell}, width));
+    }
     else if (symbol == "__p__wenviron") result = runtime_.wenviron_cell;
     else if (symbol == "__p__environ") result = runtime_.environ_cell;
     else if (symbol == "__p___initenv") result = runtime_base_.value+112;
@@ -2654,9 +2661,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         if(result)memory.store(GuestAddress{runtime_.errno_cell},32,result);
     }
     else if (symbol == "_initialize_narrow_environment" || symbol == "_initialize_wide_environment" || symbol == "_get_initial_narrow_environment" || symbol == "_get_initial_wide_environment") {
-        if(symbol=="_get_initial_narrow_environment")result=memory.load(GuestAddress{runtime_base_.value+112},x86_?32:64);
+        if(symbol=="_get_initial_narrow_environment"){
+            const auto cell=runtime_.modules.contains("ucrtbase.dll")
+                ? builtin_constant_address("ucrtbase.dll","__dcrt_initial_narrow_environment")
+                : GuestAddress{runtime_base_.value+112};
+            result=memory.load(cell,x86_?32:64);
+        }
         else if(symbol=="_get_initial_wide_environment")result=memory.load(GuestAddress{runtime_base_.value+120},x86_?32:64);
     }
+    else if (symbol == "_query_app_type") result = static_cast<std::uint32_t>(runtime_.app_type);
     else if (symbol == "_set_app_type") runtime_.app_type = static_cast<int>(arg(0));
     else if (symbol == "_set_new_handler") {result=runtime_.new_handler;runtime_.new_handler=arg(0);}
     else if (symbol == "_query_new_handler") result=runtime_.new_handler;

@@ -1,3 +1,4 @@
+#include "msvcp_locale_ids.hpp"
 #include "ansi_codepage.hpp"
 #include "x64arm/resource_cache.hpp"
 #include "x64arm/startup_profile.hpp"
@@ -103,6 +104,7 @@ struct WritableExport {
     std::string_view x86_name,x64_name;
     std::uint64_t value{};
     std::string_view initializer_module{},initializer_symbol{};
+    bool copy_pointer_value{};
 };
 std::span<const WritableExport> builtin_writable_exports(std::string_view module){
     static constexpr WritableExport legacy_crt[]{
@@ -113,12 +115,37 @@ std::span<const WritableExport> builtin_writable_exports(std::string_view module
         {"_osmode_dll","",1},
     };
     if(module=="crtdll.dll")return legacy_crt;
-    static constexpr WritableExport handlers[]{
-        {"?_Raise_handler@std@@3P6AXABVexception@stdext@@@ZA",
-         "?_Raise_handler@std@@3P6AXAEBVexception@stdext@@@ZEA"}
-    };
-    for(const auto family:{"msvcp80.dll","msvcp90.dll","msvcp100.dll","msvcp110.dll","msvcp120.dll","msvcp140.dll"})
-        if(module==family)return handlers;
+    static const auto tables=[] {
+        using namespace msvcp_locale_ids;
+        std::map<std::string_view,std::vector<WritableExport>> result;
+        // 初始環境的指標值放在 DLL 的可寫區段，具名 IAT、EAT 與 GetProcAddress 共用位址。
+        result["ucrtbase.dll"].push_back({"__dcrt_initial_narrow_environment","__dcrt_initial_narrow_environment",
+                                          0,"msvcrt.dll","__initenv",true});
+        for(auto family:{"msvcp90.dll","msvcp100.dll","msvcp110.dll","msvcp120.dll","msvcp140.dll"})
+            result[family].push_back({"?_Raise_handler@std@@3P6AXABVexception@stdext@@@ZA",
+                                      "?_Raise_handler@std@@3P6AXAEBVexception@stdext@@@ZEA"});
+        const auto append=[&](std::string_view family,const auto& names){
+            for(auto name:names){
+                unsigned initial=0;
+                if(family=="msvcp100.dll"){
+                    if(name=="?id@?$ctype@G@std@@2V0locale@2@A")initial=1;
+                    if(name=="?id@?$codecvt@GDH@std@@2V0locale@2@A")initial=2;
+                }
+                result[family].push_back({name,name,initial});
+            }
+        };
+        for(auto family:legacy_modules){
+            result[family].push_back({counter,counter,family=="msvcp100.dll"?2U:0U});
+            append(family,vc6_facets);
+            if(family!="msvcp60.dll")append(family,wide_facets);
+        }
+        for(auto family:{"msvcp120.dll","msvcp140.dll"})append(family,modern_ushort);
+        append("msvcp_win.dll",system_facets);
+        append(satellite,unicode_facets);
+        return result;
+    }();
+    const auto found=tables.find(detail::builtin_provider_family(module));
+    if(found!=tables.end())return found->second;
     return {};
 }
 struct BuiltinLayout {std::size_t first_slot,slots,pointer_rva;};
@@ -126,6 +153,7 @@ const auto& builtin_layouts(){
     static const auto bases=[] {
         const auto& catalog=detail::builtin_export_catalog();
         std::set<std::string> names{"kernel32.dll","wsock32.dll","riched20.dll","riched32.dll"};
+        names.emplace(msvcp_locale_ids::satellite);
         for(const auto name:modern_crt_libraries)names.emplace(name);
         for(const auto name:legacy_crt_libraries)names.emplace(name);
         for(const auto table:detail::builtin_forwarder_tables)
@@ -177,7 +205,7 @@ const auto& builtin_layouts(){
     }();
     return bases;
 }
-BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,const std::map<std::string,std::uint64_t>& targets,const std::map<std::uint64_t,BuiltinSystemCall>& system_calls,std::uint64_t x86_transition,
+BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,std::size_t pointer_rva,const std::map<std::string,std::uint64_t>& targets,const std::map<std::uint64_t,BuiltinSystemCall>& system_calls,std::uint64_t x86_transition,
                              const std::map<std::string,std::string>& forwarded_exports) {
     // PE 的 RVA 僅 32 位元；模組內的實際唯讀跳躍入口轉接至既有 API gateway，
     // 保留所有參數／暫存器與回傳框架；資料匯出另置於唯讀區段。
@@ -203,6 +231,7 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
     }
     const auto constants=detail::builtin_constant_exports(name);std::map<std::uint32_t,std::uint32_t> data_ordinals;
     for(std::size_t i=0;i<constants.size();++i){
+        if(!(constants[i].architectures&(x86?1U:2U)))continue;
         while(ordinals.contains(next) || data_ordinals.contains(next))++next;
         if(next>65535 || (i+1)*8>4096 || names.contains(constants[i].name))throw ModuleError(8,"內建 DLL 常數匯出超過容量或重複");
         names.emplace(constants[i].name,next);data_ordinals.emplace(next++,detail::builtin_constant_rva+static_cast<std::uint32_t>(i*8));
@@ -215,7 +244,6 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
         names.emplace(std::string(guids[i].name),next);data_ordinals.emplace(next++,detail::builtin_constant_rva+static_cast<std::uint32_t>(guid_base+i*16));
     }
     const auto pointers=builtin_writable_exports(name);
-    const auto pointer_rva=builtin_layouts().at(std::string(name)).pointer_rva;
     for(std::size_t i=0;i<pointers.size();++i){
         while(ordinals.contains(next) || data_ordinals.contains(next))++next;
         const std::string symbol(x86?pointers[i].x86_name:pointers[i].x64_name);
@@ -275,6 +303,7 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
     if(!assigned.empty())section_header(exports_section+40,".text",code,code_end-code,0x60000020);
     if(provider_size)section_header(data_section+(writable_data?40U:0U),".mdata",provider_at,provider_size,0x40000040);
     section_header(data_section+(writable_data?40U:0U)+(provider_size?40U:0U),".rsrc",resource_at,size-resource_at,0x40000040);
+    for(std::size_t i=0;i<pointers.size();++i)put(writable+i*8,x86?4:8,pointers[i].value);
     for(std::size_t i=0;i<constants.size();++i)put(detail::builtin_constant_rva+i*8,constants[i].bytes,constants[i].value);
     for(std::size_t i=0;i<guids.size();++i)std::copy(guids[i].bytes.begin(),guids[i].bytes.end(),bytes.begin()+static_cast<std::ptrdiff_t>(detail::builtin_constant_rva+guid_base+i*16));
     std::copy(resource.begin(),resource.end(),bytes.begin()+static_cast<std::ptrdiff_t>(resource_at));
@@ -327,7 +356,7 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
 }
 GuestAddress WindowsServices::builtin_constant_address(std::string_view family,std::string_view symbol)const{
     const auto constants=detail::builtin_constant_exports(family);
-    const auto value=std::find_if(constants.begin(),constants.end(),[&](const auto& item){return item.name==symbol;});
+    const auto value=std::find_if(constants.begin(),constants.end(),[&](const auto& item){return item.name==symbol && (item.architectures&(x86_?1U:2U));});
     const auto guids=detail::builtin_guid_exports(family);const auto guid=std::find_if(guids.begin(),guids.end(),[&](const auto& item){return item.name==symbol;});
     const auto pointers=builtin_writable_exports(family);
     const auto pointer=std::find_if(pointers.begin(),pointers.end(),[&](const auto& p){return symbol==(x86_?p.x86_name:p.x64_name);});
@@ -345,7 +374,7 @@ bool WindowsServices::builtin_pe_export(std::string_view module, std::string_vie
 bool WindowsServices::builtin_module(std::string_view name) const {
     if(!detail::builtin_arch_supported(name,x86_))return false;
     if(!detail::builtin_pe_bytes(name,x86_).empty())return true;
-    if(name=="riched20.dll" || name=="riched32.dll")return true;
+    if(name=="riched20.dll" || name=="riched32.dll" || name==msvcp_locale_ids::satellite)return true;
     if(angle_module(name))return native_angle_!=nullptr;
     if(native_library_module(name))return native_libraries_.enabled(name);
     if(const auto host=windows_api_set_host(name);host!=name)return builtin_module(host);
@@ -556,7 +585,7 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
     // 不將同一個 DLL 的物件、資料匯出與函式拆給兩個不同 provider。
     // 遊戲目錄自帶的 HLSL 編譯器（d3dcompiler_43／46／47）也優先載入：內建編譯器（vkd3d）不支援部分 FXC 寫法
     //（例如展開後才成為常數的取樣偏移），遊戲隨附的編譯器才保證得到它預期的位元組碼。目錄沒有時沿用內建實作。
-    const bool redistributable=name=="msvcp140.dll" || name=="msvcp140_1.dll" || name=="msvcp140_2.dll" || name=="vcruntime140.dll" || name=="vcruntime140_1.dll" ||
+    const bool redistributable=name==msvcp_locale_ids::satellite || name=="msvcp140.dll" || name=="msvcp140_1.dll" || name=="msvcp140_2.dll" || name=="vcruntime140.dll" || name=="vcruntime140_1.dll" ||
         name=="d3dcompiler_43.dll" || name=="d3dcompiler_46.dll" || name=="d3dcompiler_47.dll" ||
         // 應用程式隨附的 ICU（icuuc／icuin／icuio／icudt，匯出名稱帶版本後綴如 u_init_65）不是 KnownDLL，依 Windows 搜尋順序
         // 應用程式目錄優先於系統的 icu.dll 家族；內建 ICU 只有無後綴的系統匯出（電馭叛客呼叫 u_setMemoryFunctions_65 即中止）。
@@ -613,13 +642,14 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
                 system_calls.at(target).stack_bytes=detail::nt_entry_stack_bytes(service);
             }
         }
-        auto headers=builtin_headers(base,name,x86_,targets,system_calls,callback_return_.value+0xf8,forwarded_exports);
+        auto headers=builtin_headers(base,name,x86_,slot->second.pointer_rva,targets,system_calls,callback_return_.value+0xf8,forwarded_exports);
         // 可寫資料的初值隨映像一起發布，IAT 與 GetProcAddress 之後可使用同一份資料。
         const auto writable=builtin_writable_exports(name);
         for(std::size_t i=0;i<writable.size();++i){
             const auto& entry=writable[i];
-            auto value=entry.value;
-            if(!entry.initializer_symbol.empty())value=resolve_service(entry.initializer_module,entry.initializer_symbol,true).value;
+            if(entry.initializer_symbol.empty())continue;
+            const auto source=resolve_service(entry.initializer_module,entry.initializer_symbol,true);
+            const auto value=entry.copy_pointer_value ? memory.load(source,x86_?32:64) : source.value;
             for(unsigned byte=0;byte<(x86_?4U:8U);++byte)
                 headers.bytes[headers.writable+i*8+byte]=static_cast<std::uint8_t>(value>>(byte*8));
         }

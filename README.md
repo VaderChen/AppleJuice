@@ -124,9 +124,9 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 
 ## 實測紀錄 / 2026-11-26 / 共 46 款遊戲 / 5 款工具
 
-- <img src="docs/images/support-levels/good.png" width="16" height="16" alt="運作良好" title="運作良好"> 運作良好：29
+- <img src="docs/images/support-levels/good.png" width="16" height="16" alt="運作良好" title="運作良好"> 運作良好：30
 - <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> 運作良好 (MetalFX)：5
-- <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="效率不高" title="效率不高"> 效率不高：8
+- <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="效率不高" title="效率不高"> 效率不高：7
 - <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="可開啟" title="可開啟"> 可開啟：2
 - <img src="docs/images/support-levels/none.png" width="16" height="16" alt="無法運作、處理中" title="無法運作、處理中"> 無法運作、處理中：2
 

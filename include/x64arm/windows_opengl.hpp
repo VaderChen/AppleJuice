@@ -121,6 +121,8 @@ struct OpenGlContext {
     std::array<GenericClientArray,16> generic_arrays{};
     std::map<std::uint32_t,std::array<OpenGlArray,6>> vertex_array_clients;
     std::uint32_t error{};std::int32_t interval{1};bool beginning{};
+    // 解除執行緒繫結後，DC 仍可呈現最後繫結的 drawable。
+    bool presents_dc{};
     // glSelectBuffer／glFeedbackBuffer 的客體緩衝與大小（以 32 位元字計）；render_mode 為服務層記錄的 GL_RENDER_MODE，用來在離開時寫回客體。
     std::uint64_t select_buffer{},feedback_buffer{};std::uint32_t select_size{},feedback_size{},feedback_type{},render_mode{0x1c00};bool select_set{},feedback_set{};
     std::map<std::uint32_t,std::uint64_t> strings;

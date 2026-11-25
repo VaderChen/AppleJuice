@@ -1,3 +1,5 @@
+#include "msvcp_locale_id_lock.hpp"
+#include "x64arm/unicode.hpp"
 #include "x64arm/windows_services.hpp"
 #include "msvc_exception_exports.hpp"
 #include <algorithm>
@@ -42,6 +44,11 @@ void WindowsServices::initialize_guest_msvcp90(GuestMemory& memory){
         const auto exported=parsed.runtime.export_names.find(std::string(name));if(exported==parsed.runtime.export_names.end())throw std::logic_error("VC9 常駐串流缺少產碼入口");
         image.export_names.emplace(entry.name,parsed.runtime.export_ordinals.at(exported->second));
     }
+    if(lowering)for(const auto& entry:msvcp_locale_ids::methods){
+        if(entry.resident.empty())continue;
+        const auto ordinal=parsed.runtime.export_names.at(std::string(entry.resident));
+        image.export_names.emplace(x86_?entry.win32:entry.win64,parsed.runtime.export_ordinals.at(ordinal));
+    }
     static const bool numeric_lowering=[] {const auto* v=std::getenv("X64ARM_GUEST_CPP_NUMERIC");return !v || std::string_view(v)!="0";}();
     if(lowering && numeric_lowering)for(const auto& entry:msvcp_numeric::functions())if(!entry.assignment || entry.x86==x86_)
         image.export_names.emplace(entry.name,parsed.runtime.export_ordinals.at(parsed.runtime.export_names.at(entry.native)));
@@ -77,6 +84,7 @@ std::string_view msvcp120_stream_implementation(std::string_view symbol){
 }
 std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"internal-msvcp-locale","AssignId",2,0,0,0,true},
 #include "msvcp_yarn_descriptors.inc"
 #include "msvcp100_streambuf_descriptors.inc"
 #include "msvcp100_descriptors.inc"
@@ -183,6 +191,16 @@ std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
             if(entry.operation==detail::MsvcExceptionOperation::Vtable)continue;
             const auto count=entry.parameters-(entry.architectures==1 && entry.thiscall?1U:0U);
             all.push_back({entry.library,entry.name,count,0,0,0,!entry.thiscall});
+        }
+        for(auto family:msvcp_locale_ids::legacy_modules){
+            for(const auto& entry:msvcp_locale_ids::methods){
+                if(!msvcp_locale_ids::exported(family,entry.method))continue;
+                if(family=="msvcp100.dll" && entry.method==msvcp_locale_ids::Method::convert)continue;
+                const bool is_static=entry.method==msvcp_locale_ids::Method::counter_address;
+                all.push_back({family,entry.win32,entry.arguments,0,0,0,is_static});
+                if(family!="msvcp70.dll" && family!="msvcp71.dll")
+                    all.push_back({family,entry.win64,entry.arguments+(is_static?0U:1U),0,0,0,is_static});
+            }
         }
         const auto strings=msvcp90_string::descriptors();all.insert(all.end(),strings.begin(),strings.end());
         const auto streams=msvcp90_stream::descriptors();all.insert(all.end(),streams.begin(),streams.end());
@@ -339,6 +357,48 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,Gues
     if(service.symbol.starts_with("??0exception@") || service.symbol.starts_with("??1exception@") || service.symbol.starts_with("??4exception@") || service.symbol.starts_with("??0bad_") || service.symbol.starts_with("??1bad_") ||
        service.symbol.starts_with("??4bad_") || service.symbol.starts_with("??_Fbad_") || service.symbol.find("__non_rtti_object@")!=std::string_view::npos || service.symbol.starts_with("?what@exception@") || service.symbol.starts_with("?_type_info_dtor_internal_method@") || service.family=="x64arm.msvc" || service.symbol.starts_with("__RT") || service.symbol.starts_with("?_X") || service.symbol=="?_Random_device@std@@YAIXZ")return invoke_rtti(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
+    if(service.family=="internal-msvcp-locale" && symbol=="AssignId"){
+        const GuestAddress object{arg(0)},count{arg(1)};
+        const auto bits=static_cast<std::uint8_t>(x86_?32:64);
+        const auto lock=resolve("crt","_lock_locales").value,unlock=resolve("crt","_unlock_locales").value;
+        return nested_continuation(state,memory,"locale::id",[=](GuestState& saved,GuestMemory& mem)->service_callback::Task<std::optional<std::uint32_t>>{
+            const auto id=co_await msvcp_locale_ids::locked_facet_id(mem,object,count,bits,lock,unlock);
+            WindowsCall(saved,mem,service).return_to(saved,id);
+            co_return std::nullopt;
+        });
+    }
+    const bool modern_ids=service.family=="msvcp120.dll" || service.family=="msvcp140.dll";
+    if(modern_ids || msvcp_locale_ids::legacy(service.family)){
+        if(const auto* entry=msvcp_locale_ids::binding(symbol,x86_)){
+            using msvcp_locale_ids::Method;
+            const auto bits=static_cast<std::uint8_t>(x86_?32:64);
+            const GuestAddress object{entry->method==Method::counter_address?0:x86_?state.reg(Gpr::Rcx)&UINT32_MAX:arg(0)};
+            GuestAddress count{};
+            if(entry->method==Method::convert){
+                if(const auto id=memory.load(object,bits)){arg.return_to(state,id);return {};}
+                memory.check(object,bits/8,Access::Write);
+            }
+            if(entry->method==Method::convert || entry->method==Method::counter_address){
+                if(modern_ids)count=msvcp100_data(msvcp_locale_ids::counter,true,service.family=="msvcp120.dll");
+                else{
+                    if(!runtime_.modules.contains(std::string(service.family))){
+                        std::vector<std::uint64_t> created;
+                        load_module(memory,utf8_to_utf16(service.family),0,created);
+                    }
+                    count=builtin_constant_address(service.family,msvcp_locale_ids::counter);
+                }
+            }
+            if(entry->method==Method::convert){
+                // 已有 id 的 worker 快路徑不會攔截內部入口，鎖續行可由協調者完整收尾。
+                start_callbacks(state,memory,{{resolve("internal-msvcp-locale","AssignId").value,{object.value,count.value}}},
+                                Continuation::ReturnCallback);
+                return {};
+            }
+            const auto argument=entry->arguments?arg(x86_?0:1):0;
+            arg.return_to(state,msvcp_locale_ids::invoke(memory,entry->method,object,argument,count,bits));
+            return {};
+        }
+    }
     if(msvcp_numeric::provider(service.family)){
         const auto* numeric=msvcp_numeric::function(symbol);
         const auto* modern=msvcp_numeric::modern_function(symbol);
@@ -375,6 +435,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,Gues
             return std::nullopt;
         }
     }
+    if(msvcp90_stream::complex_stream(symbol))return invoke_msvcp100(state,memory,service);
 #include "msvcp90_string_handlers.inc"
     if(symbol.starts_with("??8type_info@@") || symbol.starts_with("??9type_info@@") || symbol.starts_with("?before@type_info@@") || symbol.starts_with("?raw_name@type_info@@")){
         const unsigned p=x86_?4U:8U;const bool raw=symbol.starts_with("?raw_name@");

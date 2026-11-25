@@ -205,6 +205,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
                 if(!arg(2))result=bytes;else if(arg(1)<bytes)fail(122);
                 else {memory.check(GuestAddress{arg(2)},bytes,Access::Write);memory.store(GuestAddress{arg(2)},32,32);memory.store(GuestAddress{arg(2)+4},32,1);memory.store(GuestAddress{arg(2)+8},32,region.size());memory.store(GuestAddress{arg(2)+12},32,region.size()*16);write_rect(arg(2)+16,gui_region_bounds(region));for(std::size_t i=0;i<region.size();++i)write_rect(arg(2)+32+i*16,region[i]);result=bytes;}
             }
+        }catch(const MemoryFault&){
+            if(symbol!="GetRgnBox" && symbol!="RectInRegion" && symbol!="GetRegionData")throw;
+            result=0;
         }catch(const std::bad_alloc&){fail(8);}catch(const std::length_error&){fail(8);}
     } else if(symbol=="RedrawWindow" || symbol=="ValidateRect" || symbol=="ValidateRgn" ||
               symbol=="InvalidateRect" || symbol=="InvalidateRgn"){

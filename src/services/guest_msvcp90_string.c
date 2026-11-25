@@ -102,7 +102,28 @@ NUMERIC_FUNCTION(C,T,B,F,signaling_NaN,SNAN,6) NUMERIC_FUNCTION(C,T,B,F,denorm_m
 NUMERIC_FUNCTION(C,T,B,F,lowest,MIN,8)
 MSVCP_NUMERIC_TYPES(NUMERIC)
 #undef NUMERIC
+/* locale::id 的物件只有一個客體 size_t。 */
+EXPORT Size* MEMBER guest_locale_id_construct(Size* object,Size value){*object=value;return object;}
+EXPORT void MEMBER guest_locale_id_clear(Size* object){*object=0;}
+EXPORT Size* MEMBER guest_locale_id_assign(Size* object,const Size* source){*object=*source;return object;}
 EXPORT void* MEMBER guest_numeric_assign(void* object,const void* source){(void)source;return object;}
+
+/* MSVC complex 的兩個分量連續排列。成員與自由函式保留各自的 Win32 ABI。 */
+#define COMPLEX_COMPONENTS(C,T) \
+typedef struct {T real,imag;} Complex##C; \
+EXPORT T guest_complex_##C##_real(const Complex##C* z){return z->real;} \
+EXPORT T guest_complex_##C##_imag(const Complex##C* z){return z->imag;} \
+EXPORT T MEMBER guest_complex_##C##_get_real(const Complex##C* z){return z->real;} \
+EXPORT T MEMBER guest_complex_##C##_get_imag(const Complex##C* z){return z->imag;} \
+EXPORT T MEMBER guest_complex_##C##_set_real(Complex##C* z,const T* x){return z->real=*x;} \
+EXPORT T MEMBER guest_complex_##C##_set_imag(Complex##C* z,const T* x){return z->imag=*x;} \
+EXPORT Complex##C* MEMBER guest_complex_##C##_construct(Complex##C* z,const T* x,const T* y){const Complex##C v={*x,*y};*z=v;return z;} \
+EXPORT Complex##C* MEMBER guest_complex_##C##_assign(Complex##C* z,const Complex##C* v){*z=*v;return z;} \
+EXPORT Complex##C* MEMBER guest_complex_##C##_assign_scalar(Complex##C* z,const T* x){const Complex##C v={*x,0};*z=v;return z;} \
+EXPORT Complex##C* MEMBER guest_complex_##C##_zero(Complex##C* z){const Complex##C v={0,0};*z=v;return z;}
+COMPLEX_COMPONENTS(F,float)
+COMPLEX_COMPONENTS(D,double)
+#undef COMPLEX_COMPONENTS
 
 /* 直接檢查 IEEE 位元，負無窮大及 signaling NaN 也適用。 */
 #define COMPLEX_TRAITS(C,T,U,SIGN,INF,NAN) \

@@ -1,6 +1,9 @@
 #include "x64arm/windows_services.hpp"
 #include "windows_locale_data.hpp"
 #include "crt_mbcs.hpp"
+#include "crt_secure_fill_exports.hpp"
+#include "crt_library.hpp"
+#include "crt_secure_append.h"
 #include "crt_bounded_length.hpp"
 #include "crt_multibyte_state.hpp"
 #include "windows_crt_character.hpp"
@@ -137,6 +140,12 @@ std::span<const WindowsServiceDescriptor> crt_mbcs_service_descriptors(){
 #define CRT_MBC_BYTE(name,ctype,type) out.push_back({"crt",#name,1});out.push_back({"crt",#name "_l",2});
 #include "crt_mbc_byte_operations.inc"
 #undef CRT_MBC_BYTE
+        for (const auto module : secure_crt_libraries) {
+            out.push_back({module,"_mbsncat_s",4,0,0,0,true});
+            out.push_back({module,"_mbsncat_s_l",5,0,0,0,true});
+            for (const auto& entry : crt_secure_set::entries)
+                out.push_back({module,entry.name,entry.arguments,0,0,0,true});
+        }
         for(const auto& [plain,localized,count]:entries){out.push_back({"crt",plain,count});if(!localized.empty())out.push_back({"crt",localized,count+1});}
         return out;
     }();
@@ -154,6 +163,45 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
         if(const auto handler=current_invalid_parameter_handler()){start_callbacks(state,memory,{{handler,{0,0,0,0,0}}},Continuation::Return,result);return std::nullopt;}
         return done(result);
     };
+    const auto* fill = crt_secure_set::lookup(service.symbol);
+    const bool append = name == "_mbsncat_s" || name == "_mbsnbcat_s";
+    if (append || fill) {
+        const auto text = arg(0), size = arg(1);
+        std::array<std::uint8_t,256> types{};
+        const std::uint8_t* lead_table = nullptr;
+        if ((append || fill->multibyte) && text && size && (!append || arg(2) || !arg(3))) {
+            const auto locale = localized ? arg(service.arguments-1) : 0;
+            const auto mbc = locale ? memory.load(GuestAddress{locale+unit},bits)
+                                    : memory.load(GuestAddress{threads_.items.at(threads_.current).teb+
+                                        (x86_?CRT_MBC_TEB32_VIEW:CRT_MBC_TEB64_VIEW)},bits);
+            if (memory.load(GuestAddress{mbc+8},32)) {
+                memory.read(GuestAddress{mbc+CRT_MBC_TYPES_OFFSET+1},types);
+                lead_table = types.data();
+            }
+        }
+        const auto write = [](void* mem,CrtMbcAddress address,std::uint8_t value) {
+            static_cast<GuestMemory*>(mem)->store(GuestAddress{address},8,value);
+        };
+        CrtAppendResult result{};
+        if (append) {
+            const auto count = arg(3);
+            result = crt_secure_append(&memory,crt_mbc_guest_byte,write,lead_table,text,size,arg(2),count,
+                                       name == "_mbsnbcat_s",count == (x86_ ? UINT32_MAX : UINT64_MAX));
+        } else {
+            const auto count = fill->limit == CrtFillAll ? 0 : arg(3);
+            const auto code = static_cast<unsigned>(crt_secure_fill(&memory,crt_mbc_guest_byte,write,lead_table,
+                                                    text,size,static_cast<unsigned>(arg(2)),fill->limit,count));
+            result = {code,code};
+        }
+        if (result.error == einval || result.error == erange) {
+            if (current_invalid_parameter_handler()) return invalid(result.status,result.error);
+            set_errno(result.error);
+            report_crt_fast_fail(state,memory,service.symbol);
+            return 0xc0000409U;
+        }
+        if (result.error) set_errno(result.error);
+        return done(result.status);
+    }
     if(name=="_mbsninc" && (!arg(0) || !arg(1)))return done(arg(0));
     const bool ordinal_compare=name=="_mbscmp" || name=="_mbsncmp" || name=="_mbsnbcmp";
     if(ordinal_compare){
@@ -463,23 +511,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
             if(name=="_mbsncat")put(to,0);else for(;count;--count,++to)put(to,0);
             return done(target);
         }
-        if(name=="_mbsnbcpy_s" || name=="_mbsnbcat_s" || name=="_mbsncpy_s"){
+        if(name=="_mbsnbcpy_s" || name=="_mbsncpy_s"){
             // (dest, size, src, count)：count＝_TRUNCATE 時截斷並回 STRUNCATE；不切斷雙位元組字元。
-            const bool append=name=="_mbsnbcat_s";const auto target=arg(0),size=arg(1),source=arg(2),count=arg(3);
+            const auto target=arg(0),size=arg(1),source=arg(2),count=arg(3);
             const bool truncate=count==(x86_?UINT32_MAX:UINT64_MAX);
             if(!count && !target && !size)return done(0);
             if(!target || !size)return invalid(einval);
-            std::uint64_t start=0;
-            if(append){
-                start=length(target,size);if(start==size){put(target,0);return invalid(einval);}
-                if(multibyte && start){std::uint64_t at=0,last=0;while(at<start){last=at;at+=lead(byte(target+at)) && at+1<start?2:1;}if(lead(byte(target+last)) && last+1==start)start=last;}
-            }
             if(!source){put(target,0);return invalid(einval);}
-            const auto available=size-start;
             const auto wanted=name=="_mbsncpy_s"?char_bytes(source,truncate?UINT64_MAX:count):std::min<std::uint64_t>(truncate?UINT64_MAX:count,length(source));
-            auto take=whole(source,std::min<std::uint64_t>(wanted,truncate?available-1:wanted));
-            if(!truncate && take+1>available){put(target,0);return invalid(erange,erange);}
-            for(std::uint64_t i=0;i<take;++i)put(target+start+i,byte(source+i));put(target+start+take,0);
+            auto take=whole(source,std::min<std::uint64_t>(wanted,truncate?size-1:wanted));
+            if(!truncate && take+1>size){put(target,0);return invalid(erange,erange);}
+            for(std::uint64_t i=0;i<take;++i)put(target+i,byte(source+i));put(target+take,0);
             return done(truncate && take<whole(source,wanted)?struncate:0U);
         }
         // ---- 填充與反轉 ----

@@ -2,6 +2,8 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "crt_os_error.hpp"
+#include "crt_bounded_length.hpp"
+#include "crt_error_text.h"
 #include "message_table_entry.hpp"
 #include "x64arm/windows_error_support.hpp"
 #include <algorithm>
@@ -16,28 +18,34 @@ std::span<const WindowsServiceDescriptor> error_service_descriptors() {
         {"crt","__doserrno",0},{"crt","_get_errno",1},{"crt","_set_errno",1},
         {"crt","_get_doserrno",1},{"crt","_set_doserrno",1},
         {"crt","strerror",1},{"crt","_wcserror",1},{"crt","perror",1},{"crt","_wperror",1},
+        {"msvcr80.dll","_strerror_s",3,0,0,0,true},{"msvcr90.dll","_strerror_s",3,0,0,0,true},
+        {"msvcr100.dll","_strerror_s",3,0,0,0,true},{"msvcr110.dll","_strerror_s",3,0,0,0,true},
+        {"msvcr120.dll","_strerror_s",3,0,0,0,true},{"ucrtbase.dll","_strerror_s",3,0,0,0,true},
+        {"crt","__wcserror_s",3},
         {"crt","strerror_s",3},{"crt","_wcserror_s",3},{"crt","__sys_nerr",0},{"crt","__sys_errlist",0}
     };return table;
 }
 namespace {
 #include "windows_generic_error_data.inc"
 constexpr std::uint32_t crt_error_count=43;
-std::string_view crt_message(std::uint32_t code) {
-    switch(code) {
-    case 0:return "Error 0";case 1:return "Operation not permitted";case 2:return "No such file or directory";
-    case 3:return "No such process";case 4:return "Interrupted function call";case 5:return "Input/output error";
-    case 6:return "No such device or address";case 7:return "Arg list too long";
-    case 8:return "Exec format error";case 9:return "Bad file number";case 10:return "No child processes";
-    case 11:return "Resource temporarily unavailable";case 12:return "Not enough core";case 13:return "Permission denied";
-    case 14:return "Bad address";case 16:return "Device or resource busy";case 17:return "File exists";case 18:return "Cross-device link";
-    case 19:return "No such device";case 20:return "Not a directory";case 21:return "Is a directory";case 22:return "Invalid argument";
-    case 23:return "Too many open files in system";case 24:return "Too many open files";case 25:return "Inappropriate I/O control operation";
-    case 27:return "File too large";case 28:return "No space left on device";case 29:return "Invalid seek";case 30:return "Read-only file system";
-    case 31:return "Too many links";case 32:return "Broken pipe";case 33:return "Math argument";case 34:return "Result too large";
-    case 36:return "Resource deadlock would occur";case 38:return "Filename too long";case 39:return "No locks available";
-    case 40:return "Function not implemented";case 41:return "Directory not empty";case 42:return "Illegal byte sequence";
-    default:return "Unknown error";
-    }
+std::string_view crt_message(std::uint32_t code) {return crt_errno_message(code);}
+void write_crt_error(GuestMemory& memory, CrtErrorAddress output, CrtErrorAddress capacity,
+                     unsigned width, CrtErrorAddress prefix, unsigned code) {
+    const CrtErrorWriter writer{
+        &memory,
+        [](void* raw,CrtErrorAddress address,CrtErrorAddress limit,unsigned unit) -> CrtErrorAddress {
+            return crt_bounded_length(*static_cast<GuestMemory*>(raw),address,limit,unit);
+        },
+        [](void* raw,CrtErrorAddress dest,CrtErrorAddress src,CrtErrorAddress length) {
+            static_cast<GuestMemory*>(raw)->move(GuestAddress{dest},GuestAddress{src},length);
+        },
+        [](void* raw,CrtErrorAddress address,unsigned unit,const char* text,CrtErrorAddress length) {
+            std::vector<std::uint8_t> bytes((length+1)*unit,0);
+            for(std::size_t i=0;i<length;++i)bytes[i*unit]=static_cast<std::uint8_t>(text[i]);
+            static_cast<GuestMemory*>(raw)->write(GuestAddress{address},bytes);
+        }
+    };
+    crt_format_error(&writer,output,capacity,width,prefix,code);
 }
 std::string_view system_message(std::uint32_t code) {
     switch (code) {
@@ -259,7 +267,7 @@ void WindowsServices::initialize_crt_error_data(GuestMemory& memory){
 }
 std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);std::uint64_t result=0;
-    if(service.family=="crt") {
+    if(service.family=="crt" || service.symbol=="_strerror_s") {
         const auto name=service.symbol;
         if(name=="__doserrno" || name=="_get_errno" || name=="_set_errno" || name=="_get_doserrno" || name=="_set_doserrno") {
             const auto cell=name.find("doserrno")!=name.npos?crt_os_error::cell(runtime_.errno_cell):runtime_.errno_cell;
@@ -276,15 +284,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,Gue
             initialize_crt_error_data(memory);
             arg.return_to(state,name=="__sys_nerr"?runtime_.crt_nerr_cell:runtime_.crt_errlist);return std::nullopt;
         }
-        if(service.symbol=="strerror_s" || service.symbol=="_wcserror_s"){
+        const bool prefixed=name=="_strerror_s" || name=="__wcserror_s";
+        if(prefixed || name=="strerror_s" || name=="_wcserror_s"){
             if(!arg(0) || !arg(1)){
                 memory.store(GuestAddress{runtime_.errno_cell},32,22);
                 if(const auto handler=current_invalid_parameter_handler()){start_callbacks(state,memory,{{handler,{0,0,0,0,0}}},Continuation::Return,22);return std::nullopt;}
-                return 0xc0000417U;
+                report_crt_fast_fail(state,memory,name);
+                return 0xc0000409U;
             }
-            const auto message=crt_message(static_cast<std::uint32_t>(arg(2))).substr(0,static_cast<std::size_t>(std::min<std::uint64_t>(arg(1)-1,UINT32_MAX)));
-            if(service.symbol=="_wcserror_s")memory.write(GuestAddress{arg(0)},utf16_bytes(utf8_to_utf16(message)));
-            else {std::vector<std::uint8_t> bytes(message.begin(),message.end());bytes.push_back(0);memory.write(GuestAddress{arg(0)},bytes);}
+            const auto code=prefixed ? memory.load(GuestAddress{runtime_.errno_cell},32) : arg(2);
+            const unsigned width=name=="__wcserror_s" || name=="_wcserror_s" ? 2U : 1U;
+            write_crt_error(memory,arg(0),arg(1),width,prefixed?arg(2):0,static_cast<unsigned>(code));
             arg.return_to(state,0);return std::nullopt;
         }
         const bool print=service.symbol=="perror" || service.symbol=="_wperror",wide=service.symbol=="_wcserror" || service.symbol=="_wperror";

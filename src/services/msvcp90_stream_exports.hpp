@@ -66,9 +66,41 @@ inline const std::vector<Binding>& bindings(){
         return v;
     }();return entries;
 }
+inline bool complex_stream(std::string_view name){
+    return name.find("?$complex@")!=name.npos && (name.find("?$basic_istream@")!=name.npos || name.find("?$basic_ostream@")!=name.npos);
+}
+inline const std::vector<Binding>& complex_bindings(){
+    static const auto entries=[]{
+        std::vector<Binding> result;
+        // VC8 由模組層對應到 VC9；VC6 的模板把分量型別放在 traits 之後。
+        for(unsigned version:{60U,70U,71U,90U})for(bool x86:{true,false}){
+            if(!x86 && (version==70 || version==71))continue;
+            const auto family="msvcp"+std::to_string(version)+".dll";
+            const std::string ref=x86?"AAV":"AEAV";
+            for(const std::string ch:{"D","G","_W"}){
+                if(version==60 && ch=="_W")continue;
+                const auto traits=ch+"U?$char_traits@"+ch+"@std@@";
+                for(const std::string scalar:{"M","N","O"})for(bool input:{true,false}){
+                    const std::string op=input?"5":"6";
+                    const auto suffix="std@@YA"+ref+"?$basic_"+(input?"istream@":"ostream@")+traits+
+                        "@0@"+ref+"10@"+(input?ref:x86?"ABV":"AEBV")+"?$complex@"+scalar+"@0@@Z";
+                    if(version<=70)result.push_back({family,"??"+op+suffix,2,x86});
+                    if(version!=70){
+                        const auto args=version==60?traits+scalar:scalar+traits;
+                        result.push_back({family,"??$?"+op+args+"@"+suffix,2,x86});
+                    }
+                }
+            }
+        }
+        return result;
+    }();
+    return entries;
+}
 inline std::vector<WindowsServiceDescriptor> descriptors(){
     std::vector<WindowsServiceDescriptor> result;
-    for(const auto& b:bindings())result.push_back({b.family,b.name,b.arguments});return result;
+    for(const auto& b:bindings())result.push_back({b.family,b.name,b.arguments});
+    for(const auto& b:complex_bindings())result.push_back({b.family,b.name,2,0,0,0,true});
+    return result;
 }
 inline bool family(std::string_view name){return name.find("basic_ifstream@")!=name.npos || name.find("basic_filebuf@")!=name.npos ||
     name.find("basic_istream@")!=name.npos || name.find("basic_ostream@")!=name.npos || name.find("basic_iostream@")!=name.npos || name.find("basic_streambuf@")!=name.npos || name.find("basic_ios@")!=name.npos || name.find("ios_base@")!=name.npos;}

@@ -517,10 +517,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_windows_metafile(GuestState
                 (void)nested_service(state,memory,"gdi32.dll","SetMapMode",{recorder,mode});
                 if(scalable){
                     std::int64_t width=0,height=0;
-                    if(framed){width=std::max<std::int64_t>(1,std::llround(x_ext*96.0/2540));height=std::max<std::int64_t>(1,std::llround(y_ext*96.0/2540));}
-                    else {const auto reference=arg(2);const auto screen=reference?reference:nested_service(state,memory,"user32.dll","GetDC",{0});
-                        width=static_cast<std::int32_t>(nested_service(state,memory,"gdi32.dll","GetDeviceCaps",{screen,8}));height=static_cast<std::int32_t>(nested_service(state,memory,"gdi32.dll","GetDeviceCaps",{screen,10}));
-                        if(!reference)(void)nested_service(state,memory,"user32.dll","ReleaseDC",{0,screen});}
+                    const auto& recorded=gui_.emf_recorders.at(recorder);
+                    if(framed){
+                        width=std::max<std::int64_t>(1,std::llround(x_ext/emf_frame_units_per_pixel(recorded,0)));
+                        height=std::max<std::int64_t>(1,std::llround(y_ext/emf_frame_units_per_pixel(recorded,1)));
+                    }else{
+                        width=emf_get(recorded.bytes,72);
+                        height=emf_get(recorded.bytes,76);
+                    }
                     (void)nested_service(state,memory,"gdi32.dll","SetViewportExtEx",{recorder,static_cast<std::uint64_t>(std::max<std::int64_t>(1,width)),static_cast<std::uint64_t>(std::max<std::int64_t>(1,height)),0});
                 }
                 played=play_windows_metafile(state,memory,recorder,bytes);
@@ -532,9 +536,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_windows_metafile(GuestState
         if(name=="GetWinMetaFileBits"){
             const auto found=gui_.metafiles.find(arg(0));if(found==gui_.metafiles.end())return fail(6);const auto mode=static_cast<std::uint32_t>(arg(3));if(mode<1 || mode>8)return fail(87);
             const auto& emf=found->second;const auto draws=emf_decode(emf.bytes);
-            // 參考裝置像素（96 DPI）→ 對應模式的邏輯單位；固定度量模式 Y 向上；等比／非等比模式以 0.01 mm 畫框為視窗。
-            static constexpr double scale[]{1,254.0/96,2540.0/96,100.0/96,1000.0/96,1440.0/96,2540.0/96,2540.0/96};
-            const double factor=scale[mode-1];const bool upward=mode>=2 && mode<=6;const GuiTransform output{factor,0,0,upward?-factor:factor,0,0};
+            // 將 EMF 參考裝置的像素換成 WMF 映射單位；固定度量模式的 Y 軸向上。
+            constexpr double per_frame_unit[]{0,0.1,1,100.0/2540,1000.0/2540,1440.0/2540,1,1};
+            const auto x=mode==1?1.0:emf_frame_units_per_pixel(emf,0)*per_frame_unit[mode-1];
+            const auto y=mode==1?1.0:emf_frame_units_per_pixel(emf,1)*per_frame_unit[mode-1];
+            const GuiTransform output{x,0,0,mode>=2 && mode<=6?-y:y,0,0};
             GuiMetafile out;wmf_begin(out,false);wmf_embed_emf(out,emf.bytes);
             const std::uint16_t map_mode[]{static_cast<std::uint16_t>(mode)};wmf_record(out,0x0103,map_mode);
             if(mode>=7){

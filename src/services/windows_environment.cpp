@@ -117,6 +117,7 @@ std::span<const WindowsServiceDescriptor> environment_service_descriptors() {
         {"kernel32.dll","GetEnvironmentVariableA",3},{"kernel32.dll","GetEnvironmentVariableW",3},
         {"kernel32.dll","SetEnvironmentVariableA",2},{"kernel32.dll","SetEnvironmentVariableW",2},
         {"kernel32.dll","NeedCurrentDirectoryForExePathA",1},{"kernel32.dll","NeedCurrentDirectoryForExePathW",1},
+        {"ucrtbase.dll","__dcrt_get_wide_environment_from_os",0,0,0,0,true},
         {"kernel32.dll","GetEnvironmentStrings",0},{"kernel32.dll","GetEnvironmentStringsA",0},{"kernel32.dll","GetEnvironmentStringsW",0},
         {"kernel32.dll","FreeEnvironmentStringsA",1},{"kernel32.dll","FreeEnvironmentStringsW",1},
         {"kernel32.dll","SetCurrentDirectoryA",1},{"kernel32.dll","SetCurrentDirectoryW",1},{"crt","_chdir",1},{"crt","_wchdir",1},{"crt","_chdrive",1},
@@ -184,6 +185,9 @@ void WindowsServices::configure_initial_environment(GuestMemory& memory,const Gu
     runtime_.initial_wenviron=memory.load(GuestAddress{runtime_.wenviron_cell},x86_?32:64);
     memory.store(GuestAddress{runtime_base_.value+112},x86_?32:64,runtime_.initial_environ);
     memory.store(GuestAddress{runtime_base_.value+120},x86_?32:64,runtime_.initial_wenviron);
+    if(runtime_.modules.contains("ucrtbase.dll"))
+        memory.store(builtin_constant_address("ucrtbase.dll","__dcrt_initial_narrow_environment"),
+                     x86_?32:64,runtime_.initial_environ);
     if(previous_initial && previous_initial!=runtime_.initial_environ)(void)free_heap(memory,previous_initial,state);
 }
 std::uint32_t WindowsServices::replace_process_environment(GuestMemory& memory,const GuestState& state,
@@ -303,7 +307,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
 #include "windows_process_parameters.inc"
 #include "policy_handlers.inc"
 #include "appcontainer_handlers.inc"
-    const bool wide=symbol.back()=='W' || symbol.starts_with("_w");
+    const bool crt_snapshot = symbol == "__dcrt_get_wide_environment_from_os";
+    const bool wide=crt_snapshot || symbol.back()=='W' || symbol.starts_with("_w");
     if(symbol=="EventRegister" || symbol=="EventUnregister" || symbol=="EventEnabled" || symbol=="EventProviderEnabled" || symbol=="EventWrite" || symbol=="EventWriteTransfer" || symbol=="EventWriteEx" ||
        symbol=="RegisterTraceGuidsA" || symbol=="RegisterTraceGuidsW" || symbol=="UnregisterTraceGuids" || symbol=="GetTraceEnableFlags" || symbol=="GetTraceEnableLevel" || symbol=="GetTraceLoggerHandle" || symbol=="TraceEvent" || symbol=="TraceMessage" || symbol=="TraceMessageVa")return invoke_etw_provider(state,memory,service);
     const auto text=[&](unsigned i){return wide?read_utf16(memory,GuestAddress{arg(i)}):ansi_to_utf16(read_ansi(memory,arg(i),32767));};
@@ -982,12 +987,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
                 }
             }
         }
-    } else if (symbol.starts_with("GetEnvironmentStrings")) {
+    } else if (crt_snapshot || symbol.starts_with("GetEnvironmentStrings")) {
         std::vector<std::uint8_t> bytes;
         for (const auto& [key,entry] : runtime_.environment) {(void)key;const auto encoded=encode(entry.first+u"="+entry.second);bytes.insert(bytes.end(),encoded.begin(),encoded.end());}
         const auto terminator=wide?2U:1U;if (bytes.empty()) bytes.resize(terminator);bytes.resize(bytes.size()+terminator);
-        result=allocate_heap(memory,bytes.size());if (!result) last_error_=8;
-        else {memory.write(GuestAddress{result},bytes);runtime_.environment_blocks.emplace(result,wide);}
+        result=allocate_heap(memory,bytes.size());
+        if (!result) {
+            if (crt_snapshot) memory.store(GuestAddress{runtime_.errno_cell},32,12);
+            else last_error_=8;
+        } else {
+            memory.write(GuestAddress{result},bytes);
+            // CRT 副本由 free 釋放；Win32 快照則加入 FreeEnvironmentStrings 的所有權表。
+            if (!crt_snapshot) runtime_.environment_blocks.emplace(result,wide);
+        }
     } else if (symbol.starts_with("FreeEnvironmentStrings")) {
         const auto found=runtime_.environment_blocks.find(arg(0));
         // A／W 的環境快照由同一個程序堆積配置，釋放只需驗證區塊所屬。

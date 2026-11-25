@@ -45,6 +45,49 @@ std::vector<GuiPathPoint> gui_flatten_path(const std::vector<GuiPathPoint>& inpu
         if(p.type&1){output.back().type|=1;current=start;}
     }return output;
 }
+// Cosmetic 畫筆以走過的裝置像素計算虛線，每段包含起點、排除終點；相連線段共享相位。
+std::array<GuiRegion,2> gui_cosmetic_dashes(const std::vector<GuiPathPoint>& path,std::span<const double> dash,bool opaque){
+    std::array<GuiRegion,2> bands;
+    if(dash.empty() || std::ranges::all_of(dash,[](double length){return length==0;}))return bands;
+    std::size_t phase=0,steps=0;
+    bool ink=true;
+    auto remaining=static_cast<std::uint32_t>(dash.front());
+    std::array<int,2> current{},start{};
+    const auto segment=[&](std::array<int,2> end){
+        auto [x,y]=current;
+        const auto dx=std::abs(end[0]-x),dy=std::abs(end[1]-y);
+        const int sx=x<end[0]?1:-1,sy=y<end[1]?1:-1;
+        steps+=static_cast<std::size_t>(std::max(dx,dy));
+        if(steps>1024*1024)throw std::length_error("GDI 虛線像素數超出上限");
+        int error=dx-dy;
+        while(x!=end[0] || y!=end[1]){
+            while(!remaining){
+                phase=(phase+1)%dash.size();ink=!ink;remaining=static_cast<std::uint32_t>(dash[phase]);
+            }
+            if(ink || opaque){
+                auto& runs=bands[ink?0:1];
+                if(!runs.empty() && runs.back()[1]==y && runs.back()[2]==x)++runs.back()[2];
+                else if(!runs.empty() && runs.back()[1]==y && runs.back()[0]==x+1)--runs.back()[0];
+                else runs.push_back({x,y,x+1,y+1});
+            }
+            --remaining;const int twice=2*error;
+            if(twice>=-dy){error-=dy;x+=sx;}
+            if(twice<=dx){error+=dx;y+=sy;}
+        }
+        current=end;
+    };
+    for(const auto& p:gui_flatten_path(path)){
+        const std::array<int,2> end{static_cast<int>(std::lround(p.x)),static_cast<int>(std::lround(p.y))};
+        if((p.type&6)==6){
+            start=current=end;phase=0;ink=true;remaining=static_cast<std::uint32_t>(dash.front());
+        }else segment(end);
+        if(p.type&1)segment(start);
+    }
+    bands[0]=gui_region_combine(bands[0],{},2);
+    if(opaque)bands[1]=gui_region_combine(bands[1],bands[0],4);
+    return bands;
+}
+
 GuiRegion native_path_region(const std::vector<GuiPathPoint>& input,unsigned fill_mode){
 #if defined(__APPLE__)
     if(input.empty())return {};PathOwner source{path(input)};const auto box=CGPathGetPathBoundingBox(source.value);if(CGRectIsNull(box) || CGRectIsEmpty(box))return {};
@@ -66,12 +109,33 @@ GuiRegion native_path_region(const std::vector<GuiPathPoint>& input,unsigned fil
 #endif
 }
 std::vector<GuiPathPoint> native_stroke_path(const std::vector<GuiPathPoint>& input,const GuiTransform& transform,double width,unsigned style,double miter){
+    return native_stroke_path(input,transform,width,style,miter,{});
+}
+std::vector<GuiPathPoint> native_stroke_path(const std::vector<GuiPathPoint>& input,const GuiTransform& transform,double width,unsigned style,double miter,std::span<const double> dash){
 #if defined(__APPLE__)
     if(input.empty() || width<=0)return {};const auto inverse=gui_inverse(transform);if(!inverse)throw std::invalid_argument("GDI stroke 矩陣不可逆");
     PathOwner device{path(input)};auto inv=affine(*inverse),matrix=affine(transform);PathOwner logical{CGPathCreateCopyByTransformingPath(device.value,&inv)};if(!logical.value)throw std::bad_alloc();
     const auto cap=(style&0xf00)==0x100?kCGLineCapSquare:(style&0xf00)==0x200?kCGLineCapButt:kCGLineCapRound;
     const auto join=(style&0xf000)==0x1000?kCGLineJoinBevel:(style&0xf000)==0x2000?kCGLineJoinMiter:kCGLineJoinRound;
-    PathOwner stroke{CGPathCreateCopyByStrokingPath(logical.value,nullptr,width,cap,join,miter)};if(!stroke.value)throw std::bad_alloc();
+    PathOwner dashed{nullptr};
+    if(!dash.empty()){
+        double period=0;
+        for(double length:dash)period+=length;
+        if(period<=0)return {};
+        // 控制多邊形的長度是曲線長度上界，先限制可能展開的虛線段數。
+        double length=0;std::array<double,2> previous{},start{};
+        for(const auto& p:input){
+            const auto point=gui_point(*inverse,p.x,p.y);
+            if((p.type&6)==6)start=point;
+            else length+=std::hypot(point[0]-previous[0],point[1]-previous[1]);
+            if(p.type&1)length+=std::hypot(start[0]-point[0],start[1]-point[1]);
+            previous=point;
+        }
+        if(length/period*static_cast<double>(dash.size())>65536)throw std::length_error("GDI 虛線段數超出上限");
+        dashed.value=CGPathCreateCopyByDashingPath(logical.value,nullptr,0,dash.data(),dash.size());
+        if(!dashed.value)throw std::bad_alloc();
+    }
+    PathOwner stroke{CGPathCreateCopyByStrokingPath(dashed.value?dashed.value:logical.value,nullptr,width,cap,join,miter)};if(!stroke.value)throw std::bad_alloc();
     PathOwner mapped{CGPathCreateCopyByTransformingPath(stroke.value,&matrix)};if(!mapped.value)throw std::bad_alloc();
     struct Collector{std::vector<GuiPathPoint> points;std::exception_ptr error;};Collector collector;
     CGPathApply(mapped.value,&collector,[](void* opaque,const CGPathElement* element){auto& c=*static_cast<Collector*>(opaque);if(c.error)return;try{
@@ -84,7 +148,7 @@ std::vector<GuiPathPoint> native_stroke_path(const std::vector<GuiPathPoint>& in
     }catch(...){c.error=std::current_exception();}});
     if(collector.error)std::rethrow_exception(collector.error);return gui_flatten_path(collector.points);
 #else
-    (void)input;(void)transform;(void)width;(void)style;(void)miter;throw std::domain_error("本平台無原生 stroke 後端");
+    (void)input;(void)transform;(void)width;(void)style;(void)miter;(void)dash;throw std::domain_error("本平台無原生 stroke 後端");
 #endif
 }
 }

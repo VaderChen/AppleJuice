@@ -447,6 +447,14 @@ bool thread_priority_worker_service(std::string_view symbol) noexcept {
 // GetSystemInfo／GetNativeSystemInfo、GetSystemTimeAsFileTime（含 Precise）。只讀初始化後不變的程序狀態或主機時鐘，
 // 原本每次往返協調者並全停其他 worker（2 vCPU 兩執行緒每次 1.2～3.5 µs）。非 NULL 模組名稱、沒有機器時鐘、
 // 輸出不可寫或與返回槽重疊時交回協調者。X64ARM_PARALLEL_PROCESS_QUERIES=0 關閉。
+// IsBad*Ptr 的範圍探測：只依區段權限判定（與 windows_memory.cpp 的協調者實作相同），不讀寫內容、不改 LastError，
+// 共用映射鎖下映射不會變動，可在 worker 執行。三國志 XI（x86）每幀約 2,400 次，主執行緒落在 worker 時每次都要全停。
+// X64ARM_PARALLEL_MEMORY_PROBE=0 交回協調者。
+bool memory_probe_worker_service(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_MEMORY_PROBE");return !value || std::string_view(value)!="0";}();
+    return enabled && (symbol=="IsBadReadPtr" || symbol=="IsBadWritePtr" || symbol=="IsBadHugeReadPtr" || symbol=="IsBadHugeWritePtr" ||
+        symbol=="IsBadCodePtr");
+}
 bool process_query_worker_service(std::string_view symbol) noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_PROCESS_QUERIES");return !value || std::string_view(value)!="0";}();
     return enabled && (symbol=="GetCurrentProcessId" || symbol=="GetProcessHeap" || symbol=="GetModuleHandleW" || symbol=="GetModuleHandleA" ||
@@ -462,6 +470,7 @@ bool parallel_tick_clock_enabled() noexcept {
 std::optional<unsigned> context_service_arguments(std::string_view symbol) noexcept {
     if(symbol=="HeapAlloc" || symbol=="HeapFree" || symbol=="HeapSize")return 3;
     if(process_query_worker_service(symbol))return symbol=="GetCurrentProcessId" || symbol=="GetProcessHeap"?0U:1U;
+    if(memory_probe_worker_service(symbol))return symbol=="IsBadCodePtr"?1U:2U;
     if(symbol=="GetLastError" || symbol=="GetCurrentThreadId" || symbol=="SwitchToThread" || tick_clock_service(symbol) || crt_clock_service(symbol) || msvcp_clock_service(symbol))return 0;
     if(symbol=="TlsSetValue" || symbol=="FlsSetValue" || symbol=="WaitForSingleObject")return 2;
     if(symbol=="WaitForSingleObjectEx")return 3;
@@ -724,7 +733,8 @@ bool WindowsServices::parallel_service_static(GuestAddress address) const noexce
     if(rtti_cast_worker_service(symbol) || key_state_worker_service(symbol) || process_memory_worker_service(symbol))return true;
     if(thrd_tail_service(symbol) || parallel_event_service(symbol) || parallel_wait_service(symbol) || parallel_null_wait_service(symbol) || parallel_semaphore_service(symbol) ||
        parallel_wait_multiple_service(symbol))return true;
-    if(thread_priority_worker_service(symbol) || crt_string_copy_worker_service(symbol) || process_query_worker_service(symbol))return true;
+    if(thread_priority_worker_service(symbol) || crt_string_copy_worker_service(symbol) || process_query_worker_service(symbol) ||
+       memory_probe_worker_service(symbol))return true;
     return symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue" ||
         symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue" ||
         symbol=="InitOnceBeginInitialize" || symbol=="InitOnceExecuteOnce" ||
@@ -1928,6 +1938,14 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         auto* object=static_cast<std::uint8_t*>(pointer(first,16,3));if(!first || !object)return false;
         if(symbol=="?__ExceptionPtrDestroy@@YAXPEAX@Z" && load(object+8,8))return false; // 釋放控制區引用交回協調者。
         put(object,0,8);put(object+8,0,8);
+    }
+    else if(memory_probe_worker_service(symbol)){
+        // 與協調者相同：長度為 0 視為有效、範圍越過位址上限視為無效，其餘逐區段核對權限（IsBadCodePtr 只看 1 位元組的讀取權限）。
+        const auto limit=x86_?UINT64_C(0xffffffff):UINT64_MAX;
+        const auto count=symbol=="IsBadCodePtr"?UINT64_C(1):second;
+        if(count && (first>limit || count-1>limit-first))result=1;
+        else try{memory.check(GuestAddress{first},static_cast<std::size_t>(count),symbol.find("Write")!=std::string_view::npos?Access::Write:Access::Read);}
+        catch(const MemoryFault&){result=1;}
     }
     else if(process_query_worker_service(symbol)){
         // 與協調者服務相同的值與寫入內容（GetSystemInfo 共用 windows_system_info_layout.hpp），都不改 LastError。

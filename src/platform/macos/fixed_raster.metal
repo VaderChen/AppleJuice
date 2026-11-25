@@ -28,7 +28,7 @@ kernel void raster(texture2d<float,access::read_write> dst [[texture(0)]],textur
  else if(a.kind==4 || a.kind==5){
   if(!inside(p,int4(min(a.rect.xy,a.rect.zw),max(a.rect.xy,a.rect.zw))))return;
   float2 t=(sample-float2(a.rect.xy))/float2(a.rect.zw-a.rect.xy);int2 q=int2(floor(float2(a.source.xy)+t*float2(a.source.zw-a.source.xy)));
-  bool reads_source=a.kind==5 || ((a.operation^(a.operation>>2))&0x33u)!=0;
+  bool reads_source=a.kind==5 || a.transparent!=0xffffffffu || ((a.operation^(a.operation>>2))&0x33u)!=0;
   if(reads_source && (any(q<0) || q.x>=int(src.get_width()) || q.y>=int(src.get_height())))return;
   c=reads_source?src.read(uint2(q)):float4(0);
   if(a.transparent!=0xffffffffu && all(uint3(round(c.rgb*255.0))==uint3(a.transparent&255,(a.transparent>>8)&255,(a.transparent>>16)&255)))return;

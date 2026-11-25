@@ -8,6 +8,11 @@
 
 // ntdll 的純運算 Rtl 家族：記憶體、計數字串（STRING／UNICODE_STRING）、整數轉換、GUID、位元圖、LUID、TIME_FIELDS、
 // 亂數、CRC32、MD4／MD5／SHA-1 訊息摘要、自訂字碼頁表（CPTABLEINFO）與 PE 映像輔助。全部在宿主端直接讀寫客體記憶體，不經客體回呼；ANSI／OEM 與引擎其他轉碼相同使用 UTF-8。
+namespace x64arm::rtl_integer {
+#define RTL_ENTRY(T,name) static inline T name
+#include "rtl_large_integer.h"
+#undef RTL_ENTRY
+}
 namespace x64arm {
 namespace {
 constexpr std::uint32_t status_invalid_parameter=0xc000000dU,status_buffer_too_small=0xc0000023U,status_buffer_overflow=0x80000005U,
@@ -61,6 +66,14 @@ std::span<const WindowsServiceDescriptor> ntdll_pure_service_descriptors(){
         {"ntdll.dll","RtlUnicodeStringToCountedOemString",3},{"ntoskrnl.exe","RtlOemStringToCountedUnicodeString",3},
         {"ntdll.dll","RtlUpcaseUnicodeStringToCountedOemString",3},{"ntdll.dll","RtlUpcaseUnicodeToMultiByteN",5,0,0,0x12},
         {"ntdll.dll","RtlUpcaseUnicodeToOemN",5,0,0,0x12},{"ntdll.dll","RtlIsNameLegalDOS8Dot3",3},
+        // Win32 fastcall：16／32 位元由 ECX 傳入，只有 64 位元參數使用堆疊。
+        {"internal-rtl-byteswap","RtlUshortByteSwap",0},{"internal-rtl-byteswap","RtlUlongByteSwap",0},
+        {"internal-rtl-byteswap","RtlUlonglongByteSwap",1,0x1},
+#define RTL_NAMED(name,args,wide) {"internal-rtl-integer",#name,args,wide},
+#define RTL_ORDINAL(ord,name,args,wide) RTL_NAMED(name,args,wide)
+#include "rtl_large_integer_exports.inc"
+#undef RTL_ORDINAL
+#undef RTL_NAMED
         // 整數轉換
         {"ntdll.dll","RtlIntegerToChar",4,0,0,0x7},{"ntdll.dll","RtlIntegerToUnicodeString",3,0,0,0x3},
         {"ntdll.dll","RtlInt64ToUnicodeString",3,0x1,0,0x2},{"ntdll.dll","RtlLargeIntegerToChar",4,0,0,0x6},
@@ -102,7 +115,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_ntdll_pure(GuestState& stat
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
+    if(service.family=="internal-rtl-byteswap"){
+        if(name=="RtlUshortByteSwap")return done(__builtin_bswap16(static_cast<std::uint16_t>(state.reg(Gpr::Rcx))));
+        if(name=="RtlUlongByteSwap")return done(__builtin_bswap32(static_cast<std::uint32_t>(state.reg(Gpr::Rcx))));
+        arg.return_to(state,__builtin_bswap64(arg(0)),true);
+        return {};
+    }
     const auto u32=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
+    if(service.family=="internal-rtl-integer"){
+        using namespace rtl_integer;
+        const auto wide_result=[&](std::uint64_t value){arg.return_to(state,value,true);return std::optional<std::uint32_t>{};};
+        const auto a=arg(0);
+        if(name=="RtlConvertLongToLargeInteger")return wide_result(RtlConvertLongToLargeInteger(static_cast<std::int32_t>(a)));
+        if(name=="RtlConvertUlongToLargeInteger")return wide_result(RtlConvertUlongToLargeInteger(static_cast<std::uint32_t>(a)));
+        if(name=="RtlLargeIntegerNegate")return wide_result(RtlLargeIntegerNegate(a));
+        const auto b=arg(1);
+        if(name=="RtlLargeIntegerAdd")return wide_result(RtlLargeIntegerAdd(a,b));
+        if(name=="RtlLargeIntegerSubtract")return wide_result(RtlLargeIntegerSubtract(a,b));
+        if(name=="RtlEnlargedIntegerMultiply")return wide_result(RtlEnlargedIntegerMultiply(static_cast<std::int32_t>(a),static_cast<std::int32_t>(b)));
+        if(name=="RtlEnlargedUnsignedMultiply")return wide_result(RtlEnlargedUnsignedMultiply(static_cast<std::uint32_t>(a),static_cast<std::uint32_t>(b)));
+        if(name=="RtlExtendedIntegerMultiply")return wide_result(RtlExtendedIntegerMultiply(a,static_cast<std::int32_t>(b)));
+        if(name=="RtlLargeIntegerShiftLeft")return wide_result(RtlLargeIntegerShiftLeft(a,static_cast<unsigned>(b)));
+        if(name=="RtlLargeIntegerShiftRight")return wide_result(RtlLargeIntegerShiftRight(a,static_cast<unsigned>(b)));
+        if(name=="RtlLargeIntegerArithmeticShift")return wide_result(RtlLargeIntegerArithmeticShift(static_cast<std::int64_t>(a),static_cast<unsigned>(b)));
+        if(name=="RtlExtendedMagicDivide")return wide_result(RtlExtendedMagicDivide(a,b,u32(2)));
+        const bool narrow=name=="RtlEnlargedUnsignedDivide";
+        if(!b || (narrow && (a>>32)>=b)){
+            begin_exception(state,memory,b?0xc0000095U:0xc0000094U,name=="RtlExtendedLargeIntegerDivide"?1U:0U,{});
+            return {};
+        }
+        if(const auto remainder=arg(2);remainder)
+            memory.store(GuestAddress{remainder},name=="RtlLargeIntegerDivide"?64:32,a%b);
+        arg.return_to(state,a/b,!narrow);
+        return {};
+    }
     const auto byte=[&](unsigned index){return static_cast<std::uint8_t>(arg(index));};
     // STRING／UNICODE_STRING 的讀寫與載入器、Rtl 轉接共用 guest_counted_string.hpp。
     const auto header=[&](std::uint64_t address){return read_counted_header(memory,address,x86_);};

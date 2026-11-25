@@ -2,6 +2,13 @@
 #include <array>
 #include <string_view>
 namespace x64arm {
+inline constexpr std::string_view secure_crt_libraries[]{"msvcr80.dll",  "msvcr90.dll",  "msvcr100.dll",
+                                              "msvcr110.dll", "msvcr120.dll", "ucrtbase.dll"};
+inline constexpr bool secure_crt_library(std::string_view module) {
+    for (const auto provider : secure_crt_libraries)
+        if (provider == module) return true;
+    return false;
+}
 // Release CRT 的共用 provider；不把任意版本或 debug CRT 名稱視為相同 ABI。
 inline constexpr std::array<std::string_view,7> legacy_crt_libraries{
     "msvcr70.dll","msvcr71.dll","msvcr80.dll","msvcr90.dll",

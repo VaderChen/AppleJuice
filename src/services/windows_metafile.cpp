@@ -4,7 +4,25 @@
 #include "x64arm/windows_geometry.hpp"
 #include "windows_wmf.hpp"
 #include <algorithm>
+#include "windows_server_metafile.inc"
 namespace x64arm {
+namespace {
+GuiTransform emf_playback_mapping(const GuiMetafile& meta,const GuiRect& target,const GuiDc& dc){
+    std::array<double,4> source{};
+    for(unsigned i=0;i<4;++i){
+        const auto coordinate=static_cast<std::int32_t>(emf_get(meta.bytes,24+4*i));
+        source[i]=coordinate/emf_frame_units_per_pixel(meta,i%2);
+    }
+    if(source[2]==source[0] || source[3]==source[1])return gui_device_transform(dc);
+    const auto sx=(static_cast<double>(target[2])-target[0])/(source[2]-source[0]);
+    const auto sy=(static_cast<double>(target[3])-target[1])/(source[3]-source[1]);
+    return gui_multiply({sx,0,0,sy,target[0]-source[0]*sx,target[1]-source[1]*sy},gui_device_transform(dc));
+}
+}
+void WindowsServices::discard_metafile_recorder(std::uint64_t dc){
+    if(metafile_playback_)metafile_playback_->recorder_caps.erase(dc);
+    gui_.emf_recorders.erase(dc);
+}
 void WindowsServices::finish_metafile_enumeration(GuestState& state,GuestMemory& memory,std::uint64_t table){
     if(!metafile_playback_)return;
     // EnumMetaFile：還原原本選取的物件並刪除 handle table 中播放端建立的物件。
@@ -18,7 +36,10 @@ void WindowsServices::finish_metafile_enumeration(GuestState& state,GuestMemory&
 
 std::span<const WindowsServiceDescriptor> metafile_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
-        {"gdi32.dll","GdiComment",3},{"gdi32.dll","PlayEnhMetaFileRecord",4},{"gdi32.dll","CreateEnhMetaFileA",4},{"gdi32.dll","CreateEnhMetaFileW",4},{"gdi32.dll","CloseEnhMetaFile",1},{"gdi32.dll","DeleteEnhMetaFile",1},
+        {"win32u.dll","NtGdiCreateServerMetaFile",6},{"win32u.dll","NtGdiGetServerMetaFileBits",7},
+        {"gdi32.dll","GdiConvertEnhMetaFile",1},{"gdi32.dll","GdiConvertMetaFilePict",1},
+        {"gdi32.dll","GdiCreateLocalEnhMetaFile",1},{"gdi32.dll","GdiCreateLocalMetaFilePict",1},
+        {"win32u.dll","NtGdiCreateMetafileDC",1},{"gdi32.dll","GdiComment",3},{"gdi32.dll","PlayEnhMetaFileRecord",4},{"gdi32.dll","CreateEnhMetaFileA",4},{"gdi32.dll","CreateEnhMetaFileW",4},{"gdi32.dll","CloseEnhMetaFile",1},{"gdi32.dll","DeleteEnhMetaFile",1},
         {"gdi32.dll","CopyEnhMetaFileA",2},{"gdi32.dll","CopyEnhMetaFileW",2},{"gdi32.dll","GetEnhMetaFileHeader",3},{"gdi32.dll","GetEnhMetaFileDescriptionA",3},{"gdi32.dll","GetEnhMetaFileDescriptionW",3},
         {"gdi32.dll","GetEnhMetaFileBits",3},{"gdi32.dll","SetEnhMetaFileBits",2},{"gdi32.dll","GetEnhMetaFilePaletteEntries",3},{"gdi32.dll","EnumEnhMetaFile",5},{"gdi32.dll","PlayEnhMetaFile",3},
         {"gdi32.dll","GetEnhMetaFileA",1},{"gdi32.dll","GetEnhMetaFileW",1},{"gdi32.dll","GetEnhMetaFilePixelFormat",3}
@@ -52,20 +73,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_metafile(GuestState& state,
                 draw.clipped=clip.has_value();draw.excluded.clear();if(clip){draw.clip=gui_region_bounds(*clip);draw.excluded=gui_region_combine(GuiRegion{draw.clip},*clip,4);}
                 if(record_metafile_draw(target_dc,draw))return;if(surface)surface->draw(draw);else window->second.drawing.push_back(std::move(draw));};
     try{
-        if(name.starts_with("CreateEnhMetaFile")){
+        if(name=="NtGdiCreateServerMetaFile" || name=="NtGdiGetServerMetaFileBits" ||
+           name.starts_with("GdiConvert") || name.starts_with("GdiCreateLocal"))
+            return finish(server_metafile_call(state,memory,arg,name));
+        const bool native_create=name=="NtGdiCreateMetafileDC";
+        if(native_create || name.starts_with("CreateEnhMetaFile")){
             if(arg(0) && !valid_dc(arg(0)))return fail(6);
             GuiMetafile meta;
             // 磁碟 EMF：與 CreateMetaFile 相同，建立時即建立（截斷）檔案，CloseEnhMetaFile 時寫出。
-            if(arg(1)){meta.file=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)}):ansi_to_utf16(read_ansi(memory,arg(1)));if(meta.file.empty())return fail(3);if(!write_guest_file(state,memory,meta.file,{}))return finish(0);}if(arg(2)){meta.frame=rect(arg(2));if(gui_rect_empty(*meta.frame))return fail(87);}
-            if(arg(3)){const bool wide=name.ends_with('W');bool zero=false,done=false;std::string narrow;
+            if(!native_create && arg(1)){meta.file=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)}):ansi_to_utf16(read_ansi(memory,arg(1)));if(meta.file.empty())return fail(3);if(!write_guest_file(state,memory,meta.file,{}))return finish(0);}if(!native_create && arg(2)){meta.frame=rect(arg(2));if(gui_rect_empty(*meta.frame))return fail(87);}
+            if(!native_create && arg(3)){const bool wide=name.ends_with('W');bool zero=false,done=false;std::string narrow;
                 for(unsigned i=0;i<32768;++i){const auto c=memory.load(GuestAddress{arg(3)+i*(wide?2:1)},wide?16:8);if(wide)meta.description.push_back(static_cast<char16_t>(c));else narrow.push_back(static_cast<char>(c));if(!c && zero){done=true;break;}zero=!c;}
                 if(!done)return fail(87);if(!wide)meta.description=utf8_to_utf16_lossy(narrow);
                 meta.description.pop_back(); // 終止符由共用 UTF-16 encoder 補上。
             }
-            emf_begin(meta);const auto handle=gui_.next_object++;gui_.emf_recorders.emplace(handle,std::move(meta));try{gui_.contexts.emplace(handle,GuiDc{});}catch(...){gui_.emf_recorders.erase(handle);throw;}return finish(handle);
+            MetafileState::DeviceCaps caps{};
+            read_gdi_device_caps(arg(0),0,caps);
+            emf_begin(meta);
+            for(unsigned axis=0;axis<2;++axis){
+                const auto mm=caps[4+axis*2];
+                emf_put(meta.bytes,72+4*axis,caps[8+axis*2]);
+                emf_put(meta.bytes,80+4*axis,mm);
+                emf_put(meta.bytes,100+4*axis,mm<=INT32_MAX/1000?mm*1000:0);
+            }
+            if(!metafile_playback_)metafile_playback_=std::make_shared<MetafileState>();
+            const auto handle=gui_.next_object++;
+            gui_.emf_recorders.emplace(handle,std::move(meta));
+            try{
+                metafile_playback_->recorder_caps.emplace(handle,caps);
+                gui_.contexts.try_emplace(handle);
+            }catch(...){discard_metafile_recorder(handle);throw;}
+            return finish(handle);
         }
         if(name=="CloseEnhMetaFile"){
-            const auto found=gui_.emf_recorders.find(arg(0));if(found==gui_.emf_recorders.end() || found->second.wmf)return fail(6);auto meta=found->second;emf_finish(meta);gui_.emf_recorders.erase(found);gui_.contexts.erase(arg(0));gui_.dc_objects.erase(arg(0));gui_.saved_contexts.erase(arg(0));
+            const auto found=gui_.emf_recorders.find(arg(0));if(found==gui_.emf_recorders.end() || found->second.wmf)return fail(6);auto meta=found->second;emf_finish(meta);discard_metafile_recorder(arg(0));gui_.contexts.erase(arg(0));gui_.dc_objects.erase(arg(0));gui_.saved_contexts.erase(arg(0));
             if(!meta.file.empty() && !write_guest_file(state,memory,meta.file,meta.bytes))return finish(0);
             const auto handle=gui_.next_object++;gui_.metafiles.emplace(handle,std::move(meta));return finish(handle);
         }
@@ -130,19 +171,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_metafile(GuestState& state,
             const auto records=emf_validate(meta.bytes);const auto handles=std::max(1U,emf_get(meta.bytes,56)&65535U);const auto allocation=allocate_heap(memory,static_cast<std::size_t>(handles)*unit+meta.bytes.size());if(!allocation)return fail(8);
             try{
                 if(!metafile_playback_)metafile_playback_=std::make_shared<MetafileState>();if(metafile_playback_->enumerations.size()>=256)throw std::length_error("EMF 巢狀列舉過深");MetafileState::Enumeration operation;operation.dc=arg(0);operation.count=handles;
-                if(arg(0)){operation.original=gui_.contexts[arg(0)];operation.saved=gui_.saved_contexts[arg(0)];const auto target=rect(arg(4));if(gui_rect_empty(target))throw std::invalid_argument("EMF 目標矩形為空");const auto source=meta.frame?gui_transform_bounds({96.0/2540,0,0,96.0/2540,0,0},*meta.frame):meta.bounds.value_or(GuiRect{});operation.mapping=gui_device_transform(operation.original);if(!gui_rect_empty(source)){const double sx=(static_cast<double>(target[2])-target[0])/(static_cast<double>(source[2])-source[0]),sy=(static_cast<double>(target[3])-target[1])/(static_cast<double>(source[3])-source[1]);operation.mapping=gui_multiply({sx,0,0,sy,target[0]-source[0]*sx,target[1]-source[1]*sy},operation.mapping);}}
+                if(arg(0)){operation.original=gui_.contexts[arg(0)];operation.saved=gui_.saved_contexts[arg(0)];const auto target=rect(arg(4));if(gui_rect_empty(target))throw std::invalid_argument("EMF 目標矩形為空");operation.mapping=emf_playback_mapping(meta,target,operation.original);}
                 metafile_playback_->enumerations.emplace(allocation,std::move(operation));memory.write(GuestAddress{allocation},std::vector<std::uint8_t>(static_cast<std::size_t>(handles)*unit));memory.store(GuestAddress{allocation},static_cast<std::uint8_t>(unit*8),handle);const auto data=allocation+static_cast<std::size_t>(handles)*unit;memory.write(GuestAddress{data},meta.bytes);std::vector<GuestCallback> callbacks;callbacks.reserve(records.size());for(const auto& [offset,size]:records){(void)size;callbacks.push_back({arg(2),{arg(0),allocation,data+offset,handles,arg(3)}});}start_callbacks(state,memory,std::move(callbacks),Continuation::MetafileEnumeration,allocation);return std::nullopt;}catch(...){finish_metafile_enumeration(state,memory,allocation);free_heap(memory,allocation,state);throw;}
         }
         if(name=="PlayEnhMetaFile"){
             if(!valid_dc(arg(0)) || !arg(2))return fail(87);
-            const auto target=rect(arg(2));if(gui_rect_empty(target))return fail(87);const auto source=meta.frame?gui_transform_bounds({96.0/2540,0,0,96.0/2540,0,0},*meta.frame):meta.bounds.value_or(GuiRect{});if(gui_rect_empty(source))return finish(1);
-            auto& dc=gui_.contexts[arg(0)];const double sx=(static_cast<double>(target[2])-target[0])/(static_cast<double>(source[2])-source[0]),sy=(static_cast<double>(target[3])-target[1])/(static_cast<double>(source[3])-source[1]);const auto mapping=gui_multiply({sx,0,0,sy,target[0]-source[0]*sx,target[1]-source[1]*sy},gui_device_transform(dc));
+            const auto target=rect(arg(2));if(gui_rect_empty(target))return fail(87);const auto mapping=emf_playback_mapping(meta,target,gui_.contexts[arg(0)]);
             const auto draws=emf_decode(meta.bytes);const auto surface=gui_.emf_recorders.contains(arg(0))?std::shared_ptr<RasterSurface>{}:raster_surface(memory,arg(0));const auto window=gui_.windows.find(arg(0)-0x10000000);if(!surface && !gui_.emf_recorders.contains(arg(0)) && window==gui_.windows.end())return fail(50);
             if(gui_.emf_recorders.contains(arg(0)) && !gui_.emf_recorders.at(arg(0)).wmf){EmfDecoder decoder;for(const auto& [offset,size]:emf_validate(meta.bytes)){const auto record=std::span(meta.bytes).subspan(offset,size);auto decoded=emf_decode_record(decoder,record);if(emf_get(record,0)==70)emf_append(gui_.emf_recorders.at(arg(0)),std::vector<std::uint8_t>(record.begin(),record.end()));for(auto draw:decoded)paint(arg(0),std::move(draw),mapping);}}
             else for(auto draw:draws)paint(arg(0),std::move(draw),mapping);
             if(window!=gui_.windows.end())present_gui(window->first);return finish(1);
         }
         return fail(50);
-    }catch(const std::domain_error&){return fail(50);}catch(const std::bad_alloc&){return fail(8);}catch(const std::length_error&){return fail(8);}catch(const std::invalid_argument&){return fail(13);}
+    }catch(const MemoryFault&){return fail(998);}catch(const std::range_error&){return fail(534);}catch(const std::domain_error&){return fail(50);}catch(const std::bad_alloc&){return fail(8);}catch(const std::length_error&){return fail(8);}catch(const std::invalid_argument&){return fail(13);}
 }
 }

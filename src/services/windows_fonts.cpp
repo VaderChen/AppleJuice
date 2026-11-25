@@ -1,15 +1,19 @@
 #include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_fonts.hpp"
+#include "x64arm/windows_transform.hpp"
 #include "x64arm/native_font_data.hpp"
 #include "x64arm/unicode.hpp"
 #include "windows_locale_data.hpp"
 #include <algorithm>
+#include <bit>
 #include <map>
 #include <set>
 #include <tuple>
 #include <cmath>
+#include <cstring>
 #include <numeric>
+#include <numbers>
 #include <unicode/ubidi.h>
 #include <unicode/ubrk.h>
 #include <unicode/uchar.h>
@@ -64,6 +68,15 @@ bool windows_ui_font_alias(std::u16string_view family){
     return std::any_of(std::begin(aliases),std::end(aliases),[&](auto alias){return alias.size()==family.size() && std::equal(alias.begin(),alias.end(),family.begin(),[&](auto a,auto b){return lower(a)==lower(b);});});
 }
 namespace {
+// 原生入口的 cwc 以 WCHAR 計算，包含單一檔名的終止字元。
+std::u16string font_resource_path(const GuestMemory& memory,std::uint64_t address,std::uint32_t count){
+    if(!count || count>32768)throw std::invalid_argument("字型檔名長度無效");
+    auto path=read_utf16_counted(memory,GuestAddress{address},count);
+    if(path.empty() || path.find(u'\0')!=path.size()-1)throw std::invalid_argument("字型檔名未正確終止");
+    path.pop_back();
+    if(path.starts_with(u"\\??\\"))path[1]=u'\\'; // 交由共用 Windows 檔案系統處理磁碟與 UNC。
+    return path;
+}
 struct Charset {std::uint8_t value;unsigned bit;std::u16string_view name;};
 constexpr Charset charsets[]{{0,0,u"Western"},{238,1,u"Central European"},{204,2,u"Cyrillic"},{161,3,u"Greek"},{162,4,u"Turkish"},{177,5,u"Hebrew"},{178,6,u"Arabic"},{186,7,u"Baltic"},{163,8,u"Vietnamese"},{222,16,u"Thai"},{128,17,u"Japanese"},{134,18,u"Chinese GB2312"},{129,19,u"Korean"},{136,20,u"Chinese Big5"},{130,21,u"Korean Johab"},{77,29,u"Macintosh"},{255,30,u"OEM"},{2,31,u"Symbol"}};
 bool valid_charset(std::uint8_t value){return value==1 || std::any_of(std::begin(charsets),std::end(charsets),[&](const auto& entry){return entry.value==value;});}
@@ -103,6 +116,18 @@ std::vector<FontEnumerationRecord> font_enumeration_records(std::vector<NativeFo
 }
 std::span<const WindowsServiceDescriptor> font_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"win32u.dll","NtGdiGetTextMetricsW",3,0,0,4},{"win32u.dll","NtGdiGetTextFaceW",4,0,0,0xa},
+        {"win32u.dll","NtGdiGetOutlineTextMetricsInternalW",4,0,0,2},{"win32u.dll","NtGdiGetCharacterPlacementW",6,0,0,0x2c},
+        {"win32u.dll","NtGdiAddFontResourceW",6,0,0,0x1e},{"win32u.dll","NtGdiRemoveFontResourceW",6,0,0,0x1e},
+        {"win32u.dll","NtGdiAddFontMemResourceEx",5,0,0,0xa},{"win32u.dll","NtGdiRemoveFontMemResourceEx",1},
+        {"win32u.dll","NtGdiGetFontData",5,0,0,0x16},{"win32u.dll","NtGdiGetRealizationInfo",2},
+        {"win32u.dll","NtGdiGetFontFileData",5},{"win32u.dll","NtGdiGetFontFileInfo",5,0,0,3},
+        {"win32u.dll","NtGdiGetFontResourceInfoInternalW",7,0,0,0x4e},
+        {"win32u.dll","NtGdiGetGlyphIndicesW",5,0,0,0x14},{"win32u.dll","NtGdiGetGlyphOutline",8,0,0,0x96},
+        {"win32u.dll","NtGdiGetFontUnicodeRanges",2},{"win32u.dll","NtGdiFontIsLinked",1},
+        {"win32u.dll","NtGdiGetTextCharsetInfo",3,0,0,4},{"win32u.dll","NtGdiGetCharSet",1},
+        {"win32u.dll","NtGdiGetCharWidthW",6,0,0,0x16},{"win32u.dll","NtGdiGetCharABCWidthsW",6,0,0,0x16},
+        {"win32u.dll","NtGdiGetCharWidthInfo",2},{"win32u.dll","NtGdiGetKerningPairs",3,0,0,2},
         {"gdi32.dll","GetCharacterPlacementA",6,0,0,0x2c},{"gdi32.dll","GetCharacterPlacementW",6,0,0,0x2c},{"gdi32.dll","GetFontLanguageInfo",1},
         {"gdi32.dll","AddFontResourceA",1},{"gdi32.dll","AddFontResourceW",1},{"gdi32.dll","RemoveFontResourceA",1},{"gdi32.dll","RemoveFontResourceW",1},
         {"gdi32.dll","GetOutlineTextMetricsA",3,0,0,0x2},{"gdi32.dll","GetOutlineTextMetricsW",3,0,0,0x2},
@@ -117,27 +142,60 @@ std::span<const WindowsServiceDescriptor> font_service_descriptors(){
 }
 std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto finish=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
+    const bool native_entry=service.symbol.starts_with("NtGdi");
+    auto resource=native_entry?service.symbol.substr(5):service.symbol;
+    if(resource=="GetRealizationInfo")resource="GetFontRealizationInfo";
+    try{
 #include "gdi_font_realization.inc"
-    if(service.symbol.starts_with("AddFontResource") || service.symbol.starts_with("RemoveFontResource")){
-        const bool extended=service.symbol.find("ResourceEx")!=std::string_view::npos;
-        const auto flags=extended?static_cast<std::uint32_t>(arg(1)):0U;
-        if(!arg(0) || (flags&~0x30U) || (extended && arg(2))){last_error_=87;return finish(0);}
-        const auto path=service.symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
+    if(resource.starts_with("AddFontResource") || resource.starts_with("RemoveFontResource")){
+        const bool extended=resource.find("ResourceEx")!=std::string_view::npos;
+        const auto flags=native_entry?static_cast<std::uint32_t>(arg(3)):extended?static_cast<std::uint32_t>(arg(1)):0U;
+        if(!arg(0) || (flags&~0x30U) || (extended && arg(2)) ||
+           (native_entry && (arg(2)!=1 || arg(4) || arg(5)))){last_error_=87;return finish(0);}
+        const auto path=native_entry?utf16_to_utf8(font_resource_path(memory,arg(0),static_cast<std::uint32_t>(arg(1)))):
+            resource.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):ansi_to_utf8(read_ansi(memory,arg(0)));
         const auto file=filesystem_.open(path);if(file.error){last_error_=file.error;return finish(0);}
-        const auto key=std::make_pair(file.key,static_cast<std::uint32_t>(flags));
-        if(service.symbol.starts_with("Remove")){
-            const auto found=gui_.file_fonts.find(key);if(found==gui_.file_fonts.end() || found->second.empty()){last_error_=2;return finish(0);}
+        const auto key=std::make_pair(file.key,flags);
+        if(resource.starts_with("Remove")){
+            const auto found=gui_.file_fonts.find(key);if(found==gui_.file_fonts.end()){last_error_=2;return finish(0);}
             gui_.memory_fonts.erase(found->second.back());found->second.pop_back();if(found->second.empty())gui_.file_fonts.erase(found);return finish(1);
         }
-        if(gui_.memory_fonts.size()>=256){last_error_=8;return finish(0);}auto faces=native_load_font_faces(*file.bytes);if(faces.empty()){last_error_=13;return finish(0);}
-        const auto count=static_cast<std::uint32_t>(faces.size()),handle=static_cast<std::uint32_t>(gui_.next_object++);gui_.memory_fonts.emplace(handle,std::move(faces));gui_.file_fonts[key].push_back(handle);return finish(count);
+        if(gui_.memory_fonts.size()>=256){last_error_=8;return finish(0);}
+        auto faces=native_load_font_faces(*file.bytes);if(faces.empty()){last_error_=13;return finish(0);}
+        const auto count=static_cast<std::uint32_t>(faces.size());
+        const auto handle=gui_.next_object++;
+        auto [entry,inserted]=gui_.file_fonts.try_emplace(key);
+        try{
+            entry->second.reserve(entry->second.size()+1);
+            gui_.memory_fonts.emplace(handle,std::move(faces));
+        }catch(...){if(inserted)gui_.file_fonts.erase(entry);throw;}
+        entry->second.push_back(handle);
+        return finish(count);
     }
-    if(service.symbol=="RemoveFontMemResourceEx")return finish(gui_.memory_fonts.erase(arg(0))?1U:0U);
-    if(service.symbol=="AddFontMemResourceEx"){
-        const auto size=static_cast<std::uint32_t>(arg(1));if(!arg(0) || !size || size>output_limit || arg(2) || !arg(3) || gui_.memory_fonts.size()>=256)return finish(0);
-        memory.check(GuestAddress{arg(3)},4,Access::Write);std::vector<std::uint8_t> bytes(size);memory.read(GuestAddress{arg(0)},bytes);auto faces=native_load_font_faces(bytes);if(faces.empty())return finish(0);
-        const auto handle=gui_.next_object++;memory.store(GuestAddress{arg(3)},32,faces.size());gui_.memory_fonts.emplace(handle,std::move(faces));return finish(static_cast<std::uint32_t>(handle));
+    if(resource=="RemoveFontMemResourceEx"){
+        const auto handle=arg(0);
+        for(const auto& [key,handles]:gui_.file_fonts)
+            if(std::find(handles.begin(),handles.end(),handle)!=handles.end())return finish(0);
+        return finish(gui_.memory_fonts.erase(handle)?1U:0U);
     }
+    if(resource=="AddFontMemResourceEx"){
+        const auto count_out=arg(native_entry?4:3);
+        const auto size=static_cast<std::uint32_t>(arg(1));
+        if(!arg(0) || !size || arg(2) || (native_entry && arg(3)) || !count_out){last_error_=87;return finish(0);}
+        if(size>native_font_file_limit || gui_.memory_fonts.size()>=256){last_error_=8;return finish(0);}
+        memory.check(GuestAddress{count_out},4,Access::Write);
+        memory.check(GuestAddress{arg(0)},size,Access::Read);
+        std::vector<std::uint8_t> bytes(size);memory.read(GuestAddress{arg(0)},bytes);
+        auto faces=native_load_font_faces(bytes);if(faces.empty()){last_error_=13;return finish(0);}
+        const auto handle=gui_.next_object++;
+        const auto count=faces.size();
+        gui_.memory_fonts.emplace(handle,std::move(faces));
+        memory.store(GuestAddress{count_out},32,count);
+        return finish(static_cast<std::uint32_t>(handle));
+    }
+    }catch(const MemoryFault&){last_error_=998;return finish(0);}
+    catch(const std::invalid_argument&){last_error_=87;return finish(0);}
+    catch(const std::bad_alloc&){last_error_=8;return finish(0);}
     if(service.symbol.starts_with("CreateFontIndirectEx")){
         // ENUMLOGFONTEXDV 以 LOGFONT 開頭（W 348／A 188 位元組後接 DESIGNVECTOR）：設計向量須帶 STAMP_DESIGNVECTOR 且軸數不超過 16；
         // 沒有 multiple master 字型時軸值不影響實現，與 OpenType 字型的 Windows 行為相同。
@@ -146,26 +204,84 @@ std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,Gue
         if(stamp!=0x08007664U || axes>16){last_error_=87;return finish(0);}
         return finish(static_cast<std::uint32_t>(nested_service(state,memory,"gdi32.dll",service.symbol.ends_with('W')?"CreateFontIndirectW":"CreateFontIndirectA",{arg(0)})));
     }
-    const bool extended=service.symbol.starts_with("EnumFontFamiliesEx"),wide=service.symbol.ends_with('W');
-    const bool query=!service.symbol.starts_with("EnumFont");
-    const auto failure=service.symbol=="GetFontLanguageInfo"?0x8000U:service.symbol=="GetFontData" || service.symbol=="GetGlyphIndicesW" || service.symbol.starts_with("GetGlyphOutline")?UINT32_MAX:0U;
-    if(!gui_.dc_objects.contains(arg(0)) && !gui_.contexts.contains(arg(0))){last_error_=6;return finish(failure);}
+    auto name=service.symbol;
+    const bool native_outline=name=="NtGdiGetGlyphOutline";
+    if(native_outline)name="GetGlyphOutlineW";
+    else if(name=="NtGdiGetTextExtent")name="GetTextExtentPointI";
+    else if(name=="NtGdiGetTextExtentExW")name="GetTextExtentExPointI";
+    else if(name=="NtGdiGetOutlineTextMetricsInternalW")name="GetOutlineTextMetricsW";
+    else if(name=="NtGdiGetTextFaceW" || name=="NtGdiGetTextMetricsW" || name=="NtGdiGetCharacterPlacementW")name.remove_prefix(5);
+    else if(name=="NtGdiGetKerningPairs")name="GetKerningPairsW";
+    else if(name=="NtGdiGetFontData" || name=="NtGdiGetGlyphIndicesW" || name=="NtGdiGetFontUnicodeRanges" || name=="NtGdiGetTextCharsetInfo" ||
+            name=="NtGdiFontIsLinked" || name=="NtGdiGetCharWidthInfo")name.remove_prefix(5);
+    const bool extended=name.starts_with("EnumFontFamiliesEx"),wide=name.ends_with('W');
+    const bool query=!name.starts_with("EnumFont");
+    const bool charset_info=name=="GetTextCharsetInfo" || name=="GetTextCharset";
+    const auto failure=name=="GetFontLanguageInfo"?0x8000U:charset_info?1U:
+        name=="GetFontData" || name=="GetGlyphIndicesW" || name.starts_with("GetGlyphOutline")?UINT32_MAX:0U;
+    if(!gui_.dc_objects.contains(arg(0)) && !gui_.contexts.contains(arg(0)) &&
+        !(arg(0)>=0x10000000 && gui_.windows.contains(arg(0)-0x10000000))){last_error_=6;return finish(failure);}
     if(query){
         const auto fail=[&](unsigned error){last_error_=error;return finish(failure);};
         const auto dc=gui_.contexts.find(arg(0));const auto model=gui_font(gui_,dc==gui_.contexts.end()?0xb011:dc->second.font);
         const auto face=native_resolve_font(model);if(!face)return fail(50);
-        const auto name=service.symbol;
+        if(charset_info || name=="NtGdiGetCharSet"){
+            if(name=="GetTextCharsetInfo" && static_cast<unsigned>(arg(2)))return fail(87);
+            unsigned charset=model.charset;
+            const auto supports=[&](const Charset& item){return (face->signature[4]&(UINT32_C(1)<<item.bit))!=0;};
+            if(std::none_of(std::begin(charsets),std::end(charsets),[&](const auto& item){return item.value==charset && supports(item);})){
+                const auto active=process_ansi_codepage();
+                auto chosen=std::find_if(std::begin(charsets),std::end(charsets),[&](const auto& item){
+                    return supports(item) && (item.value==0?1252U:gdi_charset_code_page(item.value))==active;
+                });
+                if(chosen==std::end(charsets))chosen=std::find_if(std::begin(charsets),std::end(charsets),supports);
+                charset=chosen==std::end(charsets)?1U:chosen->value;
+            }
+            if(name=="NtGdiGetCharSet"){
+                const auto page=nested_service(state,memory,"gdi32.dll","GdiGetCodePage",{arg(0)});
+                return finish((charset<<16)|static_cast<std::uint16_t>(page));
+            }
+            if(name=="GetTextCharsetInfo" && arg(1)){
+                try{
+                    memory.check(GuestAddress{arg(1)},24,Access::Write);
+                    for(unsigned i=0;i<6;++i)memory.store(GuestAddress{arg(1)+4*i},32,face->signature[i]);
+                }catch(const MemoryFault&){return fail(998);}
+            }
+            return finish(charset);
+        }
 #include "gdi_character_placement.inc"
-        if(name.starts_with("GetOutlineTextMetrics")){
-            if(dc==gui_.contexts.end() || dc->second.map_mode!=1 || dc->second.world!=gui_identity)return fail(50);
+        if(name.starts_with("GetOutlineTextMetrics") || name.starts_with("GetTextMetrics"))try{
+            const bool outline=name.starts_with("GetOutlineTextMetrics");
+            if(outline && (dc==gui_.contexts.end() || dc->second.map_mode!=1 || dc->second.world!=gui_identity))return fail(50);
             const auto metrics=native_gui_?native_gui_->font_metrics(model).value_or(fallback_font_metrics(model)):fallback_font_metrics(model);
             const unsigned tm_size=wide?60:56,selection=(4+tm_size+11+3)&~3U,pointer_size=x86_?4:8;
             const auto pointers=(selection+124+pointer_size-1)&~(pointer_size-1),header=pointers+4*pointer_size;
-            std::vector<std::uint8_t> bytes(header);
             auto basic=record(*face,wide,model.charset,u"").metrics;
-            std::copy_n(basic.begin(),tm_size,bytes.begin()+4);
-            for(const auto [offset,value]:std::array<std::pair<unsigned,std::int32_t>,9>{{{0,metrics.height},{4,metrics.ascent},{8,metrics.descent},{12,std::max(0,metrics.height-static_cast<int>(std::abs(model.height)))},{16,metrics.external_leading},{20,metrics.average_width},{24,metrics.maximum_width},{28,model.weight},{32,0}}})number(bytes,4+offset,static_cast<std::uint32_t>(value));
-            bytes[4+44+(wide?8:4)]=model.italic;bytes[4+45+(wide?8:4)]=model.underline;bytes[4+46+(wide?8:4)]=model.strikeout;
+            basic.resize(tm_size);
+            for(const auto [offset,value]:std::array<std::pair<unsigned,std::int32_t>,9>{{{0,metrics.height},{4,metrics.ascent},{8,metrics.descent},{12,std::max(0,metrics.height-static_cast<int>(std::min<std::int64_t>(INT32_MAX,std::abs(static_cast<std::int64_t>(model.height)))))},{16,metrics.external_leading},{20,metrics.average_width},{24,metrics.maximum_width},{28,model.weight?model.weight:face->weight},{32,0}}})number(basic,offset,static_cast<std::uint32_t>(value));
+            const auto style=wide?52U:48U;
+            basic[style]=model.italic;basic[style+1]=model.underline;basic[style+2]=model.strikeout;
+            // TMDIFF 含 ANSI 輪廓資料所需大小，以及該字型的四個 ANSI 字元界限。
+            const auto ansi_difference=[&]{
+                std::vector<std::uint8_t> diff(8);
+                const auto ansi_size=nested_service(state,memory,"gdi32.dll","GetOutlineTextMetricsA",{arg(0),0,0});
+                number(diff,0,static_cast<std::uint32_t>(ansi_size));
+                const auto ansi=record(*face,false,model.charset,u"").metrics;
+                std::copy_n(ansi.begin()+44,4,diff.begin()+4);
+                return diff;
+            };
+            if(!outline){
+                const auto capacity=service.symbol=="NtGdiGetTextMetricsW" && arg(2)?static_cast<unsigned>(arg(2)):tm_size;
+                if(!arg(1) || capacity>tm_size+8)return fail(87);
+                memory.check(GuestAddress{arg(1)},capacity,Access::Write);
+                if(capacity>tm_size){const auto diff=ansi_difference();basic.insert(basic.end(),diff.begin(),diff.end());}
+                memory.write(GuestAddress{arg(1)},std::span(basic).first(capacity));
+                return finish(1);
+            }
+            const auto diff_out=service.symbol=="NtGdiGetOutlineTextMetricsInternalW"?arg(3):0;
+            if(diff_out)memory.check(GuestAddress{diff_out},8,Access::Write);
+            std::vector<std::uint8_t> bytes(header);
+            std::copy(basic.begin(),basic.end(),bytes.begin()+4);
             const auto os2=native_font_table(*face,0x4f532f32),head=native_font_table(*face,0x68656164),hhea=native_font_table(*face,0x68686561),post=native_font_table(*face,0x706f7374);
             const auto word=[&](const auto& table,unsigned at,bool signed_value=false)->int{if(at+2>table.size())return 0;const auto value=static_cast<std::uint16_t>((unsigned(table[at])<<8)|table[at+1]);return signed_value?static_cast<std::int16_t>(value):value;};
             const double em=model.height<0?-static_cast<double>(model.height):model.height?static_cast<double>(model.height)*face->em/std::max(1,face->ascent+face->descent):13;
@@ -183,34 +299,64 @@ std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,Gue
             for(unsigned i=0;i<8;++i)number(bytes,selection+76+i*4,scaled(word(os2,10+i*2,true)));
             number(bytes,selection+108,scaled(face->design_metrics[9]));number(bytes,selection+112,scaled(face->design_metrics[8]));number(bytes,selection+116,scaled(face->design_metrics[7]));number(bytes,selection+120,scaled(face->design_metrics[6]));
             const std::array<std::u16string,4> names{face->family,model.face.empty()?face->family:model.face,face->style,face->full_name};
-            for(unsigned i=0;i<names.size();++i){number(bytes,pointers+i*pointer_size,static_cast<std::uint32_t>(bytes.size()),pointer_size);const auto value=wide?utf16_bytes(names[i]):[&](){auto text=utf16_to_utf8(names[i]);std::vector<std::uint8_t> data(text.begin(),text.end());data.push_back(0);return data;}();bytes.insert(bytes.end(),value.begin(),value.end());}
+            for(unsigned i=0;i<names.size();++i){number(bytes,pointers+i*pointer_size,static_cast<std::uint32_t>(bytes.size()),pointer_size);const auto value=wide?utf16_bytes(names[i]):[&](){auto text=utf16_to_ansi(names[i]);std::vector<std::uint8_t> data(text.begin(),text.end());data.push_back(0);return data;}();bytes.insert(bytes.end(),value.begin(),value.end());}
             number(bytes,0,static_cast<std::uint32_t>(bytes.size()));
+            const auto count=std::min<std::size_t>(static_cast<std::uint32_t>(arg(1)),bytes.size());
+            if(arg(2)){
+                if(!count)return fail(87);
+                memory.check(GuestAddress{arg(2)},count,Access::Write);
+            }
+            if(diff_out)memory.write(GuestAddress{diff_out},ansi_difference());
             if(!arg(2))return finish(static_cast<std::uint32_t>(bytes.size()));
-            const auto count=std::min<std::size_t>(static_cast<std::uint32_t>(arg(1)),bytes.size());if(!count)return fail(87);
             memory.write(GuestAddress{arg(2)},std::span(bytes).first(count));return finish(static_cast<std::uint32_t>(count));
-        }
-        if(name.starts_with("GetGlyphOutline") || name=="GetTextExtentPointI" || name=="GetTextExtentExPointI" || name.starts_with("GetCharABCWidths") || name=="GetCharWidthA" || name=="GetCharWidthW" || name=="GetCharWidthI"){
+        }catch(const MemoryFault&){return fail(998);}
+        const bool native_width=name=="NtGdiGetCharWidthW" || name=="NtGdiGetCharABCWidthsW";
+        const bool widths=native_width || name.starts_with("GetCharABCWidths") ||
+            (name.starts_with("GetCharWidth") && name!="GetCharWidthInfo");
+        if(widths || name.starts_with("GetGlyphOutline") || name=="GetTextExtentPointI" || name=="GetTextExtentExPointI"){
             try {
-                if(dc==gui_.contexts.end() || dc->second.map_mode!=1 || dc->second.world!=gui_identity)return fail(50);
-                if(const auto selected=gui_.fonts.find(dc->second.font);selected!=gui_.fonts.end()){
-                    const auto& logfont=selected->second;if(logfont.size()>=16 && std::any_of(logfont.begin()+8,logfont.begin()+16,[](auto byte){return byte!=0;}))return fail(50);
+                if(!widths && !name.starts_with("GetGlyphOutline")){
+                    if(dc==gui_.contexts.end() || dc->second.map_mode!=1 || dc->second.world!=gui_identity)return fail(50);
+                    if(const auto selected=gui_.fonts.find(dc->second.font);selected!=gui_.fonts.end()){
+                        const auto& logfont=selected->second;
+                        if(logfont.size()>=16 && std::any_of(logfont.begin()+8,logfont.begin()+16,[](auto byte){return byte!=0;}))return fail(50);
+                    }
                 }
                 const double em=model.height<0?-static_cast<double>(model.height):model.height?static_cast<double>(model.height)*face->em/std::max(1,face->ascent+face->descent):13;
                 const double sy=em/face->em,sx=model.width?std::abs(static_cast<double>(model.width))/std::max(1,face->average_width):sy;
                 if(em>32768 || std::abs(static_cast<double>(model.width))>32768)return fail(87);
                 if(name.starts_with("GetGlyphOutline")){
                     const auto format=static_cast<unsigned>(arg(2)),mode=format&0x7fU;const bool index=(format&0x80)!=0;
-                    if(format&~0x1ffU || mode>6 || ((format&0x100) && mode!=2 && mode!=3) || arg(1)>65535 || !arg(3) || !arg(6))return fail(87);
+                    if(format&~0x1ffU || mode>6 || ((format&0x100) && mode!=2 && mode!=3) || (!native_outline && arg(1)>65535) || !arg(3) || !arg(6))return fail(87);
                     // A 版字元碼：DBCS 的 ACP 下依字型字元集轉成 Unicode（雙位元組碼的高位元組為前導位元組）；UTF-8 只接受 ASCII。
                     const bool narrow_dbcs=!wide && !index && !process_ansi_is_utf8();
                     if(!wide && !index && !narrow_dbcs && arg(1)>127)return fail(50);
-                    const auto character=narrow_dbcs?gdi_narrow_character(static_cast<std::uint32_t>(arg(1)),model.charset):static_cast<std::uint32_t>(arg(1));
+                    const auto character=native_outline?static_cast<std::uint16_t>(arg(1)):narrow_dbcs?gdi_narrow_character(static_cast<std::uint32_t>(arg(1)),model.charset):static_cast<std::uint32_t>(arg(1));
                     const auto glyph=index?static_cast<std::uint16_t>(arg(1)):native_font_glyph_indices(*face,std::array<std::uint32_t,1>{character})[0];
-                    std::array<double,4> matrix{};for(unsigned i=0;i<4;++i)matrix[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(6)+i*4},32))/65536.0*(i<2?sx:sy);
+                    if(dc==gui_.contexts.end())return fail(6);
+                    GuiTransform mat{};
+                    for(unsigned i=0;i<4;++i)mat[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(6)+i*4},32))/65536.0;
+                    std::int32_t angle=0;
+                    const auto logical=gui_.fonts.find(dc->second.font);
+                    if(!(native_outline && arg(7)) && logical!=gui_.fonts.end() && logical->second.size()>=16){
+                        // 相容模式用 escapement，高階模式讓字形 orientation 獨立於基線。
+                        const unsigned field=dc->second.graphics_mode==2?12U:8U;
+                        std::int32_t tenths;
+                        std::memcpy(&tenths,logical->second.data()+field,sizeof(tenths));
+                        angle=tenths%3600;
+                    }
+                    const double radians=angle*std::numbers::pi/1800.0;
+                    const double c=angle%900==0?(angle%1800==0?(angle==0?1.0:-1.0):0.0):std::cos(radians);
+                    const double sine=angle%900==0?(angle%1800==0?0.0:(angle==900 || angle==-2700?1.0:-1.0)):std::sin(radians);
+                    const auto device=gui_device_transform(dc->second);
+                    // 字形座標的 Y 向上，DC 的 Y 向下；平移不改變相對於字形原點的度量。
+                    const GuiTransform to_device{device[0],-device[1],-device[2],device[3],0,0};
+                    const auto transformed=gui_multiply(gui_multiply({sx*c,sx*sine,-sy*sine,sy*c,0,0},to_device),mat);
+                    const std::array<double,4> matrix{transformed[0],transformed[1],transformed[2],transformed[3]};
                     const auto native=native_gdi_glyph(*face,glyph,matrix,mode==1?1:mode>=4?2:0);const auto& box=native.bounds;
                     const auto width=static_cast<unsigned>(box[2]-box[0]),height=static_cast<unsigned>(box[3]-box[1]);
                     const auto dx=std::round(native.advance[0]),dy=-std::round(native.advance[1]);if(dx<INT16_MIN || dx>INT16_MAX || dy<INT16_MIN || dy>INT16_MAX)return fail(534);
-                    std::vector<std::uint8_t> metrics(20);number(metrics,0,width);number(metrics,4,height);number(metrics,8,static_cast<unsigned>(box[0]));number(metrics,12,static_cast<unsigned>(box[3]));number(metrics,16,static_cast<std::uint16_t>(dx),2);number(metrics,18,static_cast<std::uint16_t>(dy),2);
+                    std::vector<std::uint8_t> metrics(20);number(metrics,0,width);number(metrics,4,height);number(metrics,8,static_cast<unsigned>(box[0]));number(metrics,12,static_cast<unsigned>(box[3]));number(metrics,16,static_cast<std::int16_t>(dx),2);number(metrics,18,static_cast<std::int16_t>(dy),2);
                     std::vector<std::uint8_t> bytes;
                     if(mode==1 || mode>=4){const auto stride=mode==1?((width+31)/32)*4:(width+3)&~3U;bytes.resize(static_cast<std::size_t>(stride)*height);const unsigned levels=mode==4?4:mode==5?16:64;
                         for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x){const auto alpha=native.alpha[static_cast<std::size_t>(y)*width+x];const auto at=static_cast<std::size_t>(y)*stride;
@@ -225,26 +371,79 @@ std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,Gue
                     memory.check(GuestAddress{arg(3)},20,Access::Write);if(mode && arg(5) && arg(4)){if(arg(4)<bytes.size())return fail(122);memory.check(GuestAddress{arg(5)},bytes.size(),Access::Write);}
                     memory.write(GuestAddress{arg(3)},metrics);if(mode && arg(5) && arg(4))memory.write(GuestAddress{arg(5)},bytes);return finish(static_cast<unsigned>(bytes.size()));
                 }
-                const bool extent=name.starts_with("GetTextExtent"),extent_ex=name=="GetTextExtentExPointI",indexed=extent || name.ends_with('I'),abc=name.starts_with("GetCharABC");
-                const auto first=static_cast<unsigned>(arg(1));const auto count=extent || indexed?static_cast<unsigned>(arg(2)):arg(2)>=arg(1) && arg(2)<=65535?static_cast<unsigned>(arg(2)-arg(1)+1):UINT32_MAX;
-                const bool narrow_dbcs=!extent && !indexed && !wide && !process_ansi_is_utf8();
-                if(count>65536 || (!extent && !indexed && !wide && !narrow_dbcs && arg(2)>127))return fail(87);
+                const bool extent=!widths,extent_ex=name=="GetTextExtentExPointI";
+                const bool abc=name.find("ABCWidths")!=name.npos;
+                // 兩個原生呼叫的整數與索引旗標分別使用不同的位元。
+                const unsigned flags=native_width?static_cast<unsigned>(arg(4)):0;
+                if(native_width && (flags&~(abc?3U:11U)))return fail(87);
+                const bool indexed=extent || (native_width?(flags&(abc?2U:8U))!=0:name.ends_with('I'));
+                const bool floating=widths && (native_width?!(flags&(abc?1U:2U)):name.find("Float")!=name.npos);
+                const unsigned first=static_cast<unsigned>(arg(1)),last_or_count=static_cast<unsigned>(arg(2));
+                const bool range=!native_width && !indexed;
+                if(range && (last_or_count<first || last_or_count>65535))return fail(87);
+                const auto count=range?last_or_count-first+1:last_or_count;
+                const auto list=extent?arg(1):(native_width || indexed)?arg(3):0;
+                const auto output=arg(native_width?5:extent_ex?6:!extent && indexed?4:3);
+                // 明列的字元或字形可以重複，筆數可超過 UTF-16 單位的值域。
+                const auto max_count=extent?65536U:output_limit/sizeof(NativeGlyphMetrics);
+                if(!output || count>max_count || (extent && count && !list) ||
+                   (!list && count && (first>65535 || count>65536-first)))return fail(87);
+                if(widths)memory.check(GuestAddress{output},count*(abc?12U:4U),Access::Write);
+                if(list && count)memory.check(GuestAddress{list},count*2U,Access::Read);
                 std::vector<std::uint16_t> glyphs(count);
-                if(indexed){const auto pointer=arg(extent?1:3);if(extent && count && !pointer)return fail(87);if(!pointer && (first>65535 || count>65536-first))return fail(87);for(unsigned i=0;i<count;++i)glyphs[i]=pointer?static_cast<std::uint16_t>(memory.load(GuestAddress{pointer+i*2},16)):static_cast<std::uint16_t>(first+i);}
-                else {std::vector<std::uint32_t> characters(count);for(unsigned i=0;i<count;++i)characters[i]=narrow_dbcs?gdi_narrow_character(first+i,model.charset):first+i;glyphs=native_font_glyph_indices(*face,characters);}
-                const auto metrics=native_font_glyph_metrics(*face,glyphs);const auto output=arg(extent?(extent_ex?6:3):(indexed?4:3));if(!output)return fail(87);
-                std::vector<std::int32_t> advances(count);for(unsigned i=0;i<count;++i){const auto value=std::round(metrics[i][1]*sx);if(value>INT32_MAX)return fail(534);advances[i]=static_cast<std::int32_t>(value);}
+                std::vector<std::uint32_t> characters(indexed?0:count);
+                const bool ansi=!indexed && !wide;
+                const bool dbcs=ansi && !process_ansi_is_utf8();
+                const unsigned single_byte_limit=(name=="GetCharWidthA" || name=="GetCharABCWidthsA")?127U:255U;
+                for(unsigned i=0;i<count;++i){
+                    const auto value=list?static_cast<unsigned>(memory.load(GuestAddress{list+i*2},16)):first+i;
+                    if(indexed)glyphs[i]=static_cast<std::uint16_t>(value);
+                    else if(wide)characters[i]=value;
+                    else if(dbcs)characters[i]=gdi_narrow_character(value,model.charset);
+                    else {
+                        // 延續公開 A 版 GetCharWidth32／Float 的單位元組轉換。
+                        if(value>single_byte_limit)return fail(87);
+                        characters[i]=cp1252_to_utf16(std::string(1,static_cast<char>(value)))[0];
+                    }
+                }
+                if(!indexed)glyphs=native_font_glyph_indices(*face,characters);
+                const auto metrics=native_font_glyph_metrics(*face,glyphs);
+                std::vector<std::int32_t> advances(count);
+                for(unsigned i=0;i<count;++i){
+                    const auto advance=std::round(metrics[i][1]*sx);
+                    if(advance<INT32_MIN || advance>INT32_MAX)return fail(534);
+                    advances[i]=static_cast<std::int32_t>(advance);
+                }
                 if(extent){if(extent_ex && static_cast<std::int32_t>(arg(3))<0)return fail(87);std::int64_t total=0;unsigned fit=0;std::vector<std::uint8_t> distances(count*4);
                     for(unsigned i=0;i<count;++i){total+=advances[i];if(total>INT32_MAX)return fail(534);number(distances,i*4,static_cast<unsigned>(total));if(total<=static_cast<std::int32_t>(arg(3)))fit=i+1;}
                     memory.check(GuestAddress{output},8,Access::Write);if(extent_ex && arg(4))memory.check(GuestAddress{arg(4)},4,Access::Write);if(extent_ex && arg(5))memory.check(GuestAddress{arg(5)},distances.size(),Access::Write);
                     memory.store(GuestAddress{output},32,static_cast<unsigned>(total));memory.store(GuestAddress{output+4},32,count?static_cast<unsigned>(std::round((face->ascent+face->descent)*sy)):0);
                     if(extent_ex && arg(4))memory.store(GuestAddress{arg(4)},32,fit);if(extent_ex && arg(5))memory.write(GuestAddress{arg(5)},distances);return finish(1);
                 }
-                std::vector<std::uint8_t> bytes(count*(abc?12:4));for(unsigned i=0;i<count;++i){if(!abc)number(bytes,i*4,static_cast<unsigned>(advances[i]));else{const auto a=static_cast<std::int32_t>(std::floor(metrics[i][0]*sx)),right=static_cast<std::int32_t>(std::ceil((metrics[i][1]-metrics[i][2])*sx));const auto b=std::max(0,right-a);number(bytes,i*12,static_cast<unsigned>(a));number(bytes,i*12+4,static_cast<unsigned>(b));number(bytes,i*12+8,static_cast<unsigned>(advances[i]-a-b));}}
-                memory.write(GuestAddress{output},bytes);return finish(1);
-            }catch(const std::bad_alloc&){return fail(8);}catch(const std::length_error&){return fail(8);}catch(const std::domain_error&){return fail(50);}catch(const std::invalid_argument&){return fail(87);}
+                std::vector<std::uint8_t> bytes(count*(abc?12:4));
+                const auto float_bits=[](double v){return std::bit_cast<std::uint32_t>(static_cast<float>(v));};
+                for(unsigned i=0;i<count;++i){
+                    const auto& m=metrics[i];
+                    if(!abc){
+                        number(bytes,i*4,floating?float_bits(m[1]*sx):static_cast<unsigned>(advances[i]));
+                    }else if(floating){
+                        number(bytes,i*12,float_bits(m[0]*sx));
+                        number(bytes,i*12+4,float_bits((m[1]-m[0]-m[2])*sx));
+                        number(bytes,i*12+8,float_bits(m[2]*sx));
+                    }else{
+                        const double left=std::floor(m[0]*sx),right=std::ceil((m[1]-m[2])*sx);
+                        const double ink=std::max(0.0,right-left),after=advances[i]-left-ink;
+                        if(left<INT32_MIN || left>INT32_MAX || ink>UINT32_MAX || after<INT32_MIN || after>INT32_MAX)return fail(534);
+                        number(bytes,i*12,static_cast<unsigned>(static_cast<std::int32_t>(left)));
+                        number(bytes,i*12+4,static_cast<unsigned>(ink));
+                        number(bytes,i*12+8,static_cast<unsigned>(static_cast<std::int32_t>(after)));
+                    }
+                }
+                if(count)memory.write(GuestAddress{output},bytes);
+                return finish(1);
+            }catch(const MemoryFault&){return fail(998);}catch(const std::bad_alloc&){return fail(8);}catch(const std::length_error&){return fail(8);}catch(const std::domain_error&){return fail(50);}catch(const std::invalid_argument&){return fail(87);}
         }
-        if(name.starts_with("GetKerningPairs") || name=="GetCharWidthInfo"){
+        if(name.starts_with("GetKerningPairs") || name=="GetCharWidthInfo")try{
             const double em=model.height<0?-static_cast<double>(model.height):model.height?static_cast<double>(model.height)*face->em/std::max(1,face->ascent+face->descent):13;
             const double sy=em/face->em,sx=model.width?std::abs(static_cast<double>(model.width))/std::max(1,face->average_width):sy;
             const auto u16=[](const std::vector<std::uint8_t>& table,std::size_t at)->std::optional<std::uint32_t>{if(at+2>table.size())return std::nullopt;return static_cast<std::uint32_t>(table[at])<<8|table[at+1];};
@@ -288,6 +487,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,Gue
             for(std::size_t i=0;i<count;++i){const auto& [first,second,amount]=out[i];memory.store(GuestAddress{arg(2)+i*8},16,first);memory.store(GuestAddress{arg(2)+i*8+2},16,second);memory.store(GuestAddress{arg(2)+i*8+4},32,static_cast<std::uint32_t>(amount));}
             return finish(static_cast<std::uint32_t>(count));
         }
+        catch(const MemoryFault&){return fail(998);}
         if(name=="FontIsLinked"){
             // 字型連結：HKLM\...\FontLink\SystemLink 有該字面名稱的 REG_MULTI_SZ 時為已連結。
             GuestScratch scratch(*this,memory,state);const auto key=scratch.text(u"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink");
@@ -295,7 +495,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,Gue
             const auto root=x86_?std::uint64_t{0x80000002U}:UINT64_C(0xffffffff80000002);
             return finish(static_cast<std::uint32_t>(nested_service(state,memory,"advapi32.dll","RegGetValueW",{root,key,value,0x20,0,0,size}))==0?1U:0U);
         }
-        if(name=="GetFontData"){
+        if(name=="GetFontData")try{
             const auto tag=static_cast<std::uint32_t>(arg(1)),offset=static_cast<std::uint32_t>(arg(2)),capacity=static_cast<std::uint32_t>(arg(4));
             // Windows tag 為 little-endian DWORD，CoreText 使用 OpenType big-endian tag。
             const auto swapped=((tag&255U)<<24)|((tag&0xff00U)<<8)|((tag>>8)&0xff00U)|(tag>>24);
@@ -303,33 +503,45 @@ std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,Gue
             if(bytes.empty() || offset>=bytes.size())return fail(87);
             const auto available=static_cast<std::uint32_t>(bytes.size()-offset);
             if(!arg(3) || !capacity)return finish(available);
-            const auto count=std::min(capacity,available);memory.write(GuestAddress{arg(3)},std::span<const std::uint8_t>{bytes}.subspan(offset,count));return finish(count);
-        }
-        if(name.starts_with("GetTextFace")){
+            const auto count=std::min(capacity,available);memory.check(GuestAddress{arg(3)},count,Access::Write);memory.write(GuestAddress{arg(3)},std::span<const std::uint8_t>{bytes}.subspan(offset,count));return finish(count);
+        }catch(const MemoryFault&){return fail(998);}
+        if(name.starts_with("GetTextFace"))try{
             const auto capacity=static_cast<std::int32_t>(arg(1));if(capacity<0)return fail(87);
-            const auto text=face->family;
+            const auto& text=service.symbol=="NtGdiGetTextFaceW" && arg(3) && !model.face.empty() && windows_ui_font_alias(model.face)?model.face:face->family;
             if(wide){if(!arg(2))return finish(static_cast<std::uint32_t>(text.size()+1));if(!capacity)return fail(87);
                 auto count=std::min(text.size(),static_cast<std::size_t>(capacity-1));if(count && text[count-1]>=0xd800 && text[count-1]<=0xdbff)--count;
-                memory.write(GuestAddress{arg(2)},utf16_bytes(text.substr(0,count)));return finish(static_cast<std::uint32_t>(count+1));}
-            const auto utf8=utf16_to_utf8(text);if(!arg(2))return finish(static_cast<std::uint32_t>(utf8.size()+1));if(!capacity)return fail(87);
-            auto count=std::min(utf8.size(),static_cast<std::size_t>(capacity-1));while(count<utf8.size() && count && (static_cast<unsigned char>(utf8[count])&0xc0)==0x80)--count;
-            std::vector<std::uint8_t> bytes(utf8.begin(),utf8.begin()+static_cast<std::ptrdiff_t>(count));bytes.push_back(0);memory.write(GuestAddress{arg(2)},bytes);return finish(static_cast<std::uint32_t>(bytes.size()));
-        }
-        if(name=="GetGlyphIndicesW"){
+                memory.check(GuestAddress{arg(2)},(count+1)*2,Access::Write);memory.write(GuestAddress{arg(2)},utf16_bytes(text.substr(0,count)));return finish(static_cast<std::uint32_t>(count+1));}
+            const auto ansi=utf16_to_ansi(text);if(!arg(2))return finish(static_cast<std::uint32_t>(ansi.size()+1));if(!capacity)return fail(87);
+            const auto count=ansi_prefix_length(ansi,static_cast<std::size_t>(capacity-1));
+            std::vector<std::uint8_t> bytes(ansi.begin(),ansi.begin()+static_cast<std::ptrdiff_t>(count));bytes.push_back(0);memory.check(GuestAddress{arg(2)},bytes.size(),Access::Write);memory.write(GuestAddress{arg(2)},bytes);return finish(static_cast<std::uint32_t>(bytes.size()));
+        }catch(const MemoryFault&){return fail(998);}
+        if(name=="GetGlyphIndicesW")try{
             const auto count=static_cast<std::int32_t>(arg(2));if(count<0 || count>1048576 || (arg(4)&~UINT64_C(1)) || (count && (!arg(1) || !arg(3))))return fail(87);
-            if(!count)return finish(0);memory.check(GuestAddress{arg(3)},static_cast<std::size_t>(count)*2,Access::Write);
+            if(!count){
+                if(!arg(1) && !arg(3) && !arg(4)){
+                    const auto maxp=native_font_table(*face,0x6d617870U);
+                    if(maxp.size()<6)return fail(13);
+                    return finish((static_cast<unsigned>(maxp[4])<<8)|maxp[5]);
+                }
+                return service.symbol=="NtGdiGetGlyphIndicesW"?fail(87):finish(0);
+            }
+            memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(count)*2,Access::Read);
+            memory.check(GuestAddress{arg(3)},static_cast<std::size_t>(count)*2,Access::Write);
             std::vector<std::uint32_t> chars(static_cast<std::size_t>(count));for(std::size_t i=0;i<chars.size();++i)chars[i]=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)+i*2},16));
             auto glyphs=native_font_glyph_indices(*face,chars);const auto replacement=arg(4)?std::uint16_t{0xffff}:native_font_glyph_indices(*face,std::array<std::uint32_t,1>{face->default_character})[0];
             for(std::size_t i=0;i<glyphs.size();++i)memory.store(GuestAddress{arg(3)+i*2},16,glyphs[i]?glyphs[i]:replacement);return finish(static_cast<std::uint32_t>(count));
         }
-        if(name=="GetFontUnicodeRanges"){
+        catch(const MemoryFault&){return fail(998);}
+        if(name=="GetFontUnicodeRanges")try{
             std::vector<std::uint32_t> chars(65536);for(unsigned i=0;i<chars.size();++i)chars[i]=i;
             const auto glyphs=native_font_glyph_indices(*face,chars);std::vector<std::pair<std::uint16_t,std::uint16_t>> ranges;unsigned supported=0;
             for(unsigned at=0;at<glyphs.size();){if(!glyphs[at]){++at;continue;}const auto first=at;while(at<glyphs.size() && glyphs[at] && at-first<65535){++at;++supported;}ranges.emplace_back(static_cast<std::uint16_t>(first),static_cast<std::uint16_t>(at-first));}
             std::vector<std::uint8_t> bytes(16+ranges.size()*4);number(bytes,0,static_cast<std::uint32_t>(bytes.size()));number(bytes,8,supported);number(bytes,12,static_cast<std::uint32_t>(ranges.size()));
             for(std::size_t i=0;i<ranges.size();++i){number(bytes,16+i*4,ranges[i].first,2);number(bytes,18+i*4,ranges[i].second,2);}
-            if(arg(1))memory.write(GuestAddress{arg(1)},bytes);return finish(static_cast<std::uint32_t>(bytes.size()));
+            if(arg(1)){memory.check(GuestAddress{arg(1)},bytes.size(),Access::Write);memory.write(GuestAddress{arg(1)},bytes);}
+            return finish(static_cast<std::uint32_t>(bytes.size()));
         }
+        catch(const MemoryFault&){return fail(998);}
         return fail(50);
     }
     if(!arg(2) || (extended && (!arg(1) || static_cast<std::uint32_t>(arg(4))))){last_error_=87;return finish(0);}

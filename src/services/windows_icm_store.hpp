@@ -83,6 +83,13 @@ struct WindowsServices::IcmProfiles {
     struct Profile {IccProfile model;std::u16string path;bool writable{},dirty{};};
     // 色彩轉換（HTRANSFORM）：輸入與輸出的通道數與色彩空間簽章取自設定檔序列兩端。
     struct Transform {std::shared_ptr<NativeColorTransform> native;unsigned input{},output{};std::uint32_t input_space{},output_space{};};
+    // 同一畫刷可同時選入多個 DC；已轉換的圖樣僅在相同色彩空間與輸出設定檔下有效。
+    struct BrushTranslation {
+        std::uint64_t color_space{};
+        std::u16string profile;
+        std::shared_ptr<RasterSurface> surface;
+    };
+    std::map<std::pair<std::uint64_t,std::uint64_t>,BrushTranslation> brush_translations;
     std::map<std::uint64_t,Profile> profiles;std::map<std::uint64_t,Transform> transforms;std::uint64_t next{0x1000};
 };
 // 色彩空間簽章的通道數（'GRAY' 1、'RGB '／'XYZ '／'Lab ' 等 3、'CMYK' 4、'2CLR'～'FCLR' 2～15）；不認得時回 0。

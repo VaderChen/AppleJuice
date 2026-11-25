@@ -8,6 +8,7 @@
 #define CRT_MBC_PROCESS_INFO 0xa00
 #define CRT_MBC_PROCESS_TYPES (CRT_MBC_PROCESS_INFO + CRT_MBC_INFO_SIZE)
 #define CRT_MBC_PROCESS_CASE (CRT_MBC_PROCESS_TYPES + CRT_MBC_TYPES_SIZE)
+#define CRT_UCHAR_PROCESS_STATES ((CRT_MBC_PROCESS_CASE + CRT_MBC_CASE_SIZE + 7) & ~7)
 
 /* Win32 的 TLS 擴充槽使用 0x2000–0x3000，Win64 使用 0x2000–0x4000。 */
 #define CRT_MBC_TEB32_VIEW 0x3800
@@ -31,6 +32,7 @@ static inline int crt_mbc_test_byte(unsigned value, unsigned ctype, unsigned typ
 /* 宿主透過 GuestMemory 讀取，常駐客體直接讀取。兩條路徑共用相同的字元邊界。 */
 typedef __UINTPTR_TYPE__ CrtMbcAddress;
 typedef unsigned (*CrtMbcRead)(const void*, CrtMbcAddress);
+typedef void (*CrtMbcWrite)(void*, CrtMbcAddress, unsigned char);
 static inline CrtMbcAddress crt_mbc_character_bytes(const void* memory, CrtMbcRead read_byte,
         const unsigned char* types, CrtMbcAddress text, CrtMbcAddress count) {
     CrtMbcAddress offset=0;

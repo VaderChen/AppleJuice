@@ -704,5 +704,38 @@ end SwapMouseButton
 
 #include "guest_sh_linear.inc"
 
+// NT 的 fastcall 和 CRT 的 cdecl 共用位元組交換，只有參數位置及清棧責任不同。
+.macro byte_swap name, width, fast
+entry \name
+.if \width == 64
+    mov eax, dword ptr [esp+8]
+    mov edx, dword ptr [esp+4]
+    bswap eax
+    bswap edx
+.else
+.if \fast
+    mov eax, ecx
+.else
+    mov eax, dword ptr [esp+4]
+.endif
+    bswap eax
+.if \width == 16
+    shr eax, 16
+.endif
+.endif
+.if \fast && \width == 64
+    ret 8
+.else
+    ret
+.endif
+end \name
+.endm
+byte_swap ByteSwapFast16, 16, 1
+byte_swap ByteSwapFast32, 32, 1
+byte_swap ByteSwapFast64, 64, 1
+byte_swap ByteSwapCrt16, 16, 0
+byte_swap ByteSwapCrt32, 32, 0
+byte_swap ByteSwapCrt64, 64, 0
+
 .globl _guest_thread_end
 _guest_thread_end:

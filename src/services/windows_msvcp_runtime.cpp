@@ -39,16 +39,38 @@ constexpr std::string_view runtime_families[]{"msvcp90.dll","msvcp100.dll","msvc
 unsigned runtime_version(std::string_view family){return family=="msvcp140.dll"?4U:family=="msvcp110.dll" || family=="msvcp120.dll"?2U:1U;}
 // msvcp140 的 __crt* 是 cdecl 包裝，Vista 起直接呼叫同名 Win32 API（kernel32 為 stdcall，x86 不能直接設為別名）；
 // 名稱、引數數與目標 API。NLS 包裝另補上 CompareStringEx／LCMapStringEx 的保留引數。
-struct CrtWrapper {std::string_view name;std::uint8_t arguments;std::string_view target;};
+enum WrapperLibrary : unsigned { Vc11 = 1, Vc12 = 2, Stl14 = 4, LegacyCrt = Vc11 | Vc12 };
+struct CrtWrapper {
+    std::string_view name;
+    std::uint8_t arguments;
+    std::string_view target;
+    unsigned reserved = 0, libraries = Stl14;
+};
 constexpr CrtWrapper crt_wrappers[]{
     {"__crtCloseThreadpoolTimer",1,"CloseThreadpoolTimer"},{"__crtCloseThreadpoolWait",1,"CloseThreadpoolWait"},
-    {"__crtCreateEventExW",4,"CreateEventExW"},{"__crtCreateSemaphoreExW",6,"CreateSemaphoreExW"},
+    {"__crtCreateEventExW",4,"CreateEventExW",0,Vc12 | Stl14},{"__crtCreateSemaphoreExW",6,"CreateSemaphoreExW",0,Vc12 | Stl14},
     {"__crtCreateThreadpoolTimer",3,"CreateThreadpoolTimer"},{"__crtCreateThreadpoolWait",3,"CreateThreadpoolWait"},
     {"__crtFlushProcessWriteBuffers",0,"FlushProcessWriteBuffers"},{"__crtFreeLibraryWhenCallbackReturns",2,"FreeLibraryWhenCallbackReturns"},
-    {"__crtGetCurrentProcessorNumber",0,"GetCurrentProcessorNumber"},{"__crtGetTickCount64",0,"GetTickCount64"},
+    {"__crtGetCurrentProcessorNumber",0,"GetCurrentProcessorNumber"},{"__crtGetTickCount64",0,"GetTickCount64",0,Vc12 | Stl14},
     {"__crtInitializeCriticalSectionEx",3,"InitializeCriticalSectionEx"},{"__crtSetThreadpoolTimer",4,"SetThreadpoolTimer"},
     {"__crtSetThreadpoolWait",3,"SetThreadpoolWait"},{"__crtWaitForThreadpoolTimerCallbacks",2,"WaitForThreadpoolTimerCallbacks"},
-    {"__crtCompareStringW",6,"CompareStringEx"},{"__crtLCMapStringW",6,"LCMapStringEx"},
+    {"__crtCreateSymbolicLinkW",3,"CreateSymbolicLinkW",0,LegacyCrt | Stl14},
+    {"__crtGetFileInformationByHandleEx",4,"GetFileInformationByHandleEx",0,Vc12 | Stl14},
+    {"__crtSetFileInformationByHandle",4,"SetFileInformationByHandle",0,Vc12 | Stl14},
+    {"__crtSetThreadStackGuarantee",1,"SetThreadStackGuarantee",0,LegacyCrt},
+    {"__crtGetSystemTimePreciseAsFileTime",1,"GetSystemTimePreciseAsFileTime"},
+    {"__crtInitOnceExecuteOnce",4,"InitOnceExecuteOnce"},
+    {"__crtCompareStringW",6,"CompareStringEx",3},{"__crtLCMapStringW",6,"LCMapStringEx",3},
+    {"__crtCompareStringEx",6,"CompareStringEx",3,LegacyCrt | Stl14},
+    {"__crtLCMapStringEx",6,"LCMapStringEx",3,LegacyCrt | Stl14},
+    {"__crtEnumSystemLocalesEx",3,"EnumSystemLocalesEx",1,LegacyCrt},
+    {"__crtGetDateFormatEx",6,"GetDateFormatEx",1,LegacyCrt},
+    {"__crtGetTimeFormatEx",6,"GetTimeFormatEx",0,LegacyCrt},
+    {"__crtGetUserDefaultLocaleName",2,"GetUserDefaultLocaleName",0,LegacyCrt},
+    {"__crtIsValidLocaleName",1,"IsValidLocaleName",0,LegacyCrt},
+    {"__crtGetLocaleInfoEx",4,"GetLocaleInfoEx"},
+    {"__crtFlsAlloc",1,"FlsAlloc",0,LegacyCrt},{"__crtFlsFree",1,"FlsFree",0,LegacyCrt},
+    {"__crtFlsGetValue",1,"FlsGetValue",0,LegacyCrt},{"__crtFlsSetValue",2,"FlsSetValue",0,LegacyCrt},
     {"__crtCompareStringA",7,""},{"__crtLCMapStringA",8,""},
     // <filesystem> 的路徑轉換：與 _MAX_FILESYS_NAME（260）同上限，以系統碼頁轉換。
     {"_To_wide",2,""},{"_To_byte",2,""},
@@ -90,7 +112,13 @@ std::span<const WindowsServiceDescriptor> msvcp_runtime_service_descriptors(){
             if(!(entry.versions&runtime_version(family)))continue;
             rows.push_back({family,entry.name,entry.arguments,entry.wide,0,0,true});
         }
-        for(const auto& wrapper:crt_wrappers)rows.push_back({"msvcp140.dll",wrapper.name,wrapper.arguments,0,0,0,true});
+        constexpr std::pair<std::string_view,unsigned> providers[]{
+            {"msvcr110.dll",Vc11},{"msvcr120.dll",Vc12},{"msvcp140.dll",Stl14}
+        };
+        for (const auto& [family,mask] : providers)
+            for (const auto& wrapper : crt_wrappers)
+                if (wrapper.libraries & mask)
+                    rows.push_back({family,wrapper.name,wrapper.arguments,0,0,0,true});
         // msvcr110／msvcr120 的 A 版本在開頭多一個 _locale_t（用於碼頁為 0 時的預設，這裡沿用目前 LC_CTYPE）；其餘參數與 msvcp140 版本相同。
         rows.push_back({"internal-crt-legacy","__crtCompareStringA",8,0,0,0,true});rows.push_back({"internal-crt-legacy","__crtLCMapStringA",9,0,0,0,true});
         // <random> 的 _XLgamma（float／double／long double）：x86 的 double 占兩個堆疊槽。
@@ -106,6 +134,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp_runtime(GuestState& s
     const bool legacy=runtime_version(service.family)==1;const unsigned p=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(p*8);
     const auto done=[&](std::uint64_t value,bool wide=false)->std::optional<std::uint32_t>{arg.return_to(state,value,wide);return std::nullopt;};
     const auto set_errno=[&](std::uint32_t value){memory.store(GuestAddress{runtime_.errno_cell},32,value);};
+    const auto wrapper = name.starts_with("__crt") || name.starts_with("_To_")
+        ? std::find_if(std::begin(crt_wrappers),std::end(crt_wrappers),
+                       [&](const CrtWrapper& item){return item.name==name;})
+        : std::end(crt_wrappers);
+    if (wrapper != std::end(crt_wrappers) && !wrapper->target.empty()) {
+        const auto target = resolve("kernel32.dll",wrapper->target);
+        // Win64 的同形呼叫與 Win32 的零參數呼叫均可沿用原框架。
+        // GetTickCount64 由目標在 Win32 直接寫回 EDX:EAX，保留高 32 位。
+        if (!wrapper->reserved && (!x86_ || !wrapper->arguments)) {
+            state.rip = target;
+            return std::nullopt;
+        }
+        std::vector<std::uint64_t> arguments(wrapper->arguments + wrapper->reserved,0);
+        for (unsigned i=0; i<wrapper->arguments; ++i) arguments[i]=arg(i);
+        start_callbacks(state,memory,{{target.value,std::move(arguments)}},Continuation::ReturnCallback);
+        return std::nullopt;
+    }
     auto& locale=current_crt_locale(state,memory);
     // 值參數：Win32 在堆疊（double 占兩槽），Win64 在與參數序相同的 XMM。
     const auto floating_argument=[&](unsigned index,unsigned width)->std::uint64_t{
@@ -276,14 +321,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp_runtime(GuestState& s
         if(parsed.overflow || parsed.value>positive+(parsed.negative?1U:0U)){range();return done((parsed.negative?positive+1:positive)&maximum,wide);}
         return done((parsed.negative?0-parsed.value:parsed.value)&maximum,wide);
     }
-    if(const auto wrapper=std::find_if(std::begin(crt_wrappers),std::end(crt_wrappers),[&](const CrtWrapper& item){return item.name==name;});wrapper!=std::end(crt_wrappers)){
-        // 64 位元回傳值（GetTickCount64）在 Win32 需 EDX:EAX，直接取值；其餘經客體呼叫原 API，等待與回呼語義完全沿用。
-        if(name=="__crtGetTickCount64")return done(nested_service(state,memory,"kernel32.dll","GetTickCount64",{}),true);
-        if(!wrapper->target.empty()){
-            std::vector<std::uint64_t> arguments;for(unsigned i=0;i<wrapper->arguments;++i)arguments.push_back(arg(i));
-            if(name=="__crtCompareStringW" || name=="__crtLCMapStringW")arguments.insert(arguments.end(),{0,0,0});
-            start_callbacks(state,memory,{{resolve("kernel32.dll",wrapper->target).value,std::move(arguments)}},Continuation::ReturnCallback);return std::nullopt;
-        }
+    if(wrapper!=std::end(crt_wrappers)){
         const auto page_of=[&](std::uint32_t page){return page?page:locale.categories[2].codepage?locale.categories[2].codepage:process_ansi_codepage();};
         if(name=="_To_wide" || name=="_To_byte"){
             // 失敗或超過 260 個單位時與 MultiByteToWideChar／WideCharToMultiByte 相同不寫入完整結果；回傳目的指標。

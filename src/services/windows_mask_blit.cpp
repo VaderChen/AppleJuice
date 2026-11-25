@@ -7,13 +7,21 @@
 
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> mask_blit_service_descriptors(){
-    static constexpr WindowsServiceDescriptor table[]{{"gdi32.dll","MaskBlt",12},{"gdi32.dll","PlgBlt",10}};return table;
+    static constexpr WindowsServiceDescriptor table[]{{"gdi32.dll","MaskBlt",12},{"gdi32.dll","PlgBlt",10},
+        {"win32u.dll","NtGdiMaskBlt",13,0,0,0x1ede},{"win32u.dll","NtGdiPlgBlt",11,0,0,0x778}};return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_mask_blit(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto fail=[&](std::uint32_t error){last_error_=error;return finish(0);};
     const auto gdi=[&](std::string_view name,std::initializer_list<std::uint64_t> arguments){return nested_service(state,memory,"gdi32.dll",name,arguments);};
+    const bool mask_blt=service.symbol=="MaskBlt" || service.symbol=="NtGdiMaskBlt";
+    const auto source_background=service.family=="win32u.dll"?arg(mask_blt?12:10):UINT32_MAX;
+    const auto copy_source=[&](std::uint64_t dest,std::uint64_t x,std::uint64_t y,std::uint64_t width,std::uint64_t height,
+                               std::uint64_t src,std::uint64_t sx,std::uint64_t sy,std::uint64_t rop){
+        if(service.family=="gdi32.dll")return gdi("BitBlt",{dest,x,y,width,height,src,sx,sy,rop});
+        return nested_service(state,memory,"win32u.dll","NtGdiBitBlt",{dest,x,y,width,height,src,sx,sy,rop,source_background,0});
+    };
     const auto signed_arg=[&](unsigned index){return static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(arg(index))));};
     const auto valid_dc=[&](std::uint64_t h){return gui_.contexts.contains(h) || gui_.dc_objects.contains(h) || (h>=0x10000000 && gui_.windows.contains(h-0x10000000));};
     const auto monochrome=[&](std::uint64_t h){const auto found=gui_.bitmaps.find(h);return found!=gui_.bitmaps.end() && found->second.bits_per_pixel==1;};
@@ -26,18 +34,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_mask_blit(GuestState& state
     // 選入點陣的記憶體 DC；compatible 為 0 時建立與目的地相容的 width×height 點陣。
     const auto surface=[&](std::uint64_t reference,std::uint64_t bitmap,std::uint64_t width,std::uint64_t height)->std::uint64_t{
         const auto dc=gdi("CreateCompatibleDC",{reference});if(!dc)return 0;temporary.dcs.emplace_back(dc,0);
-        if(!bitmap){bitmap=gdi("CreateCompatibleBitmap",{reference,width,height});if(!bitmap)return 0;temporary.objects.push_back(bitmap);}
-        temporary.dcs.back().second=gdi("SelectObject",{dc,bitmap});return dc;
+        if(!bitmap){const auto dc_state=gui_.contexts.find(reference);
+            const auto selected=dc_state==gui_.contexts.end()?gui_.bitmaps.end():gui_.bitmaps.find(dc_state->second.bitmap);
+            const bool mono=selected!=gui_.bitmaps.end() && selected->second.bits_per_pixel==1 && !selected->second.dib_address;
+            bitmap=mono?gdi("CreateBitmap",{width,height,1,1,0}):gdi("CreateCompatibleBitmap",{reference,width,height});if(!bitmap)return 0;temporary.objects.push_back(bitmap);}
+        temporary.dcs.back().second=gdi("SelectObject",{dc,bitmap});return temporary.dcs.back().second?dc:0;
     };
     // 單色遮罩依 BitBlt 規則轉色：1 為背景色（白）、0 為文字色（黑）。
     const auto mask_colors=[&](std::uint64_t dc){(void)gdi("SetTextColor",{dc,0});(void)gdi("SetBkColor",{dc,0xffffff});};
     try{
-        if(service.symbol=="MaskBlt"){
+        if(mask_blt){
             // {hdcDest, x, y, w, h, hdcSrc, xSrc, ySrc, hbmMask, xMask, yMask, MAKEROP4(fore, back)}：沒有遮罩時等同以前景 ROP 的 BitBlt。
             const auto dest=arg(0),source=arg(5),mask=arg(8);const auto rop=static_cast<std::uint32_t>(arg(11));
             const std::uint64_t fore=rop&0x00ffffffU,back=static_cast<std::uint64_t>((rop>>24)&0xffU)<<16;
             if(!valid_dc(dest))return fail(6);
-            if(!mask)return finish(gdi("BitBlt",{dest,signed_arg(1),signed_arg(2),signed_arg(3),signed_arg(4),source,signed_arg(6),signed_arg(7),fore}));
+            if(!mask)return finish(copy_source(dest,signed_arg(1),signed_arg(2),signed_arg(3),signed_arg(4),source,signed_arg(6),signed_arg(7),fore));
             if(!monochrome(mask))return fail(87);if(gui_.emf_recorders.contains(dest))return fail(50);
             const auto width=static_cast<std::int32_t>(arg(3)),height=static_cast<std::int32_t>(arg(4));if(width<=0 || height<=0)return finish(1);
             const auto mask_dc=surface(0,mask,0,0),fore_dc=surface(dest,0,static_cast<std::uint64_t>(width),static_cast<std::uint64_t>(height)),back_dc=surface(dest,0,static_cast<std::uint64_t>(width),static_cast<std::uint64_t>(height));
@@ -51,7 +62,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mask_blit(GuestState& state
                 (void)gdi("SetTextColor",{dc,text});(void)gdi("SetBkColor",{dc,background});}
             const auto w=static_cast<std::uint64_t>(width),h=static_cast<std::uint64_t>(height);
             for(const auto& [dc,operation]:{std::pair{fore_dc,fore},std::pair{back_dc,back}}){
-                if(!gdi("BitBlt",{dc,0,0,w,h,dest,signed_arg(1),signed_arg(2),srccopy}) || !gdi("BitBlt",{dc,0,0,w,h,source,signed_arg(6),signed_arg(7),operation}))return finish(0);
+                if(!gdi("BitBlt",{dc,0,0,w,h,dest,signed_arg(1),signed_arg(2),srccopy}) || !copy_source(dc,0,0,w,h,source,signed_arg(6),signed_arg(7),operation))return finish(0);
                 mask_colors(dc);
             }
             // 前景 AND 遮罩、背景 AND NOT 遮罩，OR 合成後寫回目的地。
@@ -74,12 +85,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_mask_blit(GuestState& state
         // 帶遮罩時先在來源空間準備 S AND 遮罩，目的地先清掉遮罩區再 OR 入，兩步都走同一個轉換。
         std::uint64_t mask_dc=0,masked=0;
         if(mask){mask_dc=surface(0,mask,0,0);masked=surface(dest,0,w,h);if(!mask_dc || !masked)return fail(8);
-            if(!gdi("BitBlt",{masked,0,0,w,h,source,signed_arg(3),signed_arg(4),srccopy}))return finish(0);mask_colors(masked);
+            if(!copy_source(masked,0,0,w,h,source,signed_arg(3),signed_arg(4),srccopy))return finish(0);mask_colors(masked);
             if(!gdi("BitBlt",{masked,0,0,w,h,mask_dc,signed_arg(8),signed_arg(9),srcand}))return finish(0);}
         const auto mode=gdi("GetGraphicsMode",{dest});if(!gdi("GetWorldTransform",{dest,saved}))return finish(0);
         if(!gdi("SetGraphicsMode",{dest,2}) || !gdi("ModifyWorldTransform",{dest,xform,2})){(void)gdi("SetGraphicsMode",{dest,mode});return finish(0);}
         std::uint64_t result=0;
-        if(!mask)result=gdi("BitBlt",{dest,0,0,w,h,source,signed_arg(3),signed_arg(4),srccopy});
+        if(!mask)result=copy_source(dest,0,0,w,h,source,signed_arg(3),signed_arg(4),srccopy);
         else {const auto text=gdi("GetTextColor",{dest}),background=gdi("GetBkColor",{dest});mask_colors(dest);
             result=gdi("BitBlt",{dest,0,0,w,h,mask_dc,signed_arg(8),signed_arg(9),dsna}) && gdi("BitBlt",{dest,0,0,w,h,masked,0,0,srcpaint});
             (void)gdi("SetTextColor",{dest,text});(void)gdi("SetBkColor",{dest,background});}

@@ -89,8 +89,7 @@ std::optional<std::uint32_t> WindowsServices::resume_draw_state(GuestState& stat
                     if(handle==0xb005)return;
                     RasterBlit options;options.operation=0xe2;auto& brush=options.brush;brush.color=color;
                     brush.hatch=gui_.brush_hatches.contains(handle)?gui_.brush_hatches.at(handle):-1;brush.pattern_opaque=dc.mode==2;brush.pattern_background=dc.background;brush.pattern_color=dc.color;brush.brush_origin=dc.brush_origin;
-                    std::shared_ptr<RasterSurface> pattern;
-                    if(gui_.brush_patterns.contains(handle)){const auto& bitmap=gui_.brush_patterns.at(handle);brush.pattern_brush=handle;brush.pattern_monochrome=bitmap.bits_per_pixel==1;pattern=make_hardware_raster(bitmap.width,bitmap.height,bitmap.pixels);}
+                    auto pattern=gdi_brush_raster(handle,operation.dc,brush);
                     auto dest=destination;for(auto& coordinate:dest)coordinate+=offset;target->blit(*stencil,dest,rectangle,dc,UINT32_MAX,options,pattern.get());
                 };
                 if(flags&0x20U){paint(0,gui_system_color(20),1);paint(0,gui_system_color(16),0);}

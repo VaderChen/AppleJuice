@@ -14,9 +14,35 @@ inline void emf_append(GuiMetafile& meta,const std::vector<std::uint8_t>& record
 inline void emf_scalar(GuiMetafile& meta,unsigned type,std::uint32_t value){auto r=emf_record(type,12);emf_put(r,8,value);emf_append(meta,r);}
 inline void emf_rect(GuiMetafile& meta,unsigned type,const GuiRect& rect){auto r=emf_record(type,24);for(unsigned i=0;i<4;++i)emf_put(r,8+i*4,static_cast<std::uint32_t>(rect[i]));emf_append(meta,r);}
 inline void emf_begin(GuiMetafile& meta){meta.bytes=emf_record(1,108);meta.records=1;if(!meta.description.empty()){const auto text=utf16_bytes(meta.description);emf_put(meta.bytes,60,text.size()/2);emf_put(meta.bytes,64,108);meta.bytes.insert(meta.bytes.end(),text.begin(),text.end());meta.bytes.resize((meta.bytes.size()+3)&~std::size_t{3});emf_put(meta.bytes,4,meta.bytes.size());}}
-inline void emf_finish(GuiMetafile& meta){auto end=emf_record(14,20);emf_put(end,16,20);emf_append(meta,end);const auto bounds=meta.bounds.value_or(GuiRect{0,0,0,0});auto frame=meta.frame.value_or(GuiRect{});if(!meta.frame)for(unsigned i=0;i<4;++i)frame[i]=static_cast<std::int32_t>(std::round(bounds[i]*2540.0/96));
+// EMF 畫框使用 0.01 mm，兩軸各自依標頭的參考裝置換算。舊檔缺尺寸時沿用專案顯示 DPI。
+inline double emf_frame_units_per_pixel(const GuiMetafile& meta,unsigned axis){
+    const auto pixels=static_cast<std::int32_t>(emf_get(meta.bytes,72+axis*4));
+    const auto mm=static_cast<std::int32_t>(emf_get(meta.bytes,80+axis*4));
+    return pixels>0 && mm>0?100.0*mm/pixels:2540.0/96;
+}
+inline void emf_finish(GuiMetafile& meta){
+    auto end=emf_record(14,20);emf_put(end,16,20);emf_append(meta,end);
+    GuiRect bounds{0,0,-1,-1};
+    if(meta.bounds && !gui_rect_empty(*meta.bounds)){
+        bounds=*meta.bounds;
+        // 繪圖表面的右下角不含端點，EMR_HEADER 的裝置邊界包含端點。
+        --bounds[2];--bounds[3];
+    }
+    auto frame=meta.frame.value_or(GuiRect{0,0,-1,-1});
+    if(!meta.frame && meta.bounds && !gui_rect_empty(*meta.bounds))for(unsigned i=0;i<4;++i){
+        const auto axis=i%2;
+        const auto mm=emf_get(meta.bytes,80+4*axis),pixels=emf_get(meta.bytes,72+4*axis);
+        if(!mm || !pixels)throw std::invalid_argument("EMF 參考裝置尺寸無效");
+        // 先取商與餘數，保留負座標向零截斷，同時避免將兩個 LONG 的乘積再乘 100 而溢位。
+        const auto product=static_cast<std::int64_t>(bounds[i])*mm;
+        const auto whole=product/pixels;
+        if(whole<INT32_MIN/100 || whole>INT32_MAX/100)throw std::range_error("EMF 畫框超出 LONG 範圍");
+        const auto value=whole*100+product%pixels*100/pixels;
+        if(value<INT32_MIN || value>INT32_MAX)throw std::range_error("EMF 畫框超出 LONG 範圍");
+        frame[i]=static_cast<std::int32_t>(value);
+    }
     for(unsigned i=0;i<4;++i){emf_put(meta.bytes,8+i*4,static_cast<std::uint32_t>(bounds[i]));emf_put(meta.bytes,24+i*4,static_cast<std::uint32_t>(frame[i]));}
-    emf_put(meta.bytes,40,0x464d4520);emf_put(meta.bytes,44,0x10000);emf_put(meta.bytes,48,meta.bytes.size());emf_put(meta.bytes,52,meta.records);emf_put(meta.bytes,56,4,2);emf_put(meta.bytes,72,1440);emf_put(meta.bytes,76,900);emf_put(meta.bytes,80,381);emf_put(meta.bytes,84,238);emf_put(meta.bytes,100,381000);emf_put(meta.bytes,104,238125);
+    emf_put(meta.bytes,40,0x464d4520);emf_put(meta.bytes,44,0x10000);emf_put(meta.bytes,48,meta.bytes.size());emf_put(meta.bytes,52,meta.records);emf_put(meta.bytes,56,4,2);
 }
 inline std::vector<std::pair<std::size_t,std::size_t>> emf_validate(const std::vector<std::uint8_t>& bytes){
     if(bytes.size()<88 || bytes.size()>16*1024*1024 || emf_get(bytes,0)!=1 || emf_get(bytes,4)<88 || emf_get(bytes,40)!=0x464d4520 || emf_get(bytes,48)!=bytes.size())throw std::invalid_argument("EMF 標頭不合法");

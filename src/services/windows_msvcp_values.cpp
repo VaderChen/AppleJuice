@@ -119,6 +119,10 @@ const std::vector<Binding>& bindings(){
                 add(e("??4"+complex+"%m%AV01@%R%T@Z"),Op::AssignScalar,1,true,s);
                 add(e("??4"+complex+"%m%AV01@%RV01@@Z"),Op::Assign,1,true,s);
                 for(const auto& [code,op]:std::initializer_list<Named>{{"??X",Op::MultiplyAssign},{"??Y",Op::AddAssign},{"??Z",Op::SubtractAssign},{"??_0",Op::DivideAssign}}){
+                    // VC6 同時匯出模板及非模板自由函式，左側物件是第一個 cdecl 參數。
+                    const auto suffix="@std@@YA%AV?$complex@%T@0@%AV10@%RV10@@Z";
+                    add(e(std::string("??$")+std::string(code).substr(1)+"%T%T"+suffix),op,2,false,s,Shape::ComplexComplex);
+                    add(e(std::string(code)+"std@@YA%AV?$complex@%T@0@%AV10@%RV10@@Z"),op,2,false,s,Shape::ComplexComplex);
                     add(e(code+complex+"%m%AV01@%R%T@Z"),op,1,true,s,Shape::ComplexScalar);
                     add(e(code+complex+"%m%AV01@%RV01@@Z"),op,1,true,s,Shape::ComplexComplex);
                 }
@@ -306,6 +310,24 @@ std::vector<std::pair<std::string_view,std::string>> msvcp_traits::resident_trai
     std::vector<std::pair<std::string_view,std::string>> out;
     for(const auto& b:bindings()){
         if(!(b.architectures&(x86?1U:2U)))continue;
+        std::string_view component;
+        switch(b.op){
+        case Op::Real:component="real";break;
+        case Op::Imag:component="imag";break;
+        case Op::GetReal:component="get_real";break;
+        case Op::GetImag:component="get_imag";break;
+        case Op::SetReal:component="set_real";break;
+        case Op::SetImag:component="set_imag";break;
+        case Op::Construct:component="construct";break;
+        case Op::Assign:component="assign";break;
+        case Op::AssignScalar:component="assign_scalar";break;
+        case Op::DefaultConstruct:component="zero";break;
+        default:break;
+        }
+        if(!component.empty()){
+            out.emplace_back(b.name,"guest_complex_"+std::string(b.size==4?"F_":"D_")+std::string(component));
+            continue;
+        }
         if(b.op==Op::ReturnThis && b.name.find("?$_Ctraits@")!=b.name.npos){
             out.emplace_back(b.name,"guest_numeric_assign");
             continue;
@@ -328,7 +350,11 @@ std::span<const WindowsServiceDescriptor> msvcp_values_service_descriptors(){
     // thiscall 成員由被呼叫端清理堆疊；自由與靜態函式是 cdecl。
     static const auto table=[]{
         std::vector<WindowsServiceDescriptor> out;out.reserve(bindings().size());
-        for(const auto& item:bindings())out.push_back({item.op==Op::AssignFillRef?"msvcp60.dll":"msvcp90.dll",item.name,item.arguments,item.wide,0,0,!item.member});
+        for(const auto& item:bindings()){
+            const bool free_assign=!item.member && item.op>=Op::MultiplyAssign && item.op<=Op::DivideAssign;
+            const auto family=item.op==Op::AssignFillRef || free_assign?"msvcp60.dll":"msvcp90.dll";
+            out.push_back({family,item.name,item.arguments,item.wide,0,0,!item.member});
+        }
         return out;
     }();
     return table;
@@ -498,10 +524,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp_values(GuestState& st
         // 先讀取全部輸入再寫回，保留輸出與輸入重疊時的語義。
         const bool assigns=b.op>=Op::MultiplyAssign && b.op<=Op::DivideAssign;
         const bool scalar_result=b.op==Op::Fabs || b.op==Op::Abs || b.op==Op::Arg || b.op==Op::Norm;
-        const auto output=assigns?self:scalar_result?0:a(0);
+        const auto output=assigns && b.member?self:scalar_result?0:a(0);
         C left{},right{};std::int32_t exponent=0;std::uint64_t exponent_output=0;
         const bool right_scalar=b.shape==Shape::ComplexScalar;
-        if(assigns){left=pair(self);right=operand(0,right_scalar);}
+        if(assigns){left=pair(output);right=operand(b.member?0:1,right_scalar);}
         else if(b.op==Op::Fabs){left=pair(a(0));exponent_output=a(1);}
         else if(scalar_result)left=pair(a(0));
         else if(b.op==Op::Polar)left={value(a(1)),value(a(2))};

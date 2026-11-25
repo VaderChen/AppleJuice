@@ -28,7 +28,6 @@ std::span<const WindowsServiceDescriptor> legacy_gdi_service_descriptors(){
         {"gdi32.dll","FillRgn",3},{"gdi32.dll","PaintRgn",2},{"gdi32.dll","FrameRgn",5},{"gdi32.dll","InvertRgn",2},
         {"gdi32.dll","SetPixelV",4},{"gdi32.dll","ExtFloodFill",5},{"gdi32.dll","FloodFill",4},
         {"gdi32.dll","GetBoundsRect",3},{"gdi32.dll","SetBoundsRect",3},{"gdi32.dll","GetDCOrgEx",2},
-        {"gdi32.dll","CreateDIBitmap",6},
         {"gdi32.dll","SetMetaFileBitsEx",2},{"gdi32.dll","GetMetaFileBitsEx",3},{"gdi32.dll","CopyMetaFileA",2},{"gdi32.dll","CopyMetaFileW",2},
         {"gdi32.dll","GetMetaFileA",1},{"gdi32.dll","GetMetaFileW",1},{"gdi32.dll","DeleteMetaFile",1},
         {"gdi32.dll","D3DKMTOpenAdapterFromHdc",1},{"gdi32.dll","D3DKMTOpenAdapterFromGdiDisplayName",1},{"gdi32.dll","D3DKMTOpenAdapterFromDeviceName",1},
@@ -49,12 +48,6 @@ std::span<const WindowsServiceDescriptor> legacy_gdi_service_descriptors(){
     };return table;
 }
 namespace {
-// FONTSIGNATURE 的 code page 位元（fsCsb[0]）與代表性 Unicode 子範圍（fsUsb）；依 Windows charset 對照表。
-struct CharsetSignature {std::uint8_t charset;std::int8_t code_page_bit;std::array<std::int8_t,4> unicode_bits;};
-constexpr CharsetSignature charset_signatures[]{
-    {0,0,{0,1,-1,-1}},{238,1,{0,2,-1,-1}},{204,2,{0,9,-1,-1}},{161,3,{0,7,-1,-1}},{162,4,{0,2,-1,-1}},{177,5,{0,11,-1,-1}},
-    {178,6,{0,13,-1,-1}},{186,7,{0,2,-1,-1}},{163,8,{0,2,3,-1}},{222,16,{0,24,-1,-1}},{128,17,{48,49,50,59}},{134,18,{48,59,-1,-1}},
-    {129,19,{48,56,28,59}},{136,20,{48,59,-1,-1}},{130,21,{48,56,28,-1}},{2,31,{-1,-1,-1,-1}}};
 // WMF 標頭驗證與大小改用 windows_wmf.hpp 的共用實作。
 constexpr std::size_t metafile_limit=windows_metafile_limit;
 }
@@ -315,20 +308,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
             memory.store(GuestAddress{p+8},8,blank);memory.store(GuestAddress{p+12},32,line);
             return finish(0);
         }
-        if(name=="GetTextCharsetInfo" || name=="GetTextCharset"){
-            if(!known_dc(arg(0)))return fail(6);
-            auto charset=gui_font(gui_,gui_.contexts[arg(0)].font).charset;if(charset==1)charset=0; // 已實現字型不會保留 DEFAULT_CHARSET。
-            if(name=="GetTextCharsetInfo" && arg(1)){
-                memory.check(GuestAddress{arg(1)},24,Access::Write);std::array<std::uint32_t,6> signature{};
-                const auto entry=std::find_if(std::begin(charset_signatures),std::end(charset_signatures),[&](const auto& e){return e.charset==charset;});
-                if(entry!=std::end(charset_signatures)){
-                    if(entry->code_page_bit>=0)signature[4]|=1U<<entry->code_page_bit;
-                    for(const auto bit:entry->unicode_bits)if(bit>=0)signature[static_cast<unsigned>(bit)/32]|=1U<<(bit%32);
-                }
-                for(unsigned i=0;i<6;++i)memory.store(GuestAddress{arg(1)+i*4},32,signature[i]);
-            }
-            return finish(charset);
-        }
+        if(name=="GetTextCharsetInfo" || name=="GetTextCharset")return invoke_fonts(state,memory,service);
         if(name=="FillRgn" || name=="PaintRgn" || name=="InvertRgn" || name=="FrameRgn"){
             if(!known_dc(arg(0)))return fail(6);const auto found=gui_.regions.find(arg(1));if(found==gui_.regions.end())return fail(6);
             auto region=found->second;
@@ -343,7 +323,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
                 }
                 region=gui_region_combine(region,inner,4);
             }
-            const auto brush=name=="PaintRgn"?gui_.contexts[arg(0)].brush:arg(2);const auto buffer=temporary(16);
+            const auto brush=name=="PaintRgn"?gui_.contexts[arg(0)].brush:name=="InvertRgn"?0:arg(2);
+            const auto buffer=temporary(16);
             for(const auto& r:region){
                 for(unsigned i=0;i<4;++i)memory.store(GuestAddress{buffer+i*4},32,static_cast<std::uint32_t>(r[i]));
                 const auto ok=name=="InvertRgn"?nested_service(state,memory,"user32.dll","InvertRect",{arg(0),buffer}):nested_service(state,memory,"user32.dll","FillRect",{arg(0),buffer,brush});
@@ -403,12 +384,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
                 return finish(status);
             }
             if((flags&12U)==12U || (flags&~15U))return fail(87);
-            if(flags&1U)dc.bounds={};
+            auto bounds=(flags&1U)?GuiRect{}:dc.bounds;
             if((flags&2U) && arg(1)){
                 GuiRect rect{};for(unsigned i=0;i<4;++i)rect[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(1)+i*4},32));
                 rect={std::min(rect[0],rect[2]),std::min(rect[1],rect[3]),std::max(rect[0],rect[2]),std::max(rect[1],rect[3])};rect=gui_transform_bounds(transform,rect);
-                if(!gui_rect_empty(rect))dc.bounds=gui_rect_empty(dc.bounds)?rect:GuiRect{std::min(dc.bounds[0],rect[0]),std::min(dc.bounds[1],rect[1]),std::max(dc.bounds[2],rect[2]),std::max(dc.bounds[3],rect[3])};
+                if(!gui_rect_empty(rect))bounds=gui_rect_empty(bounds)?rect:GuiRect{std::min(bounds[0],rect[0]),std::min(bounds[1],rect[1]),std::max(bounds[2],rect[2]),std::max(bounds[3],rect[3])};
             }
+            dc.bounds=bounds;
             if(flags&4U)dc.bounds_enabled=true;if(flags&8U)dc.bounds_enabled=false;
             return finish(status);
         }
@@ -421,29 +403,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
             }
             memory.check(GuestAddress{arg(1)},8,Access::Write);memory.store(GuestAddress{arg(1)},32,static_cast<std::uint32_t>(x));memory.store(GuestAddress{arg(1)+4},32,static_cast<std::uint32_t>(y));
             return finish(1);
-        }
-        if(name=="CreateDIBitmap"){
-            const auto header=arg(1);const auto init=static_cast<std::uint32_t>(arg(2));
-            if(!header || (init&~6U))return fail(87);if(arg(0) && !known_dc(arg(0)))return fail(6);
-            const auto size=static_cast<std::uint32_t>(memory.load(GuestAddress{header},32));std::int64_t width=0,height=0;
-            if(size==12){width=static_cast<std::int64_t>(memory.load(GuestAddress{header+4},16));height=static_cast<std::int64_t>(memory.load(GuestAddress{header+6},16));}
-            else if(size>=40){width=static_cast<std::int32_t>(memory.load(GuestAddress{header+4},32));height=static_cast<std::int32_t>(memory.load(GuestAddress{header+8},32));}
-            else return fail(87);
-            if(width<0)return fail(87);height=std::abs(height);
-            std::uint64_t bitmap=0;
-            if(init&2U){
-                // CBM_CREATEDIB：以 BITMAPINFO 的格式建立 DIB section，與 CreateDIBSection 共用配置。
-                if(!arg(4))return fail(87);const auto bits=temporary(8);
-                bitmap=nested_service(state,memory,"gdi32.dll","CreateDIBSection",{arg(0),arg(4),arg(5),bits,0,0});
-            }else if(!width || !height)bitmap=nested_service(state,memory,"gdi32.dll","CreateBitmap",{1,1,1,1,0});
-            else bitmap=nested_service(state,memory,"gdi32.dll","CreateCompatibleBitmap",{arg(0),static_cast<std::uint64_t>(width),static_cast<std::uint64_t>(height)});
-            if(!bitmap)return finish(0);
-            if((init&4U) && arg(3) && width && height){
-                const auto error=[&](std::uint32_t code){(void)nested_service(state,memory,"gdi32.dll","DeleteObject",{bitmap});if(code)last_error_=code;return finish(0);};
-                if(!arg(4))return error(87);
-                if(!nested_service(state,memory,"gdi32.dll","SetDIBits",{arg(0),bitmap,0,static_cast<std::uint64_t>(height),arg(3),arg(4),arg(5)}))return error(0);
-            }
-            return finish(bitmap);
         }
         if(name=="D3DKMTSetVidPnSourceOwner" || name=="D3DKMTCheckVidPnExclusiveOwnership" ||
            name=="NtGdiDdDDICheckExclusiveOwnership" || name=="NtGdiDdDDIQueryVidPnExclusiveOwnership" ||
@@ -696,7 +655,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
                 const auto handle=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32)),type=static_cast<std::uint32_t>(memory.load(GuestAddress{p+4},32));
                 const auto data=memory.load(GuestAddress{p+8},pointer_bits);const auto size=static_cast<std::uint32_t>(memory.load(GuestAddress{p+8+unit},32));
                 if(!gui_.kmt_adapters.contains(handle))return finish(invalid);if(!data)return finish(invalid);
-                const auto need=[&](std::uint32_t bytes){if(size<bytes){static std::set<std::uint32_t> reported;if(reported.insert(type).second)std::fprintf(stderr,"[d3dkmt] QueryAdapterInfo type=%u size=%u 小於 %u\n",type,size,bytes);}return size>=bytes;};
+                const auto need=[&](std::uint32_t bytes){
+                    if(size<bytes)return false;
+                    memory.check(GuestAddress{data},bytes,Access::Write);
+                    return true;
+                };
                 const auto text=[&](std::uint64_t at,std::u16string_view value,std::size_t limit){for(std::size_t i=0;i<limit;++i)memory.store(GuestAddress{at+i*2},16,i<value.size()?value[i]:0);};
                 const auto identity=metal_opengl_identity();const auto renderer=identity?utf8_to_utf16(identity->first):std::u16string(display_identity::adapter_name);
                 switch(type){
@@ -714,7 +677,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
                     if(!need(8))return finish(invalid);memory.store(GuestAddress{data},64,display_identity::version_number);return finish(ok);
                 case 25:{ // KMTQAITYPE_NODEMETADATA：單一 3D 引擎節點；UMA 經 IOMMU 存取系統記憶體。
                     // D3DKMT_NODEMETADATA：索引(4)＋EngineType(4)＋FriendlyName[32]＋Flags(4)＋GpuMmu／IoMmu 兩個 BOOLEAN，SDK 大小 78。
-                    if(!need(78))return finish(invalid);if((memory.load(GuestAddress{data},32)&0xffffU)!=0)return finish(invalid);
+                    if(!need(78))return finish(invalid);if(memory.load(GuestAddress{data},32)!=0)return finish(invalid);
                     memory.fill(GuestAddress{data+4},0,74);memory.store(GuestAddress{data+4},32,1);text(data+8,u"3D",32);memory.store(GuestAddress{data+77},8,1);return finish(ok);}
                 case 30: // KMTQAITYPE_PHYSICALADAPTERCOUNT
                     if(!need(4))return finish(invalid);memory.store(GuestAddress{data},32,1);return finish(ok);
@@ -727,21 +690,34 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
             const auto type=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));
             if((static_cast<std::uint64_t>(memory.load(GuestAddress{p+8},32))<<32|memory.load(GuestAddress{p+4},32))!=luid || !available)return finish(invalid);
             // QueryResult 含 ULONGLONG，x86 在 hProcess 後對齊到 16；x64 為 24。
-            const auto result=p+(x86_?16U:24U);memory.fill(GuestAddress{result},0,776);const auto index=static_cast<std::uint32_t>(memory.load(GuestAddress{result+776},32));
+            constexpr unsigned result_size=776;
+            const auto result=p+(x86_?16U:24U);
+            if(type>8){diagnose("QueryStatistics",type);return finish(unsupported);}
+            if(type>=3 && memory.load(GuestAddress{result+result_size},32)!=0)return finish(invalid);
+            if(type==1 || type==2 || type==4 || type==6 || type==8){
+                const auto process=memory.load(GuestAddress{p+(x86_?12U:16U)},pointer_bits);
+                if(process && !current_process_handle(process,0x400)){
+                    const auto pid=process_handle_pid(process,0x400);
+                    if(pid && pid!=process_id())return finish(unsupported);
+                    if(!pid)return finish(process_object_type(process)==u"Process"?0xc0000022U:0xc0000008U);
+                }
+            }
+            memory.check(GuestAddress{result},result_size,Access::Write);
+            memory.fill(GuestAddress{result},0,result_size);
             switch(type){
             case 0:case 2: // ADAPTER／PROCESS_ADAPTER：NbSegments、NodeCount、VidPnSourceCount。
                 memory.store(GuestAddress{result},32,1);memory.store(GuestAddress{result+4},32,1);memory.store(GuestAddress{result+8},32,1);return finish(ok);
             case 1: // PROCESS：NodeCount、VidPnSourceCount。
                 memory.store(GuestAddress{result},32,1);memory.store(GuestAddress{result+4},32,1);return finish(ok);
             case 3: // SEGMENT：CommitLimit、BytesCommitted、BytesResident、Aperture。
-                if(index)return finish(invalid);memory.store(GuestAddress{result},64,memory_limit.limit);memory.store(GuestAddress{result+8},64,memory_limit.used);memory.store(GuestAddress{result+16},64,memory_limit.used);memory.store(GuestAddress{result+40},32,1);return finish(ok);
+                memory.store(GuestAddress{result},64,memory_limit.limit);memory.store(GuestAddress{result+8},64,memory_limit.used);memory.store(GuestAddress{result+16},64,memory_limit.used);memory.store(GuestAddress{result+40},32,1);return finish(ok);
             case 4: // PROCESS_SEGMENT：BytesCommitted。
-                if(index)return finish(invalid);memory.store(GuestAddress{result},64,memory_limit.used);return finish(ok);
+                memory.store(GuestAddress{result},64,memory_limit.used);return finish(ok);
             case 5:case 6:{ // NODE／PROCESS_NODE：RunningTime（100 ns）。全域與本程序相同，因為 GPU 只服務此程序。
-                if(index)return finish(invalid);enable_gpu_statistics();const auto running=gpu_running_time();memory.store(GuestAddress{result},64,running);return finish(ok);}
+                enable_gpu_statistics();const auto running=gpu_running_time();memory.store(GuestAddress{result},64,running);return finish(ok);}
             case 7:case 8: // VIDPNSOURCE：沒有 flip 統計時全部為 0。
-                if(index)return finish(invalid);return finish(ok);
-            default:diagnose("QueryStatistics",type);return finish(unsupported);
+                return finish(ok);
+            default:return finish(unsupported);
             }
         }
         if(name=="SetMetaFileBitsEx"){
@@ -773,6 +749,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
             }
             const auto handle=gui_.next_object++;gui_.windows_metafiles.emplace(handle,std::move(bytes));return finish(handle);
         }
+    }catch(const MemoryFault&){
+        if(name=="SetBoundsRect" || name=="GetBoundsRect")return fail(998);
+        if(name=="D3DKMTQueryAdapterInfo" || name=="D3DKMTQueryStatistics")return finish(0xc0000005U);
+        throw;
     }catch(const std::bad_alloc&){return fail(8);}catch(const std::length_error&){return fail(8);}catch(const std::invalid_argument&){return fail(87);}
     throw HostCallFault("尚未實作舊式 GDI 服務");
 }

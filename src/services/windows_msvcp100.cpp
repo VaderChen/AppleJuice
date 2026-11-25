@@ -1,3 +1,4 @@
+#include "msvcp_locale_id_lock.hpp"
 #include "ansi_codepage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
@@ -5,7 +6,8 @@
 #include "crt_float_chars.hpp"
 #include "msvcp_stream_abi.hpp"
 #include "msvcp_numeric.hpp"
-#include "msvcp_number_scan.hpp"
+#include "msvcp_complex_stream.hpp"
+#include "msvcp90_stream_exports.hpp"
 #include "x64arm/x87_fp.hpp"
 #include "msvcp_rtti_shapes.hpp"
 #include "msvcp_time_get.hpp"
@@ -71,6 +73,7 @@ struct Operation {
     msvcp_detail::NumberField number_field;
     std::uint64_t time_state{},time_tm{},input_value{}; // time_get／num_get：ios_base::iostate 與 tm／數值輸出位址。
     std::u16string time_seen;int time_look{-2}; // 已取走的字元與前瞻（-2 未知、-1 輸入結束）。
+    std::optional<msvcp_detail::ComplexField> complex_field;
     bool number_ready{};
 };
 msvcp_detail::NumberType msvcp_number_type(std::string_view name){
@@ -83,14 +86,49 @@ msvcp_detail::NumberType msvcp_number_type(std::string_view name){
     return Type::Signed32;
 }
 msvcp_detail::NumberFormat msvcp_number_format(const GuestMemory& memory,const Layout& l,std::uint64_t ios,char16_t fill){
-    return {static_cast<std::uint32_t>(memory.load(GuestAddress{ios+l.flags},32)),
-        std::bit_cast<std::int64_t>(memory.load(GuestAddress{ios+l.precision},64)),
-        std::bit_cast<std::int64_t>(memory.load(GuestAddress{ios+l.width},64)),fill};
+    const auto streamsize=[&](unsigned offset)->std::int64_t{
+        const auto value=memory.load(GuestAddress{ios+offset},l.stream_bits());
+        return l.stream_bits()==32?std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(value)):std::bit_cast<std::int64_t>(value);
+    };
+    return {static_cast<std::uint32_t>(memory.load(GuestAddress{ios+l.flags},32)),streamsize(l.precision),streamsize(l.width),fill};
+}
+// VC6 將 locale 直接放在 ios_base 中。VC7 至 VC9 透過指標取 locale，
+// _Locimp 的名稱則是該版 basic_string<char>。內建 classic 直接沿用預設標點。
+msvcp_detail::NumericPunctuation legacy_stream_punctuation(const GuestMemory& memory,const Layout& l,
+                                                           std::uint64_t ios,std::uint64_t classic){
+    msvcp_detail::NumericPunctuation result;
+    const auto bits=static_cast<std::uint8_t>(l.p*8);
+    const auto ptr=[&](std::uint64_t at){return memory.load(GuestAddress{at},bits);};
+    const auto name=l.legacy_locale_name(ios,classic,ptr);
+    if(!name)return result;
+    const auto label=read_ansi(memory,name,4096);
+    if(label.empty() || label=="C" || label=="*")return result;
+    if(const auto category=windows_crt_locale(ansi_to_utf16(label))){
+        const auto numeric=windows_crt_numeric(*category);
+        const auto character=[&](const std::u16string& text)->char16_t{
+            if(text.empty())return 0;
+            if(l.element==2)return text.front();
+            const auto bytes=windows_crt_encode(text,category->codepage);
+            return bytes && !bytes->empty()?static_cast<char16_t>(bytes->front()):0;
+        };
+        result.decimal=character(numeric.decimal);
+        result.thousands=character(numeric.thousands);
+        result.grouping=numeric.grouping;
+    }
+    return result;
 }
 std::u16string format_msvcp_number(const Operation& op,GuestMemory& memory,const Layout& l){
     const auto fill=static_cast<char16_t>(memory.load(GuestAddress{op.ios+l.ios_size+2*l.p},l.character_bits()));
-    const auto result=msvcp_detail::format_number({msvcp_number_type(op.service.symbol),op.count,l.p},msvcp_number_format(memory,l,op.ios,fill));
-    memory.store(GuestAddress{op.ios+l.width},64,0);return result;
+    const auto format=msvcp_number_format(memory,l,op.ios,fill);
+    std::u16string result;
+    if(op.kind=="ostream_complex"){
+        const auto scalar=static_cast<std::uint8_t>(op.numeric_value.type==msvcp_detail::NumberType::Floating32?32:64);
+        auto real=op.numeric_value,imag=real;
+        real.value=memory.load(GuestAddress{op.output},scalar);
+        imag.value=memory.load(GuestAddress{op.output+scalar/8},scalar);
+        result=msvcp_detail::format_complex(real,imag,format,op.numeric_punctuation);
+    }else result=msvcp_detail::format_number({msvcp_number_type(op.service.symbol),op.count,l.p},format);
+    memory.store(GuestAddress{op.ios+l.width},l.stream_bits(),0);return result;
 }
 // ios_base::_Findarr：同索引沿用節點，否則回收全零節點，再不然配置新節點置於串列前端；配置失敗回傳 0。
 template<class Allocate> std::uint64_t msvcp_ios_array(GuestMemory& memory,const Layout& l,std::uint64_t base,std::uint32_t index,Allocate&& allocate){
@@ -117,7 +155,7 @@ struct Msvcp100State {
     std::map<std::string,std::uint64_t,std::less<>> data;
     std::map<std::uint64_t,Operation> operations;
     std::map<std::uint64_t,std::pair<std::uint64_t,std::uint64_t>> ios_objects;
-    std::uint64_t global{},codecvt_table{},ctype_table{},buffer_table{},ios_table{},istream_vb{},iostream_vb{},next{1},next_id{2};
+    std::uint64_t global{},codecvt_table{},ctype_table{},buffer_table{},ios_table{},istream_vb{},iostream_vb{},next{1};
     bool sync_with_stdio{true}; // ios_base::sync_with_stdio 的目前設定（MSVC 只保存值，不改變串流行為）。
     std::uint64_t std_new_handler{},ostream_vb{}; // std::set_new_handler 的處理常式、VC10 ostream 的虛擬基底表。
     struct Tables {std::uint64_t buffer{},ios{},istream{},ostream{},iostream{},codecvt{},codecvt16{},codecvt32{},codecvt_ushort{},ctype{},ctype16{},num_put{},num_put16{},num_get{},num_get16{},numpunct{},numpunct_byname{},time_put{},time_put16{},time_get{};};
@@ -171,10 +209,9 @@ void WindowsServices::initialize_msvcp100(GuestMemory& memory){
     s.ifstream_table9=table9({"FileIosDelete"});s.ifstream_vb9=runtime_allocate(memory,{},8);
     const Layout vc9(x86_,false,1,true);memory.store(GuestAddress{s.ifstream_vb9+4},32,2*l.p+vc9.file_size());
     for(const auto name:{"??_7ios_base@std@@6B@","??_7?$basic_ios@GU?$char_traits@G@std@@@std@@6B@","??_7?$basic_istream@GU?$char_traits@G@std@@@std@@6B@"})s.data.emplace(name,s.ios_table);
-    for(const auto& [name,value]:std::array<std::pair<const char*,std::uint64_t>,3>{{
-        {"?id@?$ctype@G@std@@2V0locale@2@A",1},{"?id@?$codecvt@GDH@std@@2V0locale@2@A",2},{"?_BADOFF@std@@3_JB",UINT64_MAX}}}){
-        const auto address=runtime_allocate(memory,{},8);memory.store(GuestAddress{address},64,value);s.data.emplace(name,address);
-    }
+    const auto badoff=runtime_allocate(memory,{},8);
+    memory.store(GuestAddress{badoff},64,UINT64_MAX);
+    s.data.emplace("?_BADOFF@std@@3_JB",badoff);
     s.global=runtime_allocate(memory,{},96);put(s.global,s.ctype_table);put(s.global+l.p,1);
     const auto facets=runtime_allocate(memory,{},3*l.p);put(s.global+2*l.p,facets);put(s.global+3*l.p,3);
     memory.store(GuestAddress{s.global+4*l.p},32,0x3f);
@@ -293,6 +330,7 @@ void WindowsServices::initialize_msvcp100(GuestMemory& memory){
         "?id@?$codecvt@_SDU_Mbstatet@@@std@@2V0locale@2@A","?id@?$codecvt@_UDU_Mbstatet@@@std@@2V0locale@2@A","?id@?$codecvt@GDU_Mbstatet@@@std@@2V0locale@2@A",
         "?id@?$time_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A",
         "?id@?$time_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A","?id@?$ctype@G@std@@2V0locale@2@A"}){
+        if(!variant && (symbol==msvcp_locale_ids::unicode_facets[0] || symbol==msvcp_locale_ids::unicode_facets[2]))continue;
         const auto address=runtime_allocate(memory,{},l.p);put(address,0);m.data14.emplace(symbol,address);
     }
     // ctype<char>::table_size（靜態常數 256，x86 為 unsigned int、x64 為 size_t）。
@@ -406,7 +444,7 @@ std::optional<std::uint32_t> WindowsServices::finish_msvcp_callback_exception(Gu
     exceptions_.stack.at(captured_depth).protected_callback_depth=SIZE_MAX;(void)msvc_exception_cells(state,memory,false,true);
     if(op.kind=="exception_capture"){op.exception_record=std::move(record);++op.copy_failures;prepare_msvcp_exception_capture(state,memory,frame.value);return resume_msvcp100(state,memory,frame.value,0);}
     if(op.ios){
-        const Layout l(x86_,op.modern,op.element,op.service.family=="msvcp90.dll" || op.service.family=="internal-msvcp90",msvcp_detail::vc12(op.service));const auto at=op.ios+l.state;
+        const auto l=msvcp_detail::abi(x86_,op.service,op.modern,op.element);const auto at=op.ios+l.state;
         const bool suffix=op.callback==52;
         const bool body=op.callback!=10 && op.callback!=11 && !suffix;const auto flags=memory.load(GuestAddress{at},32)|(body?4U:0U);if(body)memory.store(GuestAddress{at},32,flags);
         op.rethrow_exception=!suffix && (!body || (memory.load(GuestAddress{at+4},32)&4U));op.throw_failure=false;op.exception_record=std::move(record);op.callback=0;
@@ -508,6 +546,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         }
         if(name=="_Unlock_shared_ptr_spin_lock"){s.shared_ptr_locked=false;return done(0);}
         throw HostCallFault("未知 STL C 匯出");
+    }
+    if(l.legacy && msvcp90_stream::complex_stream(name)){
+        Operation op;
+        op.service=service;op.object=a(0);op.output=a(1);op.element=l.element;
+        const auto displacement=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{ptr(op.object)+4},32)));
+        op.ios=op.object+static_cast<std::uint64_t>(static_cast<std::int64_t>(displacement));op.buffer=ptr(op.ios+l.ios_size);
+        const bool input=name.find("?$basic_istream@")!=name.npos;
+        op.numeric_value={name.find("?$complex@M@")!=name.npos?msvcp_detail::NumberType::Floating32:msvcp_detail::NumberType::Floating64,0,l.p};
+        op.numeric_punctuation=legacy_stream_punctuation(memory,l,op.ios,s.global);
+        op.kind=input?"complex_input":"ostream_complex";
+        const auto token=s.next++;s.operations.emplace(token,std::move(op));
+        return resume_msvcp100(state,memory,token,0);
     }
 #include "msvcp90_file_handlers.inc"
     if(method=="FacetRetire"){
@@ -898,21 +948,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
             {2,2,"ctype@G"},{2,2,"codecvt@GDU_Mbstatet@@"},{2,8,"num_get@GV?$istreambuf_iterator@GU?$char_traits@G@std@@@std@@"},
             {2,8,"num_put@GV?$ostreambuf_iterator@GU?$char_traits@G@std@@@std@@"},{2,16,"time_put@GV?$ostreambuf_iterator@GU?$char_traits@G@std@@@std@@"}};
         const int only=method=="_Makexloc"?0:method=="_Makewloc"?1:method=="_Makeushloc"?2:-1;
-        struct Planned {std::uint64_t getcat,id;};std::vector<Planned> planned;
+        struct Planned {std::uint64_t getcat,id_cell;};std::vector<Planned> planned;
         for(const auto& kind:kinds){
             if((only>=0 && static_cast<int>(kind.element)!=only) || !(kind.category&category))continue;
             const auto getcat=resolve("msvcp140.dll",std::string("?_Getcat@?$")+kind.type+(x86_?"@std@@SAIPAPBVfacet@locale@2@PBV42@@Z":"@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z")).value;
-            const auto id_cell=m.data14.find(std::string("?id@?$")+kind.type+"@std@@2V0locale@2@A");
+            auto id_name=std::string("?id@?$")+kind.type+"@std@@2V0locale@2@A";
+            const auto id_cell=m.data14.find(service.family=="msvcp120.dll"?msvcp120_symbol(id_name):id_name);
             if(!getcat || id_cell==m.data14.end())throw HostCallFault("STL _Makeloc 缺少 facet 定義");
-            auto id=ptr(id_cell->second);if(!id){id=memory.load(GuestAddress{m.id_count14},32)+1;memory.store(GuestAddress{m.id_count14},32,id);put(id_cell->second,id);}
-            planned.push_back({getcat,id});
+            planned.push_back({getcat,id_cell->second});
         }
         // 暫時 locale：_Getcat 只讀 _Ptr->_Name，指向 _Locinfo 的新名稱（不轉移擁有權）。
         const auto info_name=ptr(info+(x86_?4U:8U)+5*2*l.p);
         const auto addfac=resolve("msvcp140.dll",x86_?"?_Locimp_Addfac@_Locimp@locale@std@@CAXPAV123@PAVfacet@23@I@Z":"?_Locimp_Addfac@_Locimp@locale@std@@CAXPEAV123@PEAVfacet@23@_K@Z").value;
+        const auto lock=resolve("crt","_lock_locales").value,unlock=resolve("crt","_unlock_locales").value;
+        const GuestAddress id_count{m.id_count14};
         const auto layout=l;const auto global_imp=m.global14;const bool makeloc=method=="_Makeloc";
         // 暫存（假 _Locimp、locale 與 facet 輸出格）在續行內配置：續行完成後會重新進入本服務取回結果。
-        return nested_continuation(state,memory,"locale makeloc",[this,service,planned,imp,from,info_name,category,addfac,layout,bits,global_imp,makeloc](GuestState& s2,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+        return nested_continuation(state,memory,"locale makeloc",[this,service,planned,imp,from,info_name,category,addfac,lock,unlock,id_count,layout,bits,global_imp,makeloc](GuestState& s2,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
             const auto load=[&](std::uint64_t at){return m.load(GuestAddress{at},bits);};const auto store=[&](std::uint64_t at,std::uint64_t value){m.store(GuestAddress{at},bits,value);};
             const auto imp_size=x86_?32U:56U;const auto scratch=allocate_heap(m,imp_size+layout.locale_size()+layout.p);
             if(!scratch)throw std::bad_alloc{};
@@ -929,9 +981,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
                 return 0;
             };
             for(const auto& item:planned){
-                std::uint64_t facet=from?facet_in(load(from+layout.locale_pointer()),item.id):0;
+                const auto id=co_await msvcp_locale_ids::locked_facet_id(m,GuestAddress{item.id_cell},id_count,bits,lock,unlock);
+                std::uint64_t facet=from?facet_in(load(from+layout.locale_pointer()),id):0;
                 if(!facet){store(cell,0);(void)co_await service_callback::call_value(item.getcat,{cell,from?from:temp_locale});facet=load(cell);}
-                if(facet)(void)co_await service_callback::call_value(addfac,{imp,facet,item.id});
+                if(facet)(void)co_await service_callback::call_value(addfac,{imp,facet,id});
             }
             if(makeloc){
                 m.store(GuestAddress{imp+4*layout.p},32,static_cast<std::uint32_t>(m.load(GuestAddress{imp+4*layout.p},32))|category);
@@ -992,7 +1045,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         if(method=="_Mtx_lock" || method=="_Mtx_unlock"){start_callbacks(state,memory,{{resolve("kernel32.dll",method=="_Mtx_lock"?"EnterCriticalSection":"LeaveCriticalSection").value,{a(0)}}},Continuation::Return,0);return {};}
         throw HostCallFault("未知 stdext::threads 操作");
     }
-    if(name.starts_with("??0id@locale@") || name.starts_with("??_Fid@locale@")){const bool closure=name.starts_with("??_F");put(object,closure?0:a(0));return done(closure?0:object);}
     if(name.starts_with("?_Getcat@facet@locale@"))return done(x86_?UINT32_MAX:UINT64_MAX); // locale::facet 本身沒有類別：(size_t)-1。
     if(l.modern && (name.starts_with("??0ctype_base@") || name.starts_with("??_Fctype_base@") || name.starts_with("??1ctype_base@"))){
         if(name.starts_with("??1")){put(object,m.facet_table14);return done(0);}
@@ -1025,8 +1077,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         put(output,resolve("internal-msvcp140",std::string("D")+(method=="setw"?"SetWidth":"SetPrecision")+(x86_?"32":"64")).value);
         memory.store(GuestAddress{output+8},64,a(1));return done(output);
     }
-    if(name.starts_with("??Bid@")){auto value=ptr(object);if(!value){
-        if(l.modern){value=memory.load(GuestAddress{m.id_count14},32)+1;memory.store(GuestAddress{m.id_count14},32,value);}else value=++s.next_id;put(object,value);}return done(value);}
     if(method=="_Incref" || method=="_Decref" || method=="FacetIncref" || method=="FacetDecref"){
         auto n=refs(object);if(method=="_Incref" || method=="FacetIncref"){put_refs(object,n+1);return done(0);}
         if(n)put_refs(object,--n);return done(n?0:object);
@@ -1892,7 +1942,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
 }
 
 std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,GuestMemory& memory,std::uint64_t token,std::uint64_t value){
-    auto& s=*msvcp100_;auto& op=s.operations.at(token);const Layout l(x86_,op.modern,op.element,op.service.family=="msvcp90.dll" || op.service.family=="internal-msvcp90",msvcp_detail::vc12(op.service));const auto bits=static_cast<std::uint8_t>(l.p*8);
+    auto& s=*msvcp100_;auto& op=s.operations.at(token);const auto l=msvcp_detail::abi(x86_,op.service,op.modern,op.element);const auto bits=static_cast<std::uint8_t>(l.p*8);
     auto& m=s.runtimes[l.variant()];const auto* const modern_dll=msvcp_detail::modern_dll(l.variant());
     const WindowsCall call(state,memory,op.service);
     const auto ptr=[&](std::uint64_t at){return memory.load(GuestAddress{at},bits);};
@@ -1905,7 +1955,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
             if(op.buffer && !op.throw_failure && !op.rethrow_exception && !op.allocation_failure && !unwinding &&
                !memory.load(GuestAddress{op.ios+l.state},32) && (memory.load(GuestAddress{op.ios+l.flags},32)&2U)){
                 op.completed=true;op.final_result=result;op.final_wide=wide;op.callback=52;
-                GuestCallback cb{ptr(ptr(op.buffer)+13*l.p),{op.buffer}};cb.x86_register_arguments=x86_?1:0;cb.exception_policy=GuestExceptionPolicy::CaptureCpp;
+                GuestCallback cb{ptr(ptr(op.buffer)+l.slot(13)*l.p),{op.buffer}};cb.x86_register_arguments=x86_?1:0;cb.exception_policy=GuestExceptionPolicy::CaptureCpp;
                 start_callbacks(state,memory,{std::move(cb)},Continuation::Msvcp100Operation,token);return {};
             }
         }
@@ -2149,7 +2199,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
                 format.width=current.width;format.flags=(format.flags&~0x1c0U)|(current.flags&0x1c0U);
                 if(boolalpha)op.numeric_text=op.numeric_value.value?op.numeric_punctuation.true_name:op.numeric_punctuation.false_name;
                 op.numeric_text=msvcp_detail::localize_number(std::move(op.numeric_text),op.numeric_raw,floating,boolalpha,format,op.numeric_punctuation);
-                memory.store(GuestAddress{op.ios+l.width},64,0);op.phase=4;
+                memory.store(GuestAddress{op.ios+l.width},l.stream_bits(),0);op.phase=4;
             }
             if(op.phase==4){
                 if(returned==31){if((value&l.int_mask())==l.eof())op.numeric_failed=true;++op.numeric_written;}
@@ -2286,7 +2336,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
         put(owner+2*l.p,0);put(owner+3*l.p,0);put(owner+4*l.p+8,0);s.owned_locale_imps.erase(owner);
         if(flags&1U)(void)free_heap(memory,owner,state);return finish(owner);
     }
-    if(op.ios && (op.kind=="number" || op.kind=="getline" || op.kind=="peek" || op.kind=="istream_get" || op.kind=="putback" || op.kind=="ignore" || op.kind=="istream_read" || op.kind=="tellg" || op.kind=="seekg_offset" || op.kind=="seekg" || op.kind=="seekp" || op.kind=="tellp" || op.kind.starts_with("ostream_") ||
+    if(op.ios && l.version!=60 && (op.kind=="complex_input" || op.kind=="number" || op.kind=="getline" || op.kind=="peek" || op.kind=="istream_get" || op.kind=="putback" || op.kind=="ignore" || op.kind=="istream_read" || op.kind=="tellg" || op.kind=="seekg_offset" || op.kind=="seekg" || op.kind=="seekp" || op.kind=="tellp" || op.kind.starts_with("ostream_") ||
                    op.kind=="istream_sync" || op.kind=="readsome" || op.kind=="istream_buffer" || op.kind=="seekp_offset") && !op.lock_started && op.buffer){
         op.lock_started=true;return virt(1,{},10);
     }
@@ -2372,7 +2422,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
             if(op.kind=="ostream_suffix")return finish(0);
             if(op.kind=="ostream_flush")return finish(op.object);
             // operator<<(basic_streambuf*)：sentry 失敗時沒有複製任何字元，與 MSVC 相同清 width 並設 failbit（來源為空設 badbit）。
-            if(op.kind=="ostream_buffer"){memory.store(GuestAddress{op.ios+l.width},64,0);setstate(op.limit?2:4);return finish(op.object);}
+            if(op.kind=="ostream_buffer"){memory.store(GuestAddress{op.ios+l.width},l.stream_bits(),0);setstate(op.limit?2:4);return finish(op.object);}
             if(op.kind.starts_with("ostream_")){setstate(4);return finish(op.object);}
             if(op.kind=="getline" && op.limit)memory.store(GuestAddress{op.output},l.character_bits(),0);
             setstate(2);if(op.kind=="tellg"){memory.write(GuestAddress{op.output},std::array<std::uint8_t,24>{});memory.store(GuestAddress{op.output},64,UINT64_MAX);return finish(op.output);}
@@ -2390,6 +2440,34 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
             }
             if(tied_buffer && !memory.load(GuestAddress{op.tie_ios+l.state},32))return callback(ptr(ptr(tied_buffer)+l.slot(13)*l.p),{tied_buffer},11);
         }
+    }
+    if(op.kind=="complex_input"){
+        using Field=msvcp_detail::ComplexField;
+        if(!op.complex_field)
+            op.complex_field.emplace(op.numeric_value.type,msvcp_number_format(memory,l,op.ios,u' '),op.numeric_punctuation,l.p);
+        auto& field=*op.complex_field;
+        if(returned==2 && (value&l.int_mask())==l.eof()){setstate(3);return finish(op.object);}
+        bool peeked=returned==1;
+        while(!field.done()){
+            std::uint64_t c;
+            if(peeked){c=value&l.int_mask();peeked=false;}
+            else if(available(false)>0)c=memory.load(GuestAddress{ptr(position_address(false))},l.character_bits());
+            else return virt(6,{},1);
+            const bool eof=c==l.eof();
+            const auto step=field.peek(static_cast<char16_t>(c),eof,!eof && is_space(c));
+            if(eof)setstate(1);
+            if(step==Field::Step::Fail){setstate(2);return finish(op.object);}
+            if(step==Field::Step::Complete)break;
+            if(available(false)>0)consume(false);
+            else return virt(7,{},2);
+        }
+        if(!op.throw_failure){
+            const auto scalar=static_cast<std::uint8_t>(op.numeric_value.type==msvcp_detail::NumberType::Floating32?32:64);
+            memory.check(GuestAddress{op.output},scalar/4,Access::Write);
+            memory.store(GuestAddress{op.output},scalar,field.real);
+            memory.store(GuestAddress{op.output+scalar/8},scalar,field.imag);
+        }
+        return finish(op.object);
     }
     if(op.kind=="seekg"){
         if(returned==1){if((l.stream_bits()==32?memory.load(GuestAddress{op.scratch},32)==UINT32_MAX:memory.load(GuestAddress{op.scratch},64)==UINT64_MAX) && !memory.load(GuestAddress{op.scratch+8},64))setstate(2);return finish(op.object);}
@@ -2417,7 +2495,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
             const auto source_available=[&]{return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{source_count()},32)));};
             const auto source_character=[&]{return memory.load(GuestAddress{ptr(source_position())},l.character_bits());};
             const auto source_virtual=[&](unsigned slot,unsigned next){return callback(ptr(ptr(source)+slot*l.p),{source},next);};
-            const auto complete=[&](unsigned flags){memory.store(GuestAddress{op.ios+l.width},64,0);if(flags)setstate(flags);return finish(op.object);};
+            const auto complete=[&](unsigned flags){memory.store(GuestAddress{op.ios+l.width},l.stream_bits(),0);if(flags)setstate(flags);return finish(op.object);};
             if(!source)return complete(4);
             if(!op.phase)op.phase=20;
             if(returned==31){op.output=value&l.int_mask();op.phase=22;}
@@ -2446,7 +2524,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
                 }
             }
         }
-        if(op.kind=="ostream_number"){
+        if(op.kind=="ostream_number" || op.kind=="ostream_complex"){
             try{const auto text=format_msvcp_number(op,memory,l);op.limit=text.size();op.scratch=allocate_heap(memory,std::max<std::uint64_t>(1,op.limit*l.element));
                 if(!op.scratch)throw std::bad_alloc{};op.output=op.scratch;for(std::size_t i=0;i<text.size();++i)memory.store(GuestAddress{op.output+i*l.element},l.character_bits(),text[i]);op.kind="ostream_write";
             }catch(const std::bad_alloc&){return callback(resolve("internal-msvcp140",std::string("DThrowBadAlloc")+(x86_?"32":"64")).value,{},18,false);}

@@ -120,9 +120,9 @@ For a game already in the AppleJuice library, its EXE's saved display settings t
 
 ## Tested applications / 2026-11-26 / 46 games / 5 tools
 
-- <img src="docs/images/support-levels/good.png" width="16" height="16" alt="Works well" title="Works well"> Works well: 29
+- <img src="docs/images/support-levels/good.png" width="16" height="16" alt="Works well" title="Works well"> Works well: 30
 - <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="Works well (MetalFX)" title="Works well (MetalFX)"> Works well (MetalFX): 5
-- <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="Slow" title="Slow"> Slow: 8
+- <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="Slow" title="Slow"> Slow: 7
 - <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="Launches" title="Launches"> Launches: 2
 - <img src="docs/images/support-levels/none.png" width="16" height="16" alt="Not working (WIP)" title="Not working (WIP)"> Not working (WIP): 2
 

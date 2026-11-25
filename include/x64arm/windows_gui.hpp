@@ -654,7 +654,9 @@ struct GuiDc {
     std::uint64_t acquisition_region{};
     // BeginPaint 的系統裁剪；應用程式的 SelectClipRgn／RestoreDC 不得擴張它。
     std::optional<GuiRegion> paint_clip;
-    bool display{};
+    bool display{},information{};
+    // NT 的列印份數交換槽屬於 DC 本身，初值為尚未設定，獨立於 DEVMODE 與 SaveDC 層級。
+    std::uint32_t copy_count{UINT32_MAX};
     std::uint64_t bitmap{},font{0xb011},pen{0xb007},brush{0xb000},palette{0xb00f},palette_generation{};std::uint32_t color{},background{0xffffff},mode{2},alignment{};
     std::int32_t x{},y{};
     std::uint32_t dc_pen_color{},dc_brush_color{0xffffff},rop2{13};
@@ -1265,8 +1267,14 @@ struct GuiState : GuiStationNamespace {
     std::map<std::uint64_t,std::vector<std::uint8_t>> color_spaces;           // CreateColorSpace 的 LOGCOLORSPACEW（檔名以 UTF-16 保存）
     std::uint64_t default_color_space{};
     std::map<std::uint64_t, std::uint32_t> pens;
-    struct ExtendedPen {std::uint32_t style{},width{},brush_style{};bool operator==(const ExtendedPen&)const=default;};
-    std::map<std::uint64_t,ExtendedPen> extended_pens;
+    struct PenDefinition {
+        std::uint32_t style{},width{},brush_style{},count{};
+        std::uint64_t client_hatch{},pattern_brush{};
+        std::array<std::uint32_t,16> entries{};
+        bool extended{};
+        bool operator==(const PenDefinition&) const = default;
+    };
+    std::map<std::uint64_t,PenDefinition> pen_definitions;
     std::map<std::uint64_t,std::int32_t> pen_widths,brush_hatches;
     std::vector<GuiMessage> queue;
     std::set<std::uint64_t> message_threads;

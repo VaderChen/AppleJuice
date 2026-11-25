@@ -36,7 +36,7 @@ bool WindowsServices::draw_gui_icon(GuestMemory& memory,std::uint64_t hdc,std::u
             if(brush!=0xb005){GuiDraw fill;fill.kind=GuiDraw::Kind::Fill;fill.right=rectangle[2];fill.bottom=rectangle[3];
                 fill.color=brush==0xb012?dc.dc_brush_color:gui_.brushes.contains(brush)?gui_.brushes.at(brush):brush==0xb000?0xffffffU:brush==0xb001?0xc0c0c0U:brush==0xb002?0x808080U:brush==0xb003?0x404040U:0U;
                 fill.hatch=gui_.brush_hatches.contains(brush)?gui_.brush_hatches.at(brush):-1;fill.pattern_opaque=dc.mode==2;fill.pattern_background=dc.background;fill.pattern_color=dc.color;fill.brush_origin={dc.brush_origin[0]-x,dc.brush_origin[1]-y};
-                std::shared_ptr<RasterSurface> pattern;if(gui_.brush_patterns.contains(brush)){const auto& bitmap=gui_.brush_patterns.at(brush);fill.pattern_brush=brush;fill.pattern_monochrome=bitmap.bits_per_pixel==1;pattern=make_hardware_raster(bitmap.width,bitmap.height,bitmap.pixels);}
+                auto pattern=gdi_brush_raster(brush,hdc,fill);
                 output->draw(fill,pattern.get());
             }
         }

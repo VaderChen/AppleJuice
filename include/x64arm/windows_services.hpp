@@ -1379,6 +1379,7 @@ private:
     bool write_guest_file(GuestState&,GuestMemory&,std::u16string_view path,std::span<const std::uint8_t> bytes);
     std::optional<std::vector<std::uint8_t>> read_guest_file(GuestState&,GuestMemory&,std::u16string_view path,std::size_t minimum,std::size_t limit);
     std::shared_ptr<PrintingState> printing_;
+    std::optional<std::uint32_t> invoke_gdi_escape(GuestState&,GuestMemory&,const WindowsCall&,std::string_view);
     std::optional<std::uint32_t> invoke_printing(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_spooler(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_printer_data(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1402,6 +1403,7 @@ private:
     void select_print_page(std::uint64_t,std::uint32_t);
     void refresh_print_settings(std::uint64_t);
 
+    std::optional<std::uint32_t> finish_print_operation(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t,bool);
     std::optional<std::uint32_t> resume_printing(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     std::uint64_t create_printer_dc(GuestMemory&,std::uint64_t,bool,bool);
     bool is_printer_dc(std::uint64_t) const;
@@ -2165,9 +2167,17 @@ private:
     void export_dib_bitmap(GuestMemory&,std::uint64_t handle);
     std::shared_ptr<RasterSurface> raster_surface(GuestMemory&,std::uint64_t dc,bool writing=true);
     std::optional<std::uint32_t> invoke_script(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    void read_gdi_device_caps(std::uint64_t,unsigned,std::span<std::uint32_t>);
+    bool delete_server_metafile(std::uint64_t);
+    std::uint64_t server_metafile_call(GuestState&,GuestMemory&,const WindowsCall&,std::string_view);
+    void discard_metafile_recorder(std::uint64_t);
     bool record_metafile_draw(std::uint64_t, const GuiDraw&);
     bool record_metafile_escape(std::uint64_t,std::uint16_t,std::span<const std::uint8_t>);
     std::optional<std::uint32_t> invoke_metafile(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::shared_ptr<RasterSurface> gdi_translated_brush(std::uint64_t brush,std::uint64_t hdc) const;
+    std::shared_ptr<RasterSurface> gdi_brush_raster(std::uint64_t brush,std::uint64_t hdc,GuiDraw& draw);
+    std::uint64_t create_pattern_brush(GuestState&,GuestMemory&,GuiBitmap pattern,std::span<const std::uint8_t> bits,
+                                       std::uint64_t source,std::optional<std::uint32_t> dib_usage);
     bool raster_draw(GuestMemory&,std::uint64_t dc,GuiDraw&);
     void sync_raster_bitmap(GuestMemory&,std::uint64_t handle);
     std::shared_ptr<NativeGui> native_gui_;

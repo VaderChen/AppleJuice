@@ -8,7 +8,7 @@
 // gdi32 補充家族：PolyTextOut、PolyDraw、LineDDA、GetTransform、GetCharWidthFloat、CreateBitmapIndirect、GdiGetCodePage、
 // GetGlyphIndicesA（ACP 轉 UTF-16 後交給 W 版本）、GdiGetCharDimensions（對話方塊基準單位使用的平均字寬）、
 // 色彩空間物件（LOGCOLORSPACE 狀態，DC 預設 sRGB）、MirrorRgn、FixBrushOrgEx 與 EnumObjects。
-// 全部以既有 GDI 操作（ExtTextOut、MoveToEx／LineTo／PolyBezierTo、座標轉換查詢、字元寬度、CreateBitmap）在宿主端組合；
+// 複合線段交給 GDI 路徑處理，其他繪圖操作沿用 ExtTextOut、座標轉換、字元寬度與 CreateBitmap。
 // 只有 LineDDA 需要逐點回呼客體。
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> gdi32_extra_service_descriptors(){
@@ -25,6 +25,7 @@ std::span<const WindowsServiceDescriptor> gdi32_extra_service_descriptors(){
 }
 std::optional<std::uint32_t> WindowsServices::invoke_gdi32_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const auto name=service.symbol;
+    if(name=="GetTransform")return invoke_gdi_state(state,memory,service);
     if(name=="EnumObjects"){
         // (hdc, OBJ_PEN 1／OBJ_BRUSH 2, proc(lpLogObject, lParam), lParam)：列舉 16 色 VGA 調色盤的實心筆，與 16 色實心筆刷加上 6 種黑色陰影筆刷；
         // 回呼傳回 0 即停止，函式回傳最後一次回呼的值。
@@ -47,6 +48,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi32_extra(GuestState& sta
             (void)free_heap(m,record,s);call.return_to(s,last);co_return std::optional<std::uint32_t>{};
         });
     }
+    if(name.starts_with("GetCharWidthFloat"))return invoke_fonts(state,memory,service);
+    if(name=="PolyDraw")return invoke_gdi_path(state,memory,service);
     if(name=="LineDDA"){
         // (XStart, YStart, XEnd, YEnd, LineFunc(x, y, data), Data)：依 DDA 逐一回呼線段上的點，不含終點。
         return nested_continuation(state,memory,"LineDDA",[service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
@@ -69,8 +72,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi32_extra(GuestState& sta
     const auto fail=[&](std::uint32_t error){last_error_=error;return done(0);};
     const auto gdi=[&](std::string_view symbol,std::initializer_list<std::uint64_t> args){return nested_service(state,memory,"gdi32.dll",symbol,args);};
     const auto u32=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
-    const auto load_float=[&](std::uint64_t address){return std::bit_cast<float>(static_cast<std::uint32_t>(memory.load(GuestAddress{address},32)));};
-    const auto store_float=[&](std::uint64_t address,float value){memory.store(GuestAddress{address},32,std::bit_cast<std::uint32_t>(value));};
     GuestScratch temporary(*this,memory,state);
     try{
         if(name.find("ColorSpace")!=name.npos){
@@ -134,29 +135,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi32_extra(GuestState& sta
             }
             return done(1);
         }
-        if(name=="PolyDraw"){
-            // (hdc, POINT*, BYTE* types, count)：PT_MOVETO 6、PT_LINETO 2、PT_BEZIERTO 4（三點一組），PT_CLOSEFIGURE（1）連回圖形起點。
-            const auto points=arg(1),types=arg(2);const auto count=u32(3);
-            std::vector<std::uint8_t> kinds(count);if(count)memory.read(GuestAddress{types},kinds);
-            for(std::uint32_t i=0;i<count;){
-                const auto kind=kinds[i]&~1U;
-                if(kind==6 || kind==2){if(kind==6 && (kinds[i]&1U))return fail(87);++i;continue;}
-                if(kind==4){if(i+3>count || (kinds[i+1]&~1U)!=4 || (kinds[i+2]&~1U)!=4)return fail(87);i+=3;continue;}
-                return fail(87);
-            }
-            const auto current=temporary.allocate(16);if(!current)return fail(8);
-            (void)gdi("GetCurrentPositionEx",{arg(0),current});
-            std::int64_t start_x=static_cast<std::int32_t>(memory.load(GuestAddress{current},32)),start_y=static_cast<std::int32_t>(memory.load(GuestAddress{current+4},32));
-            const auto point=[&](std::uint32_t index,unsigned axis){return memory.load(GuestAddress{points+index*8+axis*4},32);};
-            const auto close=[&](){(void)gdi("LineTo",{arg(0),static_cast<std::uint32_t>(start_x),static_cast<std::uint32_t>(start_y)});};
-            for(std::uint32_t i=0;i<count;){
-                const auto kind=kinds[i]&~1U;
-                if(kind==6){(void)gdi("MoveToEx",{arg(0),point(i,0),point(i,1),0});start_x=static_cast<std::int32_t>(point(i,0));start_y=static_cast<std::int32_t>(point(i,1));++i;}
-                else if(kind==2){(void)gdi("LineTo",{arg(0),point(i,0),point(i,1)});if(kinds[i]&1U)close();++i;}
-                else {(void)gdi("PolyBezierTo",{arg(0),points+i*8,3});if(kinds[i+2]&1U)close();i+=3;}
-            }
-            return done(1);
-        }
         if(name=="GetGlyphIndicesA"){
             // ACP 字串轉成 UTF-16 後由 GetGlyphIndicesW 查字型；回傳的索引數為轉換後的字元數。
             const auto count=static_cast<std::int32_t>(u32(2));if(count<0 || (count && !arg(1)))return done(UINT32_MAX);
@@ -173,38 +151,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi32_extra(GuestState& sta
             const auto width=static_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{size},32)));
             return done(static_cast<std::uint32_t>((width/26+1)/2));
         }
-        if(name=="GetTransform"){
-            // 0x203 世界→頁面（世界轉換）、0x304 頁面→裝置（映射模式）、0x204 世界→裝置（兩者合成）。XFORM 為 6 個 FLOAT。
-            const auto kind=u32(1);if(!arg(2))return fail(87);
-            if(kind!=0x203 && kind!=0x304 && kind!=0x204)return fail(87);
-            const auto block=temporary.allocate(64);if(!block)return fail(8);
-            std::array<float,6> world{1,0,0,1,0,0};
-            if(kind!=0x304){if(!gdi("GetWorldTransform",{arg(0),block}))return done(0);for(unsigned i=0;i<6;++i)world[i]=load_float(block+i*4);}
-            if(kind==0x203){for(unsigned i=0;i<6;++i)store_float(arg(2)+i*4,world[i]);return done(1);}
-            if(!gdi("GetViewportExtEx",{arg(0),block}) || !gdi("GetWindowExtEx",{arg(0),block+8}) || !gdi("GetViewportOrgEx",{arg(0),block+16}) || !gdi("GetWindowOrgEx",{arg(0),block+24}))return done(0);
-            const auto integer=[&](unsigned offset){return static_cast<double>(static_cast<std::int32_t>(memory.load(GuestAddress{block+offset},32)));};
-            const double sx=integer(8)!=0.0?integer(0)/integer(8):1.0,sy=integer(12)!=0.0?integer(4)/integer(12):1.0;
-            const double ox=integer(16)-integer(24)*sx,oy=integer(20)-integer(28)*sy;
-            std::array<double,6> page{sx,0,0,sy,ox,oy};
-            if(kind==0x204){
-                // 先世界轉換再頁面轉換：[M11 M12; M21 M22] 依列向量相乘，位移一併套用頁面縮放與原點。
-                page={world[0]*sx,world[1]*sy,world[2]*sx,world[3]*sy,world[4]*sx+ox,world[5]*sy+oy};
-            }
-            for(unsigned i=0;i<6;++i)store_float(arg(2)+i*4,static_cast<float>(page[i]));return done(1);
-        }
-        if(name=="GetCharWidthFloatA" || name=="GetCharWidthFloatW"){
-            // 寬度＝ABC 三段之和；與 GetCharABCWidthsFloat 共用字型度量。
-            const auto first=u32(1),last=u32(2);if(last<first || !arg(3))return fail(87);
-            const auto count=static_cast<std::size_t>(last-first)+1;if(count>65536)return fail(87);
-            const auto block=temporary.allocate(count*12);if(!block)return fail(8);
-            if(!gdi(name.ends_with('W')?"GetCharABCWidthsFloatW":"GetCharABCWidthsFloatA",{arg(0),first,last,block}))return done(0);
-            for(std::size_t i=0;i<count;++i)store_float(arg(3)+i*4,load_float(block+i*12)+load_float(block+i*12+4)+load_float(block+i*12+8));
-            return done(1);
-        }
         if(name=="CreateBitmapIndirect"){
             // BITMAP {LONG bmType, bmWidth, bmHeight, bmWidthBytes; WORD bmPlanes, bmBitsPixel; LPVOID bmBits}：與 CreateBitmap 相同的點陣圖物件。
             if(!arg(0))return fail(87);
             const auto bm=arg(0);
+            if(memory.load(GuestAddress{bm},32))return fail(87);
             return done(gdi("CreateBitmap",{memory.load(GuestAddress{bm+4},32),memory.load(GuestAddress{bm+8},32),memory.load(GuestAddress{bm+16},16),
                                             memory.load(GuestAddress{bm+18},16),memory.load(GuestAddress{bm+(x86_?20U:24U)},bits)}));
         }

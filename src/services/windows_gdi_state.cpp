@@ -16,33 +16,43 @@ std::span<const WindowsServiceDescriptor> gdi_state_service_descriptors(){
         {"gdi32.dll","SetWindowOrgEx",4},{"gdi32.dll","GetWindowOrgEx",2},{"gdi32.dll","OffsetWindowOrgEx",4},
         {"gdi32.dll","SetViewportExtEx",4},{"gdi32.dll","GetViewportExtEx",2},{"gdi32.dll","ScaleViewportExtEx",6},
         {"gdi32.dll","SetWindowExtEx",4},{"gdi32.dll","GetWindowExtEx",2},{"gdi32.dll","ScaleWindowExtEx",6},
+        {"win32u.dll","NtGdiComputeXformCoefficients",1},{"win32u.dll","NtGdiModifyWorldTransform",3,0,0,0x4},
         {"gdi32.dll","LPtoDP",3},{"gdi32.dll","DPtoLP",3},
-        {"gdi32.dll","SaveDC",1},{"gdi32.dll","RestoreDC",2},{"gdi32.dll","GetCurrentObject",2},{"gdi32.dll","GetObjectType",1},
+        {"gdi32.dll","SaveDC",1},{"gdi32.dll","RestoreDC",2},{"gdi32.dll","GetCurrentObject",2},{"win32u.dll","NtGdiGetDCObject",2,0,0,2},{"gdi32.dll","GetObjectType",1},
         {"gdi32.dll","SelectClipRgn",2},{"gdi32.dll","ExtSelectClipRgn",3},{"gdi32.dll","GetClipRgn",2},{"gdi32.dll","GetClipBox",2},
         {"gdi32.dll","IntersectClipRect",5},{"gdi32.dll","ExcludeClipRect",5},{"gdi32.dll","OffsetClipRgn",3},
-        {"gdi32.dll","PtVisible",3},{"gdi32.dll","RectVisible",2},{"gdi32.dll","GetMetaRgn",2},{"gdi32.dll","SetMetaRgn",1},{"gdi32.dll","GetRandomRgn",3}
+        {"gdi32.dll","PtVisible",3},{"gdi32.dll","RectVisible",2},{"gdi32.dll","GetMetaRgn",2},{"gdi32.dll","SetMetaRgn",1},{"gdi32.dll","GetRandomRgn",3},{"win32u.dll","NtGdiGetRandomRgn",3}
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    const WindowsCall arg(state,memory,service);const auto name=service.symbol;
+    const WindowsCall arg(state,memory,service);const bool native_region=service.symbol=="NtGdiGetRandomRgn";
+    const auto name=native_region?std::string_view{"GetRandomRgn"}:service.symbol;
     const auto finish=[&](std::uint64_t result){arg.return_to(state,result);return std::optional<std::uint32_t>{};};
     const auto failure=[&](std::uint32_t error){last_error_=error;return finish(name=="GetClipRgn" || name=="GetRandomRgn" || name.ends_with("Color")?UINT32_MAX:0);};
     const auto integer=[&](unsigned i){return static_cast<std::int32_t>(arg(i));};
     const auto read_transform=[&](std::uint64_t at){GuiTransform m{};for(unsigned i=0;i<6;++i)m[i]=std::bit_cast<float>(static_cast<std::uint32_t>(memory.load(GuestAddress{at+i*4},32)));return m;};
     const auto write_transform=[&](std::uint64_t at,const GuiTransform& m){memory.check(GuestAddress{at},24,Access::Write);for(unsigned i=0;i<6;++i)memory.store(GuestAddress{at+i*4},32,std::bit_cast<std::uint32_t>(static_cast<float>(m[i])));};
-    if(name=="CombineTransform"){if(!arg(0) || !arg(1) || !arg(2))return failure(87);const auto combined=gui_multiply(read_transform(arg(1)),read_transform(arg(2)));if(!gui_valid_transform(combined))return failure(87);write_transform(arg(0),combined);return finish(1);}
+    if(name=="CombineTransform"){
+        if(!arg(0) || !arg(1) || !arg(2))return failure(87);
+        try{
+            const auto combined=gui_multiply(read_transform(arg(1)),read_transform(arg(2)));
+            if(!gui_valid_transform(combined))return failure(87);
+            write_transform(arg(0),combined);
+            return finish(1);
+        }catch(const MemoryFault&){return failure(998);}
+    }
     const auto window=arg(0)>=0x10000000?gui_.windows.find(arg(0)-0x10000000):gui_.windows.end();
     const auto remote=window==gui_.windows.end() && arg(0)>=0x10000000 && gui_.dc_objects.contains(arg(0))?
         shared_gui_window(arg(0)-0x10000000):std::optional<SharedWindowInfo>{};
     const bool known=gui_.contexts.contains(arg(0)) || gui_.dc_objects.contains(arg(0)) || window!=gui_.windows.end();
     if(name=="GetObjectType"){
         const auto h=arg(0);if(gui_.metafiles.contains(h))return finish(13);if(gui_.windows_metafiles.contains(h))return finish(9);if(gui_.emf_recorders.contains(h))return finish(gui_.emf_recorders.at(h).wmf?4:12); // OBJ_METADC／OBJ_ENHMETADC
-        if(known)return finish(is_printer_dc(h) || window!=gui_.windows.end() || (gui_.contexts.contains(h) && gui_.contexts.at(h).display)?3:10);
+        if(known)return finish(is_printer_dc(h) || h==0x10000000 || remote || window!=gui_.windows.end() || (gui_.contexts.contains(h) && gui_.contexts.at(h).display)?3:10);
         if(gui_.bitmaps.contains(h) || h==0xb015)return finish(7);
         if(gui_.regions.contains(h))return finish(8);
         if(gui_.fonts.contains(h) || (h>=0xb00a && h<=0xb00e) || h==0xb010 || h==0xb011)return finish(6);
         if(gui_.brushes.contains(h) || (h>=0xb000 && h<=0xb005) || h==0xb012)return finish(2);
-        if(gui_.extended_pens.contains(h))return finish(11);
+        if(const auto pen=gui_.pen_definitions.find(h);pen!=gui_.pen_definitions.end() && pen->second.extended)return finish(11);
         if(gui_.pens.contains(h) || (h>=0xb006 && h<=0xb008) || h==0xb013)return finish(1);
         if(h==0xb00f || gui_.palettes.contains(h))return finish(5);return failure(6);
     }
@@ -71,6 +81,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
         gui_refresh_dc_clip(value);
     };
     const auto write_rect=[&](std::uint64_t at,const GuiRect& rect){memory.check(GuestAddress{at},16,Access::Write);for(unsigned i=0;i<4;++i)memory.store(GuestAddress{at+i*4},32,static_cast<std::uint32_t>(rect[i]));};
+    const auto device_dimensions=[&]{
+        if(dc.virtual_resolution[0]>0)return dc.virtual_resolution;
+        // 使用 GetDeviceCaps 的同一份顯示器或印表機尺寸。前兩欄是像素，後兩欄是毫米。
+        const auto cap=[&](unsigned index){
+            return static_cast<std::int32_t>(nested_service(state,memory,"gdi32.dll","GetDeviceCaps",{arg(0),index}));
+        };
+        return std::array{cap(8),cap(10),cap(4),cap(6)};
+    };
+    // 等向映射的兩軸必須代表相同實體長度。虛擬裝置可有非正方形像素。
+    const auto adjust_isotropic=[&]{
+        if(dc.map_mode!=7)return;
+        const auto dimensions=device_dimensions();
+        if(std::any_of(dimensions.begin(),dimensions.end(),[](auto n){return n<=0;}))return;
+        std::array<double,2> length{};
+        for(unsigned axis=0;axis<2;++axis){
+            const double pixel=static_cast<double>(dimensions[axis+2])/dimensions[axis];
+            length[axis]=std::abs(static_cast<double>(dc.viewport_extent[axis])/dc.window_extent[axis])*pixel;
+        }
+        if(length[0]==length[1])return;
+        const unsigned axis=length[0]>length[1]?0:1;
+        const auto extent=dc.viewport_extent[axis];
+        const auto scaled=std::round(extent*(length[1-axis]/length[axis]));
+        dc.viewport_extent[axis]=scaled!=0.0?static_cast<std::int32_t>(scaled):(extent<0?-1:1);
+    };
     try{
         if(name=="GetROP2")return finish(dc.rop2);
         if(name=="SetROP2"){if(arg(1)<1 || arg(1)>16)return failure(87);const auto old=dc.rop2;dc.rop2=static_cast<unsigned>(arg(1));return finish(old);}
@@ -83,15 +117,58 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
             if(arg(1)!=1 && arg(1)!=2)return failure(87);if(arg(1)==1 && dc.world!=gui_identity)return failure(87);const auto old=dc.graphics_mode;dc.graphics_mode=static_cast<unsigned>(arg(1));return finish(old);
         }
         if(name=="GetWorldTransform"){if(!arg(1))return failure(87);write_transform(arg(1),dc.world);return finish(1);}
-        if(name=="SetWorldTransform" || name=="ModifyWorldTransform"){
-            if(dc.graphics_mode!=2)return failure(87);const auto mode=name=="SetWorldTransform"?4U:static_cast<unsigned>(arg(2));if(mode<1 || mode>4 || (mode!=1 && !arg(1)))return failure(87);
-            auto changed=mode==1?gui_identity:read_transform(arg(1));if(mode==2)changed=gui_multiply(changed,dc.world);else if(mode==3)changed=gui_multiply(dc.world,changed);
-            if(!gui_valid_transform(changed) || !gui_inverse(changed))return failure(87);dc.world=changed;return finish(1);
+        if(name=="GetTransform"){
+            if(!arg(2))return failure(87);
+            std::optional<GuiTransform> matrix;
+            switch(integer(1)){
+            case 0x203:matrix=dc.world;break;
+            case 0x304:matrix=gui_page_transform(dc);break;
+            case 0x204:matrix=gui_device_transform(dc);break;
+            case 0x402:matrix=gui_inverse(gui_device_transform(dc));break;
+            default:return failure(87);
+            }
+            if(!matrix || !gui_valid_transform(*matrix))return failure(87);
+            write_transform(arg(2),*matrix);
+            return finish(1);
+        }
+        if(name=="NtGdiComputeXformCoefficients"){
+            adjust_isotropic();
+            // 其餘係數直接由 DC 的世界矩陣及目前範圍推導，不另存一份快取。
+            return finish(gui_valid_transform(gui_device_transform(dc)));
+        }
+        if(name=="SetWorldTransform" || name=="ModifyWorldTransform" || name=="NtGdiModifyWorldTransform"){
+            const auto mode=name=="SetWorldTransform"?4U:static_cast<unsigned>(arg(2));
+            const bool native=name=="NtGdiModifyWorldTransform";
+            if(dc.graphics_mode!=2 && (!native || mode==4))return failure(87);
+            if(mode<1 || mode>4 || (mode!=1 && !arg(1)))return failure(87);
+            if(native && mode==1 && arg(1))memory.check(GuestAddress{arg(1)},24,Access::Read);
+            auto changed=mode==1?gui_identity:read_transform(arg(1));
+            if(mode==2)changed=gui_multiply(changed,dc.world);
+            if(mode==3)changed=gui_multiply(dc.world,changed);
+            if(!gui_valid_transform(changed) || ((!native || mode==4) && !gui_inverse(changed)))return failure(87);
+            dc.world=changed;
+            return finish(1);
         }
         if(name=="GetMapMode")return finish(dc.map_mode);
         if(name=="SetMapMode"){
-            if(arg(1)<1 || arg(1)>8)return failure(87);const auto previous=dc.map_mode;dc.map_mode=static_cast<unsigned>(arg(1));
-            if(dc.map_mode==1)dc.window_extent=dc.viewport_extent={1,1};else if(dc.map_mode<=6){constexpr std::array<int,7> units{0,1,254,2540,100,1000,1440};dc.window_extent={units[dc.map_mode],units[dc.map_mode]};dc.viewport_extent={96,-96};}
+            const auto mode=static_cast<unsigned>(arg(1));
+            if(mode<1 || mode>8)return failure(87);
+            const auto previous=dc.map_mode;
+            if(mode==1)dc.window_extent=dc.viewport_extent={1,1};
+            else if(mode<=7 && !(mode==7 && previous==7)){
+                constexpr std::array<int,8> units{0,1,254,2540,100,1000,1440,254};
+                const auto dimensions=device_dimensions();
+                if(std::any_of(dimensions.begin(),dimensions.end(),[](auto n){return n<=0;}))return failure(87);
+                std::array<std::int32_t,2> extent{};
+                for(unsigned axis=0;axis<2;++axis){
+                    const auto value=(static_cast<std::int64_t>(dimensions[axis+2])*units[mode]*10+127)/254;
+                    if(value==0 || value>INT32_MAX)return failure(87);
+                    extent[axis]=static_cast<std::int32_t>(value);
+                }
+                dc.window_extent=extent;
+                dc.viewport_extent={dimensions[0],-dimensions[1]};
+            }
+            dc.map_mode=mode;
             return finish(previous);
         }
         if(name=="LPtoDP" || name=="DPtoLP"){
@@ -103,14 +180,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
         if(name.find("Viewport")!=name.npos || name.find("WindowOrg")!=name.npos || name.find("WindowExt")!=name.npos){
             const bool viewport=name.find("Viewport")!=name.npos,extent=name.find("ExtEx")!=name.npos,get=name.starts_with("Get"),scale=name.starts_with("Scale"),offset=name.starts_with("Offset");
             auto& value=extent?(viewport?dc.viewport_extent:dc.window_extent):(viewport?dc.viewport_origin:dc.window_origin);const auto output=arg(get?1:scale?5:3);if(get && !output)return failure(87);
-            if(output)memory.check(GuestAddress{output},8,Access::Write);auto changed=value;
-            if(!get && !(extent && dc.map_mode<7)){
-                for(unsigned i=0;i<2;++i){double v=integer(1+i);if(scale){const auto denominator=integer(2+i*2);if(!denominator)return failure(87);v=std::round(static_cast<double>(value[i])*integer(1+i*2)/denominator);}else if(offset)v+=value[i];
-                    if(v<INT32_MIN || v>INT32_MAX || (extent && v==0))return failure(87);changed[i]=static_cast<std::int32_t>(v);}
+            if(output){
+                memory.check(GuestAddress{output},8,Access::Write);
+                for(unsigned axis=0;axis<2;++axis)
+                    memory.store(GuestAddress{output+axis*4},32,static_cast<std::uint32_t>(value[axis]));
             }
-            if(output)for(unsigned i=0;i<2;++i)memory.store(GuestAddress{output+i*4},32,static_cast<std::uint32_t>(value[i]));if(!get)value=changed;
-            if(!get && extent && dc.map_mode==7){const double x=std::abs(static_cast<double>(dc.viewport_extent[0])/dc.window_extent[0]),y=std::abs(static_cast<double>(dc.viewport_extent[1])/dc.window_extent[1]);const auto factor=std::min(x,y);
-                for(unsigned i=0;i<2;++i)dc.viewport_extent[i]=static_cast<std::int32_t>(std::copysign(std::max(1.0,std::round(std::abs(static_cast<double>(dc.window_extent[i]))*factor)),dc.viewport_extent[i]));}
+            if(get || (extent && dc.map_mode<7))return finish(1);
+            auto changed=value;
+            for(unsigned axis=0;axis<2;++axis){
+                std::int64_t next=integer(1+axis);
+                if(scale){
+                    const auto numerator=integer(1+axis*2),denominator=integer(2+axis*2);
+                    if(!numerator || !denominator)return failure(87);
+                    next=static_cast<std::int64_t>(value[axis])*numerator/denominator;
+                    if(!next)next=1;
+                }else if(offset)next+=value[axis];
+                if(next<INT32_MIN || next>INT32_MAX || (extent && !next))return failure(87);
+                changed[axis]=static_cast<std::int32_t>(next);
+            }
+            value=changed;
+            if(extent)adjust_isotropic();
             return finish(1);
         }
         if(name=="SaveDC"){
@@ -121,17 +210,48 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
             if(!level || found==gui_.saved_contexts.end())return failure(87);auto& saved=found->second;
             const auto index=level>0?static_cast<std::int64_t>(level)-1:static_cast<std::int64_t>(saved.size())+level;
             if(index<0 || static_cast<std::uint64_t>(index)>=saved.size())return failure(87);
-            auto restored=saved[static_cast<std::size_t>(index)];restored.paint_clip=dc.paint_clip;restored.acquisition_clip=dc.acquisition_clip;restored.acquisition_region=dc.acquisition_region;update(restored);dc=std::move(restored);saved.resize(static_cast<std::size_t>(index));
+            auto restored=saved[static_cast<std::size_t>(index)];restored.copy_count=dc.copy_count;restored.paint_clip=dc.paint_clip;restored.acquisition_clip=dc.acquisition_clip;restored.acquisition_region=dc.acquisition_region;update(restored);dc=std::move(restored);saved.resize(static_cast<std::size_t>(index));
             if(window!=gui_.windows.end()){window->second.text_color=dc.color;window->second.background_mode=dc.mode;}
             gui_.dc_objects[arg(0)]=dc.font;return finish(1);
         }
-        if(name=="GetCurrentObject"){
-            switch(arg(1)){case 1:return finish(dc.pen);case 2:return finish(dc.brush);case 5:return finish(dc.palette);case 6:return finish(dc.font);case 7:return finish(dc.bitmap?dc.bitmap:0xb015);default:return failure(87);}
+        if(name=="GetCurrentObject" || name=="NtGdiGetDCObject"){
+            unsigned type=static_cast<unsigned>(arg(1));
+            if(name=="NtGdiGetDCObject"){
+                // NT 使用 GDI handle 的型別位元；Win32 入口使用 OBJ_*。
+                switch(type){
+                case 0x300000:case 0x500000:type=1;break;
+                case 0x100000:type=2;break;
+                case 0x080000:type=5;break;
+                case 0x0a0000:type=6;break;
+                case 0x050000:type=7;break;
+                case 0x090000:type=14;break;
+                default:return failure(87);
+                }
+            }
+            switch(type){
+            case 1:case 11:return finish(dc.pen);
+            case 2:return finish(dc.brush);
+            case 5:return finish(dc.palette);
+            case 6:return finish(dc.font);
+            case 7:return finish(dc.bitmap?dc.bitmap:0xb015);
+            case 14:return finish(nested_service(state,memory,"gdi32.dll","GetColorSpace",{arg(0)}));
+            default:return failure(87);
+            }
         }
         if(name=="GetClipRgn" || name=="GetMetaRgn" || name=="GetRandomRgn"){
             const auto target=gui_.regions.find(arg(1));if(target==gui_.regions.end())return failure(6);
             if(name=="GetRandomRgn"){
-                if(arg(2)!=4)return failure(87);auto region=visible();
+                const auto selector=integer(2);
+                if(native_region && selector>=1 && selector<=3){
+                    const auto requested=selector==1?dc.application_clip:selector==2?dc.meta_clip:gui_dc_clip(dc,false);
+                    if(!requested)return finish(0);
+                    target->second=*requested;
+                    return finish(1);
+                }
+                if(selector!=4)return failure(87);
+                auto region=visible();
+                if(dc.acquisition_clip)region=gui_region_combine(region,*dc.acquisition_clip,1);
+                if(dc.paint_clip)region=gui_region_combine(region,*dc.paint_clip,1);
                 if(window!=gui_.windows.end() || remote){const auto origin=remote?std::array<std::int64_t,2>{remote->client_x,remote->client_y}:gui_client_origin(gui_,window->first);for(auto& r:region)for(unsigned i=0;i<4;++i){const auto value=static_cast<std::int64_t>(r[i])+origin[i%2];if(value<INT32_MIN || value>INT32_MAX)return failure(87);r[i]=static_cast<std::int32_t>(value);}}
                 target->second=std::move(region);return finish(1);
             }
@@ -155,7 +275,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
             }
             changed.application_clip=gui_region_combine(dc.application_clip.value_or(visible()),region,4);
         }
-        else if(name=="SetMetaRgn"){changed.meta_clip=gui_dc_clip(dc,false).value_or(visible());changed.application_clip.reset();}
+        else if(name=="SetMetaRgn"){changed.meta_clip=gui_dc_clip(dc,false);changed.application_clip.reset();}
         else if(name=="SelectClipRgn" || name=="ExtSelectClipRgn"){
             const auto mode=name=="SelectClipRgn"?5:static_cast<unsigned>(arg(2));
             if(mode<1 || mode>5 || (!arg(1) && mode!=5))return failure(87);
@@ -170,6 +290,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
             changed.application_clip=gui_region_combine(dc.application_clip.value_or(visible()),region,name=="IntersectClipRect"?1:4);
         }
         update(changed);const auto kind=gui_region_kind(effective(changed,false));dc=std::move(changed);return finish(kind);
+    }catch(const MemoryFault&){
+        if(name=="RectVisible" || name=="GetClipBox")return finish(0);
+        if(name=="GetTransform" || name.ends_with("WorldTransform") || name.ends_with("ExtEx"))return failure(998);
+        throw;
     }catch(const std::bad_alloc&){return failure(8);}catch(const std::length_error&){return failure(8);}
 }
 }

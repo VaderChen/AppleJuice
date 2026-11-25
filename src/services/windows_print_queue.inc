@@ -72,7 +72,7 @@ if(name.starts_with("AddJob")){
     // (hPrinter, Level, pData, cbBuf, pcbNeeded)：ADDJOB_INFO_1 {Path, JobId}；應用程式寫入 Path 後呼叫 ScheduleJob。
     const auto found=printing_->handles.find(arg(0));if(found==printing_->handles.end())return fail(6);auto& device=found->second;
     if(!(device.access&8U) || device.read_job)return fail(5);if(d(1)!=1)return fail(124);if(!arg(4))return fail(87);
-    if(device.active)return fail(1906);if(!filesystem_.writable())return fail(5);if(printing_->next_job>INT32_MAX)return fail(8);
+    if(device.active)return fail(1906);if(!filesystem_.writable())return fail(5);if(printing_->available_job()>INT32_MAX)return fail(8);
     const auto job=printing_->next_job;const auto path=spool_directory()+spool_name(job);
     PrinterBuffer buffer(x86_?8:16,arg(2),x86_,wide);buffer.text(0,path);buffer.put(unit,job);
     memory.store(GuestAddress{arg(4)},32,buffer.bytes.size());if(d(3)<buffer.bytes.size())return fail(122);if(!arg(2))return fail(87);

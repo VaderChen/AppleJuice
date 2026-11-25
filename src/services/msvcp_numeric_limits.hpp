@@ -3,6 +3,7 @@
 #include "msvcp_numeric_values.h"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -90,7 +91,7 @@ inline auto descriptors(){
     }
     return out;
 }
-struct Constant {std::string name;std::uint64_t value;unsigned bytes;};
+struct Constant {std::string name;std::uint64_t value;unsigned bytes;unsigned architectures=3;};
 inline const std::vector<Constant>& constants(){
     static const auto values=[] {
         std::vector<Constant> out;
@@ -143,6 +144,24 @@ inline std::span<const Constant> module_constants(std::string_view library){
         }
         for(const auto library_name:{"msvcp110.dll","msvcp120.dll","msvcp140.dll"})
             result[library_name].push_back({"?_BADOFF@std@@3_JB",UINT64_MAX,8});
+        // 複數對數的 ln(2) 高位與幅值的 √2、1+√2 高低位，以真正的浮點資料匯出。
+        for(const bool single:{true,false}){
+            const std::string type=single?"M":"N";
+            const auto constant=[&](std::string name,double value,unsigned architectures){
+                const auto raw=single?static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(static_cast<float>(value))):std::bit_cast<std::uint64_t>(value);
+                return Constant{std::move(name),raw,single?4U:8U,architectures};
+            };
+            const auto log_name="?_Cm@?5???$log@"+type+"@std@@YA?AV?$complex@"+type+"@1@AEBV21@@Z@4"+type+"B";
+            for(const auto library_name:{"msvcp60.dll","msvcp80.dll","msvcp90.dll"})
+                result[library_name].push_back(constant(log_name,22713.0/32768.0,2));
+            for(const bool x86:{true,false}){
+                const auto suffix="@?BN@???$_Fabs@"+type+"@std@@YA"+type+(x86?"ABV":"AEBV")+
+                    "?$complex@"+type+"@1@"+(x86?"PAH":"PEAH")+"@Z@4"+type+"B";
+                for(const auto& [name,value]:std::array<std::pair<const char*,double>,3>{{
+                        {"?_R2",1.4142135623730950488},{"?_Xh",10125945.0/4194304.0},{"?_Xl",1.4341252375973918872e-7}}})
+                    result["msvcp60.dll"].push_back(constant(name+suffix,value,x86?1U:2U));
+            }
+        }
         return result;
     }();
     const auto found=modules.find(library);

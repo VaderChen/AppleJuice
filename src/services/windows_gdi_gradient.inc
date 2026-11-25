@@ -33,6 +33,13 @@
                     }
                     const auto source=make_hardware_raster(static_cast<std::uint32_t>(width),static_cast<std::uint32_t>(height));source->set_dib_alpha(true);source->upload(pixels,true);
                     destination->blit(*source,rect,{0,0,width,height},device,0x01ff0000U);
+                    if(dc.bounds_enabled){
+                        GuiDraw draw;
+                        draw.kind=GuiDraw::Kind::Fill;
+                        draw.device_coordinates=true;
+                        draw.x=rect[0];draw.y=rect[1];draw.right=rect[2];draw.bottom=rect[3];
+                        accumulate_dc_bounds(dc,draw);
+                    }
                 }
                 if(window!=gui_.windows.end())present_gui(window->first);
             }

@@ -9,6 +9,8 @@
 #include "x64arm/windows_palette.hpp"
 #include "x64arm/windows_fonts.hpp"
 #include "gdi_batch_layout.h"
+#include "gdi_ddb.hpp"
+#include "windows_icm_store.hpp"
 #include <unicode/utf8.h>
 #include <algorithm>
 #include <bit>
@@ -20,6 +22,22 @@ namespace x64arm {
 namespace {
 bool trace_gdi_calls(){static const bool enabled=std::getenv("X64ARM_TRACE_GDI_CALLS")!=nullptr;return enabled;}
 double trace_gdi_time(){return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();}
+// DDB 的單色位元在 ROP 前轉換。以透明色鍵保留符合的像素，其餘像素由 PATCOPY 上色。
+std::shared_ptr<RasterSurface> map_blit_colors(RasterSurface& source,std::uint32_t key,std::uint32_t match,std::uint32_t other){
+    auto mapped=make_hardware_raster(source.width(),source.height());
+    if(!mapped)throw std::bad_alloc{};
+    const GuiRect bounds{0,0,static_cast<std::int32_t>(source.width()),static_cast<std::int32_t>(source.height())};
+    GuiDraw fill;fill.kind=GuiDraw::Kind::Fill;fill.right=bounds[2];fill.bottom=bounds[3];fill.color=match;
+    mapped->draw(fill);
+    RasterBlit paint;paint.operation=0xf0;paint.transparent=key;paint.brush.color=other;
+    mapped->blit(source,bounds,bounds,GuiDc{},UINT32_MAX,paint);
+    return mapped;
+}
+std::optional<GuiRect> blit_rect(std::int32_t x,std::int32_t y,std::int32_t width,std::int32_t height){
+    const auto right=static_cast<std::int64_t>(x)+width,bottom=static_cast<std::int64_t>(y)+height;
+    if(right<INT32_MIN || right>INT32_MAX || bottom<INT32_MIN || bottom>INT32_MAX)return std::nullopt;
+    return GuiRect{x,y,static_cast<std::int32_t>(right),static_cast<std::int32_t>(bottom)};
+}
 void logical_clip(GuiDraw& draw,const GuiDc& dc,const GuiRect& rect){
     auto region=gui_transform_region_rect(gui_device_transform(dc),rect);
     if(dc.clipped)region=gui_region_combine(region,GuiRegion{dc.clip},1);
@@ -231,16 +249,70 @@ void WindowsServices::sync_raster_bitmap(GuestMemory& memory,std::uint64_t handl
         bitmap.pixels=surface->second->snapshot().pixels;bitmap.resource_id=0;export_dib_bitmap(memory,handle);
     }
 }
+std::uint64_t WindowsServices::create_pattern_brush(GuestState& state,GuestMemory& memory,GuiBitmap pattern,
+        std::span<const std::uint8_t> bits,std::uint64_t source,std::optional<std::uint32_t> dib_usage){
+    const auto handle=gui_.next_object;
+    // 筆刷獨立擁有原始列，保留重複色盤索引、未使用的位元及列填充。
+    const auto backing=bits.empty()?0:allocate_heap(memory,bits.size());
+    if(!bits.empty() && !backing)throw std::bad_alloc();
+    try{
+        if(backing)memory.write(GuestAddress{backing},bits);
+        pattern.dib_address=backing;
+        gui_.brush_patterns.emplace(handle,std::move(pattern));
+        if(dib_usage)gui_.brush_dib_patterns.emplace(handle,std::array<std::uint64_t,2>{*dib_usage,source});
+        else gui_.brush_pattern_sources.emplace(handle,source);
+        gui_.brushes.emplace(handle,0);
+    }catch(...){
+        gui_.brush_patterns.erase(handle);gui_.brush_dib_patterns.erase(handle);gui_.brush_pattern_sources.erase(handle);
+        if(backing)(void)free_heap(memory,backing,state);
+        throw;
+    }
+    ++gui_.next_object;
+    return handle;
+}
+
+std::shared_ptr<RasterSurface> WindowsServices::gdi_translated_brush(std::uint64_t brush,std::uint64_t hdc) const{
+    if(!icm_profiles_)return {};
+    const auto entry=icm_profiles_->brush_translations.find({brush,hdc});
+    if(entry==icm_profiles_->brush_translations.end())return {};
+    const auto context=gui_.contexts.find(hdc);
+    if(context==gui_.contexts.end() || context->second.color_space!=entry->second.color_space ||
+       context->second.icm_profile!=entry->second.profile)return {};
+    return entry->second.surface;
+}
+std::shared_ptr<RasterSurface> WindowsServices::gdi_brush_raster(std::uint64_t handle,std::uint64_t hdc,GuiDraw& draw){
+    const auto found=gui_.brush_patterns.find(handle);
+    if(found==gui_.brush_patterns.end())return {};
+    const auto& dc=gui_.contexts.at(hdc);
+    if(dc.icm_mode==2){
+        if(auto translated=gdi_translated_brush(handle,hdc)){
+            draw.pattern_brush=handle;draw.pattern_monochrome=false;return translated;
+        }
+    }
+    const auto& pattern=found->second;
+    const auto dib=gui_.brush_dib_patterns.find(handle);
+    draw.pattern_brush=handle;
+    draw.pattern_monochrome=pattern.bits_per_pixel==1 && dib==gui_.brush_dib_patterns.end();
+    if(dib!=gui_.brush_dib_patterns.end() && dib->second[0] && pattern.bits_per_pixel<=8){
+        // DIB_PAL_COLORS 保留的是邏輯色盤索引，每個目的 DC 可以選入不同的色盤。
+        auto colors=pattern.pixels;
+        for(auto& color:colors)color=gui_resolve_color(gui_,dc,0x01000000U|(color&0xffffU));
+        return make_hardware_raster(pattern.width,pattern.height,colors);
+    }
+    const auto cached=rasters_.find(handle);
+    if(cached!=rasters_.end())return cached->second;
+    auto surface=make_hardware_raster(pattern.width,pattern.height,pattern.pixels);
+    rasters_.emplace(handle,surface);
+    return surface;
+}
+
 bool WindowsServices::raster_draw(GuestMemory& memory,std::uint64_t dc,GuiDraw& draw){
     gui_resolve_draw_colors(gui_,gui_.contexts.at(dc),draw);
     if(!draw.device_coordinates)draw.transform=gui_device_transform(gui_.contexts.at(dc));
     accumulate_dc_bounds(gui_.contexts.at(dc),draw);
     if(record_metafile_draw(dc,draw))return true;
     const auto surface=raster_surface(memory,dc);if(!surface)return false;
-    std::shared_ptr<RasterSurface> pattern;
-    if(draw.pattern_brush){const auto& bitmap=gui_.brush_patterns.at(draw.pattern_brush);const auto cached=rasters_.find(draw.pattern_brush);
-        if(cached==rasters_.end()){pattern=make_hardware_raster(bitmap.width,bitmap.height,bitmap.pixels);rasters_.emplace(draw.pattern_brush,pattern);}else pattern=cached->second;
-    }
+    const auto pattern=gdi_brush_raster(draw.pattern_brush,dc,draw);
     surface->draw(draw,pattern.get());if(native_gui_ && draw.kind==GuiDraw::Kind::Text && dc>=0x10000000)native_gui_->graphics_text(dc-0x10000000,draw);return true;
 }
 std::span<const WindowsServiceDescriptor> gdi_service_descriptors(){
@@ -252,11 +324,21 @@ std::span<const WindowsServiceDescriptor> gdi_service_descriptors(){
         {"user32.dll","FillRect",3},{"user32.dll","FrameRect",3},{"user32.dll","InvertRect",2},{"user32.dll","DrawFocusRect",2},{"user32.dll","DrawEdge",4},{"user32.dll","DrawFrameControl",4},{"gdi32.dll","GdiFlush",0},{"gdi32.dll","BitBlt",9},{"gdi32.dll","StretchBlt",11},{"msimg32.dll","AlphaBlend",11},{"gdi32.dll","GdiAlphaBlend",11},{"msimg32.dll","TransparentBlt",11},{"gdi32.dll","PatBlt",6},{"gdi32.dll","CreateHatchBrush",2},{"gdi32.dll","Ellipse",5},
         {"user32.dll","DrawIcon",4},{"user32.dll","DrawIconEx",9},
         {"gdi32.dll","SetStretchBltMode",2},{"gdi32.dll","GetStretchBltMode",1},
+        {"win32u.dll","NtGdiSetTextJustification",3,0,0,6},
         {"gdi32.dll","SetTextCharacterExtra",2,0,0,2},{"gdi32.dll","SetTextJustification",3,0,0,6},{"gdi32.dll","GetTextCharacterExtra",1},{"gdi32.dll","SetRelAbs",2,0,0,2},{"gdi32.dll","GetRelAbs",2,0,0,2},
         {"gdi32.dll","SetMapperFlags",2,0,0,2},{"gdi32.dll","GetAspectRatioFilterEx",2},{"gdi32.dll","SetICMMode",2,0,0,2},
         {"gdi32.dll","SetColorAdjustment",2},{"gdi32.dll","GetColorAdjustment",2},{"gdi32.dll","SetSystemPaletteUse",2,0,0,2},{"gdi32.dll","GetSystemPaletteUse",1},
-        {"gdi32.dll","SetBitmapDimensionEx",4,0,0,6},{"gdi32.dll","GetBitmapDimensionEx",2},{"gdi32.dll","GetRasterizerCaps",2,0,0,2},{"gdi32.dll","SetBrushOrgEx",4},{"gdi32.dll","GetBrushOrgEx",2},{"gdi32.dll","CreatePatternBrush",1},
+        {"gdi32.dll","SetBitmapDimensionEx",4,0,0,6},{"gdi32.dll","GetBitmapDimensionEx",2},{"gdi32.dll","GetRasterizerCaps",2,0,0,2},{"win32u.dll","NtGdiGetRasterizerCaps",2,0,0,2},{"gdi32.dll","SetBrushOrgEx",4},{"gdi32.dll","GetBrushOrgEx",2},{"gdi32.dll","CreatePatternBrush",1},
+        {"win32u.dll","NtGdiCreateBitmap",5,0,0,0xf},{"win32u.dll","NtGdiCreateCompatibleBitmap",3,0,0,6},
+        {"win32u.dll","NtGdiCreateDIBSection",9,0,0,0x74},
+        {"win32u.dll","NtGdiCreatePaletteInternal",2,0,0,0x2},{"win32u.dll","NtGdiDoPalette",6,0,0,0x36},
+        {"win32u.dll","NtGdiSelectBitmap",2},{"win32u.dll","NtGdiSelectBrush",2},
+        {"win32u.dll","NtGdiSelectPen",2},{"win32u.dll","NtGdiSelectFont",2},
+        {"win32u.dll","NtGdiGetDCforBitmap",1},{"win32u.dll","NtGdiDeleteObjectApp",1},
+        {"win32u.dll","NtGdiCreateSolidBrush",2,0,0,1},{"win32u.dll","NtGdiCreateHatchBrushInternal",3,0,0,7},
+        {"win32u.dll","NtGdiCreatePatternBrushInternal",3,0,0,6},
         {"gdi32.dll","GetBitmapBits",3},{"gdi32.dll","SetBitmapBits",3},{"gdi32.dll","CreateBrushIndirect",1},
+        {"win32u.dll","NtGdiGetDeviceGammaRamp",2},{"win32u.dll","NtGdiSetDeviceGammaRamp",2},
         {"gdi32.dll","GetDeviceGammaRamp",2},{"gdi32.dll","SetDeviceGammaRamp",2},
         {"gdi32.dll","SelectPalette",3},{"gdi32.dll","RealizePalette",1},{"gdi32.dll","CreatePalette",1},
         {"gdi32.dll","GetPaletteEntries",4},{"gdi32.dll","SetPaletteEntries",4},{"gdi32.dll","ResizePalette",2},
@@ -268,14 +350,22 @@ std::span<const WindowsServiceDescriptor> gdi_service_descriptors(){
         {"gdi32.dll","CreateBitmap",5},{"gdi32.dll","CreateDIBSection",6},{"gdi32.dll","TranslateCharsetInfo",3},{"gdi32.dll","CreateDCA",4},{"gdi32.dll","CreateDCW",4},{"gdi32.dll","CreateICA",4},{"gdi32.dll","CreateICW",4},{"gdi32.dll","CreateCompatibleDC",1},{"gdi32.dll","DeleteDC",1},{"gdi32.dll","CreateCompatibleBitmap",3},
         {"gdi32.dll","SelectObject",2},{"gdi32.dll","DeleteObject",1},{"gdi32.dll","SetTextAlign",2},{"gdi32.dll","SetTextColor",2},{"gdi32.dll","SetBkColor",2},{"gdi32.dll","SetBkMode",2},
         {"msimg32.dll","GradientFill",6,0,0,52},{"gdi32.dll","GdiGradientFill",6,0,0,52},
+        {"win32u.dll","NtGdiBitBlt",11,0,0,0x7de},{"win32u.dll","NtGdiStretchBlt",12,0,0,0xfde},
+        {"win32u.dll","NtGdiAlphaBlend",12,0,0,0x7de},
         {"gdi32.dll","ExtTextOutA",8},{"gdi32.dll","ExtTextOutW",8},{"gdi32.dll","TextOutA",5},{"gdi32.dll","TextOutW",5},
         {"gdi32.dll","GetPixel",3},{"gdi32.dll","SetPixel",4},{"gdi32.dll","MoveToEx",4},{"gdi32.dll","LineTo",3},{"gdi32.dll","Polyline",3},
-        {"gdi32.dll","CreatePen",3},{"gdi32.dll","Rectangle",5},
+        {"gdi32.dll","Rectangle",5},
         {"gdi32.dll","GdiGetBatchLimit",0},{"gdi32.dll","GdiSetBatchLimit",1}
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};const auto si=[&](unsigned i){return std::bit_cast<std::int32_t>(d(i));};std::uint64_t result=0;
+    const WindowsCall arg(state,memory,service);auto symbol=service.symbol;const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};const auto si=[&](unsigned i){return std::bit_cast<std::int32_t>(d(i));};std::uint64_t result=0;
+    const bool nt_bit=symbol=="NtGdiBitBlt",nt_stretch=symbol=="NtGdiStretchBlt";
+    if(nt_bit || nt_stretch || symbol=="NtGdiAlphaBlend" || symbol=="NtGdiCreateBitmap" || symbol=="NtGdiCreateCompatibleBitmap")symbol.remove_prefix(5);
+    if(symbol=="NtGdiCreateHatchBrushInternal")symbol="CreateHatchBrush";
+    if(symbol=="NtGdiCreatePatternBrushInternal")symbol="CreatePatternBrush";
+    if(symbol=="NtGdiGetDeviceGammaRamp" || symbol=="NtGdiSetDeviceGammaRamp")symbol.remove_prefix(5);
+    if(symbol=="NtGdiGetRasterizerCaps")symbol="GetRasterizerCaps";
     if(trace_gdi_calls()){
         std::fprintf(stderr,"[gdi-call] unix=%.6f pid=%llu thread=%llu action=%.*s",trace_gdi_time(),static_cast<unsigned long long>(process_id()),static_cast<unsigned long long>(threads_.current),static_cast<int>(symbol.size()),symbol.data());
         for(unsigned i=0;i<std::min(service.arguments,12U);++i)std::fprintf(stderr," a%u=%llx",i,static_cast<unsigned long long>(arg(i)));
@@ -284,6 +374,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
     try {
     const auto window=arg(0)>=0x10000000?gui_.windows.find(arg(0)-0x10000000):gui_.windows.end();
     const bool known_dc=arg(0) && (gui_.contexts.contains(arg(0)) || gui_.dc_objects.contains(arg(0)) || window!=gui_.windows.end());
+    if(symbol=="NtGdiCreateSolidBrush"){
+        result=nested_service(state,memory,"gdi32.dll","CreateSolidBrush",{d(0)});
+        arg.return_to(state,result);return std::nullopt;
+    }
+    if(symbol=="NtGdiGetDCforBitmap"){
+        if(gui_.bitmaps.contains(arg(0))){
+            for(const auto& [handle,context]:gui_.contexts){
+                if(context.bitmap==arg(0)){result=handle;break;}
+            }
+        }
+        arg.return_to(state,result);
+        return std::nullopt;
+    }
+    if(symbol=="NtGdiDeleteObjectApp")
+        symbol=known_dc?"DeleteDC":"DeleteObject";
+    const bool native_palette=service.symbol=="NtGdiDoPalette";
+    if(native_palette){
+        // iFunc 決定來源物件、資料格式及讀寫方向；start 和 count 只有低 16 位有效。
+        constexpr std::array<std::string_view,6> operations{
+            "AnimatePalette","SetPaletteEntries","GetPaletteEntries","GetSystemPaletteEntries",
+            "GetDIBColorTable","SetDIBColorTable"};
+        if(d(4)>=operations.size()){arg.return_to(state,0);return std::nullopt;}
+        symbol=operations[d(4)];
+    }
 #include "gdi_palette_handlers.inc"
     const bool uses_dc=symbol!="GdiFlush" && symbol!="GdiGetBatchLimit" && symbol!="GdiSetBatchLimit" && symbol!="CreateBrushIndirect" && symbol!="CreateHatchBrush" && symbol!="CreatePatternBrush" && symbol!="CreateBitmap" && symbol!="CreateDIBSection" && symbol!="CreatePen" && symbol!="DeleteObject" && symbol!="TranslateCharsetInfo" && symbol!="CreateDCA" && symbol!="CreateDCW" && symbol!="CreateICA" && symbol!="CreateICW" && symbol!="CreateCompatibleDC" && symbol!="DeleteDC" && symbol!="GetBitmapBits" && symbol!="SetBitmapBits";
     // 非 HDC 參數、未知 handle 與 DeleteDC 使用局部狀態，不能讓查詢製造有效 DC。
@@ -293,7 +407,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
     if(window!=gui_.windows.end() && !gui_.dc_objects.contains(arg(0))) {dc.color=window->second.text_color;dc.mode=window->second.background_mode;}
     const bool text_calculation=symbol.starts_with("DrawText") && (d(4)&0x400U) && (symbol.starts_with("DrawTextEx") || !(d(4)&0x80U));
     if(is_printer_dc(arg(0)) && !printer_drawing_enabled(arg(0)) && (symbol=="FillRect" || symbol=="FrameRect" || symbol=="InvertRect" || symbol=="DrawFocusRect" || symbol=="DrawEdge" || symbol=="DrawFrameControl" || symbol=="SetPixel" || symbol=="LineTo" || symbol=="Polyline" || symbol=="Rectangle" || symbol=="Ellipse" || symbol.find("Blt")!=symbol.npos || symbol.find("Blend")!=symbol.npos || symbol.starts_with("TextOut") || symbol.starts_with("ExtTextOut") || (symbol.starts_with("DrawText") && !text_calculation) || symbol.starts_with("TabbedTextOut") || symbol.starts_with("DrawIcon")) && !prepare_legacy_printer_page(memory,arg(0))){arg.return_to(state,symbol=="SetPixel"?UINT32_MAX:0);return std::nullopt;}
-    if(gui_.extended_pens.contains(dc.pen) && (symbol=="LineTo" || symbol=="Polyline" || symbol=="Rectangle" || symbol=="Ellipse"))return invoke_gdi_path(state,memory,service);
+    if(const auto pen=gui_.pen_definitions.find(dc.pen);pen!=gui_.pen_definitions.end() && (pen->second.extended || pen->second.style!=0) && (symbol=="LineTo" || symbol=="Polyline" || symbol=="Rectangle" || symbol=="Ellipse"))return invoke_gdi_path(state,memory,service);
     if(dc.path.state==1){
         if(symbol=="MoveToEx" || symbol=="LineTo" || symbol=="Polyline" || symbol=="Rectangle" || symbol=="Ellipse")return invoke_gdi_path(state,memory,service);
         if(symbol.starts_with("TextOut") || symbol.starts_with("ExtTextOut") || (symbol.starts_with("DrawText") && !text_calculation) || symbol.starts_with("TabbedTextOut")){last_error_=50;arg.return_to(state,0);return std::nullopt;}
@@ -305,9 +419,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
         const bool set=symbol=="SetDIBColorTable";const auto selected=gui_.bitmaps.find(dc.bitmap);
         if(!known_dc)last_error_=6;
         else if(selected==gui_.bitmaps.end() || !selected->second.dib_address || selected->second.bits_per_pixel>8)last_error_=87;
-        else {auto& bitmap=selected->second;const auto start=d(1);
+        else {auto& bitmap=selected->second;const auto start=native_palette?static_cast<std::uint16_t>(d(1)):d(1);
             if(start<bitmap.dib_palette.size()){
-                const auto count=std::min<std::size_t>(d(2),bitmap.dib_palette.size()-start);
+                const auto count=std::min<std::size_t>(native_palette?static_cast<std::uint16_t>(d(2)):d(2),bitmap.dib_palette.size()-start);
                 if(count && !arg(3))last_error_=87;
                 else if(count){
                     memory.check(GuestAddress{arg(3)},count*4,set?Access::Read:Access::Write);
@@ -329,7 +443,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
     }else if(symbol=="GetDeviceGammaRamp" || symbol=="SetDeviceGammaRamp"){
         if(!known_dc)last_error_=6;
         else if(!arg(1))last_error_=87;
-        else if(is_printer_dc(arg(0)) || (!dc.display && !gui_.dc_objects.contains(arg(0)) && window==gui_.windows.end()) || !native_gui_)last_error_=50;
+        else if(is_printer_dc(arg(0)) || (!dc.display && arg(0)!=0x10000000 && window==gui_.windows.end()) || !native_gui_)last_error_=50;
         else {
             if(!runtime_.network.external_io)throw HostCallFault("原生 gamma ramp 不支援 deterministic compare");
             const bool set=symbol=="SetDeviceGammaRamp";memory.check(GuestAddress{arg(1)},1536,set?Access::Read:Access::Write);
@@ -368,13 +482,33 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
             else last_error_=style==8?50:87;
         }
     }
-    else if(symbol=="CreateHatchBrush"){if(d(0)>5)last_error_=87;else{result=gui_.next_object++;gui_.brushes[result]=d(1);gui_.brush_hatches[result]=si(0);}}
+    else if(symbol=="CreateHatchBrush"){
+        if(d(0)>=12)last_error_=87;
+        else if(d(0)>=6)result=nested_service(state,memory,"gdi32.dll","CreateSolidBrush",{d(1)});
+        else{
+            result=gui_.next_object;
+            gui_.brush_hatches.emplace(result,si(0));
+            try{gui_.brushes.emplace(result,d(1));}catch(...){gui_.brush_hatches.erase(result);throw;}
+            ++gui_.next_object;
+        }
+    }
     else if(symbol=="CreatePatternBrush"){
-        const auto bitmap=gui_.bitmaps.find(arg(0));if(bitmap==gui_.bitmaps.end())last_error_=6;
-        else {sync_raster_bitmap(memory,arg(0));GuiBitmap copy{bitmap->second.width,bitmap->second.height,bitmap->second.pixels};copy.bits_per_pixel=bitmap->second.bits_per_pixel;
-            const auto handle=gui_.next_object;gui_.brush_patterns.emplace(handle,std::move(copy));gui_.brush_pattern_sources[handle]=arg(0);
-            try{gui_.brushes.emplace(handle,0);}catch(...){gui_.brush_patterns.erase(handle);throw;}
-            result=handle;++gui_.next_object;
+        const auto bitmap=gui_.bitmaps.find(arg(0));
+        if(bitmap==gui_.bitmaps.end())last_error_=6;
+        else{
+            sync_raster_bitmap(memory,arg(0));
+            const auto& model=bitmap->second;
+            GuiBitmap copy{model.width,model.height,model.pixels};
+            copy.bits_per_pixel=model.bits_per_pixel;copy.dib_masks=model.dib_masks;
+            copy.dib_palette=model.dib_palette;copy.dib_compression=model.dib_compression;
+            copy.stride=(model.width*model.bits_per_pixel+31)/32*4;
+            copy.signed_height=model.signed_height;
+            std::vector<std::uint8_t> raw;
+            if(model.dib_address){
+                raw.resize(static_cast<std::size_t>(copy.stride)*copy.height);
+                memory.read(GuestAddress{model.dib_address},raw);
+            }
+            result=create_pattern_brush(state,memory,std::move(copy),raw,arg(0),std::nullopt);
         }
     }
     else if(symbol=="GetBitmapBits" || symbol=="SetBitmapBits"){
@@ -424,7 +558,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
         if(!known_dc){last_error_=6;result=0x80000000U;}
         else {result=static_cast<std::uint32_t>(dc.char_extra);if(symbol.starts_with("Set"))dc.char_extra=si(1);}
     }
-    else if(symbol=="SetTextJustification"){
+    else if(symbol=="SetTextJustification" || symbol=="NtGdiSetTextJustification"){
         // (hdc, nBreakExtra, nBreakCount)：斷字數 0 即取消對齊；分攤方式與字元間距共用 gui_text_spacing。
         if(!known_dc){last_error_=6;result=0;}
         else {dc.break_count=std::max(si(2),0);dc.break_extra=dc.break_count?si(1):0;result=1;}
@@ -449,7 +583,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
     else if(symbol=="SetColorAdjustment" || symbol=="GetColorAdjustment"){
         // COLORADJUSTMENT（24 位元組）：StretchBlt 的 HALFTONE 模式使用；設定時依文件範圍檢查各欄位。
         if(!known_dc)last_error_=6;else if(!arg(1))last_error_=87;
-        else if(symbol=="GetColorAdjustment"){for(unsigned i=0;i<12;++i)memory.store(GuestAddress{arg(1)+2*i},16,dc.color_adjustment[i]);result=1;}
+        else if(symbol=="GetColorAdjustment"){memory.check(GuestAddress{arg(1)},24,Access::Write);for(unsigned i=0;i<12;++i)memory.store(GuestAddress{arg(1)+2*i},16,dc.color_adjustment[i]);result=1;}
         else {
             std::array<std::uint16_t,12> value{};for(unsigned i=0;i<12;++i)value[i]=static_cast<std::uint16_t>(memory.load(GuestAddress{arg(1)+2*i},16));
             const auto in=[](std::int32_t v,std::int32_t low,std::int32_t high){return v>=low && v<=high;};const auto signed_at=[&](unsigned i){return static_cast<std::int32_t>(static_cast<std::int16_t>(value[i]));};
@@ -461,6 +595,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
     else if(symbol=="SetSystemPaletteUse" || symbol=="GetSystemPaletteUse"){
         // SYSPAL_STATIC 1、NOSTATIC 2、NOSTATIC256 3；系統範圍的設定，失敗回 SYSPAL_ERROR（0）。
         if(!known_dc)last_error_=6;else if(symbol=="SetSystemPaletteUse" && (d(1)<1 || d(1)>3))last_error_=87;
+        else if(!(nested_service(state,memory,"gdi32.dll","GetDeviceCaps",{arg(0),38}) & 0x100))last_error_=50;
         else {result=gui_.system_palette_use;if(symbol=="SetSystemPaletteUse")gui_.system_palette_use=d(1);}
     }
     else if(symbol=="SetBitmapDimensionEx" || symbol=="GetBitmapDimensionEx"){
@@ -468,14 +603,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
         const auto found=gui_.bitmaps.find(arg(0));const auto output=arg(symbol.starts_with("Set")?3:1);
         if(found==gui_.bitmaps.end())last_error_=6;
         else {
-            if(output){memory.store(GuestAddress{output},32,static_cast<std::uint32_t>(found->second.dimension[0]));memory.store(GuestAddress{output+4},32,static_cast<std::uint32_t>(found->second.dimension[1]));}
+            if(output){memory.check(GuestAddress{output},8,Access::Write);memory.store(GuestAddress{output},32,static_cast<std::uint32_t>(found->second.dimension[0]));memory.store(GuestAddress{output+4},32,static_cast<std::uint32_t>(found->second.dimension[1]));}
             if(symbol.starts_with("Set"))found->second.dimension={si(1),si(2)};
             result=symbol.starts_with("Set") || output?1:0;if(!result)last_error_=87;
         }
     }
     else if(symbol=="GetRasterizerCaps"){
         // RASTERIZER_STATUS：nSize 6、wFlags＝TT_AVAILABLE｜TT_ENABLED、nLanguageID 0；只複製呼叫端給的大小。
-        if(!arg(0))last_error_=87;
+        if(!arg(0) || !d(1))last_error_=87;
         else {const std::array<std::uint8_t,6> status{6,0,3,0,0,0};memory.write(GuestAddress{arg(0)},std::span(status).first(std::min<std::size_t>(d(1),6)));result=1;}
     }
     else if(symbol=="SetStretchBltMode" || symbol=="GetStretchBltMode"){
@@ -495,11 +630,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
         const auto mode=d(pat?5:stretch?10:8),rop=alpha || transparent?0xccU:(mode>>16)&255U;
         const bool reads_source=((rop^(rop>>2))&0x33U)!=0,reads_pattern=((rop^(rop>>4))&15U)!=0;
         const auto sx=pat?0:si(6),sy=pat?0:si(7),sw=stretch?si(8):si(3),sh=stretch?si(9):si(4);
-        const auto end=[](std::int32_t a,std::int32_t b){const auto v=static_cast<std::int64_t>(a)+b;if(v<INT32_MIN || v>INT32_MAX)throw HostCallFault("GDI 座標溢位");return static_cast<std::int32_t>(v);};
-        if(!known_dc || (reads_source && !gui_.contexts.contains(arg(5))))last_error_=6;
+        const auto destination=blit_rect(si(1),si(2),si(3),si(4));
+        const auto source=reads_source?blit_rect(sx,sy,sw,sh):std::optional{GuiRect{}};
+        if(!known_dc || (reads_source && !gui_.contexts.contains(arg(5)))){if(!nt_bit)last_error_=6;}
         else if((pat && reads_source) || (alpha && (mode&0xff00ffffU & ~0x01000000U)) || ((alpha || transparent) && (si(3)<=0 || si(4)<=0 || sw<=0 || sh<=0)))last_error_=87;
         else if(!alpha && !transparent && (mode&0x40000000U))last_error_=50; // CAPTUREBLT 需要視窗合成後端。
         else if(!si(3) || !si(4) || (reads_source && (!sw || !sh)))result=1;
+        else if(!destination || !source)last_error_=87;
         else if(reads_pattern && dc.brush==0xb005)result=1;
         else if(pat && gui_.emf_recorders.contains(arg(0))){
             // 中繼檔錄製 DC 沒有點陣表面：PatBlt 只讀 pattern 與目的地，以等價 ROP2（真值表 P*2+D）錄成填色。
@@ -508,29 +645,61 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
             fill.hatch=gui_.brush_hatches.contains(handle)?gui_.brush_hatches.at(handle):-1;fill.pattern_opaque=dc.mode==2;fill.pattern_background=dc.background;fill.pattern_color=dc.color;fill.brush_origin=dc.brush_origin;
             if(gui_.brush_patterns.contains(handle)){fill.pattern_brush=handle;fill.pattern_monochrome=gui_.brush_patterns.at(handle).bits_per_pixel==1;}
             std::uint32_t truth=0;for(unsigned pattern_bit=0;pattern_bit<2;++pattern_bit)for(unsigned target_bit=0;target_bit<2;++target_bit)if((rop>>(pattern_bit*4+target_bit))&1U)truth|=1U<<(pattern_bit*2+target_bit);fill.rop2=truth+1;
-            const auto x0=si(1),y0=si(2),x1=end(si(1),si(3)),y1=end(si(2),si(4));fill.x=std::min(x0,x1);fill.y=std::min(y0,y1);fill.right=std::max(x0,x1);fill.bottom=std::max(y0,y1);
+            const auto [x0,y0,x1,y1]=*destination;fill.x=std::min(x0,x1);fill.y=std::min(y0,y1);fill.right=std::max(x0,x1);fill.bottom=std::max(y0,y1);
             fill.clipped=dc.clipped;fill.clip=dc.clip;fill.excluded=dc.excluded;
             if(raster_draw(memory,arg(0),fill))result=1;else last_error_=50;
         }
         else {
-            const auto src=reads_source?raster_surface(memory,arg(5),false):std::shared_ptr<RasterSurface>{};
+            auto src=reads_source?raster_surface(memory,arg(5),false):std::shared_ptr<RasterSurface>{};
             if(reads_source && !src)last_error_=50;
             else {
                 RasterBlit options;options.operation=rop;options.transparent=transparent?mode&0xffffffU:UINT32_MAX;auto& brush=options.brush;
                 const auto handle=dc.brush;brush.color=handle==0xb012?dc.dc_brush_color:gui_.brushes.contains(handle)?gui_.brushes.at(handle):handle==0xb000?0xffffff:handle==0xb001?0xc0c0c0:handle==0xb002?0x808080:handle==0xb003?0x404040:0;
                 brush.hatch=gui_.brush_hatches.contains(handle)?gui_.brush_hatches.at(handle):-1;brush.pattern_opaque=dc.mode==2;brush.pattern_background=dc.background;brush.pattern_color=dc.color;brush.brush_origin=dc.brush_origin;
                 gui_resolve_draw_colors(gui_,dc,brush);
-                std::shared_ptr<RasterSurface> pattern;
-                if(reads_pattern && gui_.brush_patterns.contains(handle)){const auto& bitmap=gui_.brush_patterns.at(handle);brush.pattern_monochrome=bitmap.bits_per_pixel==1;
-                    const auto cached=rasters_.find(handle);if(cached==rasters_.end()){pattern=make_hardware_raster(bitmap.width,bitmap.height,bitmap.pixels);rasters_.emplace(handle,pattern);}else pattern=cached->second;
-                }
+                const auto pattern=reads_pattern?gdi_brush_raster(handle,arg(0),brush):nullptr;
                 auto target_dc=dc;if(!stretch || alpha || (transparent && dc.stretch_mode<3))target_dc.stretch_mode=3;
-                GuiRect source_rect{sx,sy,end(sx,sw),end(sy,sh)};bool valid=true;
+                GuiRect source_rect=*source;bool valid=true;
                 if(reads_source){const auto transform=gui_device_transform(gui_.contexts.at(arg(5)));if(transform[1]!=0 || transform[2]!=0){last_error_=87;valid=false;}
                     else {const auto a=gui_integer_point(transform,source_rect[0],source_rect[1]),b=gui_integer_point(transform,source_rect[2],source_rect[3]);if(!a || !b){last_error_=87;valid=false;}else source_rect={(*a)[0],(*a)[1],(*b)[0],(*b)[1]};}}
+                if(valid && alpha){
+                    const auto& r=source_rect;
+                    if(r[0]<0 || r[1]<0 || r[2]<r[0] || r[3]<r[1] || static_cast<unsigned>(r[2])>src->width() || static_cast<unsigned>(r[3])>src->height()){
+                        last_error_=87;valid=false;
+                    }else if(arg(0)==arg(5)){
+                        const auto transform=gui_device_transform(dc);
+                        const auto a=gui_integer_point(transform,(*destination)[0],(*destination)[1]),b=gui_integer_point(transform,(*destination)[2],(*destination)[3]);
+                        if(!a || !b || (std::min((*a)[0],(*b)[0])<r[2] && std::max((*a)[0],(*b)[0])>r[0] &&
+                                        std::min((*a)[1],(*b)[1])<r[3] && std::max((*a)[1],(*b)[1])>r[1])){
+                            last_error_=87;valid=false;
+                        }
+                    }
+                }
+                if(valid && reads_source && !alpha && !transparent){
+                    const auto& source_dc=gui_.contexts.at(arg(5));
+                    const auto input=gui_.bitmaps.find(source_dc.bitmap),output=gui_.bitmaps.find(dc.bitmap);
+                    const auto mono_ddb=[&](auto bitmap){
+                        return bitmap!=gui_.bitmaps.end() && bitmap->second.bits_per_pixel==1 && !bitmap->second.dib_address;
+                    };
+                    const bool input_mono=mono_ddb(input),output_mono=mono_ddb(output);
+                    if(input_mono && !output_mono){
+                        const auto foreground=gui_resolve_color(gui_,dc,dc.color),background=gui_resolve_color(gui_,dc,dc.background);
+                        if(foreground!=0 || background!=0xffffff)src=map_blit_colors(*src,0xffffff,background,foreground);
+                    }else if(output_mono && !input_mono){
+                        const auto specified=nt_bit?d(9):nt_stretch?d(11):UINT32_MAX;
+                        auto key=gui_resolve_color(gui_,source_dc,specified==UINT32_MAX?source_dc.background:specified);
+                        if(input!=gui_.bitmaps.end() && input->second.bits_per_pixel<=16){
+                            const auto& bitmap=input->second;
+                            const DibRowCodec codec(bitmap.bits_per_pixel,bitmap.dib_masks,bitmap.dib_palette);
+                            std::array<std::uint8_t,2> encoded{};
+                            if(codec.encode(std::span(&key,1),encoded,false))codec.decode(encoded,std::span(&key,1));
+                        }
+                        src=map_blit_colors(*src,key&0xffffffU,0xffffff,0);
+                    }
+                }
                 if(valid){
                     if(trace_gdi_calls())std::fprintf(stderr,"[gdi-blit] unix=%.6f pid=%llu dst=%llx src=%llx size=%ux%u source=%d,%d,%d,%d clipped=%u clip=%d,%d,%d,%d excludes=%zu\n",trace_gdi_time(),static_cast<unsigned long long>(process_id()),static_cast<unsigned long long>(arg(0)),static_cast<unsigned long long>(arg(5)),src?src->width():0,src?src->height():0,source_rect[0],source_rect[1],source_rect[2],source_rect[3],target_dc.clipped,target_dc.clip[0],target_dc.clip[1],target_dc.clip[2],target_dc.clip[3],target_dc.excluded.size());
-                    result=blit_raster(memory,arg(0),src.get(),{si(1),si(2),end(si(1),si(3)),end(si(2),si(4))},source_rect,target_dc,alpha?mode:UINT32_MAX,options,pattern.get());
+                    result=blit_raster(memory,arg(0),src.get(),*destination,source_rect,target_dc,alpha?mode:UINT32_MAX,options,pattern.get());
                 }
             }
         }
@@ -579,51 +748,102 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
     else if(symbol=="GetBkColor")result=dc.background;
     else if(symbol=="GetTextColor")result=dc.color;
     else if(symbol=="GetTextAlign")result=dc.alignment;
-    else if(symbol=="CreateDIBSection"){
+    else if(symbol=="CreateDIBSection" || symbol=="NtGdiCreateDIBSection"){
+        const bool native=symbol=="NtGdiCreateDIBSection";
+        const auto info=arg(native?3:1),bits_out=arg(native?8:3),section=arg(native?1:4);
+        const auto usage=d(native?4:2),offset=d(native?2:5);
+        const auto supplied=native?d(5):0U;
         // ppvBits 可為 NULL（不回傳位元指標，點陣圖照常建立）。
         {
-            if(arg(3))memory.store(GuestAddress{arg(3)},x86_?32:64,0);
-            if(!arg(1) || d(2)>1){last_error_=87;}
+            if(bits_out)memory.store(GuestAddress{bits_out},x86_?32:64,0);
+            if(!info || usage>1 || (arg(0) && !known_dc) || (supplied && supplied<4)){last_error_=87;}
             else {
-                memory.check(GuestAddress{arg(1)},40,Access::Read);
-                const auto field=[&](unsigned offset,std::uint8_t bits=32){return static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)+offset},bits));};
-                const auto width=std::bit_cast<std::int32_t>(field(4)),height=std::bit_cast<std::int32_t>(field(8));const auto bpp=field(14,16),header=field(0),compression=field(16);
+                const auto field=[&](unsigned offset,std::uint8_t bits=32){return static_cast<std::uint32_t>(memory.load(GuestAddress{info+offset},bits));};
+                const auto header=field(0);
+                const bool core=header==12;
+                if((!core && header<40) || (supplied && supplied<header)){last_error_=87;arg.return_to(state,0);return std::nullopt;}
+                memory.check(GuestAddress{info},core?12:40,Access::Read);
+                const auto width=core?static_cast<int>(field(4,16)):std::bit_cast<std::int32_t>(field(4));
+                const auto height=core?static_cast<int>(field(6,16)):std::bit_cast<std::int32_t>(field(8));
+                const auto planes=field(core?8:12,16),bpp=field(core?10:14,16);
+                const auto compression=core?0U:field(16),used=core?0U:field(32);
                 std::array<std::uint32_t,4> masks=bpp==16?std::array<std::uint32_t,4>{0x7c00,0x3e0,0x1f,0}:std::array<std::uint32_t,4>{0xff0000,0xff00,0xff,bpp==32?0xff000000U:0U};
-                const bool supported=(header==40 || header==52 || header==56 || header==108 || header==124) && (bpp==1 || bpp==4 || bpp==8 || bpp==16 || bpp==24 || bpp==32) && (compression==0 || (compression==3 && (bpp==16 || bpp==32)));
-                if(supported){memory.check(GuestAddress{arg(1)},header,Access::Read);if(compression==3){for(unsigned i=0;i<3;++i)masks[i]=field(40+i*4);masks[3]=header>=56?field(52):0;}}
+                const bool supported=(core || header==40 || header==52 || header==56 || header==108 || header==124) && (bpp==1 || bpp==4 || bpp==8 || bpp==16 || bpp==24 || bpp==32) && (compression==0 || (compression==3 && (bpp==16 || bpp==32)));
+                if(compression==3 && supplied && supplied<52){last_error_=87;arg.return_to(state,0);return std::nullopt;}
+                if(supported){memory.check(GuestAddress{info},header,Access::Read);if(compression==3){for(unsigned i=0;i<3;++i)masks[i]=field(40+i*4);masks[3]=header>=56?field(52):0;}}
                 if(!supported)last_error_=50;
                 else if(bpp>8 && !valid_dib_masks(masks,bpp))last_error_=87;
-                else if(width<=0 || !height || height==INT32_MIN || field(12,16)!=1)last_error_=87;
+                else if(width<=0 || !height || height==INT32_MIN || planes!=1)last_error_=87;
                 else {
                     const auto rows=static_cast<std::uint32_t>(height<0?-height:height),columns=static_cast<std::uint32_t>(width);
                     if(columns>16384 || rows>16384 || std::uint64_t{columns}*rows>64*1024*1024)last_error_=8;
-                    else if(bpp<=8 && field(32)>(1U<<bpp))last_error_=87;
-                    else if(d(2)==1 && bpp<=8 && !known_dc)last_error_=6;
+                    else if(bpp<=8 && used>(1U<<bpp))last_error_=87;
                     else {
                         std::vector<std::uint32_t> palette;
-                        if(bpp<=8){const auto count=field(32)?field(32):1U<<bpp;palette.reserve(count);
+                        if(bpp<=8){const auto count=used?used:1U<<bpp;palette.reserve(count);
                             const auto logical=gui_palette_entries(gui_,gui_.contexts.contains(arg(0))?gui_.contexts.at(arg(0)).palette:0xb00f);
-                            memory.check(GuestAddress{arg(1)+header},static_cast<std::size_t>(count)*(d(2)?2:4),Access::Read);
-                            for(unsigned i=0;i<count;++i){if(d(2)){const auto index=field(header+i*2,16);palette.push_back(index<logical.size()?gui_palette_color(logical[index]):0);}
-                                else {const auto value=field(header+i*4);palette.push_back(((value>>16)&255)|(value&0xff00)|((value&255)<<16));}}
+                            const unsigned entry_size=usage?2:core?3:4;
+                            if(supplied && (supplied-header)/entry_size<count){last_error_=87;arg.return_to(state,0);return std::nullopt;}
+                            memory.check(GuestAddress{info+header},static_cast<std::size_t>(count)*entry_size,Access::Read);
+                            for(unsigned i=0;i<count;++i){if(usage){const auto index=field(header+i*2,16);palette.push_back(index<logical.size()?gui_palette_color(logical[index]):0);}
+                                else {
+                                    const auto at=header+i*entry_size;
+                                    palette.push_back(field(at+2,8)|(field(at+1,8)<<8)|(field(at,8)<<16));
+                                }}
                         }
-                        result=create_dib_bitmap(memory,state,columns,height,static_cast<std::uint16_t>(bpp),arg(4),d(5));
-                        if(result){auto& bitmap=gui_.bitmaps.at(result);bitmap.dib_compression=compression;bitmap.dib_masks=masks;bitmap.dib_palette=std::move(palette);import_dib_bitmap(memory,result);if(arg(3))memory.store(GuestAddress{arg(3)},x86_?32:64,bitmap.dib_address);}
+                        result=create_dib_bitmap(memory,state,columns,height,static_cast<std::uint16_t>(bpp),section,offset);
+                        if(result){
+                            auto& bitmap=gui_.bitmaps.at(result);
+                            bitmap.dib_compression=compression;
+                            bitmap.dib_masks=masks;
+                            bitmap.dib_palette=std::move(palette);
+                            try{
+                                import_dib_bitmap(memory,result);
+                                if(bits_out)memory.store(GuestAddress{bits_out},x86_?32:64,bitmap.dib_address);
+                            }catch(...){
+                                if(bitmap.dib_view)(void)unmap_file_view(memory,bitmap.dib_view,true);
+                                else (void)free_heap(memory,bitmap.dib_address,state);
+                                gui_.bitmaps.erase(result);
+                                throw;
+                            }
+                        }
                     }
                 }
             }
         }
     }
     else if(symbol=="CreateBitmap"){
-        const auto bpp=d(3);if(si(0)<0 || si(1)<0 || d(0)>4096 || d(1)>4096 || d(2)!=1 || (bpp!=1 && bpp!=16 && bpp!=24 && bpp!=32)){last_error_=87;}
-        else {const auto width=d(0) && d(1)?d(0):1U,height=d(0) && d(1)?d(1):1U,depth=d(0) && d(1)?bpp:1U;
-            GuiBitmap bitmap{width,height,std::vector<std::uint32_t>(static_cast<std::size_t>(width)*height)};bitmap.bits_per_pixel=static_cast<std::uint16_t>(depth);bitmap.stride=(width*depth+15)/16*2;
-            if(depth==16)bitmap.dib_masks={0x7c00,0x3e0,0x1f,0};else bitmap.dib_masks[3]=0;
-            if(arg(4) && d(0) && d(1)){dib_scratch_.resize(static_cast<std::size_t>(bitmap.stride)*height);memory.read(GuestAddress{arg(4)},dib_scratch_);
-                if(depth==1){for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x)bitmap.pixels[static_cast<std::size_t>(y)*width+x]=(dib_scratch_[static_cast<std::size_t>(y)*bitmap.stride+x/8]&(0x80U>>(x%8)))?0xffffff:0;}
-                else {const DibRowCodec codec(depth,bitmap.dib_masks);for(unsigned y=0;y<height;++y)if(!codec.decode(std::span(dib_scratch_).subspan(static_cast<std::size_t>(y)*bitmap.stride,bitmap.stride),std::span(bitmap.pixels).subspan(static_cast<std::size_t>(y)*width,width)))throw HostCallFault("DDB 掃描列長度不符");}
+        const bool native=service.symbol=="NtGdiCreateBitmap";
+        const bool empty=!d(0) || !d(1);
+        const auto width=empty?1U:d(0),height=empty?1U:d(1);
+        const auto requested=empty?1U:std::uint64_t{d(2)}*d(3);
+        constexpr std::array<std::uint16_t,6> depths{1,4,8,16,24,32};
+        const auto depth=std::lower_bound(depths.begin(),depths.end(),requested);
+        const auto stride=depth==depths.end()?0:((std::uint64_t{width} * (*depth)+15)/16)*2;
+        if(si(0)<0 || si(1)<0){
+            if(!native || !arg(4))last_error_=87;
+        }else if((empty && native) || depth==depths.end() || (!empty && (d(2)>32 || d(3)>32)) ||
+                 width>=0x08000000 || stride*height>UINT32_MAX)last_error_=87;
+        else {
+            const auto bytes=static_cast<std::size_t>(stride*height);
+            if(arg(4) && !empty)memory.check(GuestAddress{arg(4)},bytes,Access::Read);
+            if(!gdi_bitmap_dimensions_fit(width,height)){
+                last_error_=8;arg.return_to(state,0);return std::nullopt;
             }
-            result=gui_.next_object++;gui_.bitmaps.emplace(result,std::move(bitmap));}
+            auto bitmap=gdi_ddb(width,height,*depth);
+            if(arg(4) && !empty){
+                dib_scratch_.resize(bytes);
+                memory.read(GuestAddress{arg(4)},dib_scratch_);
+                const DibRowCodec codec(*depth,bitmap.dib_masks,bitmap.dib_palette);
+                for(unsigned y=0;y<height;++y){
+                    const auto source=std::span(dib_scratch_).subspan(static_cast<std::size_t>(y)*stride,stride);
+                    const auto pixels=std::span(bitmap.pixels).subspan(static_cast<std::size_t>(y)*width,width);
+                    if(!codec.decode(source,pixels))throw HostCallFault("DDB 掃描列長度不符");
+                }
+            }
+            gui_.bitmaps.emplace(gui_.next_object,std::move(bitmap));
+            result=gui_.next_object++;
+        }
     }
     else if(symbol=="TranslateCharsetInfo"){
         // CHARSETINFO{ciCharset, ciACP, FONTSIGNATURE}：TCI_SRCCHARSET(1) 以字元集值、TCI_SRCCODEPAGE(2) 以碼頁值、
@@ -655,38 +875,88 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
         else if(driver.empty() && device.empty())last_error_=87;
         else if((driver.empty() || driver==u"display" || driver==u"\\\\.\\display1") && (device.empty() || device==u"\\\\.\\display1")){
             result=gui_.next_object++;gui_.contexts[result]={};gui_.contexts[result].display=true;
+            gui_.contexts[result].information=symbol.starts_with("CreateIC");
         }else last_error_=50;
     }else if(symbol=="CreateCompatibleDC"){if(arg(0) && !known_dc)last_error_=6;else{result=gui_.next_object++;gui_.contexts[result]={};}}
     else if(symbol=="CreateCompatibleBitmap"){
-        if(si(1)>0 && si(2)>0 && d(1)<=4096 && d(2)<=4096){
+        const bool native=service.symbol=="NtGdiCreateCompatibleBitmap";
+        if(!d(1) || !d(2)){
+            if(native)last_error_=87;
+            else result=nested_service(state,memory,"gdi32.dll","CreateBitmap",{1,1,1,1,0});
+        }else if(!known_dc && (arg(0) || native))last_error_=6;
+        else if(si(1)<0 || si(2)<0)last_error_=87;
+        else if(!gdi_bitmap_dimensions_fit(d(1),d(2)))last_error_=8;
+        else {
             const auto selected=gui_.bitmaps.find(dc.bitmap);
-            if(selected!=gui_.bitmaps.end() && selected->second.dib_address){result=create_dib_bitmap(memory,state,d(1),si(2),selected->second.bits_per_pixel);if(result){gui_.bitmaps.at(result).dib_masks=selected->second.dib_masks;gui_.bitmaps.at(result).dib_compression=selected->second.dib_compression;gui_.bitmaps.at(result).dib_palette=selected->second.dib_palette;import_dib_bitmap(memory,result);}}
-            else {result=gui_.next_object++;gui_.bitmaps[result]={d(1),d(2),std::vector<std::uint32_t>(static_cast<std::size_t>(d(1))*d(2))};}
-        }else last_error_=87;
-    }else if(symbol=="DeleteDC"){delete_printer_dc(arg(0));gui_.emf_recorders.erase(arg(0));result=gui_.contexts.erase(arg(0))?1:0;gui_.dc_objects.erase(arg(0));gui_.saved_contexts.erase(arg(0));}
+            if(selected!=gui_.bitmaps.end() && selected->second.dib_address){
+                const auto& model=selected->second;
+                result=create_dib_bitmap(memory,state,d(1),si(2),model.bits_per_pixel);
+                if(result){
+                    try{
+                        auto& bitmap=gui_.bitmaps.at(result);
+                        bitmap.dib_masks=model.dib_masks;bitmap.dib_compression=model.dib_compression;
+                        bitmap.dib_palette=model.dib_palette;
+                        import_dib_bitmap(memory,result);
+                    }catch(...){
+                        (void)nested_service(state,memory,"gdi32.dll","DeleteObject",{result});
+                        throw;
+                    }
+                }
+            }else{
+                const bool device=!arg(0) || dc.display || is_printer_dc(arg(0)) || window!=gui_.windows.end();
+                const auto depth=selected!=gui_.bitmaps.end()?selected->second.bits_per_pixel:device?32U:1U;
+                auto bitmap=gdi_ddb(d(1),d(2),static_cast<std::uint16_t>(depth));
+                if(selected!=gui_.bitmaps.end()){
+                    bitmap.dib_masks=selected->second.dib_masks;bitmap.dib_palette=selected->second.dib_palette;
+                }
+                gui_.bitmaps.emplace(gui_.next_object,std::move(bitmap));
+                result=gui_.next_object++;
+            }
+        }
+    }else if(symbol=="DeleteDC"){
+        if(icm_profiles_)std::erase_if(icm_profiles_->brush_translations,[&](const auto& item){return item.first.second==arg(0);});
+        delete_printer_dc(arg(0));discard_metafile_recorder(arg(0));result=gui_.contexts.erase(arg(0))?1:0;gui_.dc_objects.erase(arg(0));gui_.saved_contexts.erase(arg(0));}
+    else if(symbol=="DeleteObject" && ((arg(0)>=0xb006 && arg(0)<=0xb008) || arg(0)==0xb013))result=1;
     else if(symbol=="DeleteObject" &&
             (arg(0)-gui_system_brush_base<=gui_system_color_count || arg(0)-gui_system_pen_base<gui_system_color_count)){
         result=gui_.brushes.contains(arg(0)) || gui_.pens.contains(arg(0));
     }else if(symbol=="DeleteObject"){
+        if(delete_server_metafile(arg(0))){arg.return_to(state,1);return std::nullopt;}
         const auto bitmap=gui_.bitmaps.find(arg(0));
         const auto selected=[&](const GuiDc& context){return context.bitmap==arg(0) || context.font==arg(0) || context.pen==arg(0) || context.brush==arg(0) || context.palette==arg(0);};
         const bool in_use=std::any_of(gui_.contexts.begin(),gui_.contexts.end(),[&](const auto& entry){return selected(entry.second);}) || std::any_of(gui_.saved_contexts.begin(),gui_.saved_contexts.end(),[&](const auto& entry){return std::any_of(entry.second.begin(),entry.second.end(),selected);});
         if(in_use){last_error_=170;}
-        else {rasters_.erase(arg(0));raster_shared_.erase(arg(0));gui_.pen_widths.erase(arg(0));gui_.extended_pens.erase(arg(0));gui_.brush_hatches.erase(arg(0));gui_.brush_dib_patterns.erase(arg(0));gui_.brush_patterns.erase(arg(0));gui_.brush_pattern_sources.erase(arg(0));
+        else {rasters_.erase(arg(0));raster_shared_.erase(arg(0));gui_.pen_widths.erase(arg(0));const auto pen=gui_.pen_definitions.find(arg(0));
+            if(pen!=gui_.pen_definitions.end()){
+                if(pen->second.pattern_brush)(void)nested_service(state,memory,"gdi32.dll","DeleteObject",{pen->second.pattern_brush});
+                gui_.pen_definitions.erase(pen);
+            }
+            gui_.brush_hatches.erase(arg(0));gui_.brush_dib_patterns.erase(arg(0));
+            const auto pattern=gui_.brush_patterns.find(arg(0));
+            if(pattern!=gui_.brush_patterns.end()){
+                if(icm_profiles_){
+                    auto& translated=icm_profiles_->brush_translations;
+                    translated.erase(translated.lower_bound({arg(0),0}),translated.upper_bound({arg(0),UINT64_MAX}));
+                }
+                if(pattern->second.dib_address)(void)free_heap(memory,pattern->second.dib_address,state);
+                gui_.brush_patterns.erase(pattern);
+            }
+            gui_.brush_pattern_sources.erase(arg(0));
             if(bitmap!=gui_.bitmaps.end() && bitmap->second.dib_address && !bitmap->second.dib_external){if(bitmap->second.dib_view)(void)unmap_file_view(memory,bitmap->second.dib_view,true);else (void)free_heap(memory,bitmap->second.dib_address,state);}
             result=((gui_.font_natives.erase(arg(0)),gui_.fonts.erase(arg(0))) || gui_.bitmaps.erase(arg(0)) || gui_.brushes.erase(arg(0)) || gui_.pens.erase(arg(0)) || gui_.regions.erase(arg(0)) || gui_.palettes.erase(arg(0)))?1:0;
         }
     }
-    else if(symbol=="SelectObject"){
+    else if(symbol=="SelectObject" || symbol.starts_with("NtGdiSelect")){
+        const bool generic=symbol=="SelectObject";
         if(!known_dc)last_error_=6;
-        else if(is_printer_dc(arg(0)) && (gui_.bitmaps.contains(arg(1)) || arg(1)==0xb015))last_error_=50;
-        else if(gui_.bitmaps.contains(arg(1)) || arg(1)==0xb015){
+        else if((is_printer_dc(arg(0)) || dc.display || window!=gui_.windows.end()) && (gui_.bitmaps.contains(arg(1)) || arg(1)==0xb015))last_error_=50;
+        else if((generic || symbol=="NtGdiSelectBitmap") && (gui_.bitmaps.contains(arg(1)) || arg(1)==0xb015)){
             if(arg(1)!=0xb015 && std::any_of(gui_.contexts.begin(),gui_.contexts.end(),[&](const auto& entry){return entry.first!=arg(0) && entry.second.bitmap==arg(1);})){last_error_=170;}
             else {result=dc.bitmap?dc.bitmap:0xb015;dc.bitmap=arg(1);}
         }
-        else if(gui_.fonts.contains(arg(1)) || (arg(1)>=0xb00a && arg(1)<=0xb011 && arg(1)!=0xb00f)){result=dc.font;dc.font=arg(1);gui_.dc_objects[arg(0)]=arg(1);}
-        else if(gui_.pens.contains(arg(1)) || arg(1)==0xb013 || (arg(1)>=0xb006 && arg(1)<=0xb008)){result=dc.pen;dc.pen=arg(1);}
-        else if(gui_.brushes.contains(arg(1)) || arg(1)==0xb012 || (arg(1)>=0xb000 && arg(1)<=0xb005)){result=dc.brush;dc.brush=arg(1);}
+        else if((generic || symbol=="NtGdiSelectFont") && (gui_.fonts.contains(arg(1)) || (arg(1)>=0xb00a && arg(1)<=0xb011 && arg(1)!=0xb00f))){result=dc.font;dc.font=arg(1);gui_.dc_objects[arg(0)]=arg(1);}
+        else if((generic || symbol=="NtGdiSelectPen") && (gui_.pens.contains(arg(1)) || arg(1)==0xb013 || (arg(1)>=0xb006 && arg(1)<=0xb008))){result=dc.pen;dc.pen=arg(1);}
+        else if((generic || symbol=="NtGdiSelectBrush") && (gui_.brushes.contains(arg(1)) || arg(1)==0xb012 || (arg(1)>=0xb000 && arg(1)<=0xb005))){result=dc.brush;dc.brush=arg(1);}
         else last_error_=6;
     }else if(symbol=="SetTextColor"){result=dc.color;dc.color=d(1);if(window!=gui_.windows.end())window->second.text_color=d(1);}
     else if(symbol=="SetBkColor"){result=dc.background;dc.background=d(1);}
@@ -779,7 +1049,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
         }else last_error_=6;
         if(result && (dc.alignment&1)){dc.x=next_x;dc.y=next_y;}
         }catch(const std::bad_alloc&){return fail_text(8);}catch(const std::invalid_argument&){return fail_text(87);}catch(const std::domain_error&){return fail_text(50);}
-    }else if(symbol=="CreatePen"){if((d(0)&15)!=0 && (d(0)&15)!=5)last_error_=50;else{result=gui_.next_object++;gui_.pens[result]=d(2);gui_.pen_widths[result]=(d(0)&15)==5?0:std::max(1,si(1));}}
+    }
     else if(symbol=="MoveToEx"){if(arg(3)){memory.store(GuestAddress{arg(3)},32,static_cast<std::uint32_t>(dc.x));memory.store(GuestAddress{arg(3)+4},32,static_cast<std::uint32_t>(dc.y));}dc.x=si(1);dc.y=si(2);result=1;}
     else if(symbol=="Polyline"){
         const auto count=si(2);
@@ -816,6 +1086,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
         if(symbol=="LineTo"){dc.x=si(1);dc.y=si(2);}
     }
     else throw HostCallFault("尚未實作 GDI 服務");
+    }catch(const HostCallFault&){
+        if(symbol!="CreateDIBSection" && symbol!="NtGdiCreateDIBSection")throw;
+        last_error_=87;result=0;
+    }catch(const MemoryFault&){
+        if(symbol=="CreateBitmap"){
+            if(service.symbol!="NtGdiCreateBitmap")last_error_=998;
+            arg.return_to(state,0);return std::nullopt;
+        }
+        if(service.symbol!="NtGdiDoPalette" && symbol!="NtGdiCreatePaletteInternal" && symbol!="CreatePalette" &&
+           symbol!="GetColorAdjustment" && symbol!="SetColorAdjustment" && symbol!="GetRasterizerCaps" &&
+           symbol!="GetDeviceGammaRamp" && symbol!="SetDeviceGammaRamp" &&
+           symbol!="GradientFill" && symbol!="GdiGradientFill" &&
+           symbol!="NtGdiCreateDIBSection" && symbol!="CreateDIBSection" && symbol!="GetBitmapBits" && symbol!="SetBitmapBits" &&
+           symbol!="SetBitmapDimensionEx" && symbol!="GetBitmapDimensionEx" && symbol!="SetBrushOrgEx")throw;
+        last_error_=998;result=0;
     }catch(const std::bad_alloc&){last_error_=8;result=(symbol=="GetPixel" || symbol=="SetPixel")?UINT32_MAX:0;}
     if(trace_gdi_calls())std::fprintf(stderr,"[gdi-result] unix=%.6f pid=%llu thread=%llu action=%.*s result=%llx error=%u\n",trace_gdi_time(),static_cast<unsigned long long>(process_id()),static_cast<unsigned long long>(threads_.current),static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned long long>(result),last_error_);
     arg.return_to(state,result);return std::nullopt;

@@ -5,7 +5,7 @@
 #include "x64arm/windows_security_attributes.hpp"
 #include "automation_value.hpp"
 #include "windows_locale_data.hpp"
-#include "crt_mbcs.hpp"
+#include "crt_uchar_service.hpp"
 #include "crt_multibyte_state.hpp"
 #include "crt_string_conversion.hpp"
 #include "crt_time_storage.hpp"
@@ -800,6 +800,8 @@ std::optional<bool> parse_bool(std::u16string_view input,std::uint32_t lcid,bool
 }
 std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"ucrtbase.dll","mbrtoc16",4,0,0,0,true},{"ucrtbase.dll","mbrtoc32",4,0,0,0,true},
+        {"ucrtbase.dll","c16rtomb",3,0,0,0,true},{"ucrtbase.dll","c32rtomb",3,0,0,0,true},
         {"advapi32.dll","IsTextUnicode",3},{"ntdll.dll","RtlIsTextUnicode",3},
         {"crt","_create_locale",2},{"crt","_wcreate_locale",2},{"crt","_free_locale",1},{"crt","__free_locale",1},{"crt","_get_current_locale",0},{"crt","_configthreadlocale",1},
         {"crt","__x64arm_create_locale_legacy",2},{"crt","__x64arm_wcreate_locale_legacy",2},{"crt","__x64arm_current_locale_legacy",0},
@@ -898,7 +900,7 @@ std::uint64_t crt_max_address(const GuestMemory& memory,const CrtLocaleObject& l
 void initialize_crt_multibyte(GuestMemory& memory,std::uint64_t process_base,std::uint32_t codepage){
     const auto category=windows_crt_codepage(codepage);
     if(!category)throw std::logic_error("程序初始 CRT 多位元組碼頁無效");
-    static_assert(CRT_MBC_PROCESS_CASE+CRT_MBC_CASE_SIZE<=0x1000);
+    static_assert(sizeof(CrtUcharState)==8 && CRT_UCHAR_PROCESS_STATES+(CrtC32rtomb+1)*sizeof(CrtUcharState)<=0x1000);
     const auto address=process_base+CRT_MBC_PROCESS_INFO;
     crt_mbc_assign(memory,address,*category);
     memory.move(GuestAddress{process_base+CRT_MBC_PROCESS_TYPES},GuestAddress{address+CRT_MBC_TYPES_OFFSET},
@@ -913,8 +915,8 @@ std::uint32_t windows_crt_collation_lcid(std::uint32_t codepage){
 }
 
 static_assert(CRT_MBC_TEB64_VIEW>=GUEST_CRT_TABLE_OFFSET+1024 &&
-              CRT_MBC_TEB64_VIEW+16<=X64ARM_GUEST_HEAP_CACHE_HEAD_OFFSET);
-static_assert(CRT_MBC_TEB32_VIEW>=0x3000 && CRT_MBC_TEB32_VIEW+8<=CRT_MBC_TEB32_CTYPE &&
+              CRT_MBC_TEB64_VIEW+24<=X64ARM_GUEST_HEAP_CACHE_HEAD_OFFSET);
+static_assert(CRT_MBC_TEB32_VIEW>=0x3000 && CRT_MBC_TEB32_VIEW+12<=CRT_MBC_TEB32_CTYPE &&
               CRT_MBC_TEB32_CTYPE+512<=0x3ff0);
 
 void WindowsServices::sync_crt_thread_state(GuestMemory& memory,std::uint64_t id){
@@ -933,6 +935,7 @@ void WindowsServices::sync_crt_thread_state(GuestMemory& memory,std::uint64_t id
     }else if(!x86_ && locale)ctype_view=thread.teb+GUEST_CRT_TABLE_OFFSET;
     memory.store(GuestAddress{view},x86_?32:64,mbc);
     memory.store(GuestAddress{view+(x86_?4U:8U)},x86_?32:64,ctype_view);
+    memory.store(GuestAddress{view+(x86_?8U:16U)},x86_?32:64,runtime_base_.value+CRT_UCHAR_PROCESS_STATES);
     if(x86_)return;
     const auto tables=thread.teb+GUEST_CRT_TABLE_OFFSET;
     std::array<std::uint64_t,7> cells{thread.errno_cell,locale,tables,tables+512,tables+768,0,runtime_base_.value+128};
@@ -1052,6 +1055,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
     const auto finish=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto fail=[&](std::uint32_t error){last_error_=error;return finish(0);};
+    if (service.family == "ucrtbase.dll") {
+        if (const auto function = crt_uchar_function(name)) {
+            invoke_crt_uchar(arg, state, memory, *function, runtime_base_.value + CRT_UCHAR_PROCESS_STATES, runtime_.errno_cell);
+            return std::nullopt;
+        }
+    }
     // 列舉回呼共用：字串集中寫入一塊客體 heap，依序以「字串位址＋附加引數」呼叫；回呼結束或回 FALSE 後由 LocaleEnumeration 釋放。
     const auto enumerate=[&](std::uint64_t procedure,std::vector<std::pair<std::vector<std::uint8_t>,std::vector<std::uint64_t>>> items,std::uint32_t nomemory)->std::optional<std::uint32_t>{
         std::size_t size=0;for(const auto& item:items)size+=item.first.size();if(!size)return finish(1);

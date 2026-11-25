@@ -13,9 +13,12 @@ inline std::optional<GuiTransform> gui_inverse(const GuiTransform& m){
     const auto determinant=m[0]*m[3]-m[1]*m[2];if(!std::isfinite(determinant) || determinant==0)return {};
     GuiTransform out{m[3]/determinant,-m[1]/determinant,-m[2]/determinant,m[0]/determinant,0,0};out[4]=-m[4]*out[0]-m[5]*out[2];out[5]=-m[4]*out[1]-m[5]*out[3];if(!gui_valid_transform(out))return {};return out;
 }
-inline GuiTransform gui_device_transform(const GuiDc& dc){
+inline GuiTransform gui_page_transform(const GuiDc& dc){
     const double x=static_cast<double>(dc.viewport_extent[0])/dc.window_extent[0],y=static_cast<double>(dc.viewport_extent[1])/dc.window_extent[1];
-    return gui_multiply(dc.world,{x,0,0,y,dc.viewport_origin[0]-dc.window_origin[0]*x,dc.viewport_origin[1]-dc.window_origin[1]*y});
+    return {x,0,0,y,dc.viewport_origin[0]-dc.window_origin[0]*x,dc.viewport_origin[1]-dc.window_origin[1]*y};
+}
+inline GuiTransform gui_device_transform(const GuiDc& dc){
+    return gui_multiply(dc.world,gui_page_transform(dc));
 }
 inline std::array<double,2> gui_point(const GuiTransform& m,double x,double y){return {x*m[0]+y*m[2]+m[4],x*m[1]+y*m[3]+m[5]};}
 inline std::optional<std::array<std::int32_t,2>> gui_integer_point(const GuiTransform& m,double x,double y){

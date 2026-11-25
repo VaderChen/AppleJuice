@@ -130,5 +130,5 @@ if(name.starts_with("GetCharacterPlacement")){
             memory.store(GuestAddress{result+glyph_offset},32,placed.glyphs.size());memory.store(GuestAddress{result+glyph_offset+4},32,units);
         }
         return finish((static_cast<unsigned>(metrics.height)&65535U)<<16 | (static_cast<unsigned>(placed.width)&65535U));
-    }catch(const std::bad_alloc&){return fail(8);}catch(const std::length_error&){return fail(122);}catch(const std::invalid_argument&){return fail(87);}catch(const std::domain_error&){return fail(50);}
+    }catch(const MemoryFault&){return fail(998);}catch(const std::bad_alloc&){return fail(8);}catch(const std::length_error&){return fail(122);}catch(const std::invalid_argument&){return fail(87);}catch(const std::domain_error&){return fail(50);}
 }

@@ -33,7 +33,7 @@ std::span<const WindowsServiceDescriptor> crt_extra_service_descriptors(){
         {"crt","_timespec32_get",2},{"crt","_timespec64_get",2},
         {"crt","_atodbl",2},{"crt","_atoflt",2},{"crt","_atoldbl",2},
         {"crt","wctomb_s",4},{"crt","wcrtomb_s",5},
-        {"crt","_strerror",1},{"crt","__wcserror",1},{"crt","__wcserror_s",3},
+        {"crt","_strerror",1},{"crt","__wcserror",1},
         {"crt","_expand",2},{"crt","_Cbuild",3,6},{"crt","_FCbuild",2},
     };return table;
 }
@@ -176,21 +176,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_extra(GuestState& state
             std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));if(length)memory.read(GuestAddress{buffer},bytes);if(length)memory.write(GuestAddress{output},bytes);
             report(length);return done(0);
         }
-        if(name=="_strerror" || name=="__wcserror" || name=="__wcserror_s"){
+        if(name=="_strerror" || name=="__wcserror"){
             // 「訊息: errno 說明\n」；訊息為空或 NULL 時只有說明。窄字元版本以 UTF-8 寫出。
-            const bool wide=name!="_strerror";const auto message=arg(name=="__wcserror_s"?2:0);
+            const bool wide=name!="_strerror";const auto message=arg(0);
             const auto code=static_cast<std::uint32_t>(memory.load(GuestAddress{runtime_.errno_cell},32));
             const auto description=read_utf16(memory,GuestAddress{crt("_wcserror",{code})});
             std::u16string prefix;
             if(message){if(wide)prefix=read_utf16(memory,GuestAddress{message});else {std::string narrow;for(unsigned i=0;i<4096;++i){const auto c=static_cast<char>(memory.load(GuestAddress{message+i},8));if(!c)break;narrow+=c;}prefix=utf8_to_utf16_lossy(narrow);}}
             auto text=(prefix.empty()?std::u16string{}:prefix+u": ")+description;
             while(!text.empty() && (text.back()==u'\n' || text.back()==u'\r'))text.pop_back();text+=u'\n';
-            if(name=="__wcserror_s"){
-                const auto buffer=arg(0),count=arg(1);if(!buffer || !count)return invalid(einval);
-                const auto length=std::min<std::uint64_t>(text.size(),count-1);
-                for(std::uint64_t i=0;i<length;++i)memory.store(GuestAddress{buffer+i*2},16,text[static_cast<std::size_t>(i)]);
-                memory.store(GuestAddress{buffer+length*2},16,0);return done(0);
-            }
             const auto slot=cell(wide?wcserror_offset:strerror_offset);
             if(!memory.load(GuestAddress{slot},bits))memory.store(GuestAddress{slot},bits,runtime_allocate(memory,{},1024));
             const auto buffer=memory.load(GuestAddress{slot},bits);

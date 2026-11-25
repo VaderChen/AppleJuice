@@ -101,6 +101,8 @@ struct GuestThread {
     }
     // 等待剛完成而尚未 dispatch；與 Windows 可停用的動態優先序提升分開。
     bool wake_pending{};
+    // 最近一次由等待解析喚醒時的等待種類（schedule 依此分辨計時醒來與物件交接，見 X64ARM_RESIDENT_KEEP_CURRENT）。
+    ThreadWaitKind wake_kind{};
     // slot 0 停駐等待被撤銷、回到 API 入口重新執行時保留原排隊位置（只在同一呼叫點、同一堆疊沿用一次）。
     struct RevokedWait {std::uint64_t order{},rip{},rsp{};bool operator==(const RevokedWait&) const = default;} revoked_wait{};
     std::uint64_t last_dispatch_ticks{}; // 上次被排程執行的單調時鐘（100 ns），防餓死提升用。

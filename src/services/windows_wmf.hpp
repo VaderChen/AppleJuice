@@ -36,5 +36,15 @@ struct MetafileState {
     struct WindowsEnumeration {std::uint64_t dc{};unsigned handles{};std::array<std::uint64_t,4> selected{};};
     std::map<std::uint64_t,Enumeration> enumerations;
     std::map<std::uint64_t,WindowsEnumeration> windows_enumerations;
+    // 從 DRIVERVERSION 到 COLORMGMTCAPS；參考 DC 關閉後仍可查詢錄製時的裝置。
+    using DeviceCaps=std::array<std::uint32_t,122>;
+    std::map<std::uint64_t,DeviceCaps> recorder_caps;
+    // 可重現執行模式不開啟宿主工作階段；同一引擎內保留相同的物件與生命週期。
+    struct ServerFile {
+        std::array<std::uint32_t,4> attributes{}; // 格式、映射模式、水平與垂直範圍
+        std::vector<std::uint8_t> bytes;
+    };
+    std::map<std::uint32_t,ServerFile> server_files;
+    std::uint32_t next_server_file{};
 };
 }

@@ -125,10 +125,25 @@ bool supports(Kind kind,const Guid& requested,bool ex=false){if(ex && ((kind==Ki
 struct SpriteItem {std::uint64_t texture{};std::array<Vector,6> positions{};std::array<std::array<float,2>,6> uv{};std::uint32_t color{};bool retained{};};
 struct D3DLight {std::uint32_t type{3};Vector diffuse{1,1,1,0},specular{},ambient{};std::array<float,3> position{},direction{0,0,1};float range{},falloff{},attenuation0{},attenuation1{},attenuation2{},theta{},phi{};};
 static_assert(sizeof(D3DLight)==104);
+// 重設 D3D9 可程式化繪製會填寫的 GraphicsDraw 欄位（VS／PS 兩個階段、前 32 個資源與全部取樣器、頂點槽 0～15 與 31、
+// 目標、深度、狀態位元組與繪製參數），其餘欄位 D3D9 從不寫入、維持預設值。放開全部參照，資源不因重用而延長存活。
+void reset_d3d9_draw(GraphicsDraw& d){
+    for(unsigned s=0;s<2;++s){auto& stage=d.stages[s];stage.shader.reset();for(auto& c:stage.constants)c.reset();stage.constant_offsets.fill(0);
+        for(unsigned i=0;i<32;++i)stage.resources[i]={};for(auto& sampler:stage.samplers)sampler.reset();}
+    d.layout.clear();for(unsigned i=0;i<16;++i)d.vertices[i]={};d.vertices[31]={};d.indices.reset();d.index_format=42;d.index_offset=0;d.topology=4;
+    for(auto& target:d.targets)target={};d.depth={};d.viewports.clear();d.scissors.clear();d.blend.clear();d.depth_state.clear();d.raster.clear();
+    d.blend_factor={1,1,1,1};d.sample_mask=UINT32_MAX;d.stencil_reference=0;d.count=0;d.start=0;d.instances=1;d.start_instance=0;d.base_vertex=0;
+    d.alpha_function=0;d.alpha_reference=0;d.indexed=false;d.visibility.reset();d.visibility_offset=0;
+}
 unsigned texture_slot(unsigned slot){require(slot<16 || (slot>=257 && slot<=260));return slot<16?slot:slot-241;}
 struct D3DStream {std::uint64_t buffer{};unsigned offset{},stride{};};
 struct QuerySlot {std::shared_ptr<GraphicsResource> buffer;std::uint32_t offset{};};
+// 不帶裝置狀態表的物件（頂點宣告等）：Object 的取樣器／階段／變換／render 預設表只有裝置會用，
+// 建構一次要建立數十個暫時表與數百筆節點（SetFVF 每次新建內部宣告，三國志 XI 每幀十多次）。
+struct LightObject {};
 struct Object {
+    Object()=default;
+    explicit Object(LightObject):sampler{},stage{},transforms{},render{} {}
     std::shared_ptr<d3d9_validator::Shader> validator;
     std::shared_ptr<D3D9FrameCapture> frame_capture;
     unsigned query_type{};bool query_active{},query_issued{};
@@ -175,6 +190,8 @@ struct Object {
     std::map<Guid,std::pair<std::vector<std::uint8_t>,std::uint64_t>> private_data;
     std::shared_ptr<fx9::Runtime> effect;std::shared_ptr<fx9::Pool> effect_pool;
     std::shared_ptr<Object> saved,recording;
+    // 可程式化繪製重用的描述（GraphicsDraw 約 62 KB，含 6 個階段的數百個參照）：每次繪製結束只重設 D3D9 會填的欄位。
+    std::shared_ptr<GraphicsDraw> draw_reuse;
     std::set<std::pair<unsigned,unsigned>> state_mask;
     std::vector<SpriteItem> sprites;Matrix sprite_transform=identity(),sprite_world=identity(),sprite_view=identity();bool sprite_rh{};
     // ID3DXLine：預設實線（圖樣全 1、比例 1）、寬 1、不反鋸齒、非 GL 線段。
@@ -762,7 +779,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
                 }
                 memory.store(GuestAddress{address+i*ps},pb,target);
             }bridge.tables[key]=address;}
-        auto value=std::make_shared<Object>();value->root=allocate_heap(memory,kind==Kind::Device?D9_CONSTANT_DEVICE_BYTES:ps);require(value->root!=0,out_of_memory);value->kind=kind;value->ex=ex;value->implicit=implicit;value->references=implicit?0:1;
+        static const bool light_objects=[] {const auto* value=std::getenv("X64ARM_D3D9_LIGHT_OBJECTS");return !value || std::string_view(value)!="0";}();
+        auto value=light_objects && kind==Kind::VertexDeclaration?std::make_shared<Object>(LightObject{}):std::make_shared<Object>();value->root=allocate_heap(memory,kind==Kind::Device?D9_CONSTANT_DEVICE_BYTES:ps);require(value->root!=0,out_of_memory);value->kind=kind;value->ex=ex;value->implicit=implicit;value->references=implicit?0:1;
         try{
             bridge.objects.emplace(value->root,value);memory.store(GuestAddress{value->root},pb,bridge.tables.at(key));
             if(kind==Kind::Device){
@@ -1342,7 +1360,11 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                     // 純固定管線：GL 單一紋理路徑無法表達的貼圖階段（多階段、MODULATE2X 等運算、TEMP／CONSTANT 參數）或已轉換頂點的鏡面色與霧化，
                     // 改由可程式化繪製的固定頂點＋固定像素產生器處理；頂點端須無光照（或已轉換頂點）、無頂點混合與使用者剪裁面，
                     // 階段不使用座標產生或紋理變換。
-                    const bool fixed_programmable=!object.shaders[0] && !object.shaders[1] && (!d3d9_fixed::single_stage_basic(object.stage) || (rhw && (object.render.at(29) || object.render.at(28)))) &&
+                    // 單一基本階段原本走 GL 相容路徑（每次繪製數十個 GL 狀態操作；已轉換頂點逐頂點以立即模式送出、每次新建緩衝）。
+                    // 頂點端條件相同時一併改走可程式化路徑（三國志 XI 每幀數百次 2D／介面繪製）。X64ARM_D3D9_FIXED_PROGRAMMABLE_ALL=0 恢復舊分流。
+                    static const bool programmable_all=[] {const auto* value=std::getenv("X64ARM_D3D9_FIXED_PROGRAMMABLE_ALL");return !value || std::string_view(value)!="0";}();
+                    const bool fixed_programmable=!object.shaders[0] && !object.shaders[1] &&
+                        (programmable_all || !d3d9_fixed::single_stage_basic(object.stage) || (rhw && (object.render.at(29) || object.render.at(28)))) &&
                         d3d9_fixed::vertex_side_basic(object.stage) && (rhw || !object.render.at(137)) && !object.render.at(151) && !object.render.at(152);
                     // 診斷：X64ARM_TRACE_D3D9_DRAWS=1 列出不重複的繪製組態（著色器版本、FVF、光照、霧化、啟用的貼圖階段運算）。
                     if(static const bool trace_draws=std::getenv("X64ARM_TRACE_D3D9_DRAWS")!=nullptr;trace_draws){

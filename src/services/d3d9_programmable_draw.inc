@@ -1,7 +1,14 @@
                         require(type>=1 && type<=6 && primitives<=349525 && (!up || stride>0));
                         const std::uint32_t count=type==1?primitives:type==2?primitives*2:type==3?primitives+1:type==4?primitives*3:primitives+2;
                         if(count){
-                            GraphicsDraw draw;const bool fixed_vertex=!object.shaders[0];draw.topology=type==1?1:type==2?2:type==3?3:type==4?4:5;draw.count=count;
+                            // 每裝置重用同一份描述，結束時（含例外）只重設用到的欄位；X64ARM_D3D9_DRAW_REUSE=0 每次新建。
+                            static const bool draw_reuse=[] {const auto* value=std::getenv("X64ARM_D3D9_DRAW_REUSE");return !value || std::string_view(value)!="0";}();
+                            std::shared_ptr<GraphicsDraw> draw_holder;
+                            if(draw_reuse){if(!object.draw_reuse)object.draw_reuse=std::make_shared<GraphicsDraw>();draw_holder=object.draw_reuse;}
+                            else draw_holder=std::make_shared<GraphicsDraw>();
+                            GraphicsDraw& draw=*draw_holder;
+                            struct DrawReset {GraphicsDraw& draw;bool active;~DrawReset(){if(active)reset_d3d9_draw(draw);}} draw_reset{draw,draw_reuse};
+                            const bool fixed_vertex=!object.shaders[0];draw.topology=type==1?1:type==2?2:type==3?3:type==4?4:5;draw.count=count;
                             std::vector<std::uint8_t> decl;if(object.vertex_declaration)decl=get(object.vertex_declaration,Kind::VertexDeclaration)->pixels;else decl=fvf_decl(object.fvf);
                             const bool fixed_rhw=[&](){for(std::size_t i=0;i+8<decl.size();i+=8)if(decl[i+6]==9 && decl[i+7]==0)return true;return false;}();
                             constexpr std::array<const char*,14> usages{"POSITION","BLENDWEIGHT","BLENDINDICES","NORMAL","PSIZE","TEXCOORD","TANGENT","BINORMAL","TESSFACTOR","POSITIONT","COLOR","FOG","DEPTH","SAMPLE"};

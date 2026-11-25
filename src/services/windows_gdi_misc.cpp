@@ -3,12 +3,74 @@
 // 物件與 DC 驗證沿用 GDI 既有狀態；虛擬解析度存於 DC，由 GetDeviceCaps 讀取；顯示設定唯一值隨 ChangeDisplaySettings 遞增。
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "x64arm/windows_geometry.hpp"
+#include "windows_wmf.hpp"
 #include <algorithm>
+#include <bit>
+#include <utility>
 #include <vector>
 
 namespace x64arm {
+namespace {
+std::uint32_t display_device_cap(unsigned index,const std::array<std::int32_t,4>& screen,
+                                 const std::optional<std::array<std::uint32_t,4>>& mode,
+                                 const std::array<std::int32_t,4>& virtual_values){
+    const auto millimeters=[](std::int64_t pixels){return static_cast<std::uint32_t>((pixels*254+480)/960);};
+    const bool virtual_set=virtual_values[0]>0;
+    switch(index){
+    case 0:return 0x4000;                       // DRIVERVERSION
+    case 2:return 1;                            // TECHNOLOGY：DT_RASDISPLAY
+    case 4:return virtual_set?static_cast<std::uint32_t>(virtual_values[2]):millimeters(screen[2]); // HORZSIZE
+    case 6:return virtual_set?static_cast<std::uint32_t>(virtual_values[3]):millimeters(screen[3]); // VERTSIZE
+    case 8:return virtual_set?static_cast<std::uint32_t>(virtual_values[0]):static_cast<std::uint32_t>(screen[2]); // HORZRES
+    case 118:return static_cast<std::uint32_t>(screen[2]); // DESKTOPHORZRES
+    case 10:return virtual_set?static_cast<std::uint32_t>(virtual_values[1]):static_cast<std::uint32_t>(screen[3]); // VERTRES
+    case 117:return static_cast<std::uint32_t>(screen[3]); // DESKTOPVERTRES
+    case 12:return mode?(*mode)[2]:32; // BITSPIXEL
+    case 14:return 1;                           // PLANES
+    case 16:case 18:case 24:return UINT32_MAX;   // NUMBRUSHES、NUMPENS、NUMCOLORS：超過 8 位元色時為 -1
+    case 28:return 0x1ff;                       // CURVECAPS
+    case 30:return 0xfe;                        // LINECAPS
+    case 32:return 0xff;                        // POLYGONALCAPS
+    case 34:return 0x7e07;                      // TEXTCAPS
+    case 36:return 1;                           // CLIPCAPS：CP_RECTANGLE
+    case 38: // RASTERCAPS：顯示後端支援位元區塊傳輸、DIB 轉換、縮放及區域填色。
+        return 0x0001 | 0x0080 | 0x0200 | 0x0800 | 0x1000 | 0x2000;
+    case 40:case 42:return 36;                  // ASPECTX、ASPECTY
+    case 44:return 51;                          // ASPECTXY
+    case 88:case 90:return 96;                  // LOGPIXELSX、LOGPIXELSY
+    case 108:return 24;                         // COLORRES
+    case 116:return mode && (*mode)[3]?(*mode)[3]:60; // VREFRESH
+    default:return 0;                           // 其餘未提供的裝置能力
+    }
+}
+}
+void WindowsServices::read_gdi_device_caps(std::uint64_t dc,unsigned first,std::span<std::uint32_t> output){
+    const MetafileState::DeviceCaps* recorded=nullptr;
+    if(metafile_playback_){
+        const auto it=metafile_playback_->recorder_caps.find(dc);
+        if(it!=metafile_playback_->recorder_caps.end())recorded=&it->second;
+    }
+    const bool printer=is_printer_dc(dc);
+    const auto screen=printer || recorded?std::array<std::int32_t,4>{}:gui_screen_area();
+    const auto context=gui_.contexts.find(dc);
+    const auto values=context==gui_.contexts.end()?std::array<std::int32_t,4>{}:context->second.virtual_resolution;
+    for(auto& value:output){
+        const auto index=first++;
+        if(recorded && values[0]>0 && (index==4 || index==6 || index==8 || index==10)){
+            const auto slot=index<8?index/2:index/2-4;
+            value=static_cast<std::uint32_t>(values[slot]);
+        }else if(recorded)value=index<recorded->size()?(*recorded)[index]:0;
+        else if(printer)value=*printer_device_cap(dc,index);
+        else value=display_device_cap(index,screen,gui_.display_mode,values);
+    }
+}
 std::span<const WindowsServiceDescriptor> gdi_misc_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"gdi32.dll","GetDeviceCaps",2,0,0,2},{"win32u.dll","NtGdiGetDeviceCaps",2,0,0,2},
+        {"win32u.dll","NtGdiGetDeviceCapsAll",2},{"win32u.dll","NtGdiGetDeviceWidth",1},
+        {"win32u.dll","NtGdiGetDCPoint",3,0,0,2},{"win32u.dll","NtGdiGetDCDword",3,0,0,2},
+        {"win32u.dll","NtGdiGetAndSetDCDword",4,0,0,6},
         {"gdi32.dll","SetObjectOwner",2},{"gdi32.dll","SetMagicColors",3},{"gdi32.dll","EnableEUDC",1},
         {"gdi32.dll","SetVirtualResolution",5},{"gdi32.dll","GdiConvertToDevmodeW",1},
         {"gdi32.dll","GdiDllInitialize",3},{"gdi32.dll","GdiInitializeLanguagePack",1},{"gdi32.dll","GdiEntry13",0}};
@@ -22,6 +84,125 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_misc(GuestState& state,
     const auto known_dc=[&](std::uint64_t dc){
         return dc && (gui_.contexts.contains(dc) || gui_.dc_objects.contains(dc) || (dc>=0x10000000 && gui_.windows.contains(dc-0x10000000)));
     };
+    if(name=="GetDeviceCaps" || name=="NtGdiGetDeviceCaps" || name=="NtGdiGetDeviceCapsAll"){
+        const auto dc=arg(0);
+        if(!known_dc(dc))return fail(6);
+        if(name!="NtGdiGetDeviceCapsAll"){
+            std::uint32_t value{};
+            read_gdi_device_caps(dc,d(1),{&value,1});
+            return finish(value);
+        }
+        if(!arg(1))return fail(87);
+        MetafileState::DeviceCaps device{};
+        read_gdi_device_caps(dc,0,device);
+        const auto cap=[&](unsigned index){return device[index];};
+        // DEVCAPS 由固定寬度欄位組成，兩種客體使用相同配置。實體長寬取自同一份裝置狀態。
+        const auto width=cap(4),height=cap(6);
+        const std::array<std::uint32_t,36> caps{
+            cap(0),cap(2),(width+500U)/1000U,(height+500U)/1000U,width,height,
+            cap(8),cap(10),cap(12),cap(14),cap(18),cap(22),cap(24),cap(38),
+            cap(40),cap(42),cap(44),cap(88),cap(90),cap(104),cap(108),
+            cap(110),cap(111),cap(112),cap(113),cap(34),cap(116),cap(118),cap(117),
+            cap(119),0,0,0,0,cap(120),cap(121)};
+        try{
+            memory.check(GuestAddress{arg(1)},sizeof caps,Access::Write);
+            memory.write(GuestAddress{arg(1)},{reinterpret_cast<const std::uint8_t*>(caps.data()),sizeof caps});
+        }catch(const MemoryFault&){return fail(998);}
+        return finish(1);
+    }
+    if(name=="NtGdiGetDeviceWidth"){
+        const auto dc=arg(0);
+        if(!known_dc(dc))return fail(6);
+        if(metafile_playback_){
+            const auto recorded=metafile_playback_->recorder_caps.find(dc);
+            if(recorded!=metafile_playback_->recorder_caps.end())return finish(recorded->second[8]);
+        }
+        if(const auto width=printer_device_cap(dc,8))return finish(*width);
+        const auto context=gui_.contexts.find(dc);
+        if(dc>=0x10000000){
+            const auto window=gui_.windows.find(dc-0x10000000);
+            if(window!=gui_.windows.end()){
+                const bool frame=context!=gui_.contexts.end() && context->second.window_frame;
+                return finish(frame?gui_outer_size(window->second)[0]:window->second.width);
+            }
+        }
+        if(dc==0x10000000 || (context!=gui_.contexts.end() && context->second.display))return finish(static_cast<std::uint32_t>(gui_screen_area()[2]));
+        if(context!=gui_.contexts.end()){
+            const auto bitmap=gui_.bitmaps.find(context->second.bitmap);
+            if(bitmap!=gui_.bitmaps.end())return finish(bitmap->second.width);
+        }
+        return finish(1); // 新建記憶體 DC 選入的預設單色點陣圖。
+    }
+    if(name=="NtGdiGetDCDword" || name=="NtGdiGetAndSetDCDword"){
+        const bool exchange=name=="NtGdiGetAndSetDCDword";
+        const auto handle=arg(0),output=arg(exchange?3:2);
+        const auto selector=d(1);
+        if(!output)return fail(87);
+        if(!known_dc(handle))return fail(6);
+        if(selector>9 || (exchange && !selector))return fail(87);
+        try{
+            memory.check(GuestAddress{output},4,Access::Write);
+            auto& dc=gui_.contexts[handle];
+            std::uint32_t value=0;
+            if(!exchange){
+                switch(selector){
+                case 0:break; // 本引擎的 DC 不啟用 GDI 列印日誌。
+                case 1:value=dc.rel_abs;break;
+                case 2:value=static_cast<std::uint32_t>(dc.break_extra);break;
+                case 3:value=static_cast<std::uint32_t>(dc.break_count);break;
+                case 4:value=dc.arc_direction;break;
+                case 5:{
+                    const auto saved=gui_.saved_contexts.find(handle);
+                    value=saved==gui_.saved_contexts.end()?1:1+static_cast<std::uint32_t>(saved->second.size());
+                    break;
+                }
+                case 6:value=static_cast<std::uint32_t>(nested_service(state,memory,"gdi32.dll","GetFontLanguageInfo",{handle}));break;
+                case 7:{
+                    if(dc.information){value=2;break;}
+                    const auto object=nested_service(state,memory,"gdi32.dll","GetObjectType",{handle});
+                    // 記憶體 DC 持有點陣圖；中繼檔 DC 記錄命令，使用參考裝置的資訊。
+                    if(object==10)value=1;
+                    else if(object==12 || object==4)value=2;
+                    break;
+                }
+                case 8:value=dc.map_mode;break;
+                case 9:value=static_cast<std::uint32_t>(dc.char_extra);break;
+                }
+            }else{
+                const auto input=d(2);
+                switch(selector){
+                case 1:break; // PDF／點陣後端沒有待清除的 EPSPRINTING escape。
+                case 2:value=std::exchange(dc.copy_count,input);break;
+                case 3:value=std::exchange(dc.alignment,input);break;
+                case 4:value=std::exchange(dc.rel_abs,input);break;
+                case 5:value=static_cast<std::uint32_t>(std::exchange(dc.char_extra,std::bit_cast<std::int32_t>(input)));break;
+                case 6:break; // 保留的選字型選擇器；實際字型控制代碼由 NtGdiSelectFont 處理。
+                case 7:
+                    if(input>1)return fail(87);
+                    value=std::exchange(dc.mapper_flags,input);break;
+                case 8:
+                    value=static_cast<std::uint32_t>(nested_service(state,memory,"gdi32.dll","SetMapMode",{handle,input}));
+                    break;
+                case 9:
+                    if(input!=1 && input!=2)return fail(87);
+                    value=std::exchange(dc.arc_direction,input);break;
+                }
+            }
+            memory.store(GuestAddress{output},32,value);
+            return finish(1);
+        }catch(const MemoryFault&){return fail(998);}
+    }
+    if(name=="NtGdiGetDCPoint"){
+        constexpr std::array<std::string_view,6> queries{
+            "GetViewportExtEx","GetWindowExtEx","GetViewportOrgEx",
+            "GetWindowOrgEx","GetAspectRatioFilterEx","GetDCOrgEx"};
+        if(!known_dc(arg(0)))return fail(6);
+        const auto index=d(1);
+        if(!index || index>queries.size() || !arg(2))return fail(87);
+        try{memory.check(GuestAddress{arg(2)},8,Access::Write);}
+        catch(const MemoryFault&){return fail(998);}
+        return finish(nested_service(state,memory,"gdi32.dll",queries[index-1],{arg(0),arg(2)}));
+    }
     if(name=="GdiDllInitialize" || name=="GdiInitializeLanguagePack")return finish(1); // 程序附加與語言套件字型連結初始化：狀態於服務啟動時已建立。
     if(name=="GdiEntry13")return finish(gui_.display_uniqueness);
     if(name=="EnableEUDC"){gui_.eudc_enabled=d(0)!=0;return finish(1);}

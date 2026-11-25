@@ -426,25 +426,35 @@ std::span<const WindowsServiceDescriptor> opengl_service_descriptors(){
             {"opengl32.dll","glTexImage1D",8},{"opengl32.dll","glTexSubImage1D",7},{"opengl32.dll","glCopyTexImage1D",7},{"opengl32.dll","glCopyTexSubImage1D",6},
             {"opengl32.dll","glGetStringi",2},{"opengl32.dll","glGetPointerv",2},{"opengl32.dll","glGetString",1},{"opengl32.dll","glVertexPointer",4},{"opengl32.dll","glColorPointer",4},{"opengl32.dll","glNormalPointer",3},{"opengl32.dll","glTexCoordPointer",4},
             {"opengl32.dll","glEnableClientState",1},{"opengl32.dll","glDisableClientState",1},{"opengl32.dll","glArrayElement",1},
-            {"gdi32.dll","ChoosePixelFormat",2},{"gdi32.dll","DescribePixelFormat",4},{"gdi32.dll","SetPixelFormat",3},{"gdi32.dll","GdiSetPixelFormat",2},{"gdi32.dll","GetPixelFormat",1},{"gdi32.dll","SwapBuffers",1}};
+            {"gdi32.dll","ChoosePixelFormat",2},{"gdi32.dll","DescribePixelFormat",4},{"gdi32.dll","SetPixelFormat",3},{"gdi32.dll","GdiSetPixelFormat",3},{"gdi32.dll","GetPixelFormat",1},{"gdi32.dll","SwapBuffers",1},
+            {"win32u.dll","NtGdiDescribePixelFormat",4,0,0,0x6},{"win32u.dll","NtGdiSetPixelFormat",2,0,0,0x2},{"win32u.dll","NtGdiSwapBuffers",1}};
         result.insert(result.end(),std::begin(extra),std::end(extra));return result;}();return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.symbol.starts_with("wglUseFont"))return invoke_wgl_fonts(state,memory,service); // windows_wgl_fonts.cpp
-    const WindowsCall arg(state,memory,service);const auto symbol=canonical_command(service.symbol);
+    const WindowsCall arg(state,memory,service);auto symbol=canonical_command(service.symbol);
+    if(service.family=="win32u.dll" && symbol.starts_with("NtGdi"))symbol.remove_prefix(5);
     const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};const auto n=[&](unsigned i){return std::bit_cast<std::int32_t>(d(i));};
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto dc_window=[&](std::uint64_t dc)->std::uint64_t{const auto h=dc>=0x10000000?dc-0x10000000:0;return gui_.windows.contains(h)?h:0;};
     const auto current_handle=[&](){const auto it=opengl_.current.find(threads_.current);return it==opengl_.current.end()?UINT64_C(0):it->second;};
     const auto window_interval=[&](std::uint64_t window){const auto it=opengl_.swap_intervals.find(window);return it==opengl_.swap_intervals.end()?1:it->second;};
 #include "windows_wgl_formats.inc"
-    // GdiSetPixelFormat 是 opengl32 設定像素格式時使用的 gdi32 入口：與 SetPixelFormat 相同，只是沒有 PIXELFORMATDESCRIPTOR。
+    // 視窗 DC 的像素格式由索引選定；GDI 的第三個參數保留給中繼檔記錄。
     if(symbol=="ChoosePixelFormat" || symbol=="DescribePixelFormat" || symbol=="SetPixelFormat" || symbol=="GdiSetPixelFormat" || symbol=="GetPixelFormat"){
         if(!dc_window(arg(0))){last_error_=6;return finish(0);}
-        const auto descriptor=wgl_pixel_format();
         if(symbol=="GetPixelFormat")return finish(opengl_.pixel_formats.contains(arg(0))?opengl_.pixel_formats.at(arg(0)):0);
         if(symbol=="DescribePixelFormat"){
-            if(d(1)!=1){last_error_=2000;return finish(0);}if(arg(3) && d(2)){memory.write(GuestAddress{arg(3)},std::span(descriptor).first(std::min<std::size_t>(d(2),descriptor.size())));}return finish(1);
+            if(!arg(3))return finish(1);
+            if(d(1)!=1){last_error_=2000;return finish(0);}
+            auto descriptor=wgl_pixel_format();
+            const auto count=std::min<std::size_t>(d(2),descriptor.size());
+            descriptor[0]=static_cast<std::uint8_t>(count);
+            if(count)try{
+                memory.check(GuestAddress{arg(3)},count,Access::Write);
+                memory.write(GuestAddress{arg(3)},std::span(descriptor).first(count));
+            }catch(const MemoryFault&){last_error_=998;return finish(0);}
+            return finish(1);
         }
         if(symbol=="ChoosePixelFormat"){
             const auto bytes=read_bytes(memory,arg(1),40);const auto flags_value=std::uint32_t(bytes[4])|(std::uint32_t(bytes[5])<<8)|(std::uint32_t(bytes[6])<<16)|(std::uint32_t(bytes[7])<<24);
@@ -452,7 +462,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
         }
         if(d(1)!=1){last_error_=2000;return finish(0);}
         if(opengl_.pixel_formats.contains(arg(0))){last_error_=2000;return finish(0);}
-        if(symbol=="SetPixelFormat" && arg(2))memory.check(GuestAddress{arg(2)},40,Access::Read);
         opengl_.pixel_formats[arg(0)]=1;opengl_.swap_intervals[dc_window(arg(0))]=1;return finish(1);
     }
     if(symbol=="wglGetCurrentContext")return finish(current_handle());
@@ -525,13 +534,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
         const auto& w=gui_.windows.at(window);try{c.native->drawable(native_gui_?native_gui_->graphics_view(window):nullptr,std::max(1U,w.width),std::max(1U,w.height));}catch(const std::bad_alloc&){last_error_=8;return finish(0);}
         c.native->bind();const auto interval=window_interval(window);
         if(c.interval!=interval && !c.native->swap_interval(interval)){last_error_=31;return finish(0);}
+        for(auto& [handle,context]:opengl_.contexts)if(context.dc==arg(0))context.presents_dc=false;
+        c.presents_dc=true;
         c.interval=interval;c.dc=arg(0);c.window=window;c.thread=threads_.current;opengl_.current[threads_.current]=arg(1);return finish(1);
     }
-    const auto h=current_handle();
+    const auto current=current_handle();
+    const bool swap=symbol=="SwapBuffers" || symbol=="wglSwapLayerBuffers";
+    auto h=current;
+    if(swap && (!current || opengl_.contexts.at(current).dc!=arg(0))){
+        const auto target=std::find_if(opengl_.contexts.begin(),opengl_.contexts.end(),[&](const auto& item){
+            return item.second.presents_dc && item.second.dc==arg(0);
+        });
+        h=target==opengl_.contexts.end()?0:target->first;
+    }
     if(!h){if(symbol=="wglSwapIntervalEXT" || symbol=="wglGetSwapIntervalEXT")last_error_=1425;else if(symbol=="SwapBuffers" || symbol.starts_with("wgl"))last_error_=6;return finish(0);}
     auto& c=opengl_.contexts.at(h);++c.calls;
     const auto upload=[&](unsigned index,std::int32_t size,std::uint32_t type,std::span<const std::uint8_t> bytes,bool enabled){try{c.native->array(index,size,type,bytes,enabled);return true;}catch(const std::bad_alloc&){error(c,out_of_memory);return false;}};
-    if(symbol=="SwapBuffers" || symbol=="wglSwapLayerBuffers"){
+    if(swap){
         if(arg(0)!=c.dc || !gui_.windows.contains(c.window)){last_error_=6;return finish(0);}
         // 目前公開的 pixel format 只有雙緩衝主平面，PFD 的 overlay／underlay 數皆為零。
         // 空集合不交換；指定不存在的平面失敗，不能將主平面交換當作所有平面已完成。
@@ -540,12 +559,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
             if(!d(1))return finish(1);
         }
         if(c.beginning){error(c,invalid_operation);last_error_=87;return finish(0);}
-        const auto& w=gui_.windows.at(c.window);try{c.native->drawable(native_gui_?native_gui_->graphics_view(c.window):nullptr,std::max(1U,w.width),std::max(1U,w.height));}catch(const std::bad_alloc&){last_error_=8;return finish(0);}
-        const auto interval=window_interval(c.window);if(c.interval!=interval && !c.native->swap_interval(interval)){last_error_=31;return finish(0);}c.interval=interval;
-        const auto ok=c.native->swap();if(ok){++c.frames;if(const auto* directory=std::getenv("X64ARM_GL_CAPTURE_DIR");directory&&*directory){
-            const auto now=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-            if(c.frames==1 || c.frames==32 || c.frames==256 || now>=c.capture_next_milliseconds){c.capture_next_milliseconds=now+4000;try{const auto report=c.native->capture(std::filesystem::path(directory)/("context-"+std::to_string(h)+"-frame-"+std::to_string(c.frames)+".png"));(void)report;}catch(const std::exception&){}}
-        }}return finish(ok?1:0);
+        const auto present=[&](){
+            const auto& window=gui_.windows.at(c.window);
+            try{c.native->drawable(native_gui_?native_gui_->graphics_view(c.window):nullptr,std::max(1U,window.width),std::max(1U,window.height));}
+            catch(const std::bad_alloc&){last_error_=8;return false;}
+            const auto interval=window_interval(c.window);
+            if(c.interval!=interval && !c.native->swap_interval(interval)){last_error_=31;return false;}
+            c.interval=interval;
+            if(!c.native->swap())return false;
+            ++c.frames;
+            if(const auto* directory=std::getenv("X64ARM_GL_CAPTURE_DIR");directory&&*directory){
+                const auto now=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                if(c.frames==1 || c.frames==32 || c.frames==256 || now>=c.capture_next_milliseconds){
+                    c.capture_next_milliseconds=now+4000;
+                    try{(void)c.native->capture(std::filesystem::path(directory)/("context-"+std::to_string(h)+"-frame-"+std::to_string(c.frames)+".png"));}
+                    catch(const std::exception&){}
+                }
+            }
+            return true;
+        };
+        const bool presented=present();
+        if(current && current!=h)opengl_.contexts.at(current).native->bind();
+        return finish(presented);
     }
     if(symbol=="wglSwapIntervalEXT" || symbol=="wglGetSwapIntervalEXT"){
         if(!dc_window(c.dc) || !gui_.windows.contains(c.window)){last_error_=1425;return finish(0);}

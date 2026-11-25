@@ -1,3 +1,4 @@
+#include "msvcp_locale_ids.hpp"
 #include "ansi_codepage.hpp"
 #include "d3d12_shader_pending.hpp"
 #include "debug_semaphore.hpp"
@@ -75,10 +76,12 @@
 #include "guest_crt_complex_code.hpp"
 #include "crt_search_guest.hpp"
 #include "guest_crt_search_code.hpp"
+#include "guest_rtl_large_integer_code.hpp"
 #include "crt_complex_guest.hpp"
 #include "guest_crtdll_text_code.hpp"
 #include "crtdll_text_guest.hpp"
-#include "crt_mbc_contract.h"
+#include "crt_uchar_exports.hpp"
+#include "crt_secure_fill_exports.hpp"
 #include "msvc_exception_exports.hpp"
 #include "icu_normalization_guest.hpp"
 #include "icu_case_guest.hpp"
@@ -599,6 +602,9 @@ constexpr bool d3dx_guest_export(std::string_view family,std::string_view symbol
 }
 constexpr std::uint64_t guest_memory_page_offset=0x80000;
 constexpr std::uint64_t guest_scalar_math_page_offset=0x81000;
+constexpr std::size_t rtl_integer_slot=27;
+static_assert(rtl_integer_slot<windows_address_layout::private_code_slots);
+constexpr auto rtl_integer_base=windows_address_layout::private_code_address(ExecutionMode::X86,rtl_integer_slot);
 constexpr std::uint64_t guest_thread_page_offset=0x82000;
 constexpr std::uint64_t guest_tls_bitmap_page_offset=X64ARM_TLS_BITMAP_PAGE_OFFSET;
 constexpr std::uint64_t guest_descriptor_page_offset=0x85000;
@@ -904,7 +910,7 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             const auto* value=std::getenv("X64ARM_GUEST_ICU_CHARACTER");
             return !value || std::string_view(value)!="0";
         }();
-        struct PrivateImageImport {std::string_view module,symbol;};
+        struct PrivateImageImport {std::string_view module,symbol;bool host_only=false;};
         const auto initialize_guest_image=[&](std::uint64_t base,std::span<const std::uint8_t> bytes,
                 std::u16string_view path,std::span<const std::string_view> heap_imports={},
                 std::span<const PrivateImageImport> other_imports={},std::size_t slots=1){
@@ -928,7 +934,12 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
                 mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
             map_pe_image(memory,parsed);
             if(!parsed.imports.empty())
-                bind_pe_imports(memory,parsed,[&](const PeImport& item){return resolve(item.dll,item.symbol);});
+                bind_pe_imports(memory,parsed,[&](const PeImport& item){
+                    const bool host_only=std::ranges::any_of(other_imports,[&](const auto& spec){
+                        return spec.host_only && spec.module==item.dll && spec.symbol==item.symbol;
+                    });
+                    return resolve_service(item.dll,item.symbol,true,!host_only);
+                });
             runtime_.builtin_images.emplace(base,std::move(image));
         };
         // 帶 filter 的慢路徑也會將客體回呼交給同一份唯讀 ICU 常式。
@@ -961,6 +972,13 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
         initialize_guest_image(crt_complex::image_address(x86_),x86_?std::span<const std::uint8_t>{crt_complex::image_x86}:
             std::span<const std::uint8_t>{crt_complex::image_x64},u"[guest-crt-complex]");
         if(trace_services_.empty() && !startup_profile::enabled()){
+            const auto* rtl_setting=std::getenv("X64ARM_GUEST_RTL_INTEGER");
+            if(x86_ && (!rtl_setting || std::string_view(rtl_setting)!="0")){
+                static constexpr PrivateImageImport slow_division[]={
+                    {"NTDLL.dll","RtlEnlargedUnsignedDivide",true},{"NTDLL.dll","RtlExtendedLargeIntegerDivide",true},
+                    {"NTDLL.dll","RtlLargeIntegerDivide",true}};
+                initialize_guest_image(rtl_integer_base,rtl_large_integer::image_x86,u"[guest-rtl-integer]",{},slow_division);
+            }
             static const bool mbc_lowering=[] {
                 const auto* enabled=std::getenv("X64ARM_GUEST_CRT_MBC");
                 return !enabled || std::string_view(enabled)!="0";
@@ -971,7 +989,7 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
                 std::span<const std::uint8_t>{crt_search::image_x64},u"[guest-crt-search]",{},search_imports);
             if(mbc_lowering){
                 static constexpr PrivateImageImport mbc_imports[]={
-                    {"ucrtbase.dll","_set_errno"},{"ucrtbase.dll","_invalid_parameter_noinfo"}};
+                    {"ucrtbase.dll","_errno"},{"ucrtbase.dll","_set_errno"},{"ucrtbase.dll","_invalid_parameter_noinfo"}};
                 const auto base=windows_address_layout::private_code_address(memory.execution_mode(),12);
                 initialize_guest_image(base,x86_?std::span<const std::uint8_t>{crt_mbc::image_x86}:
                     std::span<const std::uint8_t>{crt_mbc::image_x64},u"[guest-crt-mbc]",{},mbc_imports);
@@ -1190,8 +1208,13 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     std::string lower(dll);
     for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if(!detail::builtin_arch_supported(lower,x86_) ||
+       (lower.starts_with("msvcp") && msvcp_locale_ids::binding(symbol,!x86_)) ||
+       (lower.starts_with("msvcp") && msvcp90_stream::complex_stream(symbol) &&
+        (x86_?symbol.find("@@YAAEAV")!=symbol.npos:symbol.find("@@YAAAV")!=symbol.npos)) ||
        ((lower=="msvcp60.dll" || lower=="msvcp80.dll" || lower=="msvcp90.dll") &&
-        (symbol.find("@?$char_traits@")!=symbol.npos || symbol.find("?$_Ctraits@")!=symbol.npos) && msvcp_traits::wrong_traits_abi(symbol,x86_))){
+        (symbol.find("@?$char_traits@")!=symbol.npos || symbol.find("?$_Ctraits@")!=symbol.npos ||
+         symbol.find("?$complex@")!=symbol.npos || symbol.find("?$_Complex_base@")!=symbol.npos) &&
+        msvcp_traits::wrong_traits_abi(symbol,x86_))){
         if(!required)return GuestAddress{};
         throw std::invalid_argument("內建 DLL 不支援目前客體架構："+lower);
     }
@@ -1252,7 +1275,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     }();
     // wsock32 其餘名稱與 ws2_32 共用；只有 wsock32 自己登錄的別名（#1141／#1142、mswsock 轉送、舊版 inet_network）另行解析。
     const auto alias_family=lower=="wsock32.dll" && !aliases.contains({std::string_view{"wsock32.dll"},symbol})?std::string_view{"ws2_32.dll"}:std::string_view{lower};
-    if(const auto found=aliases.find({alias_family,symbol});found!=aliases.end() && (!found->second->x86_only || x86_)){
+    if(const auto found=aliases.find({alias_family,symbol});found!=aliases.end() && found->second->supports(x86_)){
         const auto& alias=*found->second;lower=alias.target_family;symbol=alias.target_symbol;
     }
     if (lower == "wsock32.dll") lower = "ws2_32.dll";
@@ -1307,7 +1330,8 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         if(guest_thread_routines_.value && runtime_.image.base && trace_services_.empty() && !startup_profile::enabled()){
             const auto entries=[](const auto& source) {
                 std::unordered_map<std::string_view,std::size_t> table;
-                for(const auto& routine:source)table.try_emplace(routine.symbol,routine.entry);
+                for(const auto& routine:source)
+                    if(!routine.symbol.starts_with("ByteSwap"))table.try_emplace(routine.symbol,routine.entry);
                 return table;
             };
             static const auto win32_routines=entries(detail::guest_thread_x86_routines);
@@ -1373,7 +1397,14 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             else if(symbol=="_get_current_locale" || symbol=="__get_current_locale")symbol="__x64arm_current_locale_legacy";
         }
         // UCRT 私有轉送入口保留原函式 ABI，直接共用已實作的公開服務。
-        if((lower=="api-ms-win-crt-private-l1-1-0.dll" || lower=="ucrtbase.dll") && symbol.starts_with("_o_"))symbol.remove_prefix(3);
+        if ((lower=="api-ms-win-crt-private-l1-1-0.dll" || lower=="ucrtbase.dll") && symbol.starts_with("_o_")) {
+            const auto target = symbol.substr(3);
+            const auto function = crt_uchar_function(target);
+            if (!function || *function == CrtMbrtoc16 || *function == CrtMbrtoc32) symbol = target;
+        }
+        const bool uchar_api = crt_uchar_function(symbol).has_value();
+        const bool versioned_mbc_api = crt_secure_set::lookup(symbol) || symbol == "_strerror_s" || symbol == "_mbsncat_s" || symbol == "_mbsncat_s_l";
+        if ((uchar_api || versioned_mbc_api) && lower.starts_with("api-ms-win-crt-")) lower = "ucrtbase.dll";
         // MSVCRT 的 C++ 配置入口共用程序 heap、釋放檢查與 new-handler 重試。
         if(symbol=="??2@YAPAXI@Z" || symbol=="??_U@YAPAXI@Z" || symbol=="??2@YAPEAX_K@Z" || symbol=="??_U@YAPEAX_K@Z")symbol="malloc";
         if(symbol=="??3@YAXPAX@Z" || symbol=="??_V@YAXPAX@Z" || symbol=="??3@YAXPEAX@Z" || symbol=="??_V@YAXPEAX@Z")symbol="free";
@@ -1388,7 +1419,8 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         if(symbol=="_ctype")return GuestAddress{runtime_.ctype_table};
         if(symbol=="_mbctype")return GuestAddress{runtime_base_.value+CRT_MBC_PROCESS_TYPES};
         if(symbol=="_mbcasemap")return GuestAddress{runtime_base_.value+CRT_MBC_PROCESS_CASE};
-        if(allow_resident && trace_services_.empty() && !startup_profile::enabled()){
+        if(allow_resident && (!uchar_api || lower=="ucrtbase.dll") &&
+           (!versioned_mbc_api || secure_crt_library(lower)) && trace_services_.empty() && !startup_profile::enabled()){
             const auto mbc=windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,12);
             for(const auto base:{mbc,crt_complex::image_address(x86_),crt_search::image_address(x86_)}){
                 if(const auto image=runtime_.builtin_images.find(base);image!=runtime_.builtin_images.end())
@@ -1431,6 +1463,24 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     const auto routine=[&](std::size_t index){
         if(!allow_resident)return GuestAddress{stub_base_.value+(services.size()+index)*16};
         const auto& descriptor=runtime_service_descriptors()[index];
+        if(descriptor.family=="internal-rtl-integer"){
+            if(const auto image=runtime_.builtin_images.find(rtl_integer_base);image!=runtime_.builtin_images.end()){
+                const auto name="guest_"+std::string(descriptor.symbol);
+                return GuestAddress{rtl_integer_base+image->second.export_names.at(name)};
+            }
+        }
+        if(descriptor.family=="internal-rtl-byteswap"){
+            const auto target=guest_thread_routine(descriptor.symbol=="RtlUshortByteSwap"?"ByteSwapFast16":
+                descriptor.symbol=="RtlUlongByteSwap"?"ByteSwapFast32":"ByteSwapFast64");
+            if(target.value)return target;
+        }
+        if(descriptor.family=="crt" && descriptor.symbol.starts_with("_byteswap_")){
+            std::string_view name;
+            if(descriptor.symbol=="_byteswap_ushort")name=x86_?"ByteSwapCrt16":"WinsockSwap16";
+            else if(descriptor.symbol=="_byteswap_ulong")name=x86_?"ByteSwapCrt32":"WinsockSwap32";
+            else if(descriptor.symbol=="_byteswap_uint64")name="ByteSwapCrt64";
+            if(!name.empty())if(const auto target=guest_thread_routine(name);target.value)return target;
+        }
         if(descriptor.family=="crtdll.dll"){
             const auto base=crtdll_text::image_address;
             if(const auto image=runtime_.builtin_images.find(base);image!=runtime_.builtin_images.end())
@@ -1450,7 +1500,8 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         }
         const bool numeric=msvcp_numeric::provider(descriptor.family) &&
             (msvcp_numeric::function(descriptor.symbol) || msvcp_numeric::modern_function(descriptor.symbol));
-        if((descriptor.family=="msvcp90.dll" || descriptor.family=="msvcp60.dll" || descriptor.family=="crt" || numeric) && trace_services_.empty()){
+        if((descriptor.family=="msvcp90.dll" || descriptor.family=="msvcp60.dll" || descriptor.family=="crt" || numeric ||
+            (descriptor.family.starts_with("msvcp") && msvcp_locale_ids::binding(descriptor.symbol,x86_))) && trace_services_.empty()){
             const auto image=runtime_.builtin_images.find(callback_return_.value+msvcp90_string::image_offset);
             if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
                 return GuestAddress{image->first+entry->second};
@@ -1702,7 +1753,7 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
                 icu_resources::image_address(x86_),
                 windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,12),
                 crt_complex::image_address(x86_),crt_search::image_address(x86_),
-                x86_?crtdll_text::image_address:0})
+                x86_?crtdll_text::image_address:0,x86_?rtl_integer_base:0})
             if(const auto image=runtime_.builtin_images.find(base);image!=runtime_.builtin_images.end())
                 for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
         if(const auto image=runtime_.builtin_images.find(callback_return_.value+vcomp_image_offset);image!=runtime_.builtin_images.end())
@@ -3601,6 +3652,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
             else if(service_name.starts_with("CreateFileMapping"))trace_text("mapping",args(5),service_name.ends_with('W'));
             else if(service_name.starts_with("OpenFileMapping"))trace_text("mapping",args(2),service_name.ends_with('W'));
             else if(service_name=="CreateProcessW" || service_name=="CreateProcessA")trace_text("command",args(1),service_name.ends_with('W'));
+            else if(service_name=="getaddrinfo" || service_name=="GetAddrInfoW" || service_name=="GetAddrInfoExW" || service_name=="GetAddrInfoExA"){
+                trace_text("host",args(0),service_name.ends_with('W'));trace_text("service",args(1),service_name.ends_with('W'));}
             else if(service_name.starts_with("RegOpenKey") || service_name.starts_with("RegCreateKey"))trace_text("registry_key",args(1),service_name.ends_with('W'));
             else if(service_name.starts_with("RegQueryValue") || service_name.starts_with("RegSetValue"))trace_text("registry_value",args(1),service_name.ends_with('W'));
             else if(service_name.starts_with("OpenService") || service_name.starts_with("CreateService"))trace_text("service_name",args(1),service_name.ends_with('W'));

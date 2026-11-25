@@ -1139,5 +1139,11 @@ end SwapMouseButton
 
 #include "guest_sh_linear.inc"
 
+entry ByteSwapCrt64
+    mov rax, rcx
+    bswap rax
+    ret
+end ByteSwapCrt64
+
 .globl _guest_thread_end
 _guest_thread_end:
