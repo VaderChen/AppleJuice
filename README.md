@@ -122,15 +122,13 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 
 已加入 AppleJuice 程式庫的遊戲，其 EXE 個別儲存的兩項顯示設定優先；尚未加入的遊戲沿用啟動器目前的顯示設定。空間混音為全域偏好。此流程同樣適用其他啟動器，不以遊戲名稱判斷。
 
-## 實測紀錄 / 2026-11-25 / 共 44 款遊戲
+## 實測紀錄 / 2026-11-25 / 共 44 款遊戲 / 5 款工具
 
 - <img src="docs/images/support-levels/good.png" width="16" height="16" alt="運作良好" title="運作良好"> 運作良好：25
 - <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> 運作良好 (MetalFX)：5
 - <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="效率不高" title="效率不高"> 效率不高：10
 - <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="可開啟" title="可開啟"> 可開啟：2
 - <img src="docs/images/support-levels/none.png" width="16" height="16" alt="無法運作、處理中" title="無法運作、處理中"> 無法運作、處理中：2
-
-另有 5 款工具，見完整清單的「工具」分頁。
 
 **[完整清單（可切換語言、依支援程度分頁）](https://vaderchen.github.io/AppleJuice/tested/?lang=zh)**
 
