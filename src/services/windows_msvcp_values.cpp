@@ -2,6 +2,8 @@
 #include "x64arm/unicode.hpp"
 #include "host_complex_math.h"
 #include "msvcp_math.hpp"
+#include "msvcp90_string_exports.hpp"
+#include "crt_bounded_length.hpp"
 #include "windows_math_environment.hpp"
 #include <algorithm>
 #include <bit>
@@ -28,7 +30,7 @@ enum class Op : std::uint8_t {
     GetReal,GetImag,SetReal,SetImag,
     TraitsCosh,TraitsSinh,TraitsExp,TraitsInfinity,TraitsNan,TraitsIsinf,TraitsIsnan,TraitsLibm,
     ReturnThis,
-    CopySecure,MoveSecure,AssignFill,AssignOne,Compare,Copy,Move,Length,Find,Eof,Eq,Lt,EqInt,NotEof,ToChar,ToInt,
+    CopySecure,MoveSecure,AssignFill,AssignFillRef,AssignOne,Compare,Copy,Move,Length,Find,Eof,Eq,Lt,EqInt,NotEof,ToChar,ToInt,
     Address,Allocate,Deallocate,ConstructElement,Destroy,MaxSize};
 // 二元運算元形狀：哪一側是純量。
 enum class Shape : std::uint8_t {None,ScalarComplex,ComplexComplex,ComplexScalar,ComplexInt};
@@ -38,6 +40,7 @@ struct Binding {
     std::uint8_t other{};    // 轉換建構的來源元素大小
     bool member{};           // thiscall：Win32 的 this 在 ECX，Win64 計入第一個參數
     unsigned arguments{};std::uint32_t wide{};
+    unsigned architectures;
     std::string_view libm;   // _Ctraits 轉交的 CRT 數學函式
 };
 struct FloatType {const char* letter;std::uint8_t size;const char* structure;};
@@ -72,8 +75,10 @@ const std::vector<Binding>& bindings(){
             // Win32 的 double／long double 值參數占兩個 4-byte 槽（wide）；無指標的靜態函式兩種 ABI 同名，只登錄一次。
             const auto add=[&](std::string name,Op op,unsigned arguments,bool member,std::uint8_t size,Shape shape=Shape::None,
                                std::uint32_t wide=0,std::uint8_t other=0,std::string_view libm={}){
-                if(!seen.emplace(name,out.size()).second)return;
-                out.push_back({std::move(name),op,shape,size,other,member,arguments+(member && !x86?1U:0U),x86?wide:0U,libm});
+                const unsigned arch=x86?1U:2U;
+                const auto [slot,inserted]=seen.emplace(name,out.size());
+                if(!inserted){out[slot->second].architectures|=arch;return;}
+                out.push_back({std::move(name),op,shape,size,other,member,arguments+(member && !x86?1U:0U),x86?wide:0U,arch,libm});
             };
             for(std::size_t index=0;index<std::size(float_types);++index){
                 const auto& type=float_types[index];const std::string_view t=type.letter;const auto s=type.size;
@@ -151,6 +156,8 @@ const std::vector<Binding>& bindings(){
                 add(e("?_Copy_s"+traits+"SA%P%T%P%T%n%Q%T%1@Z"),Op::CopySecure,4,false,u);
                 add(e("?_Move_s"+traits+"SA%P%T%P%T%n%Q%T%1@Z"),Op::MoveSecure,4,false,u);
                 add(e("?assign"+traits+"SA%P%T%P%T%n%T@Z"),Op::AssignFill,3,false,u);
+                if(std::string_view(type.letter)!="_W")
+                    add(e("?assign"+traits+"SA%P%T%P%T%n%R%T@Z"),Op::AssignFillRef,3,false,u);
                 add(e("?assign"+traits+"SAX%A%T%R%T@Z"),Op::AssignOne,2,false,u);
                 add(e("?compare"+traits+"SAH%Q%T0%n@Z"),Op::Compare,3,false,u);
                 add(e("?copy"+traits+"SA%P%T%P%T%Q%T%n@Z"),Op::Copy,3,false,u);
@@ -193,8 +200,12 @@ const std::vector<Binding>& bindings(){
     }();
     return value;
 }
-const Binding& binding(std::string_view symbol){
+const auto& binding_index(){
     static const auto index=[]{std::unordered_map<std::string_view,const Binding*> out;for(const auto& item:bindings())out.emplace(item.name,&item);return out;}();
+    return index;
+}
+const Binding& binding(std::string_view symbol){
+    const auto& index=binding_index();
     const auto found=index.find(symbol);
     if(found==index.end())throw HostCallFault("未知的 msvcp90 數值服務");
     return *found->second;
@@ -283,11 +294,41 @@ X64armComplexKind complex_kind(Op op){
 }
 }
 
+bool msvcp_traits::wrong_traits_abi(std::string_view symbol,bool x86){
+    const auto& index=binding_index();
+    const auto found=index.find(symbol);
+    if(found==index.end())return false;
+    const auto& b=*found->second;
+    return !(b.architectures&(x86?1U:2U));
+}
+
+std::vector<std::pair<std::string_view,std::string>> msvcp_traits::resident_traits_routines(bool x86){
+    std::vector<std::pair<std::string_view,std::string>> out;
+    for(const auto& b:bindings()){
+        if(!(b.architectures&(x86?1U:2U)))continue;
+        if(b.op==Op::ReturnThis && b.name.find("?$_Ctraits@")!=b.name.npos){
+            out.emplace_back(b.name,"guest_numeric_assign");
+            continue;
+        }
+        if(b.op>=Op::TraitsInfinity && b.op<=Op::TraitsIsnan){
+            const auto method=b.name.substr(2,b.name.find('@')-2);
+            out.emplace_back(b.name,"guest_ctraits_"+std::string(b.size==4?"F_":"D_")+method);
+            continue;
+        }
+        if(b.op<Op::AssignFill || b.op>Op::ToInt)continue;
+        auto operation=b.name.substr(1,b.name.find('@')-1);
+        if(b.op==Op::AssignFill)operation="fill";
+        if(b.op==Op::AssignFillRef)operation="fill_ref";
+        out.emplace_back(b.name,"guest_traits_"+std::string(b.size==1?"D_":"W_")+operation);
+    }
+    return out;
+}
+
 std::span<const WindowsServiceDescriptor> msvcp_values_service_descriptors(){
     // thiscall 成員由被呼叫端清理堆疊；自由與靜態函式是 cdecl。
     static const auto table=[]{
         std::vector<WindowsServiceDescriptor> out;out.reserve(bindings().size());
-        for(const auto& item:bindings())out.push_back({"msvcp90.dll",item.name,item.arguments,item.wide,0,0,!item.member});
+        for(const auto& item:bindings())out.push_back({item.op==Op::AssignFillRef?"msvcp60.dll":"msvcp90.dll",item.name,item.arguments,item.wide,0,0,!item.member});
         return out;
     }();
     return table;
@@ -321,11 +362,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp_values(GuestState& st
         const auto element=[&](std::uint64_t address){return memory.load(GuestAddress{address},bits);};
         const auto integer=[&](std::uint64_t address){return memory.load(GuestAddress{address},narrow?32:16);};
         const auto at=[&](std::uint64_t base,std::uint64_t index){
-            if(index>output_limit)throw HostCallFault("char_traits 範圍超過上限");
-            if(index*unit>UINT64_MAX-base)throw HostCallFault("char_traits 位址溢位");
+            if(index>(size_limit-base)/unit)throw HostCallFault("char_traits 位址溢位");
             return base+index*unit;
         };
-        const auto bytes=[&](std::uint64_t count){if(count>output_limit/unit)throw HostCallFault("char_traits 範圍超過上限");return static_cast<std::size_t>(count*unit);};
+        const auto bytes=[&](std::uint64_t count){if(count>size_limit/unit)throw HostCallFault("char_traits 位元組數溢位");return static_cast<std::size_t>(count*unit);};
         switch(b.op){
         case Op::CopySecure:case Op::MoveSecure:{
             const auto destination=a(0);
@@ -336,12 +376,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp_values(GuestState& st
             }
             return done(destination);
         }
-        case Op::AssignFill:{
-            const auto first=a(0),count=a(1),value=a(2)&mask;
-            if(count){
-                std::vector<std::uint8_t> fill(bytes(count));
-                for(std::size_t i=0;i<fill.size();++i)fill[i]=static_cast<std::uint8_t>(value>>((i%unit)*8));
-                memory.write(GuestAddress{first},fill);
+        case Op::AssignFill:case Op::AssignFillRef:{
+            const auto first=a(0),count=a(1);
+            if(!count)return done(first);
+            const auto value=b.op==Op::AssignFillRef?element(a(2)):a(2)&mask;
+            const auto total=bytes(count);
+            if(narrow){memory.fill(GuestAddress{first},static_cast<std::uint8_t>(value),total);return done(first);}
+            std::array<std::uint8_t,1024> block;
+            for(std::size_t i=0;i<block.size();i+=2){block[i]=static_cast<std::uint8_t>(value);block[i+1]=static_cast<std::uint8_t>(value>>8);}
+            memory.check(GuestAddress{first},total,Access::Write);
+            for(std::size_t i=0;i<total;){
+                const auto length=std::min(block.size(),total-i);
+                memory.write(GuestAddress{first+i},std::span(block).first(length));i+=length;
             }
             return done(first);
         }
@@ -360,9 +406,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp_values(GuestState& st
             if(count)memory.move(GuestAddress{destination},GuestAddress{source},bytes(count));
             return done(destination);
         }
-        case Op::Length:return done(narrow?read_ansi(memory,a(0),output_limit).size():read_utf16(memory,GuestAddress{a(0)},output_limit).size());
+        case Op::Length:return done(crt_bounded_length(memory,a(0),size_limit/unit,unit));
         case Op::Find:{
-            const auto first=a(0),count=a(1),wanted=element(a(2));
+            const auto first=a(0),count=a(1);if(!count)return done(0);
+            const auto wanted=element(a(2));
             for(std::uint64_t i=0;i<count;++i)if(const auto address=at(first,i);element(address)==wanted)return done(address);
             return done(0);
         }

@@ -806,7 +806,7 @@ std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
         {"crt","_mbsrchr",2},{"crt","_mbsrchr_l",3},{"crt","_mbschr",2},{"crt","_mbschr_l",3},
         {"crt","_mbscpy",2},{"crt","_mbscat",2},{"crt","_mbsnbcpy",3},{"crt","_mbsnbcpy_l",4},{"crt","_mbsnbcat",3},{"crt","_mbsnbcat_l",4},
         {"crt","_mbslen",1},{"crt","_mbslen_l",2},{"crt","_mbsinc",1},{"crt","_mbsinc_l",2},{"crt","_mbsnextc",1},{"crt","_mbsnextc_l",2},
-        {"crt","_mbsnbcnt",2},{"crt","_mbsnbcnt_l",3},{"crt","_mbsnccnt",2},{"crt","_mbsnccnt_l",3},{"crt","_mbsnbcmp",3},{"crt","_mbsnbcmp_l",4},
+        {"crt","_mbsnbcnt",2},{"crt","_mbsnbcnt_l",3},{"crt","_mbsnccnt",2},{"crt","_mbsnccnt_l",3},
         {"crt","_mbspbrk",2},{"crt","_mbspbrk_l",3},{"crt","_mbscspn",2},{"crt","_mbscspn_l",3},{"crt","_mbsspn",2},{"crt","_mbsspn_l",3},{"crt","_mbsspnp",2},{"crt","_mbsspnp_l",3},
         {"crt","isleadbyte",1},{"crt","_isleadbyte_l",2},
         {"crt","_setmbcp",1},{"crt","_getmbcp",0},
@@ -1329,7 +1329,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         }
         // 多位元組字串操作：SBCS 碼頁時前導位元組表為空，流程退化成單位元組。截斷在雙位元組字元中間時不留下孤立的前導位元組。
         if(name=="_mbscpy" || name=="_mbscat" || name.starts_with("_mbsnbcpy") || name.starts_with("_mbsnbcat") || name.starts_with("_mbslen") || name.starts_with("_mbsinc") ||
-           name.starts_with("_mbsnextc") || name.starts_with("_mbsnbcnt") || name.starts_with("_mbsnccnt") || name.starts_with("_mbsnbcmp")){
+           name.starts_with("_mbsnextc") || name.starts_with("_mbsnbcnt") || name.starts_with("_mbsnccnt")){
             const auto* chosen=&current_crt_locale(state,memory);
             if(name.ends_with("_l") && arg(service.arguments-1)){
                 const auto object=runtime_.crt_locales.find(arg(service.arguments-1));
@@ -1341,7 +1341,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             const bool multibyte=memory.load(GuestAddress{mbc+8},32)!=0;
             const auto byte=[&](std::uint64_t at){return static_cast<unsigned>(memory.load(GuestAddress{at},8));};
             const auto lead=[&](unsigned value){return multibyte && codepage->lead[value];};
-            if(!arg(0) && !name.starts_with("_mbsnbcmp"))return invalid(22);
+            if((name.starts_with("_mbsnbcnt") || name.starts_with("_mbsnccnt")) && !arg(1))return returned(0);
+            if(!arg(0))return invalid(22);
             if(name=="_mbscpy" || name=="_mbscat"){
                 if(!arg(1))return invalid(22);
                 auto to=arg(0);if(name=="_mbscat")while(byte(to))++to;
@@ -1381,35 +1382,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             if(name.starts_with("_mbsinc"))return returned(arg(0)+(lead(byte(arg(0))) && byte(arg(0)+1)?2U:1U));
             if(name.starts_with("_mbsnextc")){
                 const auto value=byte(arg(0));
-                return returned(lead(value)?(value<<8)+byte(arg(0)+1):value);
+                const auto second=lead(value)?byte(arg(0)+1):0;
+                return returned(second?(value<<8)+second:value);
             }
             if(name.starts_with("_mbsnbcnt")){// 前 n 個字元占幾個位元組
-                auto left=arg(1);auto at=arg(0);
-                for(;left && byte(at);--left){if(lead(byte(at))){if(!byte(at+1)){++at;break;}at+=2;}else ++at;}
-                return returned(at-arg(0));
+                std::array<std::uint8_t,256> types{};
+                if(multibyte)memory.read(GuestAddress{mbc+CRT_MBC_TYPES_OFFSET+1},types);
+                return returned(crt_mbc_character_bytes(&memory,crt_mbc_guest_byte,multibyte?types.data():nullptr,arg(0),arg(1)));
             }
             if(name.starts_with("_mbsnccnt")){// 前 n 個位元組有幾個字元
                 auto left=arg(1);auto at=arg(0);std::uint64_t count=0;
                 while(left && byte(at)){if(lead(byte(at))){if(left==1 || !byte(at+1))break;at+=2;left-=2;}else{++at;--left;}++count;}
                 return returned(count);
             }
-            // _mbsnbcmp：最多比較 n 個位元組，雙位元組字元整個比較；被截斷的前導位元組視為字串結束。
-            if(!arg(2))return returned(0);
-            if(!arg(0) || !arg(1))return error(22);
-            const auto character=[&](std::uint64_t& at,std::uint64_t& left){
-                auto value=byte(at);++at;--left;
-                if(lead(value)){
-                    if(!left){value=0;}else{const auto next=byte(at);++at;--left;value=next?(value<<8)|next:0;}
-                }
-                return value;
-            };
-            auto first=arg(0),second=arg(1);auto left_first=arg(2),left_second=arg(2);
-            while(left_first && left_second){
-                const auto a=character(first,left_first),b=character(second,left_second);
-                if(a!=b)return returned(static_cast<std::uint32_t>(a<b?-1:1));
-                if(!a)break;
-            }
-            return returned(0);
+
         }
         const bool set_scan=name.starts_with("_mbspbrk") || name.starts_with("_mbscspn") || name.starts_with("_mbsspn");
         const bool search=set_scan || name.starts_with("_mbsrchr") || name.starts_with("_mbschr");
@@ -1419,56 +1405,55 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
                 const auto object=runtime_.crt_locales.find(arg(search?2:1));
                 if(object==runtime_.crt_locales.end())return invalid(22);selected=&object->second;
             }
-            auto locale=selected->categories[2];
-            if(search){
-                const auto address=crt_mbc_address(memory,*selected,x86_);
-                const auto current_codepage=windows_crt_codepage(static_cast<std::uint32_t>(memory.load(GuestAddress{address+4},32)));
-                if(!current_codepage)return error(22);locale=*current_codepage;
-                if(!memory.load(GuestAddress{address+8},32))locale.maximum_character_bytes=1;
-            }
             if(!search){
                 const auto value=static_cast<std::uint32_t>(arg(0));
-                return returned(value<256 && locale.lead[value]);
+                return returned(value<256 && selected->categories[2].lead[value]);
             }
             if(!arg(0))return invalid(22);
+            const auto mbc=crt_mbc_address(memory,*selected,x86_);
+            const bool multibyte=memory.load(GuestAddress{mbc+8},32)!=0;
+            std::array<std::uint8_t,256> types{};
+            if(multibyte)memory.read(GuestAddress{mbc+CRT_MBC_TYPES_OFFSET+1},types);
+            const auto lead=[&](unsigned value){return (types[value]&CRT_MBC_LEAD)!=0;};
+            const auto byte=[&](std::uint64_t at){return crt_mbc_guest_byte(&memory,at);};
             if(set_scan){
-                if(!arg(1))return invalid(22);
-                // 逐多位元組字元比對：前導位元組後接 NUL 時以字串結束處理。
-                const auto character=[&](std::uint64_t at,unsigned& count){
-                    auto value=static_cast<unsigned>(memory.load(GuestAddress{at},8));count=1;
-                    if(value && locale.lead[value]){
-                        const auto next=static_cast<unsigned>(memory.load(GuestAddress{at+1},8));
-                        if(!next){value=0;}else{value=(value<<8)|next;count=2;}
-                    }
-                    return value;
-                };
-                std::set<unsigned> members;unsigned count=1;
-                for(std::uint64_t offset=0;offset<output_limit;offset+=count){const auto value=character(arg(1)+offset,count);if(!value)break;members.insert(value);}
-                const bool first_member=name.starts_with("_mbspbrk") || name.starts_with("_mbscspn");
-                const bool want_pointer=name.starts_with("_mbspbrk") || name.starts_with("_mbsspnp");
-                for(std::uint64_t offset=0;offset<output_limit;offset+=count){
-                    const auto value=character(arg(0)+offset,count);
-                    if(!value)return returned(want_pointer?0:offset);
-                    if(members.contains(value)==first_member)return returned(want_pointer?arg(0)+offset:offset);
+                const auto text=arg(0),charset=arg(1);
+                if(!charset)return invalid(22);
+                const bool stop_on_member=name.starts_with("_mbspbrk") || name.starts_with("_mbscspn");
+                const bool pointer=name.starts_with("_mbspbrk") || name.starts_with("_mbsspnp");
+                std::set<unsigned> members;
+                bool match_any=false;
+                for(auto at=charset;const auto first=byte(at++);){
+                    if(!lead(first)){members.insert(first);continue;}
+                    const auto second=byte(at++);
+                    if(!second){match_any=true;break;}
+                    members.insert((first<<8)|second);
                 }
-                throw HostCallFault("CRT 多位元組掃描找不到終止字元");
+                auto at=text;
+                while(const auto first=byte(at)){
+                    const auto width=lead(first)?2U:1U;
+                    const auto value=width==1?first:(first<<8)|byte(at+1);
+                    if((match_any || members.contains(value))==stop_on_member)
+                        return returned(pointer?at:at-text);
+                    if(width==2 && !(value&255U)){++at;break;}
+                    at+=width;
+                }
+                return returned(pointer?0:at-text);
             }
             const bool reverse=name.starts_with("_mbsrchr");
             const auto target=static_cast<std::uint32_t>(arg(1));std::uint64_t match=0;
-            const auto sought=locale.maximum_character_bytes==1?target&255U:target;
-            for(std::uint64_t offset=0;offset<output_limit;){
-                const auto at=arg(0)+offset;if(at<arg(0))throw HostCallFault("CRT 多位元組搜尋位址溢位");
-                auto character=static_cast<unsigned>(memory.load(GuestAddress{at},8));unsigned count=1;
-                if(character && locale.lead[character]){
-                    if(offset+1>=output_limit)return error(42);
-                    const auto next=static_cast<unsigned>(memory.load(GuestAddress{at+1},8));
+            const auto sought=multibyte?target:target&255U;
+            for(auto at=arg(0);;){
+                auto character=byte(at);unsigned count=1;
+                if(character && lead(character)){
+                    const auto next=byte(at+1);
                     if(!next)return returned(reverse?(match?match:at+1):0);
                     character=(character<<8)|next;count=2;
                 }
                 if(character==sought){match=at;if(!reverse)return returned(match);}
-                if(!character)return returned(match);offset+=count;
+                if(!character)return returned(match);
+                at+=count;
             }
-            throw HostCallFault("CRT 多位元組搜尋找不到終止字元");
         }
         throw HostCallFault("未知 CRT locale 作業");
     }

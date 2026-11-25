@@ -87,24 +87,24 @@ std::optional<std::uint32_t> WindowsServices::start_sort(GuestState& state, Gues
     // 比較器返回沿 complete_call 的 CRT descriptor，兩條路徑須保持相同 ABI。
     // _s 版本的比較器為 (context, a, b)；_lfind／_lsearch 的元素數經 unsigned* 傳入。
     const bool contextual=symbol.ends_with("_s"),linear=symbol.starts_with("_l"),search=linear || symbol.starts_with("bsearch");
-    const unsigned arguments=symbol=="qsort"?4U:symbol=="bsearch_s" || symbol=="_lfind_s"?6U:5U;
+    const unsigned arguments=(search?5U:4U)+(contextual?1U:0U);
     const WindowsCall arg(state, memory, arguments, false);
     const auto invalid=[&](std::uint64_t result){
         memory.store(GuestAddress{runtime_.errno_cell},32,22);
         if(current_invalid_parameter_handler()){start_callbacks(state,memory,{{current_invalid_parameter_handler(),{0,0,0,0,0}}},Continuation::Return,result);return std::optional<std::uint32_t>{};}
+        if(linear){report_crt_fast_fail(state,memory,symbol);return std::optional<std::uint32_t>{0xc0000409U};}
         arg.return_to(state,result);return std::optional<std::uint32_t>{};
     };
     if(linear) {
         // (key, base, unsigned* num, width, compare[, context])
-        if(!arg(0) || !arg(2) || !arg(4))return invalid(0);
-        const auto count=static_cast<std::size_t>(memory.load(GuestAddress{arg(2)},32));const auto width=symbol=="_lfind_s"?arg(3):static_cast<std::uint64_t>(static_cast<std::uint32_t>(arg(3)));
-        if((count && !arg(1)) || !width)return invalid(0);
-        if(count>output_limit/width || runtime_.sorts.size()>=32)throw HostCallFault("_lfind 大小或巢狀深度超過上限");
-        if(count)memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(count*width),Access::Read);
-        memory.check(GuestAddress{arg(4)},1,Access::Execute);
-        SortState job;job.search=true;job.linear=true;job.append=symbol=="_lsearch";job.key=arg(0);job.base=arg(1);job.size=width;job.compare=arg(4);
+        const bool append=symbol.starts_with("_lsearch");
+        if(!arg(0) || !arg(2) || (append && !arg(1)))return invalid(0);
+        const auto count=static_cast<std::size_t>(memory.load(GuestAddress{arg(2)},32));
+        const auto width=contextual?arg(3):static_cast<std::uint32_t>(arg(3));
+        if((count && !arg(1)) || !width || !arg(4))return invalid(0);
+        // 比較器可能在首項便命中，也可只檢查元素的一小部分。只在實際存取時檢查客體記憶體。
+        SortState job;job.search=true;job.linear=true;job.append=append;job.key=arg(0);job.base=arg(1);job.size=width;job.compare=arg(4);
         job.right=count;job.count_cell=arg(2);job.contextual=contextual;job.context=contextual?arg(5):0;
-        if(job.append)memory.check(GuestAddress{arg(1)+count*width},static_cast<std::size_t>(width),Access::Write);
         runtime_.sorts.push_back(std::move(job));return advance_sort(state,memory,0);
     }
     if(search) {
@@ -160,15 +160,22 @@ std::optional<std::uint32_t> WindowsServices::advance_sort(GuestState& state, Gu
             ++job.middle;
         }
         if(job.middle>=job.right){
-            std::uint64_t result=0;
-            if(job.append){
-                std::vector<std::uint8_t> bytes(static_cast<std::size_t>(job.size));memory.read(GuestAddress{job.key},bytes);
-                result=job.base+job.right*job.size;memory.write(GuestAddress{result},bytes);memory.store(GuestAddress{job.count_cell},32,job.right+1);
+            const auto key=job.key,width=job.size,count_cell=job.count_cell;
+            const bool append=job.append;
+            const auto result=append?job.base+job.right*width:0;
+            release_callback();
+            runtime_.sorts.pop_back();
+            if(append){
+                memory.move(GuestAddress{result},GuestAddress{key},static_cast<std::size_t>(width));
+                // 回呼可改變 *num；尾端依進入時的長度計算，新增後遞增呼叫端目前的值。
+                memory.store(GuestAddress{count_cell},32,memory.load(GuestAddress{count_cell},32)+1);
             }
-            release_callback();runtime_.sorts.pop_back();complete_call(state,memory,result);return std::nullopt;
+            complete_call(state,memory,result);return std::nullopt;
         }
         job.waiting=true;const auto target=job.compare,key=job.key,element=job.base+job.middle*job.size;
-        compare_next(target,key,element);return std::nullopt;
+        try{compare_next(target,key,element);}
+        catch(...){runtime_.sorts.pop_back();throw;}
+        return std::nullopt;
     }
     if(job.search) {
         if(job.waiting){

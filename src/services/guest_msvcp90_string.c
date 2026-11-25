@@ -103,3 +103,37 @@ NUMERIC_FUNCTION(C,T,B,F,lowest,MIN,8)
 MSVCP_NUMERIC_TYPES(NUMERIC)
 #undef NUMERIC
 EXPORT void* MEMBER guest_numeric_assign(void* object,const void* source){(void)source;return object;}
+
+/* 直接檢查 IEEE 位元，負無窮大及 signaling NaN 也適用。 */
+#define COMPLEX_TRAITS(C,T,U,SIGN,INF,NAN) \
+EXPORT T guest_ctraits_##C##_Infv(T ignored){(void)ignored;union {U bits;T value;} u={INF};return u.value;} \
+EXPORT T guest_ctraits_##C##_Nanv(T ignored){(void)ignored;union {U bits;T value;} u={NAN};return u.value;} \
+EXPORT unsigned char guest_ctraits_##C##_Isinf(T x){union {T value;U bits;} u={x};return (u.bits&~(SIGN))==(INF);} \
+EXPORT unsigned char guest_ctraits_##C##_Isnan(T x){union {T value;U bits;} u={x};return (u.bits&~(SIGN))>(INF);}
+COMPLEX_TRAITS(F,float,unsigned,0x80000000U,0x7f800000U,0x7fc00000U)
+COMPLEX_TRAITS(D,double,unsigned long long,0x8000000000000000ULL,0x7ff0000000000000ULL,0x7ff8000000000000ULL)
+#undef COMPLEX_TRAITS
+
+/* VC6 至 VC9 的 char_traits 靜態方法都是 cdecl。寬字元採 Windows 的 16 位元碼元。 */
+#define CHAR_TRAITS(C,T,I,ORDER) \
+EXPORT void guest_traits_##C##_assign(T* out,const T* value){*out=*value;} \
+EXPORT T* guest_traits_##C##_fill(T* out,Size count,T value){for(Size i=0;i<count;++i)out[i]=value;return out;} \
+EXPORT T* guest_traits_##C##_fill_ref(T* out,Size count,const T* value){return count?guest_traits_##C##_fill(out,count,*value):out;} \
+EXPORT int guest_traits_##C##_compare(const T* lhs,const T* rhs,Size count){return C##_compare(lhs,count,rhs,count);} \
+EXPORT T* guest_traits_##C##_move(T* out,const T* in,Size count){ \
+    if((Size)out>(Size)in && ((Size)out-(Size)in)/sizeof(T)<count){while(count){--count;out[count]=in[count];}} \
+    else for(Size i=0;i<count;++i)out[i]=in[i];return out;} \
+EXPORT T* guest_traits_##C##_copy(T* out,const T* in,Size count){return guest_traits_##C##_move(out,in,count);} \
+EXPORT Size guest_traits_##C##_length(const T* text){return C##_length(text);} \
+EXPORT const T* guest_traits_##C##_find(const T* text,Size count,const T* needle){ \
+    if(count){const T value=*needle;for(Size i=0;i<count;++i)if(text[i]==value)return text+i;}return 0;} \
+EXPORT unsigned char guest_traits_##C##_eq(const T* lhs,const T* rhs){return *lhs==*rhs;} \
+EXPORT unsigned char guest_traits_##C##_lt(const T* lhs,const T* rhs){return (ORDER)*lhs<(ORDER)*rhs;} \
+EXPORT unsigned char guest_traits_##C##_eq_int_type(const I* lhs,const I* rhs){return *lhs==*rhs;} \
+EXPORT I guest_traits_##C##_eof(void){return (I)-1;} \
+EXPORT I guest_traits_##C##_not_eof(const I* value){return *value==(I)-1?0:*value;} \
+EXPORT I guest_traits_##C##_to_int_type(const T* value){return (I)*value;} \
+EXPORT T guest_traits_##C##_to_char_type(const I* value){return (T)*value;}
+CHAR_TRAITS(D,unsigned char,int,signed char)
+CHAR_TRAITS(W,unsigned short,unsigned short,unsigned short)
+#undef CHAR_TRAITS

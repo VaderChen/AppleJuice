@@ -13,12 +13,15 @@ namespace x64arm {
 std::uint32_t WindowsServices::secure_memory_copy(GuestMemory& memory,std::uint64_t destination,std::uint64_t capacity,std::uint64_t source,std::uint64_t count,unsigned unit,bool move){
     if(!count)return 0;
     if(!destination)return 22;
+    const auto byte_size=[&](std::uint64_t units){
+        if(units>(x86_?std::uint64_t{UINT32_MAX}:UINT64_MAX)/unit)throw HostCallFault("CRT 複製的位元組數溢位");
+        return static_cast<std::size_t>(units*unit);
+    };
     if(!source || count>capacity){
-        if(!move && capacity){if(capacity>output_limit/unit)throw HostCallFault("CRT 錯誤清理範圍超過上限");memory.fill(GuestAddress{destination},0,static_cast<std::size_t>(capacity*unit));}
+        if(!move && capacity)memory.fill(GuestAddress{destination},0,byte_size(capacity));
         return !source?22:34;
     }
-    if(count>output_limit/unit)throw HostCallFault("CRT 記憶體複製範圍超過上限");
-    memory.move(GuestAddress{destination},GuestAddress{source},static_cast<std::size_t>(count*unit));
+    memory.move(GuestAddress{destination},GuestAddress{source},byte_size(count));
     return 0;
 }
 std::span<const WindowsServiceDescriptor> crt_string_service_descriptors(){
@@ -32,7 +35,7 @@ std::span<const WindowsServiceDescriptor> crt_string_service_descriptors(){
         {"ntdll.dll","RtlUnicodeStringToAnsiString",3},
         {"ntdll.dll","RtlFreeAnsiString",1},{"ntdll.dll","RtlFormatCurrentUserKeyPath",1},
         {"crt","_itoa",3},{"crt","_itoa_s",4},{"crt","_itow",3},{"crt","_itow_s",4},{"crt","_ltoa",3},{"crt","_ltoa_s",4},{"crt","_ltow",3},{"crt","_ltow_s",4},{"crt","_ultoa",3},{"crt","_ultoa_s",4},{"crt","_ultow",3},{"crt","_ultow_s",4},{"crt","_i64toa",3},{"crt","_i64toa_s",4},{"crt","_i64tow",3},{"crt","_i64tow_s",4},{"crt","_ui64toa",3},{"crt","_ui64toa_s",4},{"crt","_ui64tow",3},{"crt","_ui64tow_s",4},{"crt","_wtoi",1},{"crt","_wtol",1},{"crt","_wtoi64",1},{"crt","wcstol",3},{"crt","wcstoul",3},{"crt","wcstoll",3},{"crt","wcstoull",3},{"crt","_wcstoi64",3},{"crt","_wcstoui64",3},{"crt","mbstowcs",3},{"crt","wcstombs",3},
-        {"crt","strpbrk",2},{"crt","wcspbrk",2},{"crt","wcsspn",2},{"crt","wcscspn",2},{"crt","__strncnt",2},
+        {"crt","strpbrk",2},{"crt","wcspbrk",2},{"crt","wcsspn",2},{"crt","wcscspn",2},
         {"crt","mbsrtowcs",4},{"crt","wcsrtombs",4},
         {"crt","mbstowcs_s",5},{"crt","wcstombs_s",5},{"crt","mbsrtowcs_s",6},{"crt","wcsrtombs_s",6},
         {"crt","_mbstowcs_l",4},{"crt","_wcstombs_l",4},{"crt","_mbstowcs_s_l",6},{"crt","_wcstombs_s_l",6},
@@ -46,7 +49,7 @@ std::span<const WindowsServiceDescriptor> crt_string_service_descriptors(){
         {"crt","_swab",3},{"crt","swab",3},
         {"crt","_makepath",5},{"crt","_wmakepath",5},{"crt","_makepath_s",6},{"crt","_wmakepath_s",6},
         {"crt","_splitpath",5},{"crt","_wsplitpath",5},{"crt","_splitpath_s",9},{"crt","_wsplitpath_s",9},
-        {"crt","__isascii",1},{"crt","_memicmp",3},{"crt","_mbscmp",2},{"crt","_mbstrlen",1},
+        {"crt","__isascii",1},{"crt","_memicmp",3},
         {"crt","strtok",2},{"crt","strtok_s",3},{"crt","wcstok_s",3},{"crt","wcstok",3},{"crt","_wcstok",2},
         {"crt","sscanf",2},{"crt","sscanf_s",2},{"crt","swscanf",2},{"crt","swscanf_s",2},
         {"crt","vsscanf",3},{"crt","vsscanf_s",3},{"crt","vswscanf",3},{"crt","vswscanf_s",3},
@@ -215,25 +218,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_string(GuestState& stat
                 memory.write(GuestAddress{arg(1)+offset},block);offset+=size;
             }
         }
-    }else if(symbol=="__strncnt"){
-        while(result<arg(1)){
-            if(result>=output_limit)throw HostCallFault("CRT 有界字串掃描超過上限");
-            if(!memory.load(address(arg(0),result),8))break;++result;
-        }
     }else if(symbol=="memcpy_s" || symbol=="memmove_s" || symbol=="wmemcpy_s" || symbol=="wmemmove_s"){
         if(const auto error=secure_memory_copy(memory,arg(0),arg(1),arg(2),arg(3),unit,symbol.find("move")!=symbol.npos))return invalid(error);
     }else if(symbol=="__isascii")result=static_cast<std::uint32_t>(arg(0))<128;
-    else if(symbol=="_memicmp" || symbol=="_mbscmp" || symbol=="_mbstrlen"){
-        // 與 setlocale／___mb_cur_max_func 共用目前的 C locale；不誤用宿主 locale 或 Windows ACP。
-        if(symbol=="_mbstrlen"){if(!arg(0))return invalid(22,x86_?UINT32_MAX:UINT64_MAX);result=text(arg(0)).size();}
-        else {
-            if(!arg(0) || !arg(1))return invalid(22,0x7fffffffU);
-            const bool raw=symbol=="_memicmp";const auto count=raw?arg(2):maximum;if(count>output_limit)throw HostCallFault("CRT 比較範圍超過上限");
-            for(std::uint64_t i=0;i<count;++i){auto left=memory.load(address(arg(0),i),8),right=memory.load(address(arg(1),i),8);
-                if(raw){if(left>='A' && left<='Z')left+=32;if(right>='A' && right<='Z')right+=32;}
-                if(left!=right){result=left<right?UINT32_MAX:1;break;}if(!raw && !left)break;
-                if(!raw && i+1==maximum)throw HostCallFault("CRT 比較找不到終止字元");
-            }
+    else if(symbol=="_memicmp"){
+        if(!arg(0) || !arg(1))return invalid(22,0x7fffffffU);
+        const auto count=arg(2);
+        if(count>output_limit)throw HostCallFault("CRT 比較範圍超過上限");
+        for(std::uint64_t i=0;i<count;++i){
+            auto left=memory.load(address(arg(0),i),8),right=memory.load(address(arg(1),i),8);
+            if(left>='A' && left<='Z')left+=32;
+            if(right>='A' && right<='Z')right+=32;
+            if(left!=right){result=left<right?UINT32_MAX:1;break;}
         }
     }else if(symbol.find("makepath")!=symbol.npos){
         const bool secure=symbol.ends_with("_s");const auto capacity=secure?arg(1):maximum;const unsigned first=secure?2:1;

@@ -1,6 +1,8 @@
 #include "x64arm/windows_services.hpp"
 #include "windows_locale_data.hpp"
 #include "crt_mbcs.hpp"
+#include "crt_bounded_length.hpp"
+#include "crt_multibyte_state.hpp"
 #include "windows_crt_character.hpp"
 #include <unicode/uchar.h>
 #include <algorithm>
@@ -41,6 +43,37 @@ std::uint32_t japanese_fullwidth(unsigned c){
 const std::array<std::uint32_t,256>& japanese_fullwidth_table(){
     static const auto table=[]{std::array<std::uint32_t,256> out{};for(unsigned c=0;c<256;++c)out[c]=japanese_fullwidth(c);return out;}();
     return table;
+}
+// LC_CTYPE 控制嚴格解碼。明定大小時驗證整段輸入，字元數只計至第一個 NUL。
+std::optional<std::uint64_t> checked_multibyte_length(const GuestMemory& memory,std::uint64_t text,
+        std::uint64_t limit,bool bounded,const CrtLocaleCategory& category){
+    if(category.maximum_character_bytes==1)return crt_bounded_length(memory,text,limit,1);
+    if(!limit)return std::nullopt; // 多位元組轉換不接受空的明定輸入範圍。
+    crt_multibyte::State state{};
+    std::uint64_t count=0;
+    bool terminated=false;
+    for(std::uint64_t offset=0;offset<limit;){
+        const auto bytes=memory.readable_prefix(GuestAddress{text+offset},std::min<std::uint64_t>(4096,limit-offset));
+        for(std::size_t i=0;i<bytes.size();){
+            const auto byte=bytes[i];
+            if(byte<128 && crt_multibyte::initial(state)){
+                ++i;
+                if(!byte){
+                    if(!bounded)return count;
+                    terminated=true;
+                }
+            }else{
+                const auto decoded=crt_multibyte::decode(state,bytes.subspan(i),category.codepage);
+                if(decoded.status==CrtDecodedCharacter::Status::Invalid)return std::nullopt;
+                i+=decoded.consumed;
+                if(decoded.status==CrtDecodedCharacter::Status::Partial)continue;
+            }
+            if(!terminated)++count;
+        }
+        offset+=bytes.size();
+    }
+    if(!crt_multibyte::initial(state))return std::nullopt;
+    return terminated?count:limit;
 }
 std::optional<std::uint32_t> invoke_crtdll_text(
         GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -84,7 +117,7 @@ std::span<const WindowsServiceDescriptor> crt_mbcs_service_descriptors(){
             {"_ismbcl1","_ismbcl1_l",1},{"_ismbcl2","_ismbcl2_l",1},{"_ismbclegal","_ismbclegal_l",1},{"_ismbclower","_ismbclower_l",1},
             {"_ismbcprint","_ismbcprint_l",1},{"_ismbcpunct","_ismbcpunct_l",1},{"_ismbcspace","_ismbcspace_l",1},{"_ismbcsymbol","_ismbcsymbol_l",1},
             {"_ismbcupper","_ismbcupper_l",1},{"_ismbslead","_ismbslead_l",2},{"_ismbstrail","_ismbstrail_l",2},
-            {"_mbscoll","_mbscoll_l",2},{"_mbsicoll","_mbsicoll_l",2},
+            {"_mbscmp","_mbscmp_l",2},{"_mbsnbcmp","_mbsnbcmp_l",3},{"_mbscoll","_mbscoll_l",2},{"_mbsicoll","_mbsicoll_l",2},
             {"_mbsnbcoll","_mbsnbcoll_l",3},{"_mbsnbicoll","_mbsnbicoll_l",3},
             {"_mbsncoll","_mbsncoll_l",3},{"_mbsnicoll","_mbsnicoll_l",3},
             {"_mbbtombc","_mbbtombc_l",1},{"_mbbtype","_mbbtype_l",2},{"_mbccpy","_mbccpy_l",2},{"_mbccpy_s","_mbccpy_s_l",4},
@@ -93,8 +126,8 @@ std::span<const WindowsServiceDescriptor> crt_mbcs_service_descriptors(){
             {"_mbsbtype","_mbsbtype_l",2},{"_mbsdec","_mbsdec_l",2},{"_mbsicmp","_mbsicmp_l",2},{"_mbslwr","_mbslwr_l",1},{"_mbslwr_s","_mbslwr_s_l",2},
             {"_mbsnbcat_s","_mbsnbcat_s_l",4},{"_mbsnbcpy_s","_mbsnbcpy_s_l",4},{"_mbsnbicmp","_mbsnbicmp_l",3},{"_mbsnbset","_mbsnbset_l",3},
             {"_mbsncat","_mbsncat_l",3},{"_mbsncmp","_mbsncmp_l",3},{"_mbsncpy","_mbsncpy_l",3},{"_mbsncpy_s","_mbsncpy_s_l",4},
-            {"_mbsnicmp","_mbsnicmp_l",3},{"_mbsninc","",2},{"_mbsnlen","_mbsnlen_l",2},{"_mbsnset","_mbsnset_l",3},{"_mbsrev","_mbsrev_l",1},
-            {"_mbsset","_mbsset_l",2},{"_mbsstr","",2},{"_mbstok","_mbstok_l",2},{"_mbstok_s","_mbstok_s_l",3},{"_mbsupr","_mbsupr_l",1},{"_mbsupr_s","_mbsupr_s_l",2},
+            {"_mbsnicmp","_mbsnicmp_l",3},{"_mbsninc","_mbsninc_l",2},{"_mbsnlen","_mbsnlen_l",2},{"_mbstrlen","_mbstrlen_l",1},{"_mbstrnlen","_mbstrnlen_l",2},{"_mbsnset","_mbsnset_l",3},{"_mbsrev","_mbsrev_l",1},
+            {"_mbsset","_mbsset_l",2},{"_mbsstr","_mbsstr_l",2},{"_mbstok","_mbstok_l",2},{"_mbstok_s","_mbstok_s_l",3},{"_mbsupr","_mbsupr_l",1},{"_mbsupr_s","_mbsupr_s_l",2},
         };
 #define CRTDLL_TEXT(name,count) out.push_back({"crtdll.dll",#name,count,0,0,0,true});
 #include "crtdll_text_services.inc"
@@ -121,10 +154,32 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
         if(const auto handler=current_invalid_parameter_handler()){start_callbacks(state,memory,{{handler,{0,0,0,0,0}}},Continuation::Return,result);return std::nullopt;}
         return done(result);
     };
+    if(name=="_mbsninc" && (!arg(0) || !arg(1)))return done(arg(0));
+    const bool ordinal_compare=name=="_mbscmp" || name=="_mbsncmp" || name=="_mbsnbcmp";
+    if(ordinal_compare){
+        if(name!="_mbscmp" && !arg(2))return done(0);
+        if(!arg(0) || !arg(1)){
+            if(current_invalid_parameter_handler())return invalid(nlscmperror);
+            set_errno(einval);report_crt_fast_fail(state,memory,service.symbol);return 0xc0000409U;
+        }
+    }
+    const bool checked_length=name=="_mbstrnlen" || name=="_mbstrlen";
+    const auto size_error=x86_?std::uint64_t{UINT32_MAX}:UINT64_MAX;
+    const auto length_invalid=[&]()->std::optional<std::uint32_t>{
+        if(current_invalid_parameter_handler())return invalid(size_error);
+        set_errno(einval);report_crt_fast_fail(state,memory,service.symbol);return 0xc0000409U;
+    };
+    if(checked_length && (!arg(0) || (name=="_mbstrnlen" && arg(1)>INT32_MAX)))return length_invalid();
     const bool collation=name.starts_with("_mbs") && name.ends_with("coll");
     const CrtLocaleObject* chosen=&current_crt_locale(state,memory);
     if(localized && arg(service.arguments-1)){
-        const auto found=runtime_.crt_locales.find(arg(service.arguments-1));if(found==runtime_.crt_locales.end())return invalid(collation?nlscmperror:0);chosen=&found->second;
+        const auto found=runtime_.crt_locales.find(arg(service.arguments-1));if(found==runtime_.crt_locales.end())return checked_length?length_invalid():invalid((collation || ordinal_compare)?nlscmperror:0);chosen=&found->second;
+    }
+    if(checked_length){
+        const bool bounded=name=="_mbstrnlen";
+        const auto length=checked_multibyte_length(memory,arg(0),bounded?arg(1):UINT64_MAX,bounded,chosen->categories[2]);
+        if(!length){set_errno(eilseq);return done(size_error);}
+        return done(*length);
     }
     const auto mbc=crt_mbc_address(memory,*chosen,x86_);
     if(name=="__p__mbctype")return done(mbc+CRT_MBC_TYPES_OFFSET);
@@ -132,6 +187,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
     const auto codepage=static_cast<std::uint32_t>(memory.load(GuestAddress{mbc+4},32));const bool multibyte=memory.load(GuestAddress{mbc+8},32)!=0;
     std::array<std::uint8_t,256> types{};
     memory.read(GuestAddress{mbc+CRT_MBC_TYPES_OFFSET+1},types);
+    if(ordinal_compare){
+        const auto count=name=="_mbscmp"?UINT64_MAX:arg(2);
+        return done(static_cast<std::uint32_t>(crt_mbc_compare(&memory,crt_mbc_guest_byte,
+            multibyte?types.data():nullptr,arg(0),arg(1),count,name=="_mbsnbcmp")));
+    }
     const auto& ctype=windows_crt_character_table(chosen->categories[2]);
     const auto test_byte=[&](unsigned value,const ByteClass& classification){
         return value<256 && crt_mbc_test_byte(value,ctype.masks[value+1],types[value],classification.ctype,classification.type);
@@ -143,6 +203,34 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
     const auto lead=[&](unsigned b){return multibyte && (types[b&0xffU]&4U);};
     const auto trail=[&](unsigned b){return multibyte && (types[b&0xffU]&8U);};
     const auto byte=[&](std::uint64_t at){return static_cast<unsigned>(memory.load(GuestAddress{at},8));};
+    if(name=="_mbsninc"){
+        const auto bytes=crt_mbc_character_bytes(&memory,crt_mbc_guest_byte,multibyte?types.data():nullptr,arg(0),arg(1));
+        return done(arg(0)+static_cast<std::uint32_t>(bytes));
+    }
+    if(name=="_mbsstr"){
+        const auto text=arg(0),pattern=arg(1);
+        if(pattern && !byte(pattern))return done(text);
+        if(!text || !pattern){
+            if(current_invalid_parameter_handler())return invalid(0);
+            set_errno(einval);report_crt_fast_fail(state,memory,service.symbol);return 0xc0000409U;
+        }
+        return done(crt_mbc_find_string(&memory,crt_mbc_guest_byte,multibyte?types.data():nullptr,text,pattern));
+    }
+    if(name=="_mbsnlen"){
+        const auto text=arg(0),limit=arg(1);
+        if(!multibyte)return done(crt_bounded_length(memory,text,limit,1));
+        std::uint64_t count=0,offset=0;
+        while(offset<limit){
+            const auto first=byte(text+offset++);
+            if(!first)return done(count);
+            if(lead(first)){
+                if(offset==limit)return done(limit);
+                if(!byte(text+offset++))return done(count);
+            }
+            ++count;
+        }
+        return done(limit);
+    }
     const auto put=[&](std::uint64_t at,unsigned value){memory.store(GuestAddress{at},8,value&0xffU);};
     const auto u32=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
     // 字串中位於 at 的字元：{值, 位元組數}；前導位元組後接 NUL 視為字串結束。
@@ -179,7 +267,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
         while(at<limit && byte(text+at)){if(lead(byte(text+at))){if(at+1<limit && byte(text+at+1))at+=2;else break;}else ++at;}
         return at;
     };
-    // 前 count 個字元占用的位元組數（與 _mbsnbcnt 相同規則）。
+    // 前 count 個字元占用的位元組數（複製與填充作業）。
     const auto char_bytes=[&](std::uint64_t text,std::uint64_t count){
         std::uint64_t at=0;for(;count && byte(text+at);--count){if(lead(byte(text+at))){if(!byte(text+at+1)){++at;break;}at+=2;}else ++at;}return at;
     };
@@ -277,16 +365,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
         // ---- 指標移動與長度 ----
         if(name=="_mbsdec"){
             const auto start=arg(0),current=arg(1);if(!start || !current)return invalid(0);if(current<=start)return done(0);
-            std::uint64_t at=start,previous=start;while(at<current){previous=at;at+=lead(byte(at)) && at+1<current?2:1;}
-            return done(previous);
-        }
-        if(name=="_mbsninc"){if(!arg(0))return done(0);return done(arg(0)+char_bytes(arg(0),arg(1)));}
-        if(name=="_mbsnlen"){
-            // 前 maxsize 個位元組內的字元數；其中沒有 NUL 時傳回 maxsize。
-            const auto text=arg(0),limit=arg(1);if(!text)return done(0);
-            std::uint64_t at=0,count=0;
-            while(at<limit){const auto b=byte(text+at);if(!b)return done(count);if(lead(b)){if(at+1>=limit || !byte(text+at+1))return done(count);at+=2;}else ++at;++count;}
-            return done(limit);
+            const auto last=current-1;
+            auto cursor=last;
+            while(cursor>start && lead(byte(cursor-1)))--cursor;
+            return done(last-((last-cursor)&1));
         }
         // ---- 比較 ----
         if(collation){
@@ -341,8 +423,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
             const auto result=windows_nls_compare(*left,*right,locale,fold?1U:0U);
             return result?done(static_cast<std::uint32_t>(*result)):invalid(nlscmperror);
         }
-        if(name=="_mbsicmp" || name=="_mbsnbicmp" || name=="_mbsnicmp" || name=="_mbsncmp"){
-            const bool fold=name!="_mbsncmp",bytes=name=="_mbsnbicmp",bounded=name!="_mbsicmp";
+        if(name=="_mbsicmp" || name=="_mbsnbicmp" || name=="_mbsnicmp"){
+            const bool bytes=name=="_mbsnbicmp",bounded=name!="_mbsicmp";
             if(bounded && !arg(2))return done(0);
             if(!arg(0) || !arg(1))return invalid(nlscmperror);
             auto first=arg(0),second=arg(1);std::uint64_t left_first=bounded?arg(2):UINT64_MAX,left_second=left_first;
@@ -353,7 +435,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
                     if(bytes && left<2){value=0;left=0;return 0;}
                     const auto trailing=byte(at+1);value=trailing?(value<<8)|trailing:0;at+=trailing?2:1;left-=bytes?2:1;
                 }else{++at;left-=1;}
-                return fold?convert_case(value,false):value;
+                return convert_case(value,false);
             };
             while(left_first && left_second){
                 const auto a=next(first,left_first),b=next(second,left_second);
@@ -415,18 +497,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_mbcs(GuestState& state,
             for(std::uint64_t at=text;byte(at);){const auto b=byte(at);if(lead(b) && byte(at+1)){characters.push_back({static_cast<std::uint8_t>(b),static_cast<std::uint8_t>(byte(at+1))});at+=2;}else{characters.push_back({static_cast<std::uint8_t>(b)});++at;}}
             auto at=text;for(auto it=characters.rbegin();it!=characters.rend();++it)for(const auto b:*it)put(at++,b);
             return done(text);
-        }
-        if(name=="_mbsstr"){
-            // 只在字元邊界比對子字串。
-            const auto text=arg(0),pattern=arg(1);if(!text || !pattern)return invalid(0);
-            const auto size=length(pattern);if(!size)return done(text);
-            std::vector<std::uint8_t> needle(static_cast<std::size_t>(size));memory.read(GuestAddress{pattern},needle);
-            for(std::uint64_t at=text;byte(at);){
-                bool match=true;for(std::size_t i=0;i<needle.size() && match;++i)match=byte(at+i)==needle[i];
-                if(match)return done(at);
-                at+=lead(byte(at)) && byte(at+1)?2:1;
-            }
-            return done(0);
         }
         // ---- 分詞 ----
         if(name=="_mbstok" || name=="_mbstok_s"){

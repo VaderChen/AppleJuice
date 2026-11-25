@@ -9,7 +9,7 @@
 
 namespace x64arm {
 struct CrtCharacterOperation {
-    enum class Kind { Predicate, Mask, Lower, Upper, Property } kind;
+    enum class Kind { Predicate, Identifier, Mask, Lower, Upper, Property } kind;
     unsigned mask{};
     bool wide{},explicit_locale{};
 };
@@ -30,6 +30,12 @@ constexpr std::array character_services{
     CHARACTER_PREDICATE("lower",2),CHARACTER_PREDICATE("print",0x157),
     CHARACTER_PREDICATE("punct",0x10),CHARACTER_PREDICATE("space",8),
     CHARACTER_PREDICATE("upper",1),CHARACTER_PREDICATE("xdigit",0x80),
+    CharacterService{{"crt","__iscsym",1},{Kind::Identifier,0x107,false,false}},
+    CharacterService{{"crt","__iscsymf",1},{Kind::Identifier,0x103,false,false}},
+    CharacterService{{"crt","__iswcsym",1},{Kind::Identifier,0x107,true,false}},
+    CharacterService{{"crt","__iswcsymf",1},{Kind::Identifier,0x103,true,false}},
+    CharacterService{{"crt","_iswcsym_l",2},{Kind::Identifier,0x107,true,true}},
+    CharacterService{{"crt","_iswcsymf_l",2},{Kind::Identifier,0x103,true,true}},
     CHARACTER_FORM("tolower",Lower,0,false,1),CHARACTER_FORM("toupper",Upper,0,false,1),
     CHARACTER_FORM("towlower",Lower,0,true,1),CHARACTER_FORM("towupper",Upper,0,true,1),
     CharacterService{{"crt","_isctype",2},{Kind::Mask,0,false,false}},
@@ -49,7 +55,7 @@ const CrtCharacterOperation* find_operation(const WindowsServiceDescriptor& desc
 }
 unsigned unicode_mask(char16_t value){
     const auto c=static_cast<UChar32>(value);unsigned mask=0;
-    if(u_isupper(c))mask|=1;if(u_islower(c))mask|=2;if(u_isdigit(c))mask|=4;
+    if(u_isupper(c))mask|=1;if(u_islower(c))mask|=2;if(u_isdigit(c) || (c<256 && u_getIntPropertyValue(c,UCHAR_NUMERIC_TYPE)==U_NT_DIGIT))mask|=4;
     if(u_isUWhiteSpace(c))mask|=8;if(u_isgraph(c) && !u_isalnum(c))mask|=16;
     if(u_iscntrl(c))mask|=32;if(u_isblank(c) && !u_iscntrl(c))mask|=64;
     if(u_isxdigit(c))mask|=128;if(u_isalpha(c))mask|=0x100;
@@ -103,6 +109,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_character(GuestState& s
                 !item.operation.explicit_locale && item.descriptor.symbol.substr(3)==name)return returned(item.operation.mask);
         return returned(0);
     }
+    auto c=static_cast<std::uint32_t>(arg(0));
+    if(operation->wide)c=static_cast<std::uint16_t>(c);
+    if(operation->wide && (operation->kind==Kind::Predicate || operation->kind==Kind::Mask || operation->kind==Kind::Identifier)){
+        // 寬字元分類共用固定 UTF-16 類別；兩參數或三參數 ABI 的 locale 不參與查詢。
+        retained=c<128;
+        if(!retained && environment)environment->restore();
+        unsigned mask=retained?crt_c_locale::character_mask(c):windows_crt_unicode_mask(static_cast<char16_t>(c));
+        if(retained && (mask&3))mask|=0x100;
+        if(operation->kind==Kind::Mask)return returned(mask&static_cast<std::uint16_t>(arg(1)));
+        if(operation->kind==Kind::Identifier && c=='_')return returned(1);
+        if(operation->mask==0x40 && c=='\t')mask|=0x40;
+        return returned((mask&operation->mask)!=0);
+    }
+    if(operation->kind==Kind::Identifier){
+        if(operation->mask==0x107)c=static_cast<std::uint8_t>(c);
+        if(c=='_'){retained=true;return returned(1);}
+    }
     std::uint64_t locale=operation->explicit_locale?arg(operation->kind==Kind::Mask?2U:1U):0;
     if(!locale){
         const auto thread=runtime_.crt_thread_locales.find(threads_.current);
@@ -126,7 +149,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_character(GuestState& s
     // C locale 的整個家族只用整數；其餘 locale 可能進入 ICU，先建立原宿主環境。
     retained=!category->codepage;
     if(!retained && environment)environment->restore();
-    const auto c=operation->wide?static_cast<std::uint32_t>(static_cast<std::uint16_t>(arg(0))):static_cast<std::uint32_t>(arg(0));
     if(operation->kind==Kind::Lower || operation->kind==Kind::Upper){
         const bool upper=operation->kind==Kind::Upper;
         if(!category->codepage)return returned(upper && c>='a' && c<='z'?c-32:!upper && c>='A' && c<='Z'?c+32:c);
@@ -137,7 +159,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_character(GuestState& s
     }
     unsigned mask=0;
     if(!category->codepage)mask=crt_c_locale::character_mask(c);
-    else if(operation->wide){if(c!=0xffff)mask=unicode_mask(static_cast<char16_t>(c));}
     else if(c<=255)mask=windows_crt_character_table(*category).masks[c+1];
     const auto requested=operation->kind==Kind::Mask?static_cast<std::uint16_t>(arg(1)):operation->mask;
     // isblank 包含水平 Tab；print 的 _BLANK 組合不能因此將控制字元當成可列印字元。

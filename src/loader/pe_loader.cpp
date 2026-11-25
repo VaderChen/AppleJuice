@@ -688,7 +688,10 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
     if (directory_count > 16 || std::uint64_t{directory_count} * 8 + directory_offset > optional_size) reject("data directory 數目超過 optional header");
     const auto table = opt + optional_size;
     file.check(0, headers); file.check(table, std::size_t{count} * 40);
-    if (table + std::size_t{count} * 40 > headers) reject("section table 超過 SizeOfHeaders");
+    // Windows 映像標頭佔用完整客體頁：加殼工具附加的最後幾個 section header 可超出 SizeOfHeaders
+    //（SteamStub 的 .bind；《Tales of Arise》的表尾在 0x420、SizeOfHeaders 0x400），只要仍在標頭頁內就照常載入。
+    const auto table_end = table + std::size_t{count} * 40;
+    if (table_end > ((static_cast<std::size_t>(headers) + 4095) & ~std::size_t{4095})) reject("section table 超過映像標頭頁");
     const std::uint64_t user_limit = x86 ? UINT64_C(0x100000000) : UINT64_C(0x0000700000000000);
     if (!preferred || preferred % 65536 || preferred >= user_limit || image_size > user_limit - preferred)
         reject("image base 未對齊或超出客體地址範圍");
@@ -701,7 +704,8 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
     const auto mapped_headers=(static_cast<std::size_t>(headers)+4095)&~std::size_t{4095};
     Image image{std::vector<std::uint8_t>(mapped_headers), {}, headers,image_size};
     image.sections.reserve(count);
-    std::copy_n(bytes.begin(), headers, image.header_bytes.begin());
+    // 超出 SizeOfHeaders 的 section header 一併放進標頭頁，客體從自身映像列舉 section 時看到完整的表。
+    std::copy_n(bytes.begin(), std::max<std::size_t>(headers, table_end), image.header_bytes.begin());
     for (unsigned n = 0; n < count; ++n) {
         const auto at = table + std::size_t{n} * 40;
         const auto virtual_size = file.u32(at + 8), rva = file.u32(at + 12), raw_size = file.u32(at + 16), raw = file.u32(at + 20);

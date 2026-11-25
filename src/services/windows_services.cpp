@@ -73,6 +73,9 @@
 #include "icu_resources_guest.hpp"
 #include "guest_crt_mbc_code.hpp"
 #include "guest_crt_complex_code.hpp"
+#include "crt_search_guest.hpp"
+#include "guest_crt_search_code.hpp"
+#include "crt_complex_guest.hpp"
 #include "guest_crtdll_text_code.hpp"
 #include "crtdll_text_guest.hpp"
 #include "crt_mbc_contract.h"
@@ -137,8 +140,6 @@ namespace x64arm::detail {void peek_idle_invalidate() noexcept;}
 namespace x64arm::detail {ParallelMappingLock& parallel_mapping_mutex() noexcept;void stream_timing_dump(std::FILE*) noexcept;}
 namespace x64arm {
 namespace {
-constexpr std::size_t crt_complex_slot=25;
-static_assert(crt_complex_slot<windows_address_layout::private_code_slots);
 // 診斷（X64ARM_DEBUG_HOST_FAULT=<檔案>，預設關閉）：宿主 SIGSEGV／SIGBUS 時把訊號、位址與呼叫堆疊附加到檔案，再交給原本的處理程序
 // （客體記憶體錯誤仍由既有處理程序承接）。用於子程序在宿主層級崩潰、沒有留下停止原因的情形。
 struct sigaction host_fault_previous[2];int host_fault_fd=-1;
@@ -957,18 +958,23 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             std::span<const std::uint8_t>{icu_date_format::image_x64},u"[guest-icu-date-format]");
         initialize_guest_image(icu_formatted::image_address(x86_),x86_?std::span<const std::uint8_t>{icu_formatted::image_x86}:
             std::span<const std::uint8_t>{icu_formatted::image_x64},u"[guest-icu-formatted]");
+        initialize_guest_image(crt_complex::image_address(x86_),x86_?std::span<const std::uint8_t>{crt_complex::image_x86}:
+            std::span<const std::uint8_t>{crt_complex::image_x64},u"[guest-crt-complex]");
         if(trace_services_.empty() && !startup_profile::enabled()){
             static const bool mbc_lowering=[] {
                 const auto* enabled=std::getenv("X64ARM_GUEST_CRT_MBC");
                 return !enabled || std::string_view(enabled)!="0";
             }();
-            const auto complex_base=windows_address_layout::private_code_address(memory.execution_mode(),crt_complex_slot);
-            initialize_guest_image(complex_base,x86_?std::span<const std::uint8_t>{crt_complex::image_x86}:
-                std::span<const std::uint8_t>{crt_complex::image_x64},u"[guest-crt-complex]");
+            static constexpr PrivateImageImport search_imports[]={
+                {"ucrtbase.dll","memcpy"},{"ucrtbase.dll","_set_errno"},{"ucrtbase.dll","_invalid_parameter_noinfo"}};
+            initialize_guest_image(crt_search::image_address(x86_),x86_?std::span<const std::uint8_t>{crt_search::image_x86}:
+                std::span<const std::uint8_t>{crt_search::image_x64},u"[guest-crt-search]",{},search_imports);
             if(mbc_lowering){
+                static constexpr PrivateImageImport mbc_imports[]={
+                    {"ucrtbase.dll","_set_errno"},{"ucrtbase.dll","_invalid_parameter_noinfo"}};
                 const auto base=windows_address_layout::private_code_address(memory.execution_mode(),12);
                 initialize_guest_image(base,x86_?std::span<const std::uint8_t>{crt_mbc::image_x86}:
-                    std::span<const std::uint8_t>{crt_mbc::image_x64},u"[guest-crt-mbc]");
+                    std::span<const std::uint8_t>{crt_mbc::image_x64},u"[guest-crt-mbc]",{},mbc_imports);
             }
             if(x86_ && crtdll_text::resident_enabled()){
                 initialize_guest_image(crtdll_text::image_address,std::span<const std::uint8_t>{crtdll_text::image_x86},
@@ -1183,7 +1189,9 @@ GuestAddress WindowsServices::host_service_stub(std::string_view family,std::str
 GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_view symbol,bool required,bool allow_resident) const {
     std::string lower(dll);
     for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if(!detail::builtin_arch_supported(lower,x86_)){
+    if(!detail::builtin_arch_supported(lower,x86_) ||
+       ((lower=="msvcp60.dll" || lower=="msvcp80.dll" || lower=="msvcp90.dll") &&
+        (symbol.find("@?$char_traits@")!=symbol.npos || symbol.find("?$_Ctraits@")!=symbol.npos) && msvcp_traits::wrong_traits_abi(symbol,x86_))){
         if(!required)return GuestAddress{};
         throw std::invalid_argument("內建 DLL 不支援目前客體架構："+lower);
     }
@@ -1380,9 +1388,9 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         if(symbol=="_ctype")return GuestAddress{runtime_.ctype_table};
         if(symbol=="_mbctype")return GuestAddress{runtime_base_.value+CRT_MBC_PROCESS_TYPES};
         if(symbol=="_mbcasemap")return GuestAddress{runtime_base_.value+CRT_MBC_PROCESS_CASE};
-        if(allow_resident){
-            for(const auto slot:{std::size_t{12},crt_complex_slot}){
-                const auto base=windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,slot);
+        if(allow_resident && trace_services_.empty() && !startup_profile::enabled()){
+            const auto mbc=windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,12);
+            for(const auto base:{mbc,crt_complex::image_address(x86_),crt_search::image_address(x86_)}){
                 if(const auto image=runtime_.builtin_images.find(base);image!=runtime_.builtin_images.end())
                     if(const auto entry=image->second.export_names.find(std::string(symbol));entry!=image->second.export_names.end())
                         return GuestAddress{base+entry->second};
@@ -1442,7 +1450,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         }
         const bool numeric=msvcp_numeric::provider(descriptor.family) &&
             (msvcp_numeric::function(descriptor.symbol) || msvcp_numeric::modern_function(descriptor.symbol));
-        if((descriptor.family=="msvcp90.dll" || descriptor.family=="crt" || numeric) && trace_services_.empty()){
+        if((descriptor.family=="msvcp90.dll" || descriptor.family=="msvcp60.dll" || descriptor.family=="crt" || numeric) && trace_services_.empty()){
             const auto image=runtime_.builtin_images.find(callback_return_.value+msvcp90_string::image_offset);
             if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
                 return GuestAddress{image->first+entry->second};
@@ -1693,7 +1701,7 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
                 icu_display_names::image_address(x86_),
                 icu_resources::image_address(x86_),
                 windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,12),
-                windows_address_layout::private_code_address(x86_?ExecutionMode::X86:ExecutionMode::X64,crt_complex_slot),
+                crt_complex::image_address(x86_),crt_search::image_address(x86_),
                 x86_?crtdll_text::image_address:0})
             if(const auto image=runtime_.builtin_images.find(base);image!=runtime_.builtin_images.end())
                 for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}

@@ -13,6 +13,7 @@ inline constexpr bool builtin_arch_supported(std::string_view module,bool x86){
 // Windows CRT 的 long double 與 double 同為 binary64；名稱、參數及回傳 ABI
 // 完全相同的入口共用實作與 resident AOT 配方。不要依字尾猜測混合型別的 ABI。
 inline constexpr std::pair<std::string_view,std::string_view> crt_export_aliases[]{
+    {"__strncnt","strnlen"},{"__wcsncnt","wcsnlen"},
     {"_malloc_crt","malloc"},{"_malloc_base","malloc"},
     {"_calloc_crt","calloc"},{"_calloc_base","calloc"},
     {"_realloc_crt","realloc"},{"_realloc_base","realloc"},
@@ -62,12 +63,11 @@ inline constexpr std::pair<std::string_view,std::string_view> crt_export_aliases
     {"_strlwr_l","_strlwr"},{"_strlwr_s_l","_strlwr_s"},{"_strupr_l","_strupr"},{"_strupr_s_l","_strupr_s"},
     {"_wcslwr_l","_wcslwr"},{"_wcslwr_s_l","_wcslwr_s"},{"_wcsupr_l","_wcsupr"},{"_wcsupr_s_l","_wcsupr_s"},
     {"_strxfrm_l","strxfrm"},{"_wcsxfrm_l","wcsxfrm"},{"_memicmp_l","_memicmp"},{"_wctomb_l","wctomb"},{"_wctomb_s_l","wctomb_s"},
-    {"_mbtowc_l","mbtowc"},{"_mblen_l","mblen"},{"_mbstrlen_l","_mbstrlen"},{"_atodbl_l","_atodbl"},{"_atoflt_l","_atoflt"},{"_atoldbl_l","_atoldbl"},
+    {"_mbtowc_l","mbtowc"},{"_mblen_l","mblen"},{"_atodbl_l","_atodbl"},{"_atoflt_l","_atoflt"},{"_atoldbl_l","_atoldbl"},
     // 同一操作的舊名稱與 ABI 相同的變體（Windows 的 long 為 32 位元；_set_controlfp 只是不使用 _controlfp 的回傳值）。
     {"_fgetchar","getchar"},{"_fputchar","putchar"},{"_copysignf","copysignf"},{"is_wctype","iswctype"},{"_set_controlfp","_controlfp"},
     {"scalbln","scalbn"},{"scalblnf","scalbnf"},{"scalblnl","scalbn"},{"_scalb","scalbn"},{"_scalbf","scalbnf"},{"remquol","remquo"},
     // 多位元組：逐字元比較的結果與無號位元組比較相同，不受 locale 影響；C locale 的排序即比較。_s 複製／串接失敗而不截斷，與位元組版本相同。
-    {"_mbscmp_l","_mbscmp"},
     {"_mbscpy_s","strcpy_s"},{"_mbscpy_s_l","strcpy_s"},{"_mbscat_s","strcat_s"},{"_mbscat_s_l","strcat_s"},{"_mbsdup","_strdup"},
     // _Exit 與 _exit 同為不執行 atexit 的立即結束；寬字元舊名稱；_fread_nolock_s 與 fread_s 共用可遞迴的串流鎖；
     // __CxxFrameHandler2 與 __CxxFrameHandler 共用同一份 FuncInfo 版本判讀；mbsnbcmp_l 為 UCRT 匯出的無底線舊名稱。
@@ -2752,6 +2752,8 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"ntdll.dll","_CIcos","msvcrt.dll","_CIcos"},
     // ntdll 的 CRT 子集與 msvcrt 同 ABI：swprintf／_swprintf／_vswprintf 為不帶 count 的舊式版本。
     {"ntdll.dll","__iscsym","msvcrt.dll","__iscsym"},{"ntdll.dll","__iscsymf","msvcrt.dll","__iscsymf"},{"ntdll.dll","__toascii","msvcrt.dll","__toascii"},
+    {"msvcrtd.dll","__iscsym","msvcrt.dll","__iscsym"},{"msvcrtd.dll","__iscsymf","msvcrt.dll","__iscsymf"},
+    {"msvcrtd.dll","_lfind","msvcrt.dll","_lfind"},{"msvcrtd.dll","_lsearch","msvcrt.dll","_lsearch"},
     {"ntdll.dll","_lfind","msvcrt.dll","_lfind"},{"ntdll.dll","_memccpy","msvcrt.dll","_memccpy"},{"ntdll.dll","_swprintf","msvcrt.dll","_swprintf"},
     {"ntdll.dll","_tolower","msvcrt.dll","_tolower"},{"ntdll.dll","_toupper","msvcrt.dll","_toupper"},{"ntdll.dll","_vswprintf","msvcrt.dll","_vswprintf"},
     {"ntdll.dll","bsearch_s","msvcrt.dll","bsearch_s"},{"ntdll.dll","iswascii","msvcrt.dll","iswascii"},{"ntdll.dll","qsort_s","msvcrt.dll","qsort_s"},
@@ -3226,7 +3228,7 @@ inline constexpr std::string_view ucrt_optional_exports[]{
     "_ismbcpunct", "_ismbcpunct_l", "_ismbcspace", "_ismbcspace_l", "_ismbcsymbol", "_ismbcsymbol_l", "_ismbcupper", "_ismbcupper_l",
     "_ismbslead", "_ismbslead_l", "_ismbstrail", "_ismbstrail_l", "_iswctype_l", "_itoa", "_itoa_s", "_itow", "_itow_s", "_j0", "_j1",
     "_jn", "_kbhit", "_ldclass", "_ldpcomp", "_ldsign", "_ldtest", "_lfind", "_lfind_s", "_loaddll", "_localtime32", "_localtime32_s",
-    "_localtime64", "_localtime64_s", "_lock_file", "_locking", "_logb", "_logbf", "_lsearch", "_lseek", "_lseeki64", "_ltoa", "_ltoa_s",
+    "_localtime64", "_localtime64_s", "_lock_file", "_locking", "_logb", "_logbf", "_lsearch", "_lsearch_s", "_lseek", "_lseeki64", "_ltoa", "_ltoa_s",
     "_ltow", "_ltow_s", "_makepath", "_makepath_s", "_malloc_base", "_mbbtombc", "_mbbtombc_l", "_mbbtype", "_mbbtype_l", "_mbccpy",
     "_mbccpy_l", "_mbccpy_s", "_mbccpy_s_l", "_mbcjistojms", "_mbcjistojms_l", "_mbcjmstojis", "_mbcjmstojis_l", "_mbclen", "_mbclen_l",
     "_mbctohira", "_mbctohira_l", "_mbctokata", "_mbctokata_l", "_mbctolower", "_mbctolower_l", "_mbctombb", "_mbctombb_l", "_mbctoupper",
@@ -3236,9 +3238,9 @@ inline constexpr std::string_view ucrt_optional_exports[]{
     "_mbsnbcat", "_mbsnbcat_l", "_mbsnbcat_s", "_mbsnbcat_s_l", "_mbsnbcmp", "_mbsnbcnt", "_mbsnbcnt_l", "_mbsnbcoll", "_mbsnbcoll_l",
     "_mbsnbcpy", "_mbsnbcpy_l", "_mbsnbcpy_s", "_mbsnbcpy_s_l", "_mbsnbicmp", "_mbsnbicmp_l", "_mbsnbicoll", "_mbsnbicoll_l", "_mbsnbset",
     "_mbsnbset_l", "_mbsncat", "_mbsncat_l", "_mbsnccnt", "_mbsnccnt_l", "_mbsncmp", "_mbsncmp_l", "_mbsncpy", "_mbsncpy_l", "_mbsncpy_s",
-    "_mbsncpy_s_l", "_mbsncoll", "_mbsncoll_l", "_mbsnextc", "_mbsnextc_l", "_mbsnicmp", "_mbsnicmp_l", "_mbsnicoll", "_mbsnicoll_l", "_mbsninc", "_mbsnlen", "_mbsnlen_l", "_mbsnset", "_mbsnset_l",
+    "_mbsncpy_s_l", "_mbsncoll", "_mbsncoll_l", "_mbsnextc", "_mbsnextc_l", "_mbsnicmp", "_mbsnicmp_l", "_mbsnicoll", "_mbsnicoll_l", "_mbsninc", "_mbsninc_l", "_mbsnlen", "_mbsnlen_l", "_mbsnset", "_mbsnset_l",
     "_mbspbrk", "_mbspbrk_l", "_mbsrchr", "_mbsrchr_l", "_mbsrev", "_mbsrev_l", "_mbsset", "_mbsset_l", "_mbsspn", "_mbsspn_l", "_mbsspnp",
-    "_mbsspnp_l", "_mbsstr", "_mbstok", "_mbstok_l", "_mbstok_s", "_mbstok_s_l", "_mbstowcs_l", "_mbstowcs_s_l", "_mbstrlen", "_mbstrlen_l",
+    "_mbsspnp_l", "_mbsstr", "_mbsstr_l", "_mbstok", "_mbstok_l", "_mbstok_s", "_mbstok_s_l", "_mbstowcs_l", "_mbstowcs_s_l", "_mbstrlen", "_mbstrlen_l", "_mbstrnlen", "_mbstrnlen_l",
     "_mbsupr", "_mbsupr_l", "_mbsupr_s", "_mbsupr_s_l", "_mbtowc_l", "_memicmp", "_memicmp_l", "_mkdir", "_mkgmtime32", "_mkgmtime64",
     "_mktemp", "_mktemp_s", "_mktime32", "_mktime64", "_msize", "_nextafter", "_nextafterf", "_open_osfhandle", "_pclose", "_pipe",
     "_popen", "_purecall", "_putc_nolock", "_putch", "_putch_nolock", "_putenv", "_putenv_s", "_putw", "_putwc_nolock", "_putwch",

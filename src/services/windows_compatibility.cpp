@@ -1,3 +1,4 @@
+#include "crt_bounded_length.hpp"
 #include "ansi_codepage.hpp"
 #include "mapi_property_tag.h"
 #include "mapi_restriction.hpp"
@@ -276,7 +277,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         
         {"crt", "_fileno", 1}, 
         {"crt", "rand_s", 1}, {"crt", "rand", 0}, {"crt", "srand", 1},
-        {"crt", "qsort", 4}, {"crt", "bsearch", 5}, {"crt","qsort_s",5},{"crt","bsearch_s",6},{"crt","_lfind",5},{"crt","_lfind_s",6},{"crt","_lsearch",5},
+        {"crt", "qsort", 4}, {"crt", "bsearch", 5}, {"crt","qsort_s",5},{"crt","bsearch_s",6},{"crt","_lfind",5},{"crt","_lfind_s",6},{"crt","_lsearch",5},{"crt","_lsearch_s",6},
         {"crt", "setlocale", 2}, {"crt", "_wsetlocale", 2}, {"crt", "localeconv", 0}, {"crt", "___lc_codepage_func", 0}, {"crt", "___lc_collate_cp_func", 0},
         {"crt", "___mb_cur_max_func", 0}, {"crt", "__mb_cur_max_func", 0}, {"crt", "_lock", 1}, {"crt", "_unlock", 1},
         {"crt", "__lconv_init", 0},
@@ -542,7 +543,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     if(module_api=="SetDefaultDllDirectories" || module_api=="AddDllDirectory" || module_api=="RemoveDllDirectory")return invoke_module(state,memory,service);
     if(module_api.starts_with("QueryFullProcessImageName") || module_api.starts_with("GetProcessImageFileName") || module_api.starts_with("K32") || module_api.starts_with("EnumProcessModules") || module_api.starts_with("GetModule") || module_api.starts_with("LoadLibrary") || module_api.starts_with("GetDllDirectory") || module_api.starts_with("SetDllDirectory") || module_api=="GetProcAddress" || module_api=="FreeLibrary" || module_api=="DisableThreadLibraryCalls")return invoke_module(state,memory,service);
     if (service.symbol == "qsort" || service.symbol == "bsearch" || service.symbol=="qsort_s" || service.symbol=="bsearch_s" ||
-        service.symbol=="_lfind" || service.symbol=="_lfind_s" || service.symbol=="_lsearch") return start_sort(state, memory, service.symbol);
+        service.symbol=="_lfind" || service.symbol=="_lfind_s" || service.symbol=="_lsearch" || service.symbol=="_lsearch_s") return start_sort(state, memory, service.symbol);
     if(service.symbol=="__chkstk"){
         // x64 堆疊探測：呼叫端在配置區域框架前呼叫，進入時 RSP 為 16n（不是一般呼叫的 16n+8），也沒有 home area，
         // 因此不經 WindowsCall 的框架檢查。RAX 為配置大小，自回傳位址之上逐頁往下確認可寫；保留 RAX 與其他暫存器，
@@ -1905,11 +1906,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             result=arg(0);
         }
     } else if (symbol == "wcslen" || symbol == "wcsnlen" || symbol == "strnlen") {
-        const unsigned width = symbol == "strnlen" ? 1 : 2;
-        const auto limit = symbol == "wcslen" ? UINT64_C(1048576) : arg(1);
-        if (limit > 1048576 || limit > (UINT64_MAX - arg(0)) / width) throw HostCallFault("CRT 字串範圍超過上限");
-        for (; result < limit; ++result) if (!memory.load(GuestAddress{arg(0) + result * width}, static_cast<std::uint8_t>(width * 8))) break;
-        if (symbol == "wcslen" && result == limit) throw HostCallFault("wcslen 找不到終止字元");
+        result=crt_bounded_length(memory,arg(0),symbol=="wcslen"?UINT64_MAX:arg(1),symbol=="strnlen"?1U:2U);
     } else if (symbol == "memchr") {
         if (arg(2) > memory.limit() || arg(2) > UINT64_MAX - arg(0)) throw HostCallFault("memchr 範圍超過上限");
         for (std::uint64_t i = 0; i < arg(2); ++i) if (memory.load(GuestAddress{arg(0) + i}, 8) == (arg(1) & 255)) { result = arg(0) + i; break; }

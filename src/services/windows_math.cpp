@@ -2,6 +2,7 @@
 #include "windows_scalar_math.hpp"
 #include "windows_math_environment.hpp"
 #include "host_complex_math.h"
+#include "crt_complex_guest.hpp"
 #include "crt_float_bits.h"
 #include "x64arm/x87_fp.hpp"
 #include "x64arm/unicode.hpp"
@@ -40,6 +41,9 @@ constexpr std::pair<std::string_view,std::string_view> sse_math_aliases[]{
 using ComplexKind=X64armComplexKind;
 struct ComplexOperation {
     std::string_view name;ComplexKind kind;bool single{},real{},binary{};
+    constexpr bool arithmetic() const {
+        return kind==X64armComplexScale || kind==X64armComplexMultiply || kind==X64armComplexNorm;
+    }
 };
 // 複數的輸入／輸出是 CRT 結構 ABI，不是兩個獨立的浮點參數。
 constexpr ComplexOperation complex_operations[]{
@@ -731,9 +735,9 @@ void invoke_complex_operation(const ComplexOperation& operation, const WindowsCa
 #if defined(__clang__)
 #pragma STDC FENV_ACCESS ON
 #endif
-    // 純結構算術只提交浮點狀態；CRT 的 errno 由需要數學錯誤回報的函式管理。
-    if(operation.kind==X64armComplexScale || operation.kind==X64armComplexMultiply || operation.kind==X64armComplexNorm)
-        errno_cell=0;
+    // 常駐算術在兩種架構都使用 SSE2；Win32 的浮點回傳仍經 ST(0)。
+    const bool x87_environment=x86 && !operation.arithmetic();
+    if(operation.arithmetic())errno_cell=0;
     const auto execute=[&]<class T>(){
         constexpr bool single=sizeof(T)==4;
         const bool hidden=!single && !operation.real;
@@ -753,7 +757,7 @@ void invoke_complex_operation(const ComplexOperation& operation, const WindowsCa
         }else if(operation.binary)y=input(first+1);
         const auto output=hidden?arg(0):0;
         if(hidden)memory.check(GuestAddress{output},16,Access::Write);
-        Environment environment(x86?static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13:state.mxcsr);
+        Environment environment(x87_environment?static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13:state.mxcsr);
         const auto result=host_complex(operation.kind,x,y);
         if(operation.real){
             if(x86)conversion_result(state,true,result.real(),single);
@@ -761,14 +765,14 @@ void invoke_complex_operation(const ComplexOperation& operation, const WindowsCa
                 const auto bits=[&] {if constexpr(single)return std::uint64_t{std::bit_cast<std::uint32_t>(result.real())};else return std::bit_cast<std::uint64_t>(result.real());}();
                 for(unsigned n=0;n<sizeof(T);++n)state.xmm[0][n]=static_cast<std::uint8_t>(bits>>(n*8));
             }
-            commit_math_environment(state,memory,errno_cell,x86,environment);
+            commit_math_environment(state,memory,errno_cell,x87_environment,environment);
             arg.return_to(state,0);
         }else if constexpr(single){
             const auto bits=std::bit_cast<std::uint32_t>(result.real())|(std::uint64_t{std::bit_cast<std::uint32_t>(result.imag())}<<32);
-            commit_math_environment(state,memory,errno_cell,x86,environment);
+            commit_math_environment(state,memory,errno_cell,x87_environment,environment);
             arg.return_to(state,bits,true);
         }else {
-            commit_math_environment(state,memory,errno_cell,x86,environment);
+            commit_math_environment(state,memory,errno_cell,x87_environment,environment);
             memory.store(GuestAddress{output},64,std::bit_cast<std::uint64_t>(result.real()));
             memory.store(GuestAddress{output+8},64,std::bit_cast<std::uint64_t>(result.imag()));
             arg.return_to(state,output);
@@ -798,6 +802,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
         }
     }
     if(const auto* operation=complex_operation(symbol)){
+        // ARM 宿主環境無法獨立表示 SSE 的 DAZ、FTZ 與未遮罩例外。
+        // 追蹤這些模式時沿用原呼叫框架，讓同一段客體指令負責例外與結果。
+        if(operation->arithmetic() && (state.mxcsr&0x9fc0U)!=0x1f80U){
+            const auto base=crt_complex::image_address(x86_);
+            const auto& image=runtime_.builtin_images.at(base);
+            state.rip=GuestAddress{base+image.export_names.at(std::string(symbol))};
+            return std::nullopt;
+        }
         invoke_complex_operation(*operation,arg,state,memory,x86_,runtime_.errno_cell);
         return std::nullopt;
     }

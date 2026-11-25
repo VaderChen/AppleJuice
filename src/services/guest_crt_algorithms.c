@@ -393,6 +393,22 @@ INLINE const GuestCrtThreadState *thread_state(void) {
     __asm__("movq %%gs:0x30, %0" : "=r"(teb));
     return (const GuestCrtThreadState *)(teb + GUEST_CRT_STATE_OFFSET);
 }
+/* 單位元組 LC_CTYPE 可直接掃描；其他 locale、無效參數與錯誤處理走共用宿主。 */
+EXPORT Size (*volatile host__mbstrnlen_l)(const char*,Size,Address);
+EXPORT Size (*volatile host__mbstrlen_l)(const char*,Address);
+INLINE int current_single_byte(Address locale){
+    const GuestCrtThreadState *state=thread_state();
+    return (!locale || locale==state->locale_address) && *(const unsigned*)(Address)state->mb_cur_max_address==1;
+}
+EXPORT Size guest_text__mbstrnlen_l(const char* text,Size limit,Address locale){
+    return text && limit<=0x7fffffff && current_single_byte(locale)?
+        guest_strnlen(text,limit):host__mbstrnlen_l(text,limit,locale);
+}
+EXPORT Size guest_text__mbstrnlen(const char* text,Size limit){return guest_text__mbstrnlen_l(text,limit,0);}
+EXPORT Size guest_text__mbstrlen_l(const char* text,Address locale){
+    return text && current_single_byte(locale)?guest_strnlen(text,(Size)-1):host__mbstrlen_l(text,locale);
+}
+EXPORT Size guest_text__mbstrlen(const char* text){return guest_text__mbstrlen_l(text,0);}
 /* 直接讀取已發布的客體 locale 欄位；明確 locale 的版型／驗證仍由共用 provider 處理。 */
 EXPORT unsigned (*volatile host____mb_cur_max_l_func)(Address);
 EXPORT unsigned guest____mb_cur_max_func(void) {
@@ -428,10 +444,15 @@ static const Wide c_masks[128] = {
 #undef C_DIGIT
 
 INLINE int character_mask(unsigned c, unsigned wide, Address locale, unsigned *mask) {
+    if (wide) {
+        if (c >= 128) return 0;
+        *mask = c_masks[c];
+        if (*mask & 3) *mask |= 0x100;
+        return 1;
+    }
     const GuestCrtThreadState *state = thread_state();
     if (locale && locale != state->locale_address) return 0;
     if (!state->ctype_codepage) { *mask = c < 128 ? c_masks[c] : 0; return 1; }
-    if (wide) return 0; /* 非 C 寬字元仍由既有 Unicode／ICU 契約處理。 */
     *mask = c < 256 ? ((const Wide *)(Address)state->ctype_address)[c] : 0;
     return 1;
 }
@@ -473,6 +494,23 @@ PREDICATE_FAMILY(xdigit,0x80)
 #undef PREDICATE_FAMILY
 #undef PREDICATE_L
 #undef PREDICATE
+
+/* 窄字元讀取目前執行緒的分類表。寬字元的 ASCII 常駐，非 ASCII 共用宿主 Unicode 分類。 */
+EXPORT unsigned guest_text___iscsym(unsigned input) {
+    const Byte c = (Byte)input;
+    return c == '_' || guest_text_isalnum(c);
+}
+EXPORT unsigned guest_text___iscsymf(unsigned c) {
+    return c == '_' || guest_text_isalpha(c);
+}
+#define WIDE_IDENTIFIER(name, localized, classify) \
+    EXPORT unsigned guest_text_##name(Wide c) { return c == '_' || classify(c); } \
+    EXPORT unsigned guest_text_##localized(Wide c, Address locale) { \
+        (void)locale; return guest_text_##name(c); \
+    }
+WIDE_IDENTIFIER(__iswcsym, _iswcsym_l, guest_text_iswalnum)
+WIDE_IDENTIFIER(__iswcsymf, _iswcsymf_l, guest_text_iswalpha)
+#undef WIDE_IDENTIFIER
 
 #define MASK_ENTRY(name,wide) \
     EXPORT unsigned (*volatile host_##name)(unsigned,unsigned); \

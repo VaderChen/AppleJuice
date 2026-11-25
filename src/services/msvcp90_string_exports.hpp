@@ -4,6 +4,11 @@
 #include <unordered_map>
 #include <vector>
 
+namespace x64arm::msvcp_traits {
+std::vector<std::pair<std::string_view,std::string>> resident_traits_routines(bool x86);
+bool wrong_traits_abi(std::string_view symbol,bool x86);
+}
+
 namespace x64arm::msvcp90_string {
 inline constexpr std::uint64_t image_offset=0xf0000;
 // VC9 的字串含一個 allocator 指標、16-byte SSO、size 與 capacity。

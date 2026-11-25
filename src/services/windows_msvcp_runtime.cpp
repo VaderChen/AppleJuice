@@ -23,7 +23,7 @@ struct RuntimeEntry {std::string_view name;std::uint8_t arguments,wide,versions;
 constexpr RuntimeEntry runtime_entries[]{
     {"_Cosh",2,3,7},{"_LCosh",2,3,7},{"_FCosh",2,0,7},
     {"_Sinh",2,3,7},{"_LSinh",2,3,7},{"_FSinh",2,0,7},
-    {"_Exp",3,2,7},{"_LExp",3,2,4},{"_FExp",3,0,7},
+    {"_Exp",3,2,7},{"_LExp",3,2,7},{"_FExp",3,0,7},
     {"_Dtest",1,0,7},{"_LDtest",1,0,7},{"_FDtest",1,0,7},
     {"_Dscale",2,0,3},{"_LDscale",2,0,3},{"_FDscale",2,0,3},
     {"_Getctype",1,0,3},{"_Getcvt",0,0,3},{"_Getcoll",1,0,7},{"_Getdateorder",0,0,7},

@@ -5,6 +5,10 @@
 #include <cstdint>
 
 namespace x64arm {
+inline unsigned crt_mbc_guest_byte(const void* context,CrtMbcAddress at){
+    return static_cast<unsigned>(static_cast<const GuestMemory*>(context)->load(GuestAddress{at},8));
+}
+
 void initialize_crt_multibyte(GuestMemory&,std::uint64_t process_base,std::uint32_t codepage);
 
 // _locale_t 的 mbcinfo 指標（locinfo 之後一格）。locale 物件與 MBCS 字串函式共用同一份客體 ABI 狀態：

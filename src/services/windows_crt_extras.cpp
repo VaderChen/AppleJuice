@@ -20,7 +20,7 @@ constexpr std::uint32_t einval=22,erange=34,eilseq=42,enomem=12;
 }
 std::span<const WindowsServiceDescriptor> crt_extra_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
-        {"crt","__iscsym",1},{"crt","__iscsymf",1},{"crt","__iswcsym",1},{"crt","__iswcsymf",1},{"crt","__toascii",1},
+        {"crt","__toascii",1},
         {"crt","_tolower",1},{"crt","_toupper",1},{"crt","iswascii",1},{"crt","wctrans",1},{"crt","towctrans",2},
         {"crt","_chgsign",1,1},{"crt","_chgsignf",1},{"crt","_finitef",1},{"crt","_isnanf",1},
         {"crt","remquo",3,3},{"crt","remquof",3},{"crt","tgammaf",1},
@@ -63,15 +63,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_extra(GuestState& state
     const auto u32=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
     const auto s32=[&](unsigned index){return static_cast<std::int32_t>(u32(index));};
     try{
-        // 字元分類：C locale 下 ASCII 英數；寬字元版本與 iswalnum／iswalpha 共用 Unicode 分類。
-        if(name=="__iscsym" || name=="__iscsymf"){
-            const auto c=s32(0);const bool alpha=(c>='A' && c<='Z') || (c>='a' && c<='z');
-            return done(alpha || c=='_' || (name=="__iscsym" && c>='0' && c<='9'));
-        }
-        if(name=="__iswcsym" || name=="__iswcsymf"){
-            const auto c=u32(0)&0xffffU;if(c=='_')return done(1);
-            return done(crt(name=="__iswcsym"?"iswalnum":"iswalpha",{c})!=0);
-        }
         if(name=="__toascii")return done(u32(0)&0x7fU);
         // 不檢查範圍的轉換：與 Windows 相同，只對對應大小寫字母有意義。
         if(name=="_tolower")return done(static_cast<std::uint32_t>(s32(0)-'A'+'a'));

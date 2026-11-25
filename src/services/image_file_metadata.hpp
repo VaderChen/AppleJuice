@@ -109,8 +109,10 @@ public:
            file_alignment>65536 || file_alignment>alignment || !image_size_ || image_size_%alignment ||
            !headers_ || headers_>image_size_ || headers_%file_alignment)invalid();
         const auto directories=file.integer(opt+directory_offset-4,4),table=opt+header_.optional_size;
-        if(directories>16 || directory_offset+directories*8>header_.optional_size || table>headers_ ||
-           std::uint64_t{header_.sections}*40>headers_-table)invalid();
+        // 與載入器相同：section table 可超出 SizeOfHeaders（加殼工具附加的 section header），只要仍在映像標頭頁內。
+        const auto header_page=(headers_+4095)&~std::uint64_t{4095};
+        if(directories>16 || directory_offset+directories*8>header_.optional_size || table>header_page ||
+           std::uint64_t{header_.sections}*40>header_page-table)invalid();
         file.check(0,headers_);file.check(table,std::uint64_t{header_.sections}*40);
         for(unsigned n=0;n<header_.sections;++n){
             const auto at=table+n*40,virtual_size=file.integer(at+8,4),rva=file.integer(at+12,4),raw_size=file.integer(at+16,4),raw=file.integer(at+20,4);

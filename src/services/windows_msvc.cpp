@@ -34,6 +34,8 @@ void WindowsServices::initialize_guest_msvcp90(GuestMemory& memory){
         if(found==parsed.runtime.export_names.end())throw std::logic_error("VC9 常駐字串缺少產碼入口："+name);
         image.export_names.emplace(entry.name,parsed.runtime.export_ordinals.at(found->second));
     }
+    if(lowering)for(const auto& [symbol,native]:msvcp_traits::resident_traits_routines(x86_))
+        image.export_names.emplace(symbol,parsed.runtime.export_ordinals.at(parsed.runtime.export_names.at(native)));
     static const bool stream_lowering=[] {const auto* v=std::getenv("X64ARM_GUEST_CPP_STREAMS");return !v || std::string_view(v)!="0";}();
     if(lowering && stream_lowering)for(const auto& entry:msvcp90_stream::bindings())if(entry.x86==x86_){
         const auto name=msvcp90_stream::native_name(entry.name);if(name.empty())continue;
