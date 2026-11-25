@@ -255,6 +255,7 @@ class MetalGl final:public NativeOpenGlContext {
     std::atomic<bool> present_queue_active_{false}; // 呈現執行緒存在（供其他執行緒的就緒查詢讀取）。
     bool immediate_unavailable_{};
     static bool immediate_present_enabled(){static const bool enabled=[] {const auto* value=std::getenv("X64ARM_METAL_IMMEDIATE_PRESENT");return !value || std::string_view(value)=="1";}();return enabled;}
+    static bool upscaled_immediate_present() noexcept {static const bool enabled=[]{const char* value=std::getenv("X64ARM_METAL_UPSCALE_IMMEDIATE");return !value || std::string_view(value)!="0";}();return enabled;}
     void finish_immediate_present(){interpolation_presenter_.reset();present_queue_active_.store(false,std::memory_order_release);if(immediate_presenter_){immediate_presenter_->finish();immediate_presenter_->report();immediate_presenter_.reset();}}
     std::shared_ptr<GpuMemoryReservation> surface_;
     std::vector<std::shared_ptr<GpuMemoryReservation>> pending_leases_;
@@ -1136,12 +1137,23 @@ public:
             }
         }
         interpolation_fed_=false;
-        auto front_copy=[commands_ blitCommandEncoder];MetalEncoderScope front_copy_scope{front_copy};[front_copy copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:front_ destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];front_copy_scope.end();if(layer_ && !interval_ && immediate_present_enabled() && !immediate_unavailable_ && present_scale_==1 && !interpolation_active_.load(std::memory_order_relaxed)){
-            if(!immediate_presenter_)try{immediate_presenter_=std::make_unique<MetalImmediatePresenter>(device_,layer_,width_,height_);}catch(const std::bad_alloc&){immediate_unavailable_=true;}
+        auto front_copy=[commands_ blitCommandEncoder];MetalEncoderScope front_copy_scope{front_copy};[front_copy copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:front_ destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];front_copy_scope.end();if(layer_ && !interval_ && immediate_present_enabled() && !immediate_unavailable_ && (present_scale_==1 || upscaled_immediate_present()) && !interpolation_active_.load(std::memory_order_relaxed)){
+            // 2 倍放大顯示也走立即呈現：先以 MetalFX 放大到 present_upscaled_，再複製到呈現用紋理（尺寸為放大後的大小）。
+            // 原本放大模式由繪製執行緒自己取 drawable，畫面被壓在螢幕更新率、讀檔也受拖累（電馭叛客讀檔 72 對 19～29 秒）。X64ARM_METAL_UPSCALE_IMMEDIATE=0 關閉。
+            if(!immediate_presenter_)try{immediate_presenter_=std::make_unique<MetalImmediatePresenter>(device_,layer_,width_*present_scale_,height_*present_scale_);}catch(const std::bad_alloc&){immediate_unavailable_=true;}
             if(immediate_presenter_){
-                const auto index=immediate_presenter_->prepare();auto encoder=[commands_ blitCommandEncoder];MetalEncoderScope scope{encoder};
-                [encoder copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
-                          sourceSize:MTLSizeMake(width_,height_,1) toTexture:immediate_presenter_->texture(index)
+                const auto index=immediate_presenter_->prepare();
+                id<MTLTexture> shown=color_;unsigned shown_width=width_,shown_height=height_;
+                if(present_scale_>1){
+                    if(@available(macOS 13.0,*)){
+                        id<MTLFXSpatialScaler> scaler=present_scaler_;scaler.colorTexture=color_;scaler.outputTexture=present_upscaled_;
+                        scaler.inputContentWidth=width_;scaler.inputContentHeight=height_;[scaler encodeToCommandBuffer:commands_];
+                        shown=present_upscaled_;shown_width=width_*present_scale_;shown_height=height_*present_scale_;
+                    }
+                }
+                auto encoder=[commands_ blitCommandEncoder];MetalEncoderScope scope{encoder};
+                [encoder copyFromTexture:shown sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                          sourceSize:MTLSizeMake(shown_width,shown_height,1) toTexture:immediate_presenter_->texture(index)
                     destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
                 scope.end();auto ready=commands_;const auto timing=trace_frame(ready,request);flush(false);immediate_presenter_->publish(index,ready,timing);return true;
             }
