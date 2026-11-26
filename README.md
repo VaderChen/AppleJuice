@@ -4,7 +4,7 @@
 
 # AppleJuice
 
-A Windows gaming compatibility runtime for Apple Silicon. Play supported Windows games on your Mac with AppleJuice’s own CPU translator and Direct3D-to-Metal graphics.
+AppleJuice is free to use, and its source code is publicly available. Play supported Windows games on your Mac with AppleJuice’s own CPU translator and Direct3D-to-Metal graphics.
 
 **[Download for Mac](https://github.com/VaderChen/AppleJuice/releases/latest)** · [Release notes](https://github.com/VaderChen/AppleJuice/releases) · **[Game compatibility](https://vaderchen.github.io/AppleJuice/tested/?lang=en)** · [Quick start](#start) · [Technical guide](docs/product/guide.en.md) · [Gameplay showcase](#games)
 

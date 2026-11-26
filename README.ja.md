@@ -4,7 +4,7 @@
 
 # AppleJuice
 
-Apple Silicon Mac で対応する Windows ゲームをプレイできます。独自の CPU 変換器で x86／x64 コードを実行し、Direct3D の描画を Metal に変換します。
+AppleJuice は無料で利用でき、ソースコードも公開しています。Apple Silicon Mac で対応する Windows ゲームをプレイできます。独自の CPU 変換器で x86／x64 コードを実行し、Direct3D の描画を Metal に変換します。
 
 **[Mac 版をダウンロード](https://github.com/VaderChen/AppleJuice/releases/latest)** · [リリースノート](https://github.com/VaderChen/AppleJuice/releases) · **[ゲーム互換性](https://vaderchen.github.io/AppleJuice/tested/?lang=ja)** · [クイックスタート](#start) · [技術ガイド](docs/product/guide.ja.md) · [実機プレイ映像](#games)
 

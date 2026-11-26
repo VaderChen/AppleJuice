@@ -4,7 +4,7 @@
 
 # AppleJuice
 
-在 Apple Silicon Mac 上玩支援的 Windows 遊戲。AppleJuice 以自研 CPU 轉譯器執行 x86／x64 程式，並將 Direct3D 繪圖接到 Metal。
+AppleJuice 可免費使用，原始碼公開。在 Apple Silicon Mac 上玩支援的 Windows 遊戲。AppleJuice 以自研 CPU 轉譯器執行 x86／x64 程式，並將 Direct3D 繪圖接到 Metal。
 
 **[下載 Mac 版](https://github.com/VaderChen/AppleJuice/releases/latest)** · [版本說明](https://github.com/VaderChen/AppleJuice/releases) · **[遊戲相容性](https://vaderchen.github.io/AppleJuice/tested/?lang=zh)** · [快速開始](#start) · [技術手冊](docs/product/guide.zh.md) · [實機遊玩展示](#games)
 

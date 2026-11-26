@@ -4,6 +4,8 @@
 
 # AppleJuice
 
+AppleJuice is free to use, and its source code is publicly available.
+
 [Read the English product guide](README.md) · [Download for Mac](https://github.com/VaderChen/AppleJuice/releases/latest) · [Game compatibility](https://vaderchen.github.io/AppleJuice/tested/?lang=en)
 
 [☕ Buy Me a Coffee](https://buymeacoffee.com/vaderchen)
