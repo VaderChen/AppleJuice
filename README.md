@@ -1,6 +1,6 @@
 [![AppleJuice — Windows Gaming. Squeezed for Apple Silicon.](docs/images/branding/hero.svg)](https://vaderchen.github.io/AppleJuice/)
 
-[![Open web version](docs/images/branding/web-en.svg)](https://vaderchen.github.io/AppleJuice/)
+[![Open web version](docs/images/branding/web-en.svg)](https://vaderchen.github.io/AppleJuice/) &nbsp; [English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
 # AppleJuice
 
@@ -8,7 +8,7 @@ A Windows gaming compatibility runtime for Apple Silicon. Play supported Windows
 
 **[Download for Mac](https://github.com/VaderChen/AppleJuice/releases/latest)** · [Release notes](https://github.com/VaderChen/AppleJuice/releases) · **[Game compatibility](https://vaderchen.github.io/AppleJuice/tested/?lang=en)** · [Quick start](#start) · [Technical guide](docs/product/guide.en.md) · [Gameplay showcase](#games)
 
-[English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [☕ Buy Me a Coffee](https://buymeacoffee.com/vaderchen)
+[☕ Buy Me a Coffee](https://buymeacoffee.com/vaderchen)
 
 [![Release](https://img.shields.io/github/v/release/VaderChen/AppleJuice)](https://github.com/VaderChen/AppleJuice/releases/latest) ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-394a40) ![Apple Silicon](https://img.shields.io/badge/architecture-ARM64-394a40) [![Source available](https://img.shields.io/badge/license-source--available-394a40)](LICENSE.en.md)
 
