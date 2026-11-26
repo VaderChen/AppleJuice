@@ -21,7 +21,7 @@ Apple Silicon · macOS 13 以上。下載版已內含執行環境。
 1. 前往發行頁下載 arm64 DMG，在 Finder 開啟後將 AppleJuice.app 拖到「應用程式」。
 2. 啟動 AppleJuice，按「加入 EXE」選取自己的遊戲，設定工作目錄與磁碟映射，開放存檔所需的寫入權限，再按播放。
 
-[安裝與疑難排解](docs/product/install.md) · [觀看 Steam 安裝實錄（39 秒）](docs/media/gameplay/steam-temporary-install.mp4)
+[安裝與疑難排解](docs/product/install.md) · [觀看 Steam 安裝實錄（39 秒）](https://vaderchen.github.io/AppleJuice/?lang=zh#steam-install)
 
 <a id="games"></a>
 
@@ -66,7 +66,7 @@ resident AOT 將客體指令轉成 ARM64 區段，交由常駐 worker 執行。�
 
 ![PE / ARM64 / Metal](docs/images/branding/runtime.svg)
 
-[技術手冊](docs/product/guide.zh.md) · [PE → ARM64 / Direct3D → Metal](docs/product/architecture.md) · [效能測試](https://vaderchen.github.io/AppleJuice/geekbench7/?lang=zh)
+[技術手冊](docs/product/guide.zh.md) · [PE → ARM64 / Direct3D → Metal](https://vaderchen.github.io/AppleJuice/architecture/?lang=zh) · [效能測試](https://vaderchen.github.io/AppleJuice/geekbench7/?lang=zh)
 
 ## 開發方向
 

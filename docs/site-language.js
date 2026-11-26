@@ -41,7 +41,7 @@ languageMenu.addEventListener('change', () => {
   location.assign(url);
 });
 if (siteLanguage.requested) {
-  for (const link of document.querySelectorAll('.site-nav a, main a[href="tested/"], main a[href="geekbench7/"]')) {
+  for (const link of document.querySelectorAll('.site-nav a, main a[href="architecture/"], main a[href="tested/"], main a[href="geekbench7/"]')) {
     const url = new URL(link.href);
     if (url.origin === location.origin) {
       url.searchParams.set('lang', siteLanguage.requested);

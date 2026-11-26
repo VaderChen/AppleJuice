@@ -21,7 +21,7 @@ Apple Silicon · macOS 13 이상. 배포 앱에 런타임이 포함되어 있습
 1. 릴리스 페이지에서 arm64 DMG를 내려받아 Finder에서 열고 AppleJuice.app을 응용 프로그램 폴더로 드래그하세요.
 2. AppleJuice에서 ‘EXE 추가’를 눌러 게임을 선택하세요. 작업 폴더와 드라이브 매핑을 설정하고 저장에 필요한 쓰기 권한을 허용한 뒤 재생 버튼을 누르세요.
 
-[설치 및 문제 해결](docs/product/install.md) · [Steam 설치 영상 보기(39초)](docs/media/gameplay/steam-temporary-install.mp4)
+[설치 및 문제 해결](docs/product/install.md) · [Steam 설치 영상 보기(39초)](https://vaderchen.github.io/AppleJuice/?lang=ko#steam-install)
 
 <a id="games"></a>
 
@@ -66,7 +66,7 @@ MetalFX 2배 업스케일링과 HRTF 헤드폰 믹싱을 선택할 수 있습니
 
 ![PE / ARM64 / Metal](docs/images/branding/runtime.svg)
 
-[기술 안내서](docs/product/guide.ko.md) · [PE → ARM64 / Direct3D → Metal](docs/product/architecture.md) · [벤치마크](https://vaderchen.github.io/AppleJuice/geekbench7/?lang=ko)
+[기술 안내서](docs/product/guide.ko.md) · [PE → ARM64 / Direct3D → Metal](https://vaderchen.github.io/AppleJuice/architecture/?lang=ko) · [벤치마크](https://vaderchen.github.io/AppleJuice/geekbench7/?lang=ko)
 
 ## 개발 방향
 

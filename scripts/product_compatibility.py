@@ -2,6 +2,7 @@
 import argparse
 from collections import Counter
 from difflib import unified_diff
+from html import escape
 import json
 from pathlib import Path
 import re
@@ -41,6 +42,26 @@ def updates():
         new = re.sub(pattern, "\n" + "\n".join(lines) + "\n\n", old, flags=re.S)
         if new != old:
             yield path, old, new
+
+    path = ROOT / "docs/index.html"
+    old = path.read_text()
+    rows = []
+    for level in data["levels"]:
+        translations = " ".join(
+            f'data-{lang}="{escape(data["labels"][lang][level])}"'
+            for lang in ("zh", "ja", "ko")
+        )
+        rows.append(
+            f'<tr><th scope="row"><img src="images/support-levels/{level}.png" '
+            f'width="16" height="16" alt=""> <span {translations}>'
+            f'{escape(data["labels"]["en"][level])}</span></th><td>{games[level]}</td></tr>'
+        )
+    pattern = r"(?<=<!-- game-counts:start -->).*?(?=<!-- game-counts:end -->)"
+    new, count = re.subn(pattern, "\n" + "\n".join(rows) + "\n", old, flags=re.S)
+    if count != 1:
+        raise ValueError("網頁版首頁的遊戲統計標記不完整")
+    if new != old:
+        yield path, old, new
 
 
 def main():

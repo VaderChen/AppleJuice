@@ -26,6 +26,13 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 .chapters img{display:block;width:100%;height:auto;border-radius:.4rem}figcaption{margin-top:.45rem}
 
 .actions{display:flex;align-items:center;flex-wrap:wrap;gap:1rem}
+.game-counts { width:min(100%,25rem); border-collapse:collapse; margin:1rem 0; font-variant-numeric:tabular-nums }
+.game-counts :is(th,td) { padding:.4rem .8rem; border-bottom:1px solid var(--line); text-align:start }
+.game-counts thead { background:var(--soft) }
+.game-counts tbody th { font-weight:normal }
+.game-counts img { vertical-align:middle }
+.game-counts tr > :last-child { text-align:end }
+#steam-install video { aspect-ratio: 8 / 5; max-width:56rem }
 </style>
 </head>
 <body>
@@ -49,11 +56,23 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 <figure><a href="media/gameplay/applejuice-gameplay.mp4#t=44"><img src="images/gameplay/tales-of-arise.png" width="1920" height="1080" loading="lazy" data-alt="battle" alt="Play Tales of Arise: the party encounters an enemy and enters battle in the dungeon."></a>
 <figcaption><strong><span data-copy="tales">0:44 · Tales of Arise</span></strong><br><span data-copy="talesBuild">Steam build 12823607 · 4 CPU cores</span></figcaption></figure>
 </div></section>
-<section><h2><span data-copy="results">From the tested library</span></h2><a href="tested/"><span data-copy="records">Browse game and tool records</span></a></section>
-<section><h2><span data-copy="runtime">Inside the runtime</span></h2><p><span data-copy="runtimeInfo">A resident translator produces ARM64 code. Windows services connect the game to native graphics, input and audio. Output options include MetalFX upscaling, VideoToolbox frame interpolation and HRTF headphone mixing.</span></p><a href="https://github.com/VaderChen/AppleJuice/blob/main/docs/product/architecture.md"><span data-copy="architecture">Explore the architecture</span></a></section>
+<section><h2 id="game-counts-title"><span data-copy="results">From the tested library</span></h2>
+<table class="game-counts" aria-labelledby="game-counts-title">
+<thead><tr><th scope="col" data-copy="status">Status</th><th scope="col" data-copy="gameCount">Games</th></tr></thead>
+<tbody><!-- game-counts:start -->
+<tr><th scope="row"><img src="images/support-levels/good.png" width="16" height="16" alt=""> <span data-zh="運作良好" data-ja="良好" data-ko="원활">Works well</span></th><td>30</td></tr>
+<tr><th scope="row"><img src="images/support-levels/metalfx.png" width="16" height="16" alt=""> <span data-zh="運作良好 (MetalFX)" data-ja="良好（MetalFX）" data-ko="원활 (MetalFX)">Works well (MetalFX)</span></th><td>5</td></tr>
+<tr><th scope="row"><img src="images/support-levels/slow.png" width="16" height="16" alt=""> <span data-zh="效率不高" data-ja="低効率" data-ko="저효율">Slow</span></th><td>7</td></tr>
+<tr><th scope="row"><img src="images/support-levels/menu.png" width="16" height="16" alt=""> <span data-zh="可開啟" data-ja="起動可" data-ko="실행 가능">Launches</span></th><td>2</td></tr>
+<tr><th scope="row"><img src="images/support-levels/none.png" width="16" height="16" alt=""> <span data-zh="無法運作、處理中" data-ja="動作不可・対応中" data-ko="미작동·작업 중">Not working (WIP)</span></th><td>2</td></tr>
+<!-- game-counts:end --></tbody></table>
+<a href="tested/"><span data-copy="records">Browse game and tool records</span></a></section>
+<section><h2><span data-copy="runtime">Inside the runtime</span></h2><p><span data-copy="runtimeInfo">A resident translator produces ARM64 code. Windows services connect the game to native graphics, input and audio. Output options include MetalFX upscaling, VideoToolbox frame interpolation and HRTF headphone mixing.</span></p><a href="architecture/"><span data-copy="architecture">Explore the architecture</span></a></section>
 <section><h2><span data-copy="performance">CPU performance</span></h2><p><span data-copy="measurements">Compare Geekbench 7 scores by workload on an Apple M4 Pro.</span></p><a href="geekbench7/"><span data-copy="readScores">View benchmark scores</span></a></section>
 <section><h2><span data-copy="gettingStarted">Getting started</span></h2><details open><summary><span data-copy="installGame">How do I install a game?</span></summary><p><span data-copy="installSteps">Copy AppleJuice.app from the release DMG to Applications. Open the Launcher, choose Add EXE, select your game and review its drive mappings before pressing Play.</span></p></details>
-<details><summary><span data-copy="installSteam">How do I install Steam?</span></summary><p><span data-copy="steamSteps">Choose Run once and select SteamSetup.exe in the macOS file picker. After setup finishes, Steam.exe appears in the Launcher sidebar.</span> <a href="media/gameplay/steam-temporary-install.mp4"><span data-copy="watchInstall">Watch the Steam installation (39 seconds)</span></a>.</p></details>
+<section id="steam-install"><h3><span data-copy="installSteam">How do I install Steam?</span></h3><p><span data-copy="steamSteps">Choose Run once and select SteamSetup.exe in the macOS file picker. After setup finishes, Steam.exe appears in the Launcher sidebar.</span></p>
+<video controls playsinline preload="none" width="1440" height="900" poster="images/gameplay/steam-install.jpg" aria-labelledby="steam-video-title"><source src="media/gameplay/steam-temporary-install.mp4" type="video/mp4"></video>
+<p><a id="steam-video-title" href="media/gameplay/steam-temporary-install.mp4"><span data-copy="watchInstall">Watch the Steam installation (39 seconds)</span></a></p></section>
 <details><summary><span data-copy="whichGames">Which games work?</span></summary><p><span data-copy="ratings">The tested list distinguishes default performance, enhanced output, slow gameplay, launch-only and failed runs. Check your edition and settings.</span></p></details>
 <a href="https://github.com/VaderChen/AppleJuice/issues/new/choose"><span data-copy="report">Share a test or report a problem</span></a></section>
 </main>

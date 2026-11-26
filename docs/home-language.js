@@ -1,4 +1,6 @@
 const homeCopy = {
+  status: {zh:"狀態", ja:"動作状況", ko:"상태"},
+  gameCount: {zh:"遊戲數量", ja:"ゲーム数", ko:"게임 수"},
   headline: {"zh": "在 Apple Silicon 上玩 Windows 遊戲", "ja": "Apple Silicon で Windows ゲームを。", "ko": "Apple Silicon에서 즐기는 Windows 게임"},
   intro: {"zh": "在 Mac 上遊玩支援的 Windows 遊戲。AppleJuice 將 x86 與 x64 程式碼轉譯為 ARM64，並透過 Metal 呈現 Direct3D 畫面。", "ja": "対応する Windows ゲームを Mac でプレイ。AppleJuice は x86・x64 コードを ARM64 に変換し、Direct3D の描画に Metal を使います。", "ko": "지원되는 Windows 게임을 Mac에서 플레이하세요. AppleJuice는 x86 및 x64 코드를 ARM64로 변환하고 Metal을 통해 Direct3D 그래픽을 표시합니다."},
   download: {"zh": "下載 Mac 版", "ja": "Mac 版をダウンロード", "ko": "Mac용 다운로드"},
@@ -49,4 +51,8 @@ if (current !== 'en') {
   }
   document.title = 'AppleJuice | ' + homeCopy.headline[current];
   document.querySelector('meta[name="description"]').content = homeCopy.intro[current];
+}
+
+for (const label of document.querySelectorAll('.game-counts [data-zh]')) {
+  if (current !== 'en') label.textContent = label.dataset[current];
 }

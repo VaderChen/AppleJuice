@@ -11,7 +11,7 @@ Use an Apple Silicon Mac running macOS 13 or later. In the Apple menu, **About T
 
 Choose **Run once** in the Launcher and select **SteamSetup.exe** in the macOS file picker. Follow the setup wizard. To return to the Launcher first, clear **Run Steam** before choosing **Finish**. Look for **Steam.exe** in the left sidebar.
 
-[Watch the 39-second installation walkthrough](../media/gameplay/steam-temporary-install.mp4)
+[Watch the 39-second installation walkthrough](https://vaderchen.github.io/AppleJuice/?lang=en#steam-install)
 
 ## Frequently asked questions
 
