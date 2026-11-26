@@ -6,7 +6,7 @@ Apple Silicon Mac で対応する Windows ゲームをプレイできます。�
 
 **[Mac 版をダウンロード](https://github.com/VaderChen/AppleJuice/releases/latest)** · **[ゲーム互換性](https://vaderchen.github.io/AppleJuice/tested/?lang=ja)** · [クイックスタート](#start) · [技術ガイド](docs/product/guide.ja.md) · [実機プレイ映像](#games)
 
-[English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
+[English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [☕ Buy Me a Coffee](https://buymeacoffee.com/vaderchen)
 
 [![Release](https://img.shields.io/github/v/release/VaderChen/AppleJuice)](https://github.com/VaderChen/AppleJuice/releases/latest) ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-394a40) ![Apple Silicon](https://img.shields.io/badge/architecture-ARM64-394a40) [![Source available](https://img.shields.io/badge/license-source--available-394a40)](LICENSE.ja.md)
 

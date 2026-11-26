@@ -6,7 +6,7 @@ Apple Silicon Mac에서 지원되는 Windows 게임을 실행하세요. AppleJui
 
 **[Mac용 다운로드](https://github.com/VaderChen/AppleJuice/releases/latest)** · **[게임 호환성](https://vaderchen.github.io/AppleJuice/tested/?lang=ko)** · [빠른 시작](#start) · [기술 안내서](docs/product/guide.ko.md) · [실제 플레이 영상](#games)
 
-[English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
+[English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [☕ Buy Me a Coffee](https://buymeacoffee.com/vaderchen)
 
 [![Release](https://img.shields.io/github/v/release/VaderChen/AppleJuice)](https://github.com/VaderChen/AppleJuice/releases/latest) ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-394a40) ![Apple Silicon](https://img.shields.io/badge/architecture-ARM64-394a40) [![Source available](https://img.shields.io/badge/license-source--available-394a40)](LICENSE.ko.md)
 
