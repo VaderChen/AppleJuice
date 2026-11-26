@@ -1,15 +1,16 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 395" role="img" aria-labelledby="title description">
 <title id="title">AppleJuice execution path</title>
-<desc id="description">A Windows game passes through the PE loader to resident ARM64 translation and Windows services. Direct3D maps to Metal with optional MetalFX upscaling. The macOS audio branch supports HRTF headphone mixing alongside native input and file services.</desc>
+<desc id="description">A Windows game passes through AppleJuice’s own macOS-native PE/DLL loader, which operates independently of Wine and Windows, then to resident ARM64 translation and Windows services. Direct3D maps to Metal with optional MetalFX upscaling. The macOS audio branch supports HRTF headphone mixing alongside native input and file services.</desc>
 <rect width="600" height="395" rx="14" fill="#19221e"/>
-<g fill="none" stroke="#bbee9f" stroke-width="3"><path d="M300 55v24m0 40v26m0 40v26m0 44v18H149v24m151-24h151v24"/></g>
+<g fill="none" stroke="#bbee9f" stroke-width="3"><path d="M300 55v20 M300 131v14 M300 185v26 M300 255v18H149v24 M300 273h151v24"/></g>
 <g fill="none" stroke="#f27676" stroke-width="2">
 <rect x="16" y="297" width="266" height="82" rx="9"/>
 <rect x="318" y="297" width="266" height="82" rx="9"/>
 </g>
 <g font-family="Arial,sans-serif" font-size="20" text-anchor="middle" fill="#f5f9f4">
 <text x="300" y="46">Windows game · x86 / x64</text>
-<text x="300" y="109">PE / DLL loader</text>
+<text x="300" y="96" font-weight="bold">Fully native macOS PE / DLL loader</text>
+<text x="300" y="120" font-size="17" fill="#bbee9f">Runs without Wine or Windows</text>
 <text x="300" y="173" fill="#bbee9f">Resident AOT → ARM64</text>
 <text x="300" y="240">Windows API services</text>
 <text x="149" y="326">Direct3D → Metal</text>
