@@ -56,7 +56,7 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 <main>
 <header><h1><span data-copy="headline">Windows gaming on Apple Silicon.</span></h1>
 <p><span data-copy="intro">Play supported Windows games on your Mac. AppleJuice translates x86 and x64 code to ARM64 and brings Direct3D graphics to Metal.</span></p>
-<div class="actions"><a class="button" href="https://github.com/VaderChen/AppleJuice/releases/latest"><span data-copy="download">Download for Mac</span></a><a href="tested/"><span data-copy="findGame">Find your game →</span></a></div>
+<div class="actions"><a class="button" href="https://github.com/VaderChen/AppleJuice/releases/latest"><span data-copy="download">Download for Mac</span></a><a href="tested/"><span data-copy="findGame">Find your game →</span></a><a href="https://github.com/VaderChen/AppleJuice/releases"><span data-copy="releaseNotes">Release notes</span></a></div>
 <p><span data-copy="requirements">Apple Silicon · macOS 13 or later</span></p></header>
 <section id="gameplay" aria-labelledby="gameplay-title">
 <h2 id="gameplay-title"><span data-copy="showcase">Gameplay showcase</span></h2>
@@ -71,7 +71,7 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 <figure><a href="media/gameplay/applejuice-gameplay.mp4#t=44"><img src="images/gameplay/tales-of-arise.png" width="1920" height="1080" loading="lazy" data-alt="battle" alt="Play Tales of Arise: the party encounters an enemy and enters battle in the dungeon."></a>
 <figcaption><strong><span data-copy="tales">0:44 · Tales of Arise</span></strong><br><span data-copy="talesBuild">Steam build 12823607 · 4 CPU cores</span></figcaption></figure>
 </div></section>
-<section><h2><span data-copy="results">From the tested library</span></h2><p><span data-copy="examples">Romance of the Three Kingdoms XI with Power Up Kit reaches its own frame-rate cap with default settings in build 727. Death Stranding Director’s Cut can load a Chapter 3 save, but white flicker and uneven performance keep its rating at “Launches”.</span></p><a href="tested/"><span data-copy="records">Browse game and tool records</span></a></section>
+<section><h2><span data-copy="results">From the tested library</span></h2><a href="tested/"><span data-copy="records">Browse game and tool records</span></a></section>
 <section><h2><span data-copy="runtime">Inside the runtime</span></h2><p><span data-copy="runtimeInfo">A resident translator produces ARM64 code. Windows services connect the game to native graphics, input and audio. Optional spatial MetalFX upscaling and headphone mixing work at the output stage.</span></p><a href="https://github.com/VaderChen/AppleJuice/blob/main/docs/product/architecture.md"><span data-copy="architecture">Explore the architecture</span></a></section>
 <section><h2><span data-copy="performance">CPU performance</span></h2><p><span data-copy="measurements">Compare Geekbench 7 scores by workload on an Apple M4 Pro.</span></p><a href="geekbench7/"><span data-copy="readScores">View benchmark scores</span></a></section>
 <section><h2><span data-copy="gettingStarted">Getting started</span></h2><details open><summary><span data-copy="installGame">How do I install a game?</span></summary><p><span data-copy="installSteps">Copy AppleJuice.app from the release DMG to Applications. Open the Launcher, choose Add EXE, select your game and review its drive mappings before pressing Play.</span></p></details>

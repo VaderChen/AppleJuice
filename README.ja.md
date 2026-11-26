@@ -4,7 +4,7 @@
 
 Apple Silicon Mac で対応する Windows ゲームをプレイできます。独自の CPU 変換器で x86／x64 コードを実行し、Direct3D の描画を Metal に変換します。
 
-**[Mac 版をダウンロード](https://github.com/VaderChen/AppleJuice/releases/latest)** · **[ゲーム互換性](https://vaderchen.github.io/AppleJuice/tested/?lang=ja)** · [クイックスタート](#start) · [技術ガイド](docs/product/guide.ja.md) · [実機プレイ映像](#games)
+**[Mac 版をダウンロード](https://github.com/VaderChen/AppleJuice/releases/latest)** · [リリースノート](https://github.com/VaderChen/AppleJuice/releases) · **[ゲーム互換性](https://vaderchen.github.io/AppleJuice/tested/?lang=ja)** · [クイックスタート](#start) · [技術ガイド](docs/product/guide.ja.md) · [実機プレイ映像](#games)
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [☕ Buy Me a Coffee](https://buymeacoffee.com/vaderchen)
 
@@ -34,8 +34,6 @@ Apple Silicon · macOS 13 以降。配布版にはランタイムが含まれま
 | ![エルザが船室を走り、折り返す場面。](docs/images/gameplay/frontier-hunter.png) | ![ダンジョンを進み、敵と遭遇して戦闘に入る場面。](docs/images/gameplay/tales-of-arise.png) |
 | Steam 15701452 · CPU 2 コア | Steam 12823607 · CPU 4 コア |
 
-11 月 26 日版では『三國志XI with パワーアップキット』が既定の設定でゲーム本来のフレームレート上限に達しました。 [Release ↗](https://github.com/VaderChen/AppleJuice/releases/tag/v0.26.1126-build-727)
-
 ## ゲーム互換性
 
 <!-- compatibility:start -->
@@ -52,7 +50,7 @@ Apple Silicon · macOS 13 以降。配布版にはランタイムが含まれま
 
 「良好（MetalFX）」は、Launcher のフレーム補間または 2 倍拡大（MetalFX）を有効にすると「良好」の基準を満たすことを示します。無効の場合は「低効率」です。
 
-DEATH STRANDING DIRECTOR'S CUT は現在「起動可」です。第 3 章のセーブ読込とキャラクター移動は確認済みですが、白いちらつきが発生する場合があり、安定した 50 FPS には達していません。問題を解決し、実際のプレイと他の場面の検証を終えた後に評価を更新します。「良好」は安定して 50 FPS を超えるか、アプリ自身のフレームレート上限に達することを基準とします。
+「良好」は安定して 50 FPS を超えるか、アプリ自身のフレームレート上限に達することを基準とします。
 
 記録は当時のバージョンと設定によるもので、ゲーム全体の流れ、他のバージョン、すべての設定での動作を示すものではありません。
 

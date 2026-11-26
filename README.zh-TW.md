@@ -4,7 +4,7 @@
 
 在 Apple Silicon Mac 上玩支援的 Windows 遊戲。AppleJuice 以自研 CPU 轉譯器執行 x86／x64 程式，並將 Direct3D 繪圖接到 Metal。
 
-**[下載 Mac 版](https://github.com/VaderChen/AppleJuice/releases/latest)** · **[遊戲相容性](https://vaderchen.github.io/AppleJuice/tested/?lang=zh)** · [快速開始](#start) · [技術手冊](docs/product/guide.zh.md) · [實機遊玩展示](#games)
+**[下載 Mac 版](https://github.com/VaderChen/AppleJuice/releases/latest)** · [版本說明](https://github.com/VaderChen/AppleJuice/releases) · **[遊戲相容性](https://vaderchen.github.io/AppleJuice/tested/?lang=zh)** · [快速開始](#start) · [技術手冊](docs/product/guide.zh.md) · [實機遊玩展示](#games)
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [☕ Buy Me a Coffee](https://buymeacoffee.com/vaderchen)
 
@@ -34,8 +34,6 @@ Apple Silicon · macOS 13 以上。下載版已內含執行環境。
 | ![艾爾莎在艙房內跑動、折返。](docs/images/gameplay/frontier-hunter.png) | ![角色穿過地下城後遇敵，隊伍進入戰鬥。](docs/images/gameplay/tales-of-arise.png) |
 | Steam 15701452 · 2 個 CPU 核心 | Steam 12823607 · 4 個 CPU 核心 |
 
-11 月 26 日發行版中，《三國志 XI 威力加強版》以預設設定達到遊戲本身的幀率上限。 [Release ↗](https://github.com/VaderChen/AppleJuice/releases/tag/v0.26.1126-build-727)
-
 ## 遊戲相容性
 
 <!-- compatibility:start -->
@@ -52,7 +50,7 @@ Apple Silicon · macOS 13 以上。下載版已內含執行環境。
 
 「運作良好 (MetalFX)」表示開啟 Launcher 的畫面內插或 2 倍放大（MetalFX）後達到運作良好標準；未開啟時仍屬效率不高。
 
-《死亡擱淺 DIRECTOR'S CUT》目前評為「可開啟」。已驗證第 3 章的存檔載入與角色行走，仍可能出現泛白閃爍，尚未達到穩定 50 FPS；待問題解決並完成實際遊玩與其他場景驗收後，再更新支援程度。「運作良好」須穩定超過 50 FPS，或達到程式本身的幀率上限。
+「運作良好」須穩定超過 50 FPS，或達到程式本身的幀率上限。
 
 實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
 

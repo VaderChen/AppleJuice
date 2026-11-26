@@ -4,7 +4,7 @@
 
 Apple Silicon Mac에서 지원되는 Windows 게임을 실행하세요. AppleJuice는 자체 CPU 변환기로 x86/x64 코드를 실행하고 Direct3D 그래픽을 Metal로 변환합니다.
 
-**[Mac용 다운로드](https://github.com/VaderChen/AppleJuice/releases/latest)** · **[게임 호환성](https://vaderchen.github.io/AppleJuice/tested/?lang=ko)** · [빠른 시작](#start) · [기술 안내서](docs/product/guide.ko.md) · [실제 플레이 영상](#games)
+**[Mac용 다운로드](https://github.com/VaderChen/AppleJuice/releases/latest)** · [릴리스 노트](https://github.com/VaderChen/AppleJuice/releases) · **[게임 호환성](https://vaderchen.github.io/AppleJuice/tested/?lang=ko)** · [빠른 시작](#start) · [기술 안내서](docs/product/guide.ko.md) · [실제 플레이 영상](#games)
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [☕ Buy Me a Coffee](https://buymeacoffee.com/vaderchen)
 
@@ -34,8 +34,6 @@ Apple Silicon · macOS 13 이상. 배포 앱에 런타임이 포함되어 있습
 | ![엘사가 선실 안을 달리다가 방향을 바꾸는 장면.](docs/images/gameplay/frontier-hunter.png) | ![던전에서 적과 만나 전투에 들어가는 장면.](docs/images/gameplay/tales-of-arise.png) |
 | Steam 15701452 · CPU 2코어 | Steam 12823607 · CPU 4코어 |
 
-11월 26일 릴리스에서 삼국지 XI 파워업키트는 기본 설정으로 게임 자체 프레임 상한에 도달했습니다. [Release ↗](https://github.com/VaderChen/AppleJuice/releases/tag/v0.26.1126-build-727)
-
 ## 게임 호환성
 
 <!-- compatibility:start -->
@@ -52,7 +50,7 @@ Apple Silicon · macOS 13 이상. 배포 앱에 런타임이 포함되어 있습
 
 "원활 (MetalFX)"는 Launcher의 프레임 보간 또는 2배 확대(MetalFX)를 켜면 원활 기준을 충족한다는 뜻이며, 끄면 저효율에 해당합니다.
 
-DEATH STRANDING DIRECTOR'S CUT은 현재 "실행 가능"으로 평가합니다. 3장 저장 파일 불러오기와 캐릭터 이동은 확인했지만 흰색 깜박임이 발생할 수 있으며 안정적인 50 FPS에는 도달하지 못했습니다. 문제를 해결하고 실제 플레이와 다른 장면의 검증을 마친 뒤 지원 수준을 갱신합니다. "원활"은 50 FPS를 안정적으로 초과하거나 프로그램 자체의 프레임률 상한에 도달한 경우를 뜻합니다.
+"원활"은 50 FPS를 안정적으로 초과하거나 프로그램 자체의 프레임률 상한에 도달한 경우를 뜻합니다.
 
 실측 기록은 당시 버전과 설정 기준이며, 전체 게임 진행, 다른 버전 또는 모든 설정에서의 동작을 의미하지 않습니다.
 
