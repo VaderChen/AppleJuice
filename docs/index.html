@@ -37,6 +37,7 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 .faq .answer p { margin:0 }
 .faq video { margin-block:.85rem .55rem }
 .faq .report { margin:0; padding-block-start:1.5rem; border-top:1px solid var(--line) }
+.score-chart img { display:block; width:100%; height:auto; border:1px solid var(--line); border-radius:.6rem }
 #steam-install video { aspect-ratio: 8 / 5; max-width:56rem }
 </style>
 </head>
@@ -73,7 +74,11 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 <!-- game-counts:end --></tbody></table>
 <a href="tested/"><span data-copy="records">Browse game and tool records</span></a></section>
 <section><h2><span data-copy="runtime">Inside the runtime</span></h2><p><span data-copy="runtimeInfo">A resident translator produces ARM64 code. Windows services connect the game to native graphics, input and audio. Output options include MetalFX upscaling, VideoToolbox frame interpolation and HRTF headphone mixing.</span></p><a href="architecture/"><span data-copy="architecture">Explore the architecture</span></a></section>
-<section><h2><span data-copy="performance">CPU performance</span></h2><p><span data-copy="measurements">Compare Geekbench 7 scores by workload on an Apple M4 Pro.</span></p><a href="geekbench7/"><span data-copy="readScores">View benchmark scores</span></a></section>
+<section><h2><span data-copy="performance">CPU performance</span></h2><p><span data-copy="measurements">Compare Geekbench 7 scores by workload on an Apple M4 Pro.</span></p>
+<figure class="score-chart"><a href="images/geekbench7-scores-2026-11-25/cpu.png">
+<img loading="lazy" src="images/geekbench7-scores-2026-11-25/cpu.png" width="1940" height="872" data-alt="scoreTotals" alt="AppleJuice / Rosetta 2 / native ARM64 scores. 1 CPU: 1,387 / 1,281 / 3,057. 2 CPUs: 2,251 / 2,100 / 5,604. 4 CPUs: 4,137 / 3,990 / 10,784."></a>
+<figcaption data-copy="scoreCaption">Geekbench 7 CPU scores on Apple M4 Pro · Higher is better</figcaption></figure>
+<a href="geekbench7/"><span data-copy="readScores">View benchmark scores</span></a></section>
 <section class="faq"><h2><span data-copy="gettingStarted">Getting started</span></h2>
 <div class="answer"><h3><span data-copy="installGame">How do I install a game?</span></h3><p><span data-copy="installSteps">Copy AppleJuice.app from the release DMG to Applications. Open the Launcher, choose Add EXE, select your game and review its drive mappings before pressing Play.</span></p></div>
 <div class="answer" id="steam-install"><h3><span data-copy="installSteam">How do I install Steam?</span></h3><p><span data-copy="steamSteps">Choose Run once and select SteamSetup.exe in the macOS file picker. After setup finishes, Steam.exe appears in the Launcher sidebar.</span></p>

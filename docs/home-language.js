@@ -1,4 +1,10 @@
 const homeCopy = {
+  scoreCaption: {zh:"Apple M4 Pro 上的 Geekbench 7 CPU 總分 · 分數越高越好", ja:"Apple M4 Pro の Geekbench 7 CPU 総合スコア（高いほど良好）", ko:"Apple M4 Pro의 Geekbench 7 CPU 총점 · 높을수록 좋음"},
+  scoreTotals: {
+    zh:"依序為 AppleJuice、Rosetta 2、原生 ARM64。1 核：1,387／1,281／3,057。2 核：2,251／2,100／5,604。4 核：4,137／3,990／10,784。",
+    ja:"AppleJuice、Rosetta 2、ネイティブ ARM64 の順。1 コア：1,387／1,281／3,057。2 コア：2,251／2,100／5,604。4 コア：4,137／3,990／10,784。",
+    ko:"AppleJuice / Rosetta 2 / 네이티브 ARM64 순서. 1코어: 1,387 / 1,281 / 3,057. 2코어: 2,251 / 2,100 / 5,604. 4코어: 4,137 / 3,990 / 10,784."
+  },
   status: {zh:"狀態", ja:"動作状況", ko:"상태"},
   gameCount: {zh:"遊戲數量", ja:"ゲーム数", ko:"게임 수"},
   headline: {"zh": "在 Apple Silicon 上玩 Windows 遊戲", "ja": "Apple Silicon で Windows ゲームを。", "ko": "Apple Silicon에서 즐기는 Windows 게임"},
