@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="154" height="36" role="img" aria-label="ウェブ版を開く">
+  <rect width="154" height="36" rx="8" fill="#21633c"/>
+  <g transform="translate(13 9)" fill="none" stroke="#d4f2c2" stroke-width="1.4">
+    <circle cx="9" cy="9" r="8"/><ellipse cx="9" cy="9" rx="3.7" ry="8"/><path d="M1 9h16"/>
+  </g>
+  <text x="42" y="23.5" font-family="system-ui,sans-serif" font-weight="600" font-size="15" fill="white">ウェブ版を開く</text>
+</svg>

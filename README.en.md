@@ -1,3 +1,7 @@
+[![AppleJuice — Windows Gaming. Squeezed for Apple Silicon.](docs/images/branding/hero.svg)](https://vaderchen.github.io/AppleJuice/?lang=en)
+
+[![Open web version](docs/images/branding/web-en.svg)](https://vaderchen.github.io/AppleJuice/?lang=en)
+
 # AppleJuice
 
 [Read the English product guide](README.md) · [Download for Mac](https://github.com/VaderChen/AppleJuice/releases/latest) · [Game compatibility](https://vaderchen.github.io/AppleJuice/tested/?lang=en)

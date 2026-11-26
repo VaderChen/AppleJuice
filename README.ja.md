@@ -1,4 +1,6 @@
-![AppleJuice — Windows Gaming. Squeezed for Apple Silicon.](docs/images/branding/hero.svg)
+[![AppleJuice — Windows Gaming. Squeezed for Apple Silicon.](docs/images/branding/hero.svg)](https://vaderchen.github.io/AppleJuice/?lang=ja)
+
+[![ウェブ版を開く](docs/images/branding/web-ja.svg)](https://vaderchen.github.io/AppleJuice/?lang=ja)
 
 # AppleJuice
 
