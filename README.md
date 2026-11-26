@@ -21,13 +21,13 @@ Apple Silicon · macOS 13 or later. The packaged app includes the runtime.
 1. Open the release and download the arm64 DMG. Open it in Finder and drag AppleJuice.app to Applications.
 2. Launch AppleJuice, choose **Add EXE**, then select your copy of the Windows game. Set its working directory and drive mappings. Enable write access where the game needs to save, then press Play.
 
-[Installation & troubleshooting](docs/product/install.md) · [Watch Steam install in AppleJuice (39 seconds)](https://vaderchen.github.io/AppleJuice/?lang=en#steam-install)
+[Installation & troubleshooting](docs/product/install.md) · [Watch Steam install in AppleJuice](https://vaderchen.github.io/AppleJuice/?lang=en#steam-install)
 
 <a id="games"></a>
 
 ## Gameplay showcase
 
-**[Watch the 78-second gameplay capture](docs/media/gameplay/applejuice-gameplay.mp4)** · 0:00 Steam Library launch
+**[Watch the gameplay capture](docs/media/gameplay/applejuice-gameplay.mp4)** · 0:00 Steam Library launch
 
 Both gameplay chapters were recorded on an Apple M4 Pro with 64 GiB of unified memory, macOS 27.2.1 and AppleJuice 0.26.1126 (build 727). Both games use D3D11. The game output and silent recording are 1920 × 1080, with Launcher MetalFX upscaling and frame interpolation off.
 

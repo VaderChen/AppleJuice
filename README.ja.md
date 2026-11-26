@@ -21,13 +21,13 @@ Apple Silicon · macOS 13 以降。配布版にはランタイムが含まれま
 1. リリースページから arm64 用 DMG をダウンロードし、Finder で開いて AppleJuice.app を「アプリケーション」にドラッグします。
 2. AppleJuice の「EXE を追加」でゲームを選び、作業フォルダとドライブを設定します。セーブに必要な書き込みを許可し、再生ボタンを押します。
 
-[インストールとトラブル対処](docs/product/install.md) · [Steam のインストール手順を見る（39 秒）](https://vaderchen.github.io/AppleJuice/?lang=ja#steam-install)
+[インストールとトラブル対処](docs/product/install.md) · [Steam のインストール手順を見る](https://vaderchen.github.io/AppleJuice/?lang=ja#steam-install)
 
 <a id="games"></a>
 
 ## 実機プレイ映像
 
-**[78 秒のプレイ映像を見る](docs/media/gameplay/applejuice-gameplay.mp4)** · 0:00 Steam ライブラリから起動
+**[プレイ映像を見る](docs/media/gameplay/applejuice-gameplay.mp4)** · 0:00 Steam ライブラリから起動
 
 両作品のプレイ映像は Apple M4 Pro、ユニファイドメモリ 64 GiB、macOS 27.2.1、AppleJuice 0.26.1126（ビルド 727）で収録しました。両作品とも D3D11 を使用。ゲーム出力と無音の録画は 1920 × 1080 で、ランチャーの MetalFX 拡大とフレーム補間はオフです。
 
