@@ -29,12 +29,14 @@ Apple Silicon · macOS 13 or later. The packaged app includes the runtime.
 
 **[Watch the gameplay capture](docs/media/gameplay/applejuice-gameplay.mp4)** · 0:00 Steam Library launch
 
-Both gameplay chapters were recorded on an Apple M4 Pro with 64 GiB of unified memory, macOS 27.2.1 and AppleJuice 0.26.1126 (build 727). Both games use D3D11. The game output and silent recording are 1920 × 1080, with Launcher MetalFX upscaling and frame interpolation off.
+Recorded on Apple M4 Pro with 64 GiB of unified memory and macOS 27.2.1 at 1920 × 1080. Frontier Hunter uses AppleJuice 0.26.1126 build 727 with 2 CPU cores. The other games use build 1536 with 4 CPU cores. Only the final Tomb Raider chapter enables frame interpolation.
 
 | 0:12 · Frontier Hunter: Erza’s Wheel of Fortune | 0:44 · Tales of Arise |
 |---|---|
 | ![Erza runs across a cabin and turns back.](docs/images/gameplay/frontier-hunter.png) | ![A dungeon encounter in Tales of Arise enters battle.](docs/images/gameplay/tales-of-arise.png) |
-| Steam 15701452 · 2 CPU cores | Steam 12823607 · 4 CPU cores |
+| Steam 15701452 · 2 CPU cores | D3D11 · MetalFX off |
+
+[1:24 · The Witcher 3](docs/media/gameplay/applejuice-gameplay.mp4#t=83.933) · [1:54 · Shadow of the Tomb Raider · Interpolation off](docs/media/gameplay/applejuice-gameplay.mp4#t=113.933) · [2:34 · Shadow of the Tomb Raider · Interpolation on](docs/media/gameplay/applejuice-gameplay.mp4#t=154)
 
 ## Game compatibility
 

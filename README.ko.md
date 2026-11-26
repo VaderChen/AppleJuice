@@ -29,12 +29,14 @@ Apple Silicon · macOS 13 이상. 배포 앱에 런타임이 포함되어 있습
 
 **[플레이 영상 보기](docs/media/gameplay/applejuice-gameplay.mp4)** · 0:00 Steam 라이브러리에서 실행
 
-두 게임의 플레이 장면은 Apple M4 Pro, 통합 메모리 64 GiB, macOS 27.2.1, AppleJuice 0.26.1126(빌드 727)에서 녹화했습니다. 두 게임 모두 D3D11을 사용합니다. 게임 출력과 무음 영상은 1920 × 1080이며 런처의 MetalFX 업스케일링과 프레임 보간은 껐습니다.
+Apple M4 Pro, 64 GiB 통합 메모리, macOS 27.2.1에서 1920 × 1080으로 녹화했습니다. 프런티어 헌터는 AppleJuice 0.26.1126 빌드 727과 CPU 2코어를, 나머지 게임은 빌드 1536과 CPU 4코어를 사용했습니다. 툼 레이더의 마지막 장면에서만 프레임 보간을 켰습니다.
 
 | 0:12 · 프런티어 헌터: 엘사의 운명의 바퀴 | 0:44 · 테일즈 오브 어라이즈 |
 |---|---|
 | ![엘사가 선실 안을 달리다가 방향을 바꾸는 장면.](docs/images/gameplay/frontier-hunter.png) | ![던전에서 적과 만나 전투에 들어가는 장면.](docs/images/gameplay/tales-of-arise.png) |
-| Steam 15701452 · CPU 2코어 | Steam 12823607 · CPU 4코어 |
+| Steam 15701452 · CPU 2코어 | D3D11 · MetalFX 끔 |
+
+[1:24 · 더 위쳐 3](docs/media/gameplay/applejuice-gameplay.mp4#t=83.933) · [1:54 · 섀도우 오브 더 툼 레이더 · 보간 끔](docs/media/gameplay/applejuice-gameplay.mp4#t=113.933) · [2:34 · 섀도우 오브 더 툼 레이더 · 보간 켬](docs/media/gameplay/applejuice-gameplay.mp4#t=154)
 
 ## 게임 호환성
 

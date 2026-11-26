@@ -29,12 +29,14 @@ Apple Silicon · macOS 13 以降。配布版にはランタイムが含まれま
 
 **[プレイ映像を見る](docs/media/gameplay/applejuice-gameplay.mp4)** · 0:00 Steam ライブラリから起動
 
-両作品のプレイ映像は Apple M4 Pro、ユニファイドメモリ 64 GiB、macOS 27.2.1、AppleJuice 0.26.1126（ビルド 727）で収録しました。両作品とも D3D11 を使用。ゲーム出力と無音の録画は 1920 × 1080 で、ランチャーの MetalFX 拡大とフレーム補間はオフです。
+Apple M4 Pro、64 GiB のユニファイドメモリ、macOS 27.2.1 で 1920 × 1080 の映像を収録しました。フロンティアハンターは AppleJuice 0.26.1126 ビルド 727、CPU 2 コア、ほかの作品はビルド 1536、CPU 4 コアです。フレーム補間はトゥームレイダーの最後の章でのみ有効です。
 
 | 0:12 · フロンティアハンター ～エルザの運命の輪～ | 0:44 · テイルズ オブ アライズ |
 |---|---|
 | ![エルザが船室を走り、折り返す場面。](docs/images/gameplay/frontier-hunter.png) | ![ダンジョンを進み、敵と遭遇して戦闘に入る場面。](docs/images/gameplay/tales-of-arise.png) |
-| Steam 15701452 · CPU 2 コア | Steam 12823607 · CPU 4 コア |
+| Steam 15701452 · CPU 2 コア | D3D11 · MetalFX オフ |
+
+[1:24 · ウィッチャー3](docs/media/gameplay/applejuice-gameplay.mp4#t=83.933) · [1:54 · シャドウ オブ ザ トゥームレイダー · 補間オフ](docs/media/gameplay/applejuice-gameplay.mp4#t=113.933) · [2:34 · シャドウ オブ ザ トゥームレイダー · 補間オン](docs/media/gameplay/applejuice-gameplay.mp4#t=154)
 
 ## ゲーム互換性
 
