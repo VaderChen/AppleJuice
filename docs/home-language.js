@@ -19,7 +19,7 @@ const homeCopy = {
   releaseNotes: {"zh": "版本說明", "ja": "リリースノート", "ko": "릴리스 노트"},
   records: {"zh": "查看遊戲與工具紀錄", "ja": "ゲームとツールの記録を見る", "ko": "게임 및 도구 기록 보기"},
   runtime: {"zh": "執行環境", "ja": "ランタイムの仕組み", "ko": "런타임 구조"},
-  runtimeInfo: {"zh": "常駐轉譯器產生 ARM64 程式碼。Windows 服務銜接遊戲與原生繪圖、輸入及音訊；輸出階段可選用 MetalFX 空間放大與耳機混音。", "ja": "常駐トランスレータが ARM64 コードを生成し、Windows サービスがゲームをネイティブの描画・入力・音声に接続します。出力時には MetalFX 空間アップスケーリングとヘッドホンミキシングを選べます。", "ko": "상주 변환기가 ARM64 코드를 생성하고 Windows 서비스가 게임을 네이티브 그래픽, 입력 및 오디오에 연결합니다. 출력 단계에서 MetalFX 공간 업스케일링과 헤드폰 믹싱을 선택할 수 있습니다."},
+  runtimeInfo: {"zh": "常駐轉譯器產生 ARM64 程式碼。Windows 服務銜接遊戲與原生繪圖、輸入及音訊；輸出階段可選用 MetalFX 放大、VideoToolbox 畫面內插與 HRTF 耳機混音。", "ja": "常駐トランスレータが ARM64 コードを生成し、Windows サービスがゲームをネイティブの描画・入力・音声に接続します。出力時には MetalFX アップスケーリング、VideoToolbox フレーム補間、HRTF ヘッドホンミキシングを選べます。", "ko": "상주 변환기가 ARM64 코드를 생성하고 Windows 서비스가 게임을 네이티브 그래픽, 입력 및 오디오에 연결합니다. 출력 단계에서 MetalFX 업스케일링, VideoToolbox 프레임 보간, HRTF 헤드폰 믹싱을 선택할 수 있습니다."},
   architecture: {"zh": "查看架構說明", "ja": "アーキテクチャを読む", "ko": "아키텍처 보기"},
   performance: {"zh": "CPU 效能", "ja": "CPU 性能", "ko": "CPU 성능"},
   measurements: {"zh": "比較 Apple M4 Pro 在 Geekbench 7 各項測試的分數。", "ja": "Apple M4 Pro の Geekbench 7 スコアを項目別に比較できます。", "ko": "Apple M4 Pro의 Geekbench 7 점수를 항목별로 비교하세요."},

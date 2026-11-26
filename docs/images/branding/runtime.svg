@@ -1,11 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 395" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 417" role="img" aria-labelledby="title description">
 <title id="title">AppleJuice execution path</title>
-<desc id="description">A Windows game passes through AppleJuice’s own macOS-native PE/DLL loader, which operates independently of Wine and Windows, then to resident ARM64 translation. AppleJuice implements its own native Windows API compatibility layer, which also runs without Wine or Windows. Direct3D maps to Metal with optional MetalFX upscaling. The macOS audio branch supports HRTF headphone mixing alongside native input and file services.</desc>
-<rect width="600" height="395" rx="14" fill="#19221e"/>
+<desc id="description">A Windows game passes through AppleJuice’s own macOS-native PE/DLL loader, which operates independently of Wine and Windows, then to resident ARM64 translation. AppleJuice implements its own native Windows API compatibility layer, which also runs without Wine or Windows. Direct3D maps to Metal with optional MetalFX upscaling and VideoToolbox frame interpolation. The macOS audio branch supports HRTF headphone mixing alongside native input and file services.</desc>
+<rect width="600" height="417" rx="14" fill="#19221e"/>
 <g fill="none" stroke="#bbee9f" stroke-width="3"><path d="M300 55v20 M300 131v14 M300 185v16 M300 260v13H149v24 M300 273h151v24"/></g>
 <g fill="none" stroke="#f27676" stroke-width="2">
-<rect x="16" y="297" width="266" height="82" rx="9"/>
-<rect x="318" y="297" width="266" height="82" rx="9"/>
+<rect x="16" y="297" width="266" height="104" rx="9"/>
+<rect x="318" y="297" width="266" height="104" rx="9"/>
 </g>
 <g font-family="Arial,sans-serif" font-size="20" text-anchor="middle" fill="#f5f9f4">
 <text x="300" y="46">Windows game · x86 / x64</text>
@@ -18,5 +18,6 @@
 <text x="451" y="326">macOS audio / input / files</text>
 <g font-size="17" fill="#bbee9f">
 <text x="149" y="358">MetalFX upscaling</text>
+<text x="149" y="382">VideoToolbox frame interpolation</text>
 <text x="451" y="358">HRTF headphone mixing</text>
 </g></g></svg>
