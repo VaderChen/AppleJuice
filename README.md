@@ -31,14 +31,19 @@ Apple Silicon · macOS 13 or later. The packaged app includes the runtime.
 
 Recorded on Apple M4 Pro with 64 GiB of unified memory and macOS 27.2.1 at 1920 × 1080. Frontier Hunter uses AppleJuice 0.26.1126 build 727 with 2 CPU cores. The other games use build 1536 with 4 CPU cores. Only the final Tomb Raider chapter enables frame interpolation.
 
-| 0:12 · Frontier Hunter: Erza’s Wheel of Fortune | 0:44 · Tales of Arise |
-|---|---|
-| ![Erza runs across a cabin and turns back.](docs/images/gameplay/frontier-hunter.png) | ![A dungeon encounter in Tales of Arise enters battle.](docs/images/gameplay/tales-of-arise.png) |
-| Steam 15701452 · 2 CPU cores | D3D11 · MetalFX off |
-
-| [1:24 · The Witcher 3](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=83.933) | [1:54 · Shadow of the Tomb Raider · Interpolation off](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=113.933) | [2:34 · Shadow of the Tomb Raider · Interpolation on](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=154) |
-|---|---|---|
-| [![1:24 · The Witcher 3](docs/images/gameplay/witcher-3.jpg)](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=83.933) | [![1:54 · Shadow of the Tomb Raider · Interpolation off](docs/images/gameplay/tomb-raider-native.jpg)](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=113.933) | [![2:34 · Shadow of the Tomb Raider · Interpolation on](docs/images/gameplay/tomb-raider-interpolated.jpg)](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=154) |
+<table>
+<tr>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=12,44"><img src="docs/images/gameplay/frontier-hunter.png" width="400" alt=""><br><strong>0:12 · Frontier Hunter: Erza’s Wheel of Fortune</strong></a><br>D3D11 · 2 CPU cores · Interpolation off</td>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=44,83.933"><img src="docs/images/gameplay/tales-of-arise.png" width="400" alt=""><br><strong>0:44 · Tales of Arise</strong></a><br>D3D11 · 4 CPU cores · Interpolation off</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=83.933"><img src="docs/images/gameplay/witcher-3.jpg" width="400" alt=""><br><strong>1:24 · The Witcher 3</strong></a><br>D3D12 · 4 CPU cores · Interpolation off</td>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=113.933"><img src="docs/images/gameplay/tomb-raider-native.jpg" width="400" alt=""><br><strong>1:54 · Shadow of the Tomb Raider</strong></a><br>D3D12 · 4 CPU cores · Interpolation off</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=154"><img src="docs/images/gameplay/tomb-raider-interpolated.jpg" width="400" alt=""><br><strong>2:34 · Shadow of the Tomb Raider</strong></a><br>D3D12 · 4 CPU cores · Interpolation on</td>
+<td></td></tr>
+</table>
 
 ## Game compatibility
 

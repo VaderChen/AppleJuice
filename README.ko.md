@@ -31,14 +31,19 @@ Apple Silicon · macOS 13 이상. 배포 앱에 런타임이 포함되어 있습
 
 Apple M4 Pro, 64 GiB 통합 메모리, macOS 27.2.1에서 1920 × 1080으로 녹화했습니다. 프런티어 헌터는 AppleJuice 0.26.1126 빌드 727과 CPU 2코어를, 나머지 게임은 빌드 1536과 CPU 4코어를 사용했습니다. 툼 레이더의 마지막 장면에서만 프레임 보간을 켰습니다.
 
-| 0:12 · 프런티어 헌터: 엘사의 운명의 바퀴 | 0:44 · 테일즈 오브 어라이즈 |
-|---|---|
-| ![엘사가 선실 안을 달리다가 방향을 바꾸는 장면.](docs/images/gameplay/frontier-hunter.png) | ![던전에서 적과 만나 전투에 들어가는 장면.](docs/images/gameplay/tales-of-arise.png) |
-| Steam 15701452 · CPU 2코어 | D3D11 · MetalFX 끔 |
-
-| [1:24 · 더 위쳐 3](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=83.933) | [1:54 · 섀도우 오브 더 툼 레이더 · 보간 끔](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=113.933) | [2:34 · 섀도우 오브 더 툼 레이더 · 보간 켬](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=154) |
-|---|---|---|
-| [![1:24 · 더 위쳐 3](docs/images/gameplay/witcher-3.jpg)](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=83.933) | [![1:54 · 섀도우 오브 더 툼 레이더 · 보간 끔](docs/images/gameplay/tomb-raider-native.jpg)](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=113.933) | [![2:34 · 섀도우 오브 더 툼 레이더 · 보간 켬](docs/images/gameplay/tomb-raider-interpolated.jpg)](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=154) |
+<table>
+<tr>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=12,44"><img src="docs/images/gameplay/frontier-hunter.png" width="400" alt=""><br><strong>0:12 · 프런티어 헌터: 엘사의 운명의 바퀴</strong></a><br>D3D11 · CPU 2코어 · 보간 끔</td>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=44,83.933"><img src="docs/images/gameplay/tales-of-arise.png" width="400" alt=""><br><strong>0:44 · 테일즈 오브 어라이즈</strong></a><br>D3D11 · CPU 4코어 · 보간 끔</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=83.933"><img src="docs/images/gameplay/witcher-3.jpg" width="400" alt=""><br><strong>1:24 · 더 위쳐 3</strong></a><br>D3D12 · CPU 4코어 · 보간 끔</td>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=113.933"><img src="docs/images/gameplay/tomb-raider-native.jpg" width="400" alt=""><br><strong>1:54 · 섀도우 오브 더 툼 레이더</strong></a><br>D3D12 · CPU 4코어 · 보간 끔</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=154"><img src="docs/images/gameplay/tomb-raider-interpolated.jpg" width="400" alt=""><br><strong>2:34 · 섀도우 오브 더 툼 레이더</strong></a><br>D3D12 · CPU 4코어 · 보간 켬</td>
+<td></td></tr>
+</table>
 
 ## 게임 호환성
 

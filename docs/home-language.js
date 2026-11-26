@@ -1,7 +1,12 @@
 const homeCopy = {
-  interpolatedTomb: {"zh": "古墓奇兵：暗影 · 開啟內插", "ja": "シャドウ オブ ザ トゥームレイダー · 補間オン", "ko": "섀도우 오브 더 툼 레이더 · 보간 켬"},
-  nativeTomb: {"zh": "古墓奇兵：暗影 · 關閉內插", "ja": "シャドウ オブ ザ トゥームレイダー · 補間オフ", "ko": "섀도우 오브 더 툼 레이더 · 보간 끔"},
-  witcher: {"zh": "巫師 3", "ja": "ウィッチャー3", "ko": "더 위쳐 3"},
+  interpolatedSettings: {"zh": "D3D12 · 4 個 CPU 核心 · 開啟內插", "ja": "D3D12 · CPU 4 コア · 補間オン", "ko": "D3D12 · CPU 4코어 · 보간 켬"},
+  nativeSettings: {"zh": "D3D12 · 4 個 CPU 核心 · 關閉內插", "ja": "D3D12 · CPU 4 コア · 補間オフ", "ko": "D3D12 · CPU 4코어 · 보간 끔"},
+  witcherSettings: {"zh": "D3D12 · 4 個 CPU 核心 · 關閉內插", "ja": "D3D12 · CPU 4 コア · 補間オフ", "ko": "D3D12 · CPU 4코어 · 보간 끔"},
+  talesSettings: {"zh": "D3D11 · 4 個 CPU 核心 · 關閉內插", "ja": "D3D11 · CPU 4 コア · 補間オフ", "ko": "D3D11 · CPU 4코어 · 보간 끔"},
+  frontierSettings: {"zh": "D3D11 · 2 個 CPU 核心 · 關閉內插", "ja": "D3D11 · CPU 2 コア · 補間オフ", "ko": "D3D11 · CPU 2코어 · 보간 끔"},
+  interpolatedTomb: {"zh": "2:34 · 古墓奇兵：暗影", "ja": "2:34 · シャドウ オブ ザ トゥームレイダー", "ko": "2:34 · 섀도우 오브 더 툼 레이더"},
+  nativeTomb: {"zh": "1:54 · 古墓奇兵：暗影", "ja": "1:54 · シャドウ オブ ザ トゥームレイダー", "ko": "1:54 · 섀도우 오브 더 툼 레이더"},
+  witcher: {"zh": "1:24 · 巫師 3", "ja": "1:24 · ウィッチャー3", "ko": "1:24 · 더 위쳐 3"},
   scoreCaption: {zh:"Apple M4 Pro 上的 Geekbench 7 CPU 總分 · 分數越高越好", ja:"Apple M4 Pro の Geekbench 7 CPU 総合スコア（高いほど良好）", ko:"Apple M4 Pro의 Geekbench 7 CPU 총점 · 높을수록 좋음"},
   scoreTotals: {
     zh:"依序為 AppleJuice、Rosetta 2、原生 ARM64。1 核：1,387／1,281／3,057。2 核：2,251／2,100／5,604。4 核：4,137／3,990／10,784。",

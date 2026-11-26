@@ -23,7 +23,11 @@ h2{line-height:1.2;margin:.5rem 0}p{max-width:64ch;color:var(--muted)}
 section{border-top:1px solid var(--line);padding-block:1.5rem}
 figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#19221e;border-radius:.45rem}
 .chapters{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,18rem),1fr));gap:1rem}
-.chapters img{display:block;width:100%;height:auto;border-radius:.4rem}figcaption{margin-top:.45rem}
+.chapters img{display:block;width:100%;height:auto;border-radius:.4rem}.chapters figure{margin:0;display:flex;flex-direction:column;gap:.25rem}
+.chapters a{display:grid;gap:.5rem;text-decoration:none;color:var(--ink)}
+.chapters a:hover strong,.chapters a:focus-visible strong{text-decoration:underline}
+.chapters figcaption{font-size:.9rem;color:var(--muted);margin-top:auto}
+.chapters{margin-block:1rem}
 
 .actions{display:flex;align-items:center;flex-wrap:wrap;gap:1rem}
 .game-counts { width:min(100%,25rem); border-collapse:collapse; margin:1rem 0; font-variant-numeric:tabular-nums }
@@ -35,10 +39,10 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 .faq h3 { margin:0 0 .45rem; font-size:1.15rem; line-height:1.4 }
 .faq .answer { padding-block:1.25rem; border-top:1px solid var(--line) }
 .faq .answer p { margin:0 }
-.faq video { margin-block:.85rem .55rem }
+.faq .actions { margin-top:.85rem }
 .faq .report { margin:0; padding-block-start:1.5rem; border-top:1px solid var(--line) }
 .score-chart img { display:block; width:100%; height:auto; border:1px solid var(--line); border-radius:.6rem }
-#steam-install video { aspect-ratio: 8 / 5; max-width:56rem }
+
 #gameplay-player { width:min(64rem,94vw); padding:.8rem; border:1px solid var(--line); border-radius:.8rem; background:var(--surface); color:var(--ink) }
 #gameplay-player::backdrop { background:#080e0acc }
 #gameplay-player video { max-height:72vh; object-fit:contain }
@@ -58,21 +62,24 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 <h2 id="gameplay-title"><span data-copy="showcase">Gameplay showcase</span></h2>
 <p><span data-copy="capture">Recorded on Apple M4 Pro with 64 GiB of unified memory and macOS 27.2.1 at 1920 × 1080. Frontier Hunter uses AppleJuice 0.26.1126 build 727 with 2 CPU cores. The other games use build 1536 with 4 CPU cores. Only the final Tomb Raider chapter enables frame interpolation.</span></p>
 <div class="actions">
-<a class="button" href="media/gameplay/applejuice-gameplay.mp4"><span aria-hidden="true">▶</span> <span data-copy="playGameplay">Watch gameplay</span></a>
+<a class="button" data-video-title="gameplay-title" href="media/gameplay/applejuice-gameplay.mp4"><span aria-hidden="true">▶</span> <span data-copy="playGameplay">Watch gameplay</span></a>
 <span data-copy="videoNote">0:00 · Launching Frontier Hunter from the Steam Library.</span>
 </div>
 <dialog id="gameplay-player" aria-labelledby="player-title" closedby="any">
 <div class="player-bar"><strong id="player-title" data-copy="showcase">Gameplay showcase</strong><form method="dialog"><button autofocus data-copy="closePlayer">Close</button></form></div>
-<video controls playsinline preload="none" width="1920" height="1080" data-label="movie" aria-label="AppleJuice gameplay chapters"></video>
+<video controls playsinline preload="none" aria-labelledby="player-title"></video>
 </dialog>
 <div class="chapters">
-<figure><a href="media/gameplay/applejuice-gameplay.mp4#t=12,44"><img src="images/gameplay/frontier-hunter.png" width="1920" height="1080" loading="lazy" data-alt="cabin" alt="Play Frontier Hunter: Erza runs across her cabin and changes direction."></a>
-<figcaption><strong><span data-copy="frontier">0:12 · Frontier Hunter: Erza’s Wheel of Fortune</span></strong><br><span data-copy="frontierBuild">Steam build 15701452 · 2 CPU cores</span></figcaption></figure>
-<figure><a href="media/gameplay/applejuice-gameplay.mp4#t=44,83.933"><img src="images/gameplay/tales-of-arise.png" width="1920" height="1080" loading="lazy" data-alt="battle" alt="Play Tales of Arise: the party encounters an enemy and enters battle in the dungeon."></a>
-<figcaption><strong><span data-copy="tales">0:44 · Tales of Arise</span></strong><br><span data-copy="talesBuild">D3D11 · MetalFX off</span></figcaption></figure>
-<figure><a href="media/gameplay/applejuice-gameplay.mp4#t=83.933"><img src="images/gameplay/witcher-3.jpg" width="1280" height="720" loading="lazy" alt=""><strong>1:24 · <span data-copy="witcher">The Witcher 3</span></strong></a></figure>
-<figure><a href="media/gameplay/applejuice-gameplay.mp4#t=113.933"><img src="images/gameplay/tomb-raider-native.jpg" width="1280" height="720" loading="lazy" alt=""><strong>1:54 · <span data-copy="nativeTomb">Shadow of the Tomb Raider · Interpolation off</span></strong></a></figure>
-<figure><a href="media/gameplay/applejuice-gameplay.mp4#t=154"><img src="images/gameplay/tomb-raider-interpolated.jpg" width="1280" height="720" loading="lazy" alt=""><strong>2:34 · <span data-copy="interpolatedTomb">Shadow of the Tomb Raider · Interpolation on</span></strong></a></figure>
+<figure><a data-video-title="gameplay-title" href="media/gameplay/applejuice-gameplay.mp4#t=12,44"><img src="images/gameplay/frontier-hunter.png" width="1920" height="1080" loading="lazy" alt=""><strong data-copy="frontier">0:12 · Frontier Hunter: Erza’s Wheel of Fortune</strong></a>
+<figcaption data-copy="frontierSettings">D3D11 · 2 CPU cores · Interpolation off</figcaption></figure>
+<figure><a data-video-title="gameplay-title" href="media/gameplay/applejuice-gameplay.mp4#t=44,83.933"><img src="images/gameplay/tales-of-arise.png" width="1920" height="1080" loading="lazy" alt=""><strong data-copy="tales">0:44 · Tales of Arise</strong></a>
+<figcaption data-copy="talesSettings">D3D11 · 4 CPU cores · Interpolation off</figcaption></figure>
+<figure><a data-video-title="gameplay-title" href="media/gameplay/applejuice-gameplay.mp4#t=83.933"><img src="images/gameplay/witcher-3.jpg" width="1280" height="720" loading="lazy" alt=""><strong data-copy="witcher">1:24 · The Witcher 3</strong></a>
+<figcaption data-copy="witcherSettings">D3D12 · 4 CPU cores · Interpolation off</figcaption></figure>
+<figure><a data-video-title="gameplay-title" href="media/gameplay/applejuice-gameplay.mp4#t=113.933"><img src="images/gameplay/tomb-raider-native.jpg" width="1280" height="720" loading="lazy" alt=""><strong data-copy="nativeTomb">1:54 · Shadow of the Tomb Raider</strong></a>
+<figcaption data-copy="nativeSettings">D3D12 · 4 CPU cores · Interpolation off</figcaption></figure>
+<figure><a data-video-title="gameplay-title" href="media/gameplay/applejuice-gameplay.mp4#t=154"><img src="images/gameplay/tomb-raider-interpolated.jpg" width="1280" height="720" loading="lazy" alt=""><strong data-copy="interpolatedTomb">2:34 · Shadow of the Tomb Raider</strong></a>
+<figcaption data-copy="interpolatedSettings">D3D12 · 4 CPU cores · Interpolation on</figcaption></figure>
 </div></section>
 <section><h2 id="game-counts-title"><span data-copy="results">From the tested library</span></h2>
 <table class="game-counts" aria-labelledby="game-counts-title">
@@ -94,8 +101,7 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 <section class="faq"><h2><span data-copy="gettingStarted">Getting started</span></h2>
 <div class="answer"><h3><span data-copy="installGame">How do I install a game?</span></h3><p><span data-copy="installSteps">Copy AppleJuice.app from the release DMG to Applications. Open the Launcher, choose Add EXE, select your game and review its drive mappings before pressing Play.</span></p></div>
 <div class="answer" id="steam-install"><h3><span data-copy="installSteam">How do I install Steam?</span></h3><p><span data-copy="steamSteps">Choose Run once and select SteamSetup.exe in the macOS file picker. After setup finishes, Steam.exe appears in the Launcher sidebar.</span></p>
-<video controls playsinline preload="none" width="1440" height="900" poster="images/gameplay/steam-install.jpg" aria-labelledby="steam-video-title"><source src="media/gameplay/steam-temporary-install.mp4" type="video/mp4"></video>
-<p><a id="steam-video-title" href="media/gameplay/steam-temporary-install.mp4"><span data-copy="watchInstall">Watch the Steam installation</span></a></p></div>
+<div class="actions"><a class="button" data-video-title="steam-video-title" href="media/gameplay/steam-temporary-install.mp4"><span aria-hidden="true">▶</span> <span id="steam-video-title" data-copy="watchInstall">Watch the Steam installation</span></a></div></div>
 <div class="answer"><h3><span data-copy="whichGames">Which games work?</span></h3><p><span data-copy="ratings">The tested list distinguishes default performance, enhanced output, slow gameplay, launch-only and failed runs. Check your edition and settings.</span></p></div>
 <p class="report"><a href="https://github.com/VaderChen/AppleJuice/issues/new/choose"><span data-copy="report">Share a test or report a problem</span></a></p></section>
 </main>
@@ -106,11 +112,13 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 const playerDialog = document.getElementById('gameplay-player');
 if (typeof playerDialog.showModal === 'function') {
   const video = playerDialog.querySelector('video');
-  for (const link of document.querySelectorAll('#gameplay a[href*="applejuice-gameplay.mp4"]')) {
+  for (const link of document.querySelectorAll('a[data-video-title]')) {
     link.setAttribute('aria-haspopup', 'dialog');
     link.addEventListener('click', event => {
       if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
       event.preventDefault();
+      const title = document.getElementById(link.dataset.videoTitle).textContent;
+      document.getElementById('player-title').textContent = title;
       video.src = link.href;
       playerDialog.showModal();
       video.play().catch(() => {}); // 瀏覽器限制自動播放時，仍可使用原生控制列。

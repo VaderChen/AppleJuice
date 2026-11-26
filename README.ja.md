@@ -31,14 +31,19 @@ Apple Silicon · macOS 13 以降。配布版にはランタイムが含まれま
 
 Apple M4 Pro、64 GiB のユニファイドメモリ、macOS 27.2.1 で 1920 × 1080 の映像を収録しました。フロンティアハンターは AppleJuice 0.26.1126 ビルド 727、CPU 2 コア、ほかの作品はビルド 1536、CPU 4 コアです。フレーム補間はトゥームレイダーの最後の章でのみ有効です。
 
-| 0:12 · フロンティアハンター ～エルザの運命の輪～ | 0:44 · テイルズ オブ アライズ |
-|---|---|
-| ![エルザが船室を走り、折り返す場面。](docs/images/gameplay/frontier-hunter.png) | ![ダンジョンを進み、敵と遭遇して戦闘に入る場面。](docs/images/gameplay/tales-of-arise.png) |
-| Steam 15701452 · CPU 2 コア | D3D11 · MetalFX オフ |
-
-| [1:24 · ウィッチャー3](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=83.933) | [1:54 · シャドウ オブ ザ トゥームレイダー · 補間オフ](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=113.933) | [2:34 · シャドウ オブ ザ トゥームレイダー · 補間オン](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=154) |
-|---|---|---|
-| [![1:24 · ウィッチャー3](docs/images/gameplay/witcher-3.jpg)](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=83.933) | [![1:54 · シャドウ オブ ザ トゥームレイダー · 補間オフ](docs/images/gameplay/tomb-raider-native.jpg)](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=113.933) | [![2:34 · シャドウ オブ ザ トゥームレイダー · 補間オン](docs/images/gameplay/tomb-raider-interpolated.jpg)](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=154) |
+<table>
+<tr>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=12,44"><img src="docs/images/gameplay/frontier-hunter.png" width="400" alt=""><br><strong>0:12 · フロンティアハンター ～エルザの運命の輪～</strong></a><br>D3D11 · CPU 2 コア · 補間オフ</td>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=44,83.933"><img src="docs/images/gameplay/tales-of-arise.png" width="400" alt=""><br><strong>0:44 · テイルズ オブ アライズ</strong></a><br>D3D11 · CPU 4 コア · 補間オフ</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=83.933"><img src="docs/images/gameplay/witcher-3.jpg" width="400" alt=""><br><strong>1:24 · ウィッチャー3</strong></a><br>D3D12 · CPU 4 コア · 補間オフ</td>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=113.933"><img src="docs/images/gameplay/tomb-raider-native.jpg" width="400" alt=""><br><strong>1:54 · シャドウ オブ ザ トゥームレイダー</strong></a><br>D3D12 · CPU 4 コア · 補間オフ</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=154"><img src="docs/images/gameplay/tomb-raider-interpolated.jpg" width="400" alt=""><br><strong>2:34 · シャドウ オブ ザ トゥームレイダー</strong></a><br>D3D12 · CPU 4 コア · 補間オン</td>
+<td></td></tr>
+</table>
 
 ## ゲーム互換性
 
