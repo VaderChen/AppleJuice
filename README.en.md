@@ -1,6 +1,6 @@
 [![AppleJuice — Windows Gaming. Squeezed for Apple Silicon.](docs/images/branding/hero.svg)](https://vaderchen.github.io/AppleJuice/?lang=en)
 
-[![Open web version](docs/images/branding/web-en.svg)](https://vaderchen.github.io/AppleJuice/?lang=en) &nbsp; [English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
+<a href="https://vaderchen.github.io/AppleJuice/?lang=en"><img src="docs/images/branding/web-en.svg" alt="Open web version" align="middle"></a> &nbsp; [English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
 # AppleJuice
 

@@ -1,7 +1,4 @@
 const homeCopy = {
-  gameplay: {"zh": "實機遊玩", "ja": "プレイ映像", "ko": "플레이 영상"},
-  tested: {"zh": "相容性清單", "ja": "動作確認済みゲーム", "ko": "테스트한 게임"},
-  benchmarks: {"zh": "效能測試", "ja": "ベンチマーク", "ko": "벤치마크"},
   headline: {"zh": "在 Apple Silicon 上玩 Windows 遊戲", "ja": "Apple Silicon で Windows ゲームを。", "ko": "Apple Silicon에서 즐기는 Windows 게임"},
   intro: {"zh": "在 Mac 上遊玩支援的 Windows 遊戲。AppleJuice 將 x86 與 x64 程式碼轉譯為 ARM64，並透過 Metal 呈現 Direct3D 畫面。", "ja": "対応する Windows ゲームを Mac でプレイ。AppleJuice は x86・x64 コードを ARM64 に変換し、Direct3D の描画に Metal を使います。", "ko": "지원되는 Windows 게임을 Mac에서 플레이하세요. AppleJuice는 x86 및 x64 코드를 ARM64로 변환하고 Metal을 통해 Direct3D 그래픽을 표시합니다."},
   download: {"zh": "下載 Mac 版", "ja": "Mac 版をダウンロード", "ko": "Mac용 다운로드"},
@@ -33,16 +30,12 @@ const homeCopy = {
   whichGames: {"zh": "哪些遊戲可以玩？", "ja": "どのゲームが動作しますか？", "ko": "어떤 게임을 플레이할 수 있나요?"},
   ratings: {"zh": "實測清單分別列出預設設定下運作良好、透過 MetalFX 改善、執行緩慢、僅能開啟及無法執行的結果。請核對遊戲版本與設定。", "ja": "動作確認リストは標準設定で快適、MetalFX で改善、低速、起動のみ、起動不可の結果に分かれます。ゲームの版と設定をご確認ください。", "ko": "테스트 목록은 기본 설정에서 원활한 게임, MetalFX로 개선되는 게임, 느린 게임, 실행만 가능한 게임과 실행에 실패한 게임을 구분합니다. 게임 버전과 설정을 확인하세요."},
   report: {"zh": "提供測試結果或回報問題", "ja": "テスト結果を共有・問題を報告", "ko": "테스트 결과 공유 또는 문제 신고"},
-  language: {"zh": "語言", "ja": "言語", "ko": "언어"},
-  auto: {"zh": "自動偵測", "ja": "自動判定", "ko": "자동 감지"},
-  main: {"zh": "主導覽", "ja": "メインナビゲーション", "ko": "주 탐색"},
-  guides: {"zh": "產品指南", "ja": "製品ガイド", "ko": "제품 안내"},
   movie: {"zh": "78 秒《邊境獵人》與《破曉傳奇》實機錄影", "ja": "フロンティアハンターとテイルズ オブ アライズの実機映像（78 秒）", "ko": "프런티어 헌터와 테일즈 오브 어라이즈 실기 영상(78초)"},
   cabin: {"zh": "播放《邊境獵人》：艾爾莎在艙房中跑動並折返。", "ja": "フロンティアハンターを再生：エルザが船室を走って折り返す。", "ko": "프런티어 헌터 재생: 엘사가 선실을 가로질러 달리다 방향을 바꿉니다."},
   battle: {"zh": "播放《破曉傳奇》：隊伍在地下城遇敵並進入戰鬥。", "ja": "テイルズ オブ アライズを再生：一行がダンジョンで敵に遭遇し、戦闘に入る。", "ko": "테일즈 오브 어라이즈 재생: 일행이 던전에서 적을 만나 전투에 들어갑니다."},
 };
 
-const { current, requested } = siteLanguage;
+const { current } = siteLanguage;
 document.documentElement.lang = current === 'zh' ? 'zh-Hant' : current;
 if (current !== 'en') {
   for (const node of document.querySelectorAll('[data-copy]')) {
@@ -56,18 +49,4 @@ if (current !== 'en') {
   }
   document.title = 'AppleJuice | ' + homeCopy.headline[current];
   document.querySelector('meta[name="description"]').content = homeCopy.intro[current];
-}
-const languageMenu = document.getElementById('language');
-languageMenu.value = requested || '';
-document.getElementById('language-control').hidden = false;
-languageMenu.addEventListener('change', () => {
-  const url = new URL(location.href);
-  if (languageMenu.value) url.searchParams.set('lang', languageMenu.value);
-  else url.searchParams.delete('lang');
-  location.assign(url);
-});
-if (requested) {
-  for (const link of document.querySelectorAll('a[href="tested/"], a[href="geekbench7/"]')) {
-    link.setAttribute('href', link.getAttribute('href') + '?lang=' + requested);
-  }
 }

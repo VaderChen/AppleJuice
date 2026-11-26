@@ -4,24 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AppleJuice | Geekbench 7 workload scores</title>
+<link rel="stylesheet" href="../site.css">
 <style>
-:root { color-scheme: light dark; --bg: #fff; --ink: #1f2328; --muted: #59636e; --line: #d1d9e0; --soft: #f6f8fa; --accent: #0969da; --apple: #b45226; --ros: #16767d; --arm: #546684 }
-@media (prefers-color-scheme: dark) {
-  :root { --bg: #0d1117; --ink: #f0f6fc; --muted: #a6afb9; --line: #3d444d; --soft: #151b23; --accent: #85b9ff; --apple: #ec935e; --ros: #5ac1c4; --arm: #9db3d4 }
-}
-* { box-sizing: border-box }
-body { margin: 0; background: var(--bg); color: var(--ink); font: 1rem/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif }
-main { max-width: 58rem; margin: auto; padding: 1.6rem 1rem 3rem }
-header, nav { display: flex; align-items: center; flex-wrap: wrap; gap: .45rem }
-header { justify-content: space-between; margin-bottom: 2rem }
-a { color: var(--accent); text-underline-offset: .2em }
-nav { gap: 0; border: 1px solid var(--line); border-radius: .45rem; overflow: hidden }
-nav a { padding: .42rem .7rem; text-decoration: none; color: var(--ink) }
-nav a + a { border-inline-start: 1px solid var(--line) }
-nav a[aria-current="true"] { background: var(--ink); color: var(--bg) }
-nav a:hover { text-decoration: underline }
-nav a:focus-visible { outline-offset: -3px }
-h1 { font-size: clamp(1.55rem, 4vw, 2.15rem); line-height: 1.2; margin: 0 }
+:root { --apple:#b45226; --ros:#16767d; --arm:#546684 }
+@media(prefers-color-scheme:dark){:root{--apple:#ec935e;--ros:#5ac1c4;--arm:#9db3d4}}
 .spec, .method { color: var(--muted); margin: .65rem 0 }
 .spec { font-size: .9rem }
 .group { overflow-x: auto; margin-top: 1.75rem }
@@ -41,13 +27,10 @@ td:nth-child(4) .bar { background: var(--arm) }
   thead th { font-size: .8rem }
   tbody { font-size: .9rem }
 }
-.views { display: inline-flex; gap: .2rem; padding: .2rem; margin: .5rem 0; border: 1px solid var(--line); border-radius: .5rem; background: var(--soft) }
-.views a { padding: .38rem .95rem; border-radius: .3rem; text-decoration: none; color: var(--ink) }
-.views a[aria-current="page"] { background: var(--ink); color: var(--bg) }
 .chart-section { margin: 1.6rem 0 2.5rem }
 .chart-section h2 { margin: 0 0 .65rem; font-size: 1.3rem }
 .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(22rem, 100%), 1fr)); gap: .75rem }
-.chart-grid figure { margin: 0; padding: .85rem 1rem 1rem; border: 1px solid var(--line); border-radius: .5rem }
+.chart-grid figure { margin: 0; padding: .85rem 1rem 1rem;  }
 .chart-grid figcaption { margin-bottom: .5rem; font-weight: 650 }
 .plot-row { display: grid; grid-template-columns: 6.5em minmax(0, 1fr) 5ch; align-items: center; gap: .65rem; font-size: .88rem; margin-top: .2rem }
 .plot-row .track { border-inline-start: 1px solid var(--line); background: var(--soft) }
@@ -55,6 +38,8 @@ td:nth-child(4) .bar { background: var(--arm) }
 .plot-row:nth-of-type(2) .fill { background: var(--ros) }
 .plot-row:nth-of-type(3) .fill { background: var(--arm) }
 .plot-row .value { text-align: end; font-variant-numeric: tabular-nums }
+
+.group caption { padding: .65rem .8rem }
 </style>
 <meta name="description" content="Compare recorded CPU scores by workload and thread count on one Apple M4 Pro.">
 <link rel="canonical" href="https://vaderchen.github.io/AppleJuice/geekbench7/">
@@ -64,11 +49,9 @@ td:nth-child(4) .bar { background: var(--arm) }
 <link rel="alternate" hreflang="ko" href="https://vaderchen.github.io/AppleJuice/geekbench7/?lang=ko">
 </head>
 <body>
+<nav class="site-nav" data-nav-label="main" aria-label="Main"><a class="brand" href="../"><img src="../images/branding/mark.png" alt="" width="38" height="38">AppleJuice</a><a href="../#gameplay"><span data-nav-copy="gameplay">Gameplay</span></a><a href="../tested/"><span data-nav-copy="tested">Tested games</span></a><a aria-current="page" href="../geekbench7/"><span data-nav-copy="benchmarks">Benchmarks</span></a><a href="https://github.com/VaderChen/AppleJuice">GitHub</a><label hidden id="language-control" for="language"><svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></svg><span class="language-label" data-nav-copy="language">Language</span>
+<select id="language" name="language"><option value="" data-nav-copy="auto">Automatic</option><option value="en" lang="en">English</option><option value="zh" lang="zh-Hant">繁體中文</option><option value="ja" lang="ja">日本語</option><option value="ko" lang="ko">한국어</option></select></label></nav>
 <main>
-<header><a id="back" href="https://github.com/VaderChen/AppleJuice#readme">← 返回 README</a>
-<nav aria-label="顯示語言">
-<a href="?lang=zh" hreflang="zh-Hant" lang="zh-Hant" aria-current="true">繁體中文</a><a href="?lang=en" hreflang="en" lang="en">English</a><a href="?lang=ja" hreflang="ja" lang="ja">日本語</a><a href="?lang=ko" hreflang="ko" lang="ko">한국어</a>
-</nav></header>
 <h1>Geekbench 7 各測項分數</h1>
 <p class="spec">Apple M4 Pro · 64 GB · macOS 27.2.1 · Geekbench 7.0.0 Pro (703423) · Launcher 0.26.1125 (1313) · <time datetime="2026-11-25">2026-11-25</time></p>
 <p class="method">分數越高越好。每個測項暖機一次、計分三次。各組內的色條使用相同刻度。</p>
@@ -117,6 +100,7 @@ td:nth-child(4) .bar { background: var(--arm) }
 <tr><th scope="row" data-workload="10" title="Ray Tracer">光線追蹤</th><td>5,144<div class="bar" aria-hidden="true" style="--width:42.50%"></div></td><td>4,470<div class="bar" aria-hidden="true" style="--width:36.93%"></div></td><td>10,746<div class="bar" aria-hidden="true" style="--width:88.78%"></div></td></tr>
 </tbody></table></div>
 </main>
+<footer data-nav-label="guides" aria-label="Product guides"><a href="https://github.com/VaderChen/AppleJuice#readme" hreflang="en">English</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.zh-TW.md" hreflang="zh-Hant">繁體中文</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.ja.md" hreflang="ja">日本語</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.ko.md" hreflang="ko">한국어</a><a href="https://buymeacoffee.com/vaderchen">☕ Buy Me a Coffee</a></footer>
 <script src="../site-language.js"></script>
 <script>
 const translations = {
@@ -243,14 +227,6 @@ document.documentElement.lang = text.locale;
 document.title = text.title + " · AppleJuice";
 document.querySelector("h1").textContent = text.title;
 document.querySelector(".method").textContent = text.method;
-document.querySelector("nav").setAttribute("aria-label", text.language);
-for (const link of document.querySelectorAll("nav a")) {
-  if (link.lang === text.locale) link.setAttribute("aria-current", "true");
-  else link.removeAttribute("aria-current");
-}
-const back = document.querySelector("#back");
-back.textContent = "← " + text.back;
-back.href = "https://github.com/VaderChen/AppleJuice" + (lang === "en" ? "#readme" : "/blob/main/README." + (lang === "zh" ? "zh-TW" : lang) + ".md");
 for (const header of document.querySelectorAll("[data-label]")) header.textContent = text[header.dataset.label];
 for (const cell of document.querySelectorAll("[data-workload]")) cell.textContent = text.names[Number(cell.dataset.workload)];
 // 圖表沿用已翻譯的表頭與資料列，避免維護第二份分數。
@@ -264,9 +240,6 @@ const urlFor = (language, asTable) => {
   else url.searchParams.delete("view");
   return url.href;
 };
-for (const link of document.querySelectorAll("nav a")) {
-  link.href = urlFor(new URL(link.href).searchParams.get("lang"), tableView);
-}
 const views = document.createElement("div");
 views.className = "views";
 for (const [label, asTable] of [[text.chart, false], [text.table, true]]) {

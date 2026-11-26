@@ -15,44 +15,22 @@
 <meta property="og:image:alt" content="AppleJuice launcher icon and wordmark">
 <meta name="twitter:card" content="summary_large_image">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"AppleJuice","operatingSystem":"macOS 13 or later on Apple Silicon","applicationCategory":"GameApplication","downloadUrl":"https://github.com/VaderChen/AppleJuice/releases/latest","license":"https://github.com/VaderChen/AppleJuice/blob/main/LICENSE.md"}</script>
+<link rel="stylesheet" href="site.css">
 <style>
-:root {color-scheme:light dark;--paper:#fafcf8;--ink:#18231c;--muted:#47564c;--line:#c9d3ca;--link:#21633c;--accent:#bbee9f}
-@media(prefers-color-scheme:dark){:root{--paper:#111914;--ink:#eff7ed;--muted:#bccbbd;--line:#39503f;--link:#bbee9f}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--paper);color:var(--ink);font:1.05rem/1.6 system-ui,sans-serif}
-main,nav,footer{max-width:64rem;margin:auto;padding:1.2rem clamp(1rem,5vw,3rem)}
-nav,footer,.actions{display:flex;align-items:center;flex-wrap:wrap;gap:1rem}
-nav{border-bottom:1px solid var(--line)}nav strong{margin-right:auto;display:inline-flex;align-items:center;gap:.45rem}nav img{display:block}
-a{color:var(--link);text-underline-offset:.2em}a:focus-visible{outline:3px solid currentColor;outline-offset:3px}
-header{padding:clamp(2rem,6vw,5rem) 0 2rem}h1{font-size:clamp(2.7rem,7vw,5.2rem);line-height:1.04;letter-spacing:-.05em;margin:0;max-width:15ch}
+header{padding:0 0 2rem}h1{font-size:clamp(2.7rem,7vw,5.2rem);line-height:1.04;letter-spacing:-.05em;margin:0;max-width:15ch}
 h2{line-height:1.2;margin:.5rem 0}p{max-width:64ch;color:var(--muted)}
 .button{background:var(--accent);color:#132318;padding:.65rem 1.1rem;border-radius:.45rem;text-decoration:none;font-weight:650}
-section,footer{border-top:1px solid var(--line);padding-block:1.5rem}summary{cursor:pointer}
+section{border-top:1px solid var(--line);padding-block:1.5rem}summary{cursor:pointer}
 figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#19221e;border-radius:.45rem}
 .chapters{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,18rem),1fr));gap:1rem}
 .chapters img{display:block;width:100%;height:auto;border-radius:.4rem}figcaption{margin-top:.45rem}
-/* 整顆按鈕皆可開啟選單，裝飾圖示不攔截滑鼠。 */
-#language-control:not([hidden]){position:relative;display:inline-flex;align-items:center;color:var(--link)}
-#language-control .language-label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
-#language-control svg{position:absolute;left:.85rem;pointer-events:none}
-#language-control::after{content:"";position:absolute;right:.95rem;width:.38rem;height:.38rem;border:solid currentColor;border-width:0 1.6px 1.6px 0;transform:translateY(-2px) rotate(45deg);pointer-events:none}
-#language{appearance:none;box-sizing:border-box;width:10.25rem;min-height:44px;padding:.55rem 2rem .55rem 2.55rem;
-  border:1px solid var(--line);border-radius:2rem;background:var(--paper);background:color-mix(in srgb,var(--paper) 94%,var(--link));
-  color:var(--ink);font:600 .95rem/1.4 system-ui,sans-serif;cursor:pointer}
-#language:hover{border-color:var(--link)}
-#language:focus-visible{outline:3px solid var(--link);outline-offset:3px}
-@supports (appearance:base-select){
-  #language,#language::picker(select){appearance:base-select}
-  #language::picker-icon{display:none}
-  #language::picker(select){margin-top:.35rem;padding:.32rem;background:var(--paper);color:var(--ink);border:1px solid var(--line);border-radius:.85rem;box-shadow:0 .45rem 1.2rem #0002}
-  #language option{min-height:2.45rem;padding:.45rem .65rem;border-radius:.5rem;font:500 .95rem/1.45 system-ui,sans-serif}
-  #language option:checked,#language option:hover,#language option:focus-visible{background:color-mix(in srgb,var(--paper) 85%,var(--link));color:var(--link)}
-}
+
+.actions{display:flex;align-items:center;flex-wrap:wrap;gap:1rem}
 </style>
 </head>
 <body>
-<nav data-label="main" aria-label="Main"><strong><img src="images/branding/mark.png" alt="" width="38" height="38">AppleJuice</strong><a href="#gameplay"><span data-copy="gameplay">Gameplay</span></a><a href="tested/"><span data-copy="tested">Tested games</span></a><a href="geekbench7/"><span data-copy="benchmarks">Benchmarks</span></a><a href="https://github.com/VaderChen/AppleJuice">GitHub</a><label hidden id="language-control" for="language"><svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></svg><span class="language-label" data-copy="language">Language</span>
-<select id="language" name="language"><option value="" data-copy="auto">Automatic</option><option value="en" lang="en">English</option><option value="zh" lang="zh-Hant">繁體中文</option><option value="ja" lang="ja">日本語</option><option value="ko" lang="ko">한국어</option></select></label></nav>
+<nav class="site-nav" data-nav-label="main" aria-label="Main"><a class="brand" aria-current="page" href="./"><img src="images/branding/mark.png" alt="" width="38" height="38">AppleJuice</a><a href="#gameplay"><span data-nav-copy="gameplay">Gameplay</span></a><a href="tested/"><span data-nav-copy="tested">Tested games</span></a><a href="geekbench7/"><span data-nav-copy="benchmarks">Benchmarks</span></a><a href="https://github.com/VaderChen/AppleJuice">GitHub</a><label hidden id="language-control" for="language"><svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></svg><span class="language-label" data-nav-copy="language">Language</span>
+<select id="language" name="language"><option value="" data-nav-copy="auto">Automatic</option><option value="en" lang="en">English</option><option value="zh" lang="zh-Hant">繁體中文</option><option value="ja" lang="ja">日本語</option><option value="ko" lang="ko">한국어</option></select></label></nav>
 <main>
 <header><h1><span data-copy="headline">Windows gaming on Apple Silicon.</span></h1>
 <p><span data-copy="intro">Play supported Windows games on your Mac. AppleJuice translates x86 and x64 code to ARM64 and brings Direct3D graphics to Metal.</span></p>
@@ -79,7 +57,7 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 <details><summary><span data-copy="whichGames">Which games work?</span></summary><p><span data-copy="ratings">The tested list distinguishes default performance, enhanced output, slow gameplay, launch-only and failed runs. Check your edition and settings.</span></p></details>
 <a href="https://github.com/VaderChen/AppleJuice/issues/new/choose"><span data-copy="report">Share a test or report a problem</span></a></section>
 </main>
-<footer data-label="guides" aria-label="Product guides"><a href="https://github.com/VaderChen/AppleJuice#readme" hreflang="en">English</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.zh-TW.md" hreflang="zh-Hant">繁體中文</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.ja.md" hreflang="ja">日本語</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.ko.md" hreflang="ko">한국어</a><a href="https://buymeacoffee.com/vaderchen">☕ Buy Me a Coffee</a></footer>
+<footer data-nav-label="guides" aria-label="Product guides"><a href="https://github.com/VaderChen/AppleJuice#readme" hreflang="en">English</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.zh-TW.md" hreflang="zh-Hant">繁體中文</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.ja.md" hreflang="ja">日本語</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.ko.md" hreflang="ko">한국어</a><a href="https://buymeacoffee.com/vaderchen">☕ Buy Me a Coffee</a></footer>
 <script src="site-language.js"></script>
 <script src="home-language.js"></script>
 </body></html>

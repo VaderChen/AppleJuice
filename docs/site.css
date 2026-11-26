@@ -1,0 +1,55 @@
+/* 全站共用色彩、版心、導覽與控制項。 */
+:root {
+  color-scheme: light dark;
+  --paper: #fafcf8; --surface: #fff; --ink: #18231c; --muted: #47564c;
+  --line: #c9d3ca; --link: #21633c; --soft: #edf3ec; --accent: #bbee9f;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #111914; --surface: #19241c; --ink: #eff7ed; --muted: #bccbbd;
+    --line: #39503f; --link: #bbee9f; --soft: #243329;
+  }
+}
+* { box-sizing: border-box }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 1rem/1.6 system-ui,sans-serif }
+main, .site-nav, footer { max-width: 68rem; margin-inline: auto; padding-inline: clamp(1rem, 4vw, 3rem) }
+main { padding-block: clamp(2rem, 5vw, 4rem) 3rem }
+.site-nav, footer { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem .75rem; padding-block: 1rem }
+.site-nav { border-bottom: 1px solid var(--line) }
+.site-nav a { display: inline-flex; align-items: center; min-height: 44px; padding-inline: .6rem; color: var(--muted); text-decoration: none; font-weight: 600; border-radius: .6rem }
+.site-nav a:hover, .site-nav a[aria-current] { color: var(--link); background: var(--soft) }
+.site-nav .brand { gap: .5rem; margin-inline-end: auto; padding-inline: 0 .6rem; color: var(--ink); font-size: 1.25rem; letter-spacing: -.035em }
+.site-nav .brand img { display: block }
+a { color: var(--link); text-underline-offset: .2em }
+:focus-visible { outline: 3px solid var(--link); outline-offset: 2px }
+footer { border-top: 1px solid var(--line); gap: .65rem 1.2rem }
+h1 { margin: 0; font-size: clamp(2rem, 1.4rem + 3vw, 3.75rem); line-height: 1.12; letter-spacing: -.04em; text-wrap: balance }
+h2 { line-height: 1.2 }
+.wrap, .chart-grid figure, .group { background: var(--surface); border: 1px solid var(--line); border-radius: .8rem }
+.seg, .views { display: inline-flex; gap: .2rem; padding: .2rem; border: 1px solid var(--line); border-radius: .7rem; background: var(--soft) }
+.seg button, .views a { padding: .45rem .9rem; border: 0; border-radius: .45rem; color: var(--ink); background: transparent; font: inherit; cursor: pointer; text-decoration: none }
+.seg button[aria-pressed="true"], .views a[aria-current="page"] { background: var(--link); color: var(--paper) }
+@media (max-width: 48rem) {
+  .site-nav { display: grid; grid-template-columns: repeat(4, auto); justify-content: space-between; gap: .25rem }
+  .site-nav .brand { grid-column: 1 / 3; grid-row: 1 }
+  #language-control { grid-column: 3 / 5; grid-row: 1; justify-self: end }
+  .site-nav a { padding-inline: .2rem; font-size: .9rem }
+  .site-nav .brand { font-size: 1.15rem }
+}
+/* 整顆按鈕皆可開啟選單，裝飾圖示不攔截滑鼠。 */
+#language-control:not([hidden]){position:relative;display:inline-flex;align-items:center;color:var(--link)}
+#language-control .language-label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+#language-control svg{position:absolute;left:.85rem;pointer-events:none}
+#language-control::after{content:"";position:absolute;right:.95rem;width:.38rem;height:.38rem;border:solid currentColor;border-width:0 1.6px 1.6px 0;transform:translateY(-2px) rotate(45deg);pointer-events:none}
+#language{appearance:none;box-sizing:border-box;width:10.25rem;min-height:44px;padding:.55rem 2rem .55rem 2.55rem;
+  border:1px solid var(--line);border-radius:2rem;background:var(--paper);background:color-mix(in srgb,var(--paper) 94%,var(--link));
+  color:var(--ink);font:600 .95rem/1.4 system-ui,sans-serif;cursor:pointer}
+#language:hover{border-color:var(--link)}
+#language:focus-visible{outline:3px solid var(--link);outline-offset:3px}
+@supports (appearance:base-select){
+  #language,#language::picker(select){appearance:base-select}
+  #language::picker-icon{display:none}
+  #language::picker(select){margin-top:.35rem;padding:.32rem;background:var(--paper);color:var(--ink);border:1px solid var(--line);border-radius:.85rem;box-shadow:0 .45rem 1.2rem #0002}
+  #language option{min-height:2.45rem;padding:.45rem .65rem;border-radius:.5rem;font:500 .95rem/1.45 system-ui,sans-serif}
+  #language option:checked,#language option:hover,#language option:focus-visible{background:color-mix(in srgb,var(--paper) 85%,var(--link));color:var(--link)}
+}
