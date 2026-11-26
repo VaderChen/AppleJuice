@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Geekbench 7 各測項分數 · AppleJuice</title>
+<title>AppleJuice | Geekbench 7 workload scores</title>
 <style>
 :root { color-scheme: light dark; --bg: #fff; --ink: #1f2328; --muted: #59636e; --line: #d1d9e0; --soft: #f6f8fa; --accent: #0969da; --apple: #b45226; --ros: #16767d; --arm: #546684 }
 @media (prefers-color-scheme: dark) {
@@ -56,6 +56,12 @@ td:nth-child(4) .bar { background: var(--arm) }
 .plot-row:nth-of-type(3) .fill { background: var(--arm) }
 .plot-row .value { text-align: end; font-variant-numeric: tabular-nums }
 </style>
+<meta name="description" content="Compare recorded CPU scores by workload and thread count on one Apple M4 Pro.">
+<link rel="canonical" href="https://vaderchen.github.io/AppleJuice/geekbench7/">
+<link rel="alternate" hreflang="en" href="https://vaderchen.github.io/AppleJuice/geekbench7/?lang=en">
+<link rel="alternate" hreflang="zh-Hant" href="https://vaderchen.github.io/AppleJuice/geekbench7/?lang=zh">
+<link rel="alternate" hreflang="ja" href="https://vaderchen.github.io/AppleJuice/geekbench7/?lang=ja">
+<link rel="alternate" hreflang="ko" href="https://vaderchen.github.io/AppleJuice/geekbench7/?lang=ko">
 </head>
 <body>
 <main>
@@ -111,6 +117,7 @@ td:nth-child(4) .bar { background: var(--arm) }
 <tr><th scope="row" data-workload="10" title="Ray Tracer">光線追蹤</th><td>5,144<div class="bar" aria-hidden="true" style="--width:42.50%"></div></td><td>4,470<div class="bar" aria-hidden="true" style="--width:36.93%"></div></td><td>10,746<div class="bar" aria-hidden="true" style="--width:88.78%"></div></td></tr>
 </tbody></table></div>
 </main>
+<script src="../site-language.js"></script>
 <script>
 const translations = {
   "zh": {
@@ -230,9 +237,7 @@ const translations = {
     ]
   }
 };
-const query = new URLSearchParams(location.search).get("lang");
-const preferred = navigator.language.toLowerCase().split("-")[0];
-const lang = Object.hasOwn(translations, query) ? query : Object.hasOwn(translations, preferred) ? preferred : "en";
+const lang = siteLanguage.current;
 const text = translations[lang];
 document.documentElement.lang = text.locale;
 document.title = text.title + " · AppleJuice";
@@ -245,13 +250,20 @@ for (const link of document.querySelectorAll("nav a")) {
 }
 const back = document.querySelector("#back");
 back.textContent = "← " + text.back;
-if (lang !== "zh") back.href = "https://github.com/VaderChen/AppleJuice/blob/main/README." + lang + ".md";
+back.href = "https://github.com/VaderChen/AppleJuice" + (lang === "en" ? "#readme" : "/blob/main/README." + (lang === "zh" ? "zh-TW" : lang) + ".md");
 for (const header of document.querySelectorAll("[data-label]")) header.textContent = text[header.dataset.label];
 for (const cell of document.querySelectorAll("[data-workload]")) cell.textContent = text.names[Number(cell.dataset.workload)];
 // 圖表沿用已翻譯的表頭與資料列，避免維護第二份分數。
 const settings = new URLSearchParams(location.search);
 const tableView = settings.get("view") === "table";
-const urlFor = (language, asTable) => "?lang=" + language + (asTable ? "&view=table" : "");
+const urlFor = (language, asTable) => {
+  const url = new URL(location.href);
+  if (language) url.searchParams.set("lang", language);
+  else url.searchParams.delete("lang");
+  if (asTable) url.searchParams.set("view", "table");
+  else url.searchParams.delete("view");
+  return url.href;
+};
 for (const link of document.querySelectorAll("nav a")) {
   link.href = urlFor(new URL(link.href).searchParams.get("lang"), tableView);
 }
@@ -259,7 +271,7 @@ const views = document.createElement("div");
 views.className = "views";
 for (const [label, asTable] of [[text.chart, false], [text.table, true]]) {
   const link = document.createElement("a");
-  link.href = urlFor(lang, asTable);
+  link.href = urlFor(siteLanguage.requested, asTable);
   link.textContent = label;
   if (tableView === asTable) link.setAttribute("aria-current", "page");
   views.append(link);

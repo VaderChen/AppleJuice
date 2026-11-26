@@ -1,0 +1,143 @@
+# AppleJuice
+
+[English](../../README.md) · [繁體中文](../../README.zh-TW.md) · [日本語](../../README.ja.md) · [한국어](../../README.ko.md)
+
+在 Apple Silicon Mac 上執行 Windows 程式的相容性專案，包含 **Win64 Launcher** 圖形啟動器與 **x64arm** 命令列程式。AppleJuice 提供 PE／DLL 載入與 Windows 相容服務，並將視窗、繪圖、音訊及輸入接到 macOS 原生介面與 Metal。
+
+發布版的最低系統為 **Apple Silicon、macOS 13.0**。畫面內插另需 **macOS 26 以上**及支援的裝置；不符合此條件時停用內插，一般程式執行、MetalFX 放大與空間混音不因此要求升級至 macOS 27。
+
+儲存庫隨附完整的 `x64kernel/` 靜態 SDK；一般建置不需要核心來源。核心另由 AppleJuiceKernel 提供。靜態連結後的執行檔與 Launcher 套件均屬 AppleJuice 可發布範圍，散布時須保留適用授權。
+
+目前維護 resident AOT 的單核與多核執行路徑。**LLVM 執行後端與舊 JIT 已移除。** `--backend jit` 是既有介面名稱，預設仍選擇 resident AOT。
+
+## 專案目標與特色
+
+- **不需要 Windows 系統檔案**：目標是在無須安裝 Windows 或提供 Windows 系統 DLL 的情況下執行支援的程式。應用程式及其附帶相依元件由使用者準備。
+- **優先使用原生 ARM64 指令**：在維持 x86／x64 指令語義與程式行為正確的前提下，盡量使用 Apple Silicon 原生 ARM64 與 NEON 向量運算。
+- **運用原生硬體加速**：圖形與 GPU 運算優先使用 Metal，影片等工作負載盡量使用 macOS 原生框架與可用的硬體加速。
+
+## Geekbench 7 CPU 分數
+
+2026-11-25 在同一台 Apple M4 Pro（64 GB，macOS 27.2.1）測試 Geekbench 7.0.0 Pro（build 703423）。AppleJuice 使用 Launcher 0.26.1125（build 1313）執行 Windows x86_64 版，Rosetta 2 執行 macOS x86_64 版，原生使用 macOS ARM64 版。
+
+三方各取一輪完整測試。每個測項暖機一次、計分三次，圖表直接採用 Geekbench 匯出的官方分數，分數越高越好。1 CPU 涵蓋 16 個單核測項，2 CPU 與 4 CPU 各涵蓋 8 個多核測項。CPU 數依各測項實際使用的工作執行緒數標示。
+
+| CPU 配置 | AppleJuice | Rosetta 2 | 原生 ARM64 |
+|---:|---:|---:|---:|
+| 1 CPU | 1,387 | 1,281 | 3,057 |
+| 2 CPU | 2,251 | 2,100 | 5,604 |
+| 4 CPU | 4,137 | 3,990 | 10,784 |
+
+![1 CPU、2 CPU、4 CPU 的總分](../../docs/images/geekbench7-scores-2026-11-25/cpu.png)
+
+[查看各測項分數](https://vaderchen.github.io/AppleJuice/geekbench7/?lang=zh)
+
+## 開始使用
+
+準備 Apple Silicon Mac、Xcode Command Line Tools、CMake 3.24+、Ninja、Python 3、Perl、make、Go 1.23+ 與 MinGW x64 GCC（`x86_64-w64-mingw32-gcc`）。前端資源已隨附，一般建置不需 Node.js；首次 Go 建置需要網路連線或 module 快取。
+
+在儲存庫根目錄執行，或在 Finder 雙擊 `run.command`：
+
+```sh
+./run.command
+```
+
+首次執行會自動建置與封裝；之後核對並沿用已驗證的套件，正常啟動不等待同一提交內的開發改動重新編譯。Git 提交更新時會重新建置；要套用尚未提交的修改，執行 `./run.command --rebuild` 或下方的自行編譯流程。
+
+完成後開啟 `build/launcher/Win64 Launcher.app`。按「加入 EXE」，選取自行準備的 Windows 程式，設定工作資料夾、命令列、磁碟映射與寫入權限，再按播放圖示。文字程式使用內嵌終端，視窗程式開啟獨立視窗。
+
+## 自行編譯
+
+```sh
+cmake --preset release
+cmake --build --preset release --target x64arm --parallel 4
+./build/release/x64arm doctor
+python3 scripts/build_launcher.py --jobs 4
+```
+
+前三行建置並檢查 CLI；最後一行建置並封裝 Launcher。保留隨附 SDK 的完整標頭、靜態函式庫、CMake 設定及授權，勿混用不同版本。固定第三方來源與授權亦隨附於儲存庫。
+
+## 文件與相容性
+
+[開始使用](../../docs/getting-started.md) · [Launcher 操作](../../docs/launcher.md) · [建置與封裝](../../docs/build-and-release.md) · [執行與相容性](../../docs/realworld-support.md) · [GPU 記憶體](../../docs/gpu-memory.md) · [Geekbench 測試方式](../../docs/geekbench7-single-core.md) · [文件導覽](../../docs/README.md)
+
+x64 OpenCL 與 Vulkan 分別使用 macOS OpenCL.framework 與 Vulkan loader／MoltenVK；需求與限制見 [OpenCL／Vulkan](../../docs/opencl-vulkan-support.md)。
+
+### CPU 與多核
+
+32／64 位元程式預設使用 resident AOT。Launcher 可依程式設定客體 CPU 核心數，多個客體執行緒由常駐 worker 並行執行。2026-11-02 以 Geekbench 7 官方多核 8 個測項量測，相對單核基準，2 核為 1.79～2.18 倍、4 核為 2.84～4.35 倍。
+
+### Direct3D 9
+
+提供 D3D9／D3D9Ex 裝置、紋理與緩衝區、固定功能與可程式化繪圖、交換鏈及 Metal 呈現。特殊格式、裝置能力與渲染狀態組合仍有相容性邊界。
+
+### Direct3D 10／10.1
+
+提供 D3D10／D3D10.1 裝置、資源、著色器、繪圖與 DXGI 交換鏈，連接 Metal。裝置建立成功或版本號不代表所有功能、格式均可使用。
+
+### Direct3D 11
+
+提供裝置與 context、資源與 view、DXBC 著色器轉譯、Draw／Dispatch 及 DXGI 呈現，包含圖形與 GPU 運算。D3D11.1～11.4 介面轉接至同一套處理流程，著色器可於背景轉譯。進階功能、格式與擴充介面仍須依程式需求確認；feature level 不代表完整 11.x 相容。多 vCPU 時，不回傳結果的方法會經命令串流交由獨立執行緒依序執行，減少繪圖執行緒的等待（`X64ARM_D3D11_STREAM=0` 關閉）。
+
+### Direct3D 12
+
+提供裝置、命令佇列／清單、資源與描述元、根簽章、繪圖／運算、fence 與 DXGI 呈現的功能子集，透過 Metal 執行，命令清單由獨立的提交執行緒重播。已有間接命令與 Bundle 路徑；DXR、Mesh Shader、Work Graph 等進階功能不在完整相容承諾內。
+
+### x86（32 位元 Windows）
+
+除了 x86_64（64 位元），亦可載入 x86 PE32 EXE 與相符 DLL。32／64 位元程式預設均使用 resident AOT；附帶 DLL 須與 EXE 位元數相同，同一程序不能混載 32／64 位元 DLL。x86 的 API 與圖形涵蓋範圍不保證與 x64 完全相同，也不代表完整 WOW64、16 位元程式、核心驅動程式或 DRM 均可使用。
+
+詳細範圍與使用建議見 [Direct3D 與 x86 相容性](../../docs/direct3d-and-x86.md)。
+
+### 其他 API
+
+- **OpenGL／WebGL**：OpenGL／WGL 預設轉為 Metal 繪製，初始化失敗時改用 macOS OpenGL；WebGL 使用的 EGL／GLES 交由 ANGLE 的 Metal 後端。
+- **音訊**：DirectSound（含 3D 定位與錄音）、XAudio2、WASAPI 與 X3DAudio 經 Core Audio 輸出，保留立體聲左右聲道與聲像。
+- **輸入**：DirectInput（含力回饋）、XInput 與 Raw Input 取用 macOS 實體輸入裝置的資料。
+- **影片**：Media Foundation 與 D3D11 DXVA 的 H.264 編解碼使用 VideoToolbox 硬體加速；Windows Media（ASF）的 VC-1／WMV 與 WMA 由內建、只含解碼器的 FFmpeg 解碼。HEVC 與 AV1 尚未完成。
+
+AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數組合並未全面支援。成功載入或顯示視窗不代表完整應用程式均可使用。磁碟映射不是完整 OS 沙箱；啟用的服務可能存取映射檔案或使用網路。請只執行信任的程式，並依需要設定存取權限。
+
+儲存庫包含 `src/`、`include/`、`launcher/`、`cmake/`、必要建置腳本、`third_party/`、`x64kernel/` 與使用文件。
+
+## 原生 MetalFX 與多聲道 HRTF 耳機模擬
+
+這兩項功能皆由 AppleJuice 在畫面呈現與音訊輸出層原生提供，遊戲沒有內建 MetalFX 或 HRTF 支援，也可以手動開啟，不需要修改遊戲或安裝遊戲模組。
+
+### MetalFX 升頻與畫面內插
+
+- **2 倍放大顯示**：在主畫面開啟同名開關，以 macOS 原生 MetalFX 空間升頻將遊戲輸出放大 2 倍，無須遊戲整合升頻功能。
+- **畫面內插**：由本專案另外透過 macOS 原生 VideoToolbox，在前後兩張已完成畫面之間產生中間畫面，提高顯示流暢度，無須遊戲提供深度或動態向量。需要 macOS 26 以上及支援的裝置，輸入畫面最高為 1920×1080；內插不會提高遊戲本身的更新頻率。
+- **遊戲內 XeSS**：程式本身提供 XeSS 時，亦可對應至 MetalFX 時間性升頻。這條路徑啟用後，Launcher 的畫面內插與 2 倍放大會自動停用，改由遊戲的升頻輸出。
+
+### 多聲道 HRTF 耳機模擬
+
+開啟「空間混音(耳機)」，即可將程式輸出的 5.1、7.1 等多聲道音訊，依各聲道方位經 HRTF 轉為立體聲雙耳輸出，讓一般耳機呈現方向感，並保留低頻聲道。遊戲或影音程式無須內建 HRTF；空間效果依來源實際提供的聲道資訊而定。
+
+主畫面與「設定 → 音訊」皆提供同步的 Switch 開關。此功能預設關閉，設定於下次啟動程式時生效，目前不啟用頭部追蹤。
+
+### 從 Steam 或其他啟動器開啟遊戲
+
+在 AppleJuice 選取 Steam，調整「空間混音(耳機)」、「2 倍放大顯示」及「畫面內插」，再從 Steam 啟動遊戲。新建立的遊戲及其子程序會讀取最新設定；修改開關後不必重新啟動 Steam。已執行的遊戲須關閉再開啟，才會套用新的畫面與音訊設定。
+
+已加入 AppleJuice 程式庫的遊戲，其 EXE 個別儲存的兩項顯示設定優先；尚未加入的遊戲沿用啟動器目前的顯示設定。空間混音為全域偏好。此流程同樣適用其他啟動器，不以遊戲名稱判斷。
+
+## 支持開發
+
+如果 AppleJuice 對你有幫助，歡迎請我喝杯咖啡，支持持續開發。
+
+[☕ Buy Me a Coffee](https://buymeacoffee.com/vaderchen)
+
+## 授權
+
+Copyright (C) 2026 VaderChen.
+
+AppleJuice（包含 x64arm 引擎與 Win64 Launcher 的自有內容）採[原始碼公開・禁止商業販售授權](../../LICENSE.md)。允許非販售的使用、修改與免費分享，包含公司內部自用；禁止販售、付費代管／SaaS、收費服務及付費產品整合。一般員工薪資不視為販售；藉軟體提供取得廣告、導購佣金或資料交易收入亦受限制。有相關商業需求時，請與著作權人討論另行書面授權，洽詢本身不構成授權。
+
+靜態連結 AppleJuiceKernel 後的執行檔與 Launcher 套件亦屬於 AppleJuice 的可發布範圍，隨成品保留核心及第三方授權聲明；拆分儲存庫不改變既有授權限制。
+
+此為自訂的原始碼公開授權，不屬於 OSI 定義的開源授權。四語 README 為摘要，以繁體中文完整授權為準。第三方元件、另附授權的內容與外部 Windows 程式仍依各自授權處理。
+
+完整授權：[繁體中文](../../LICENSE.md) · [English](../../LICENSE.en.md) · [日本語](../../LICENSE.ja.md) · [한국어](../../LICENSE.ko.md)
+
+[商業販售政策](../../COMMERCIAL-LICENSE.md) · [授權適用範圍與來源](../../docs/licensing.md) · [第三方授權索引](../../THIRD-PARTY-NOTICES.md)

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 356" role="img" aria-labelledby="title description">
+<title id="title">AppleJuice execution path</title>
+<desc id="description">A Windows game passes through the PE loader to resident ARM64 translation and Windows services. Direct3D calls map to Metal; audio and input use macOS services.</desc>
+<rect width="600" height="356" rx="14" fill="#19221e"/>
+<g fill="none" stroke="#bbee9f" stroke-width="3"><path d="M300 55v24m0 40v26m0 40v26m0 44v18H149v24m151-24h151v24"/></g>
+<g font-family="Arial,sans-serif" font-size="20" text-anchor="middle" fill="#f5f9f4">
+<text x="300" y="46">Windows game · x86 / x64</text>
+<text x="300" y="109">PE / DLL loader</text>
+<text x="300" y="173" fill="#bbee9f">Resident AOT → ARM64</text>
+<text x="300" y="240">Windows API services</text>
+<text x="149" y="326">Direct3D → Metal</text>
+<text x="451" y="326">macOS audio / input / files</text></g></svg>

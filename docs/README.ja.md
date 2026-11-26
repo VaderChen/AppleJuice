@@ -1,6 +1,6 @@
 # AppleJuice
 
-[繁體中文](../README.md) · [English](README.en.md) · **日本語** · [한국어](README.ko.md)
+[繁體中文](../README.zh-TW.md) · [English](README.en.md) · **日本語** · [한국어](README.ko.md)
 
 AppleJuice は Apple Silicon Mac 向けの Windows 互換レイヤーと Go／WKWebView の Win64 Launcher を提供します。C++20 ランタイムが PE を読み込み、Windows API を macOS と Metal に対応付けます。CPU の変換と実行には、独立した AppleJuiceKernel の静的 SDK を使用します。
 

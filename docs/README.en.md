@@ -1,6 +1,6 @@
 # AppleJuice
 
-[繁體中文](../README.md) · **English** · [日本語](README.ja.md) · [한국어](README.ko.md)
+[繁體中文](../README.zh-TW.md) · **English** · [日本語](README.ja.md) · [한국어](README.ko.md)
 
 AppleJuice provides the Windows compatibility layer and Go/WKWebView Win64 Launcher for Apple Silicon Macs. Its C++20 runtime loads PE files and maps Windows APIs to macOS and Metal. CPU translation and execution are provided by the separate AppleJuiceKernel static SDK.
 

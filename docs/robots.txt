@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /AppleJuice/
+Sitemap: https://vaderchen.github.io/AppleJuice/sitemap.xml

@@ -959,7 +959,11 @@ std::pair<std::vector<std::uint8_t>,std::uint32_t> WindowsServices::process_crea
        (token.user.attributes&0x10U) || std::any_of(token.groups.begin(),token.groups.end(),[](const auto& group){return group.attributes&0x10U;}))return {{},1314};
     auto elevated=token;elevated.integrity=std::max(token.integrity,privilege==2?0x4000U:0x3000U);
     const auto admins=sddl_sid("BA");
-    if(const auto group=std::find_if(elevated.groups.begin(),elevated.groups.end(),[&](const auto& item){return item.sid==admins;});group!=elevated.groups.end())group->attributes|=7U;else elevated.groups.push_back({admins,7});
+    // 提升權杖的 Administrators 群組可成為新物件的擁有者。
+    constexpr std::uint32_t administrator_group_attributes=0x1U|0x2U|0x4U|0x8U;
+    const auto group=std::find_if(elevated.groups.begin(),elevated.groups.end(),[&](const auto& item){return item.sid==admins;});
+    if(group!=elevated.groups.end())group->attributes|=administrator_group_attributes;
+    else elevated.groups.push_back({admins,administrator_group_attributes});
     if(privilege==2){elevated.user.sid=sddl_sid("SY");elevated.owner=elevated.user.sid;elevated.primary_group=admins;elevated.session=0;}
     // 權限只由既有 Sandbox broker 產生；一般使用者與 restricted token 不取得新 privilege。
     static constexpr unsigned administrator_privileges[]{4,5,8,9,10,11,12,13,14,15,17,18,19,20,22,23,24,28,29,30,33,34,35,36};
