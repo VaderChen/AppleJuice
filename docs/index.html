@@ -20,7 +20,7 @@
 header{padding:0 0 2rem}h1{font-size:clamp(2.7rem,7vw,5.2rem);line-height:1.04;letter-spacing:-.05em;margin:0;max-width:15ch}
 h2{line-height:1.2;margin:.5rem 0}p{max-width:64ch;color:var(--muted)}
 .button{background:var(--accent);color:#132318;padding:.65rem 1.1rem;border-radius:.45rem;text-decoration:none;font-weight:650}
-section{border-top:1px solid var(--line);padding-block:1.5rem}summary{cursor:pointer}
+section{border-top:1px solid var(--line);padding-block:1.5rem}
 figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#19221e;border-radius:.45rem}
 .chapters{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,18rem),1fr));gap:1rem}
 .chapters img{display:block;width:100%;height:auto;border-radius:.4rem}figcaption{margin-top:.45rem}
@@ -32,6 +32,11 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 .game-counts tbody th { font-weight:normal }
 .game-counts img { vertical-align:middle }
 .game-counts tr > :last-child { text-align:end }
+.faq h3 { margin:0 0 .45rem; font-size:1.15rem; line-height:1.4 }
+.faq .answer { padding-block:1.25rem; border-top:1px solid var(--line) }
+.faq .answer p { margin:0 }
+.faq video { margin-block:.85rem .55rem }
+.faq .report { margin:0; padding-block-start:1.5rem; border-top:1px solid var(--line) }
 #steam-install video { aspect-ratio: 8 / 5; max-width:56rem }
 </style>
 </head>
@@ -69,12 +74,13 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 <a href="tested/"><span data-copy="records">Browse game and tool records</span></a></section>
 <section><h2><span data-copy="runtime">Inside the runtime</span></h2><p><span data-copy="runtimeInfo">A resident translator produces ARM64 code. Windows services connect the game to native graphics, input and audio. Output options include MetalFX upscaling, VideoToolbox frame interpolation and HRTF headphone mixing.</span></p><a href="architecture/"><span data-copy="architecture">Explore the architecture</span></a></section>
 <section><h2><span data-copy="performance">CPU performance</span></h2><p><span data-copy="measurements">Compare Geekbench 7 scores by workload on an Apple M4 Pro.</span></p><a href="geekbench7/"><span data-copy="readScores">View benchmark scores</span></a></section>
-<section><h2><span data-copy="gettingStarted">Getting started</span></h2><details open><summary><span data-copy="installGame">How do I install a game?</span></summary><p><span data-copy="installSteps">Copy AppleJuice.app from the release DMG to Applications. Open the Launcher, choose Add EXE, select your game and review its drive mappings before pressing Play.</span></p></details>
-<section id="steam-install"><h3><span data-copy="installSteam">How do I install Steam?</span></h3><p><span data-copy="steamSteps">Choose Run once and select SteamSetup.exe in the macOS file picker. After setup finishes, Steam.exe appears in the Launcher sidebar.</span></p>
+<section class="faq"><h2><span data-copy="gettingStarted">Getting started</span></h2>
+<div class="answer"><h3><span data-copy="installGame">How do I install a game?</span></h3><p><span data-copy="installSteps">Copy AppleJuice.app from the release DMG to Applications. Open the Launcher, choose Add EXE, select your game and review its drive mappings before pressing Play.</span></p></div>
+<div class="answer" id="steam-install"><h3><span data-copy="installSteam">How do I install Steam?</span></h3><p><span data-copy="steamSteps">Choose Run once and select SteamSetup.exe in the macOS file picker. After setup finishes, Steam.exe appears in the Launcher sidebar.</span></p>
 <video controls playsinline preload="none" width="1440" height="900" poster="images/gameplay/steam-install.jpg" aria-labelledby="steam-video-title"><source src="media/gameplay/steam-temporary-install.mp4" type="video/mp4"></video>
-<p><a id="steam-video-title" href="media/gameplay/steam-temporary-install.mp4"><span data-copy="watchInstall">Watch the Steam installation (39 seconds)</span></a></p></section>
-<details><summary><span data-copy="whichGames">Which games work?</span></summary><p><span data-copy="ratings">The tested list distinguishes default performance, enhanced output, slow gameplay, launch-only and failed runs. Check your edition and settings.</span></p></details>
-<a href="https://github.com/VaderChen/AppleJuice/issues/new/choose"><span data-copy="report">Share a test or report a problem</span></a></section>
+<p><a id="steam-video-title" href="media/gameplay/steam-temporary-install.mp4"><span data-copy="watchInstall">Watch the Steam installation (39 seconds)</span></a></p></div>
+<div class="answer"><h3><span data-copy="whichGames">Which games work?</span></h3><p><span data-copy="ratings">The tested list distinguishes default performance, enhanced output, slow gameplay, launch-only and failed runs. Check your edition and settings.</span></p></div>
+<p class="report"><a href="https://github.com/VaderChen/AppleJuice/issues/new/choose"><span data-copy="report">Share a test or report a problem</span></a></p></section>
 </main>
 <footer data-nav-label="guides" aria-label="Product guides"><a href="https://github.com/VaderChen/AppleJuice#readme" hreflang="en">English</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.zh-TW.md" hreflang="zh-Hant">繁體中文</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.ja.md" hreflang="ja">日本語</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.ko.md" hreflang="ko">한국어</a><a href="https://buymeacoffee.com/vaderchen">☕ Buy Me a Coffee</a></footer>
 <script src="site-language.js"></script>
