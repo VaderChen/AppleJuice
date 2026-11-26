@@ -39,6 +39,11 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 .faq .report { margin:0; padding-block-start:1.5rem; border-top:1px solid var(--line) }
 .score-chart img { display:block; width:100%; height:auto; border:1px solid var(--line); border-radius:.6rem }
 #steam-install video { aspect-ratio: 8 / 5; max-width:56rem }
+#gameplay-player { width:min(64rem,94vw); padding:.8rem; border:1px solid var(--line); border-radius:.8rem; background:var(--surface); color:var(--ink) }
+#gameplay-player::backdrop { background:#080e0acc }
+#gameplay-player video { max-height:72vh; object-fit:contain }
+.player-bar { display:flex; align-items:center; justify-content:space-between; gap:1rem; margin-bottom:.6rem }
+.player-bar button { padding:.45rem 1rem; border:1px solid var(--line); border-radius:.5rem; background:var(--soft); color:var(--ink); font:inherit; cursor:pointer }
 </style>
 </head>
 <body>
@@ -52,21 +57,23 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 <section id="gameplay" aria-labelledby="gameplay-title">
 <h2 id="gameplay-title"><span data-copy="showcase">Gameplay showcase</span></h2>
 <p><span data-copy="capture">Recorded on Apple M4 Pro with 64 GiB of unified memory and macOS 27.2.1 at 1920 × 1080. Frontier Hunter uses AppleJuice 0.26.1126 build 727 with 2 CPU cores. The other games use build 1536 with 4 CPU cores. Only the final Tomb Raider chapter enables frame interpolation.</span></p>
-<video controls playsinline loading="lazy" preload="none" width="1920" height="1080" poster="images/gameplay/frontier-hunter.png" data-label="movie" aria-label="AppleJuice gameplay chapters" aria-describedby="gameplay-description">
-<source src="media/gameplay/applejuice-gameplay.mp4" type="video/mp4">
-</video>
-<p id="gameplay-description"><span data-copy="videoNote">0:00 · Launching Frontier Hunter from the Steam Library.</span> <a href="media/gameplay/applejuice-gameplay.mp4"><span data-copy="openVideo">Open the MP4</span></a>.</p>
+<div class="actions">
+<a class="button" href="media/gameplay/applejuice-gameplay.mp4"><span aria-hidden="true">▶</span> <span data-copy="playGameplay">Watch gameplay</span></a>
+<span data-copy="videoNote">0:00 · Launching Frontier Hunter from the Steam Library.</span>
+</div>
+<dialog id="gameplay-player" aria-labelledby="player-title" closedby="any">
+<div class="player-bar"><strong id="player-title" data-copy="showcase">Gameplay showcase</strong><form method="dialog"><button autofocus data-copy="closePlayer">Close</button></form></div>
+<video controls playsinline preload="none" width="1920" height="1080" data-label="movie" aria-label="AppleJuice gameplay chapters"></video>
+</dialog>
 <div class="chapters">
 <figure><a href="media/gameplay/applejuice-gameplay.mp4#t=12,44"><img src="images/gameplay/frontier-hunter.png" width="1920" height="1080" loading="lazy" data-alt="cabin" alt="Play Frontier Hunter: Erza runs across her cabin and changes direction."></a>
 <figcaption><strong><span data-copy="frontier">0:12 · Frontier Hunter: Erza’s Wheel of Fortune</span></strong><br><span data-copy="frontierBuild">Steam build 15701452 · 2 CPU cores</span></figcaption></figure>
 <figure><a href="media/gameplay/applejuice-gameplay.mp4#t=44,83.933"><img src="images/gameplay/tales-of-arise.png" width="1920" height="1080" loading="lazy" data-alt="battle" alt="Play Tales of Arise: the party encounters an enemy and enters battle in the dungeon."></a>
 <figcaption><strong><span data-copy="tales">0:44 · Tales of Arise</span></strong><br><span data-copy="talesBuild">D3D11 · MetalFX off</span></figcaption></figure>
-</div>
-<ul>
-<li><a href="media/gameplay/applejuice-gameplay.mp4#t=83.933">1:24 · <span data-copy="witcher">The Witcher 3</span></a></li>
-<li><a href="media/gameplay/applejuice-gameplay.mp4#t=113.933">1:54 · <span data-copy="nativeTomb">Shadow of the Tomb Raider · Interpolation off</span></a></li>
-<li><a href="media/gameplay/applejuice-gameplay.mp4#t=154">2:34 · <span data-copy="interpolatedTomb">Shadow of the Tomb Raider · Interpolation on</span></a></li>
-</ul></section>
+<figure><a href="media/gameplay/applejuice-gameplay.mp4#t=83.933"><img src="images/gameplay/witcher-3.jpg" width="1280" height="720" loading="lazy" alt=""><strong>1:24 · <span data-copy="witcher">The Witcher 3</span></strong></a></figure>
+<figure><a href="media/gameplay/applejuice-gameplay.mp4#t=113.933"><img src="images/gameplay/tomb-raider-native.jpg" width="1280" height="720" loading="lazy" alt=""><strong>1:54 · <span data-copy="nativeTomb">Shadow of the Tomb Raider · Interpolation off</span></strong></a></figure>
+<figure><a href="media/gameplay/applejuice-gameplay.mp4#t=154"><img src="images/gameplay/tomb-raider-interpolated.jpg" width="1280" height="720" loading="lazy" alt=""><strong>2:34 · <span data-copy="interpolatedTomb">Shadow of the Tomb Raider · Interpolation on</span></strong></a></figure>
+</div></section>
 <section><h2 id="game-counts-title"><span data-copy="results">From the tested library</span></h2>
 <table class="game-counts" aria-labelledby="game-counts-title">
 <thead><tr><th scope="col" data-copy="status">Status</th><th scope="col" data-copy="gameCount">Games</th></tr></thead>
@@ -95,4 +102,25 @@ figure{margin:1rem 0}video{display:block;width:100%;height:auto;background:#1922
 <footer data-nav-label="guides" aria-label="Product guides"><a href="https://github.com/VaderChen/AppleJuice#readme" hreflang="en">English</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.zh-TW.md" hreflang="zh-Hant">繁體中文</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.ja.md" hreflang="ja">日本語</a><a href="https://github.com/VaderChen/AppleJuice/blob/main/README.ko.md" hreflang="ko">한국어</a><a href="https://buymeacoffee.com/vaderchen">☕ Buy Me a Coffee</a></footer>
 <script src="site-language.js"></script>
 <script src="home-language.js"></script>
+<script>
+const playerDialog = document.getElementById('gameplay-player');
+if (typeof playerDialog.showModal === 'function') {
+  const video = playerDialog.querySelector('video');
+  for (const link of document.querySelectorAll('#gameplay a[href*="applejuice-gameplay.mp4"]')) {
+    link.setAttribute('aria-haspopup', 'dialog');
+    link.addEventListener('click', event => {
+      if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      video.src = link.href;
+      playerDialog.showModal();
+      video.play().catch(() => {}); // 瀏覽器限制自動播放時，仍可使用原生控制列。
+    });
+  }
+  playerDialog.addEventListener('close', () => {
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+  });
+}
+</script>
 </body></html>

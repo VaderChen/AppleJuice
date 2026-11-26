@@ -27,7 +27,7 @@ Apple Silicon · macOS 13 이상. 배포 앱에 런타임이 포함되어 있습
 
 ## 실제 플레이 영상
 
-**[플레이 영상 보기](docs/media/gameplay/applejuice-gameplay.mp4)** · 0:00 Steam 라이브러리에서 실행
+**[플레이 영상 보기](https://vaderchen.github.io/AppleJuice/?lang=ko#gameplay)** · 0:00 Steam 라이브러리에서 실행
 
 Apple M4 Pro, 64 GiB 통합 메모리, macOS 27.2.1에서 1920 × 1080으로 녹화했습니다. 프런티어 헌터는 AppleJuice 0.26.1126 빌드 727과 CPU 2코어를, 나머지 게임은 빌드 1536과 CPU 4코어를 사용했습니다. 툼 레이더의 마지막 장면에서만 프레임 보간을 켰습니다.
 
@@ -36,7 +36,9 @@ Apple M4 Pro, 64 GiB 통합 메모리, macOS 27.2.1에서 1920 × 1080으로 녹
 | ![엘사가 선실 안을 달리다가 방향을 바꾸는 장면.](docs/images/gameplay/frontier-hunter.png) | ![던전에서 적과 만나 전투에 들어가는 장면.](docs/images/gameplay/tales-of-arise.png) |
 | Steam 15701452 · CPU 2코어 | D3D11 · MetalFX 끔 |
 
-[1:24 · 더 위쳐 3](docs/media/gameplay/applejuice-gameplay.mp4#t=83.933) · [1:54 · 섀도우 오브 더 툼 레이더 · 보간 끔](docs/media/gameplay/applejuice-gameplay.mp4#t=113.933) · [2:34 · 섀도우 오브 더 툼 레이더 · 보간 켬](docs/media/gameplay/applejuice-gameplay.mp4#t=154)
+| [1:24 · 더 위쳐 3](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=83.933) | [1:54 · 섀도우 오브 더 툼 레이더 · 보간 끔](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=113.933) | [2:34 · 섀도우 오브 더 툼 레이더 · 보간 켬](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=154) |
+|---|---|---|
+| [![1:24 · 더 위쳐 3](docs/images/gameplay/witcher-3.jpg)](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=83.933) | [![1:54 · 섀도우 오브 더 툼 레이더 · 보간 끔](docs/images/gameplay/tomb-raider-native.jpg)](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=113.933) | [![2:34 · 섀도우 오브 더 툼 레이더 · 보간 켬](docs/images/gameplay/tomb-raider-interpolated.jpg)](https://vaderchen.github.io/AppleJuice/media/gameplay/applejuice-gameplay.mp4#t=154) |
 
 ## 게임 호환성
 
